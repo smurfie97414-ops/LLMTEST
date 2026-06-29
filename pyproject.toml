@@ -16,4 +16,4 @@ dependencies = []
 cortex3 = "cortex3:main"
 
 [tool.setuptools]
-py-modules = ["cortex3"]
+py-modules = ["cortex3", "cortex3_phases", "cortex3_ledgers", "cortex3_analysis", "cortex3_cycle", "cortex3_selection"]
