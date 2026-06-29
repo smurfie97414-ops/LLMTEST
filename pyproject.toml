@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cortex3-llmtest"
+version = "0.1.0"
+description = "Recursive Verified Cognitive Compilation research scaffold"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{name = "LLMTEST contributors"}]
+license = {text = "MIT"}
+dependencies = []
+
+[project.scripts]
+cortex3 = "cortex3:main"
+
+[tool.setuptools]
+py-modules = ["cortex3"]
