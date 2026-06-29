@@ -18,3 +18,5 @@ jobs:
         run: python -m unittest discover -s tests
       - name: Demo smoke test
         run: python -m cortex3 demo --seed 1 --n-per-skill 2
+      - name: Cycle report smoke test
+        run: python tools/run_cycle_report.py
