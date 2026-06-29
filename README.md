@@ -80,22 +80,21 @@ Hierarchical Dynamic Verifier
           └── sleep / consolidation buffer
 ```
 
-## Ce qui est déjà implémenté dans cette première fondation
+## Implémentation actuelle
 
-Cette base contient un package Python installable avec :
+Cette base contient maintenant :
 
-- `Task`, `CandidateAnswer`, `CostTrace`, rapports de vérification ;
-- `ArithmeticSkill` : tâches math exactes avec transformations métamorphiques ;
-- `LongContextAnchorSkill` : tests d'ancres exactes dans contexte bruité ;
-- `InstructionSkill` : respect strict de format ;
-- `DynamicSkillVerifier` : génération dynamique de suites de test ;
-- `CompressionAdversary` : variantes adversariales depuis les échecs ;
-- `TernaryBlock` : représentation sign+mask `{-1,0,+1}` avec zéros provisoires/certifiés/réversibles ;
-- `ExactAnchorLedger` : extraction et fidélité des ancres exactes ;
-- `AdaptiveHorizonPolicy` : politique MTP adaptative selon confiance/risque/domaine ;
-- `MinimalRegrowthPlanner` : propositions de réparation à coût minimal ;
-- une démo CLI vérification → adversaire → regrowth ;
-- des tests unitaires et une CI GitHub Actions.
+- `cortex3.py` : noyau de tâches, skills, vérificateur dynamique, adversarial checks, ternaire sign+mask, ancrage exact, horizon MTP adaptatif, regrowth minimal et CLI de démonstration ;
+- `cortex3_phases.py` : registre exécutable des 10 phases Cortex-3 ;
+- `cortex3_ledgers.py` : Bit Ledger, Skill Ledger, Causal Ledger et Uncertainty Ledger ;
+- `cortex3_analysis.py` : analyse des causes probables d'une régression ;
+- `cortex3_cycle.py` : cycle complet référence/trial → vérification → ledgers → analyse → actions budgetées → rapport ;
+- `cortex3_selection.py` : sélection offline de trials et choix des compétences frontières ;
+- `tools/run_cycle_report.py` : génération d'un rapport markdown du cycle ;
+- `tests/` : tests unitaires pour le noyau et les nouveaux modules ;
+- `.github/workflows/ci.yml` : CI GitHub Actions.
+
+Le fichier `Cortex-3 PLAN.txt` contient le plan complet de recherche et reste conservé dans le repo.
 
 ## Métrique centrale
 
@@ -118,11 +117,11 @@ qualité_vérifiée = exactitude × robustesse métamorphique × calibration × 
 git clone https://github.com/smurfie97414-ops/LLMTEST.git
 cd LLMTEST
 python -m venv .venv
-source .venv/bin/activate  # Windows: .venv\\Scripts\\activate
+source .venv/bin/activate  # Windows: .venv\Scripts\activate
 pip install -e .
 ```
 
-## Démo
+## Démo noyau
 
 ```bash
 python -m cortex3 demo --seed 7 --n-per-skill 5
@@ -130,22 +129,29 @@ python -m cortex3 demo --seed 7 --n-per-skill 5
 
 La démo compare une référence simple à un agent « compressé » volontairement corrompu. Le vérificateur détecte les régressions, l'adversaire génère des variantes et le regrowth propose des réparations minimales.
 
+## Rapport de cycle
+
+```bash
+python tools/run_cycle_report.py
+```
+
+Ce rapport exécute le cycle complet : référence vs trial, régressions, ledgers, analyse des causes et actions budgetées.
+
 ## Tests
 
 ```bash
 python -m unittest discover -s tests
 ```
 
-## Roadmap
+## Roadmap immédiate
 
-1. Renforcer le Dynamic Skill Verifier : calibration, code exécutable, long contexte plus dur.
-2. Ajouter un vrai `BitLinear` PyTorch sign+mask avec residual synapse buffer.
-3. Ajouter les têtes MTP/FSP entraînables et la cohérence temporelle.
-4. Ajouter une mémoire KV latente avec registre exact d'ancres.
-5. Ajouter le raisonnement latent avec certificats courts.
-6. Ajouter l'attribution causale des régressions.
-7. Ajouter un moteur de regrowth qui applique réellement les réparations.
-8. Ajouter un Recursive Improvement Engine sandboxé.
+1. Étendre les skills vers le code exécutable et les tests unitaires générés.
+2. Ajouter un module PyTorch `BitLinear` sign+mask avec residual synapse buffer.
+3. Ajouter des checks courts pour FSP/output goals et les connecter au cycle.
+4. Ajouter une mémoire latente simulée + registre exact d'ancres.
+5. Ajouter la sélection de chemins fast/normal/careful dans une vraie boucle d'inférence.
+6. Ajouter des rapports JSON/markdown persistés dans `runs/`.
+7. Ajouter le premier micro-entraînement toy model pour tester MTP vs NTP en faible précision.
 
 ## Phrase centrale
 
