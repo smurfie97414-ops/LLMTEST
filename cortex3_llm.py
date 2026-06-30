@@ -47,6 +47,7 @@ from cortex3_cycle import CortexCycle
 from cortex3_future import ContractDecision, FutureContract, FutureContractEngine, FutureContractLedger, MTPFSPConfig
 from cortex3_improvement import RecursiveImprovementEngine, RollbackEvent
 from cortex3_inference import InferenceConfig, UltraFastInferenceEngine
+from cortex3_ledgers import BitLedger, CausalLedger, CausalTrace, SkillLedger, SkillState, UncertaintyLedger
 from cortex3_memory import CognitiveMemory, CognitiveMemoryConfig, MemoryMode, MemorySegment
 from cortex3_objective import build_objective_report
 from cortex3_phases import CORTEX3_PHASES
@@ -264,6 +265,134 @@ def _restore_compression_trace_ledger(ledger: CompressionTraceLedger | None, pay
     ledger.total_kv_bytes = float(
         cost_trace.get("kv_bytes", sum(item.bytes_used for item in ledger.kv_events))
     )
+
+
+def _cost_trace_payload(cost: CostTrace) -> dict[str, Any]:
+    return asdict(cost)
+
+
+def _bit_ledger_payload(ledger: BitLedger) -> dict[str, Any]:
+    payload = asdict(ledger)
+    payload["total_effective_bits"] = ledger.total_effective_bits
+    return payload
+
+
+def _restore_bit_ledger(ledger: BitLedger, payload: Mapping[str, Any] | None) -> None:
+    data = dict(payload or {})
+    ledger.weight_bits = float(data.get("weight_bits", 0.0))
+    ledger.scale_bits = float(data.get("scale_bits", 0.0))
+    ledger.activation_bits = float(data.get("activation_bits", 0.0))
+    ledger.kv_bytes = float(data.get("kv_bytes", 0.0))
+    ledger.routing_bits = float(data.get("routing_bits", 0.0))
+    ledger.certificate_bits = float(data.get("certificate_bits", 0.0))
+    ledger.verifier_steps = int(data.get("verifier_steps", 0))
+    ledger.notes = [str(item) for item in data.get("notes", ())]
+
+
+def _merge_bit_ledger(target: BitLedger, source: BitLedger, *, note_prefix: str = "") -> None:
+    target.weight_bits += float(source.weight_bits)
+    target.scale_bits += float(source.scale_bits)
+    target.activation_bits += float(source.activation_bits)
+    target.kv_bytes += float(source.kv_bytes)
+    target.routing_bits += float(source.routing_bits)
+    target.certificate_bits += float(source.certificate_bits)
+    target.verifier_steps += int(source.verifier_steps)
+    for note in source.notes:
+        target.notes.append(f"{note_prefix}{note}" if note_prefix else str(note))
+
+
+def _skill_ledger_payload(ledger: SkillLedger) -> dict[str, Any]:
+    return {
+        "protected_threshold": float(ledger.protected_threshold),
+        "states": {skill: asdict(state) for skill, state in ledger.states.items()},
+        "fragile_skills": [asdict(state) for state in ledger.fragile_skills()],
+    }
+
+
+def _restore_skill_ledger(ledger: SkillLedger, payload: Mapping[str, Any] | None) -> None:
+    data = dict(payload or {})
+    ledger.protected_threshold = float(data.get("protected_threshold", ledger.protected_threshold))
+    ledger.states.clear()
+    for skill, raw_state in dict(data.get("states") or {}).items():
+        state = dict(raw_state)
+        ledger.states[str(skill)] = SkillState(
+            skill=str(state.get("skill", skill)),
+            score=float(state.get("score", 0.0)),
+            pass_rate=float(state.get("pass_rate", 0.0)),
+            failures=int(state.get("failures", 0)),
+            fragility=float(state.get("fragility", 0.0)),
+            protected=bool(state.get("protected", False)),
+            history=[float(item) for item in state.get("history", ())],
+        )
+
+
+def _causal_trace_payload(trace: CausalTrace) -> dict[str, Any]:
+    return asdict(trace)
+
+
+def _causal_trace_from_payload(payload: Mapping[str, Any]) -> CausalTrace:
+    data = dict(payload or {})
+    return CausalTrace(
+        task_id=str(data.get("task_id", "")),
+        skill=str(data.get("skill", "")),
+        mtp_horizon=int(data.get("mtp_horizon", 1)),
+        activation_bits=int(data.get("activation_bits", 8)),
+        kv_mode=str(data.get("kv_mode", "exact")),
+        verifier_level=int(data.get("verifier_level", 0)),
+        certificate_fields=tuple(str(item) for item in data.get("certificate_fields", ())),
+        uncertainty=float(data.get("uncertainty", 0.0)),
+    )
+
+
+def _causal_ledger_payload(ledger: CausalLedger) -> dict[str, Any]:
+    return {
+        "trace_count": len(ledger.traces),
+        "traces": {task_id: _causal_trace_payload(trace) for task_id, trace in ledger.traces.items()},
+    }
+
+
+def _restore_causal_ledger(ledger: CausalLedger, payload: Mapping[str, Any] | None) -> None:
+    ledger.traces.clear()
+    data = dict(payload or {})
+    for task_id, raw_trace in dict(data.get("traces") or {}).items():
+        ledger.traces[str(task_id)] = _causal_trace_from_payload(dict(raw_trace))
+
+
+def _uncertainty_ledger_payload(ledger: UncertaintyLedger) -> dict[str, Any]:
+    bins = {
+        skill: [{"confidence": float(confidence), "passed": bool(passed)} for confidence, passed in pairs]
+        for skill, pairs in ledger.bins.items()
+    }
+    return {
+        "bins": bins,
+        "skill_count": len(bins),
+        "observation_count": sum(len(pairs) for pairs in bins.values()),
+        "expected_calibration_error": ledger.expected_calibration_error(),
+    }
+
+
+def _restore_uncertainty_ledger(ledger: UncertaintyLedger, payload: Mapping[str, Any] | None) -> None:
+    ledger.bins.clear()
+    data = dict(payload or {})
+    for skill, raw_pairs in dict(data.get("bins") or {}).items():
+        for raw_pair in raw_pairs:
+            pair = dict(raw_pair)
+            ledger.record(str(skill), float(pair.get("confidence", 0.0)), bool(pair.get("passed", False)))
+
+
+def _ledger_bundle_payload(
+    *,
+    bit_ledger: BitLedger,
+    skill_ledger: SkillLedger,
+    causal_ledger: CausalLedger,
+    uncertainty_ledger: UncertaintyLedger,
+) -> dict[str, Any]:
+    return {
+        "bit_ledger": _bit_ledger_payload(bit_ledger),
+        "skill_ledger": _skill_ledger_payload(skill_ledger),
+        "causal_ledger": _causal_ledger_payload(causal_ledger),
+        "uncertainty_ledger": _uncertainty_ledger_payload(uncertainty_ledger),
+    }
 
 
 def _anchor_payload(anchor: Anchor) -> dict[str, Any]:
@@ -2403,12 +2532,122 @@ class CortexTrainingPhaseController:
         self.objective_feedback_total = 0.0
         self.last_objective_loss_total = 0.0
         self.objective_feedback_history: list[dict[str, Any]] = []
+        self.bit_ledger = BitLedger()
+        self.skill_ledger = SkillLedger()
+        self.causal_ledger = CausalLedger()
+        self.uncertainty_ledger = UncertaintyLedger()
+        self._last_ingested_compression_cost = CostTrace()
 
     def _touch(self, phase_id: str) -> None:
         self.phase_counts[phase_id] = self.phase_counts.get(phase_id, 0) + 1
 
     def _record_error(self, phase_id: str, exc: Exception) -> None:
         self.errors.append({"phase": phase_id, "type": type(exc).__name__, "message": str(exc)})
+
+    def _current_compression_cost(self) -> CostTrace:
+        if self.model.compression_ledger is None:
+            return CostTrace()
+        return self.model.compression_ledger.cost_trace
+
+    def _ingest_compression_trace_delta(self, *, step: int, note: str) -> None:
+        current = self._current_compression_cost()
+        previous = self._last_ingested_compression_cost
+        delta = CostTrace(
+            weight_bits_read=max(0.0, current.weight_bits_read - previous.weight_bits_read),
+            activation_bits=max(0.0, current.activation_bits - previous.activation_bits),
+            kv_bytes=max(0.0, current.kv_bytes - previous.kv_bytes),
+            generated_tokens=max(0, current.generated_tokens - previous.generated_tokens),
+            latent_steps=max(0, current.latent_steps - previous.latent_steps),
+            experts_activated=max(0, current.experts_activated - previous.experts_activated),
+            verifier_steps=max(0, current.verifier_steps - previous.verifier_steps),
+            wall_time_ms=max(0.0, current.wall_time_ms - previous.wall_time_ms),
+        )
+        if delta.effective_cost() > 0:
+            self.bit_ledger.ingest_cost(delta, note=f"step-{step}:{note}")
+        self._last_ingested_compression_cost = current
+
+    def _record_causal_trace(
+        self,
+        *,
+        trace_id: str,
+        skill: str,
+        confidence: float,
+        anchors: int,
+        certificate_fields: Iterable[str],
+        verifier_level: int | None = None,
+        mtp_horizon: int | None = None,
+    ) -> None:
+        risk = max(0.0, min(1.0, 1.0 - float(confidence)))
+        route = self.cycle.router.route(skill, float(confidence), risk)
+        self.bit_ledger.routing_bits += math.log2(3.0)
+        self.causal_ledger.record(
+            CausalTrace(
+                task_id=trace_id,
+                skill=skill,
+                mtp_horizon=int(mtp_horizon or route.mtp_horizon),
+                activation_bits=(
+                    int(self.model.config.ternary_activation_bits)
+                    if self.model.config.use_ternary_core
+                    else 32
+                ),
+                kv_mode="latent" if anchors or skill in {"long_context_anchor", "entity_tracking"} else "exact",
+                verifier_level=int(route.verifier_level if verifier_level is None else verifier_level),
+                certificate_fields=tuple(str(item) for item in certificate_fields),
+                uncertainty=risk,
+            )
+        )
+
+    def _record_case_ledgers(self, case: Any, *, step: int, source: str) -> None:
+        answer_cost = case.answer.cost.merge(case.verifier_cost)
+        self.bit_ledger.ingest_cost(answer_cost, note=f"{source}:{case.task.skill}")
+        if case.answer.certificate:
+            self.bit_ledger.add_certificate(case.answer.certificate)
+        self.uncertainty_ledger.record(case.task.skill, case.answer.confidence, bool(case.passed))
+        self._record_causal_trace(
+            trace_id=f"{source}-{step}-{case.task.task_id}",
+            skill=case.task.skill,
+            confidence=case.answer.confidence,
+            anchors=len(case.task.anchors),
+            certificate_fields=case.answer.certificate.keys(),
+        )
+
+    def _ingest_suite_ledgers(self, report: Any, *, step: int, source: str) -> None:
+        for skill_report in report.skill_reports.values():
+            for case in skill_report.cases:
+                self._record_case_ledgers(case, step=step, source=source)
+
+    def _record_training_example_ledgers(self, example: TrainingExample, *, phase_id: str) -> None:
+        self.bit_ledger.ingest_cost(example.answer.cost, note=f"replay:{phase_id}:{example.targeted_skill}")
+        if example.answer.certificate:
+            self.bit_ledger.add_certificate(example.answer.certificate)
+        confidence = float(example.confidence_label if example.confidence_label is not None else example.answer.confidence)
+        self.uncertainty_ledger.record(example.targeted_skill, confidence, True)
+        self._record_causal_trace(
+            trace_id=f"replay-{phase_id}-{example.example_id}",
+            skill=example.targeted_skill,
+            confidence=confidence,
+            anchors=len(example.task.anchors),
+            certificate_fields=example.answer.certificate.keys(),
+            verifier_level=example.verification_level,
+        )
+
+    def _ingest_cycle_ledgers(self, cycle_report: Any, *, step: int) -> dict[str, Any]:
+        self.skill_ledger.update_from_report(cycle_report.trial)
+        self._ingest_suite_ledgers(cycle_report.trial, step=step, source="trial")
+        if cycle_report.extra_report is not None:
+            self._ingest_suite_ledgers(cycle_report.extra_report, step=step, source="compression-adversary")
+        for action in cycle_report.actions:
+            self.bit_ledger.scale_bits += float(action.cost) * 8.0
+            self.bit_ledger.notes.append(f"step-{step}:regrowth:{action.action}:{action.target}")
+        self._ingest_compression_trace_delta(step=step, note="phase-audit")
+        return {
+            "bit_ledger_total_effective_bits": self.bit_ledger.total_effective_bits,
+            "skill_ledger_states": len(self.skill_ledger.states),
+            "fragile_skills": [state.skill for state in self.skill_ledger.fragile_skills()],
+            "causal_trace_count": len(self.causal_ledger.traces),
+            "uncertainty_observations": sum(len(pairs) for pairs in self.uncertainty_ledger.bins.values()),
+            "expected_calibration_error": self.uncertainty_ledger.expected_calibration_error(),
+        }
 
     def interval(self) -> int:
         return int(self.config.cortex_phase_interval or self.config.eval_interval)
@@ -2464,6 +2703,18 @@ class CortexTrainingPhaseController:
             )
             observed = self._observed_contract_tokens(future_targets, contract.accepted_horizon)
             decision = self.future_engine.gate_contract(contract, observed_tokens=[int(token) for token in observed])
+            self.bit_ledger.ingest_cost(decision.cost, note=f"P3:{decision.contract.contract_id}")
+            self.uncertainty_ledger.record("llm_pretraining_future_contract", decision.contract.confidence, decision.accepted)
+            self._record_causal_trace(
+                trace_id=f"P3-{step}-{decision.contract.contract_id}",
+                skill="llm_pretraining_future_contract",
+                confidence=decision.contract.confidence,
+                anchors=0,
+                certificate_fields=("future_contract", "fsp_gate"),
+                verifier_level=1,
+                mtp_horizon=decision.contract.accepted_horizon,
+            )
+            self._ingest_compression_trace_delta(step=step, note="future-contract")
             self._touch("P3")
             decision_label = "ACCEPT" if decision.accepted else "REJECT"
             decision_task = Task(
@@ -2614,6 +2865,7 @@ class CortexTrainingPhaseController:
         self.replay_batches.append(self._batch_from_example(example))
         self.phase_replay_examples[phase_id] = self.phase_replay_examples.get(phase_id, 0) + 1
         self.phase_replay_example_ids.append(example.example_id)
+        self._record_training_example_ledgers(example, phase_id=phase_id)
         return example
 
     def _add_sleep_replay(self, examples: Sequence[TrainingExample]) -> None:
@@ -2621,6 +2873,7 @@ class CortexTrainingPhaseController:
             self.replay_batches.append(self._batch_from_example(example))
             self.phase_replay_examples["P9"] = self.phase_replay_examples.get("P9", 0) + 1
             self.phase_replay_example_ids.append(f"llm-p9-{self.phase_replay_examples['P9']}-{example.example_id}")
+            self._record_training_example_ledgers(example, phase_id="P9")
 
     def state_dict(self) -> dict[str, Any]:
         return {
@@ -2640,11 +2893,18 @@ class CortexTrainingPhaseController:
             "last_objective_loss_total": float(self.last_objective_loss_total),
             "objective_feedback_history": list(self.objective_feedback_history),
             "certificate_head_forward_events": int(self.model.certificate_forward_events),
+            "last_ingested_compression_cost": _cost_trace_payload(self._last_ingested_compression_cost),
             "future_ledger": self.future_ledger.to_dict(),
             "compression_trace_ledger": (
                 self.model.compression_ledger.to_dict()
                 if self.model.compression_ledger is not None
                 else None
+            ),
+            "ledgers": _ledger_bundle_payload(
+                bit_ledger=self.bit_ledger,
+                skill_ledger=self.skill_ledger,
+                causal_ledger=self.causal_ledger,
+                uncertainty_ledger=self.uncertainty_ledger,
             ),
             "memory_state": _memory_state(self.memory),
             "sleep_state": _sleep_state(self.sleep),
@@ -2682,8 +2942,14 @@ class CortexTrainingPhaseController:
             for item in payload.get("objective_feedback_history", ())
         ]
         self.model.certificate_forward_events = int(payload.get("certificate_head_forward_events", 0))
+        self._last_ingested_compression_cost = _cost_trace_from_payload(payload.get("last_ingested_compression_cost"))
         _restore_future_contract_ledger(self.future_ledger, payload.get("future_ledger"))
         _restore_compression_trace_ledger(self.model.compression_ledger, payload.get("compression_trace_ledger"))
+        ledgers = dict(payload.get("ledgers") or {})
+        _restore_bit_ledger(self.bit_ledger, ledgers.get("bit_ledger"))
+        _restore_skill_ledger(self.skill_ledger, ledgers.get("skill_ledger"))
+        _restore_causal_ledger(self.causal_ledger, ledgers.get("causal_ledger"))
+        _restore_uncertainty_ledger(self.uncertainty_ledger, ledgers.get("uncertainty_ledger"))
         _restore_memory_state(self.memory, payload.get("memory_state"))
         _restore_sleep_state(self.sleep, payload.get("sleep_state"))
         _restore_improvement_state(self.improvement, payload.get("improvement_state"))
@@ -2718,6 +2984,11 @@ class CortexTrainingPhaseController:
             "compression_trace_counts": compression_trace_counts,
             "variable_input_compression_events": compression_trace_counts.get("kv_events", 0),
             "certificate_head_forward_events": int(self.model.certificate_forward_events),
+            "bit_ledger_total_effective_bits": self.bit_ledger.total_effective_bits,
+            "skill_ledger_states": len(self.skill_ledger.states),
+            "causal_ledger_traces": len(self.causal_ledger.traces),
+            "uncertainty_ledger_observations": sum(len(pairs) for pairs in self.uncertainty_ledger.bins.values()),
+            "uncertainty_ledger_ece": self.uncertainty_ledger.expected_calibration_error(),
             "memory_recent_segments": len(self.memory.recent.segments),
             "memory_latent_segments": len(self.memory.latent.segments),
             "sleep_replay_examples": len(self.sleep.replay.examples),
@@ -2746,6 +3017,7 @@ class CortexTrainingPhaseController:
                 "regressions": len(cycle_report.regressions),
                 "aggregate_score": cycle_report.trial.aggregate_score,
             }
+            audit["ledgers"] = self._ingest_cycle_ledgers(cycle_report, step=step)
             first_failure = cycle_report.regressions[0] if cycle_report.regressions else None
             verifier_task = first_failure.task if first_failure is not None else Task(
                 f"phase-p1-{step}",
@@ -2837,6 +3109,7 @@ class CortexTrainingPhaseController:
                 "certificate": certificate.to_dict(),
             }
             if verification.passed:
+                self.bit_ledger.add_certificate(certificate.to_dict())
                 self._add_verified_phase_replay(
                     "P5",
                     task,
@@ -2897,6 +3170,17 @@ class CortexTrainingPhaseController:
             inference_results.append(inferred)
             self._touch("P8")
             audit["inference"] = inferred.to_dict()
+            self.bit_ledger.ingest_cost(inferred.cost, note=f"P8:{inferred.route.path.value}:{inferred.task.skill}")
+            self.uncertainty_ledger.record(inferred.task.skill, inferred.answer.confidence, bool(inferred.passed))
+            self._record_causal_trace(
+                trace_id=f"P8-{step}-{inferred.task.task_id}",
+                skill=inferred.task.skill,
+                confidence=inferred.answer.confidence,
+                anchors=len(inferred.task.anchors),
+                certificate_fields=inferred.answer.certificate.keys(),
+                verifier_level=inferred.route.verifier_level,
+                mtp_horizon=inferred.route.mtp_horizon,
+            )
             if inferred.passed:
                 self._add_verified_phase_replay(
                     "P8",
@@ -3022,6 +3306,11 @@ class CortexTrainingPhaseController:
                 "skill_expert_activations": trace_counts.get("expert_activations", 0),
                 "certificate_head_forward_events": int(self.model.certificate_forward_events),
                 "future_contract_decisions": len(self.future_ledger.decisions),
+                "bit_ledger_total_effective_bits": self.bit_ledger.total_effective_bits,
+                "skill_ledger_states": len(self.skill_ledger.states),
+                "causal_ledger_traces": len(self.causal_ledger.traces),
+                "uncertainty_ledger_observations": sum(len(pairs) for pairs in self.uncertainty_ledger.bins.values()),
+                "uncertainty_ledger_ece": self.uncertainty_ledger.expected_calibration_error(),
                 "confidence_regularization_steps": self.regularization_steps,
                 "sleep_replay_batches_available": len(self.replay_batches),
                 "sleep_replay_updates": self.replay_updates,
@@ -3044,6 +3333,12 @@ class CortexTrainingPhaseController:
             "trace_counts": trace_counts,
             "retained_trace_counts": compression_trace.get("retained_event_counts", {}),
             "future_ledger": self.future_ledger.to_dict(),
+            "ledgers": _ledger_bundle_payload(
+                bit_ledger=self.bit_ledger,
+                skill_ledger=self.skill_ledger,
+                causal_ledger=self.causal_ledger,
+                uncertainty_ledger=self.uncertainty_ledger,
+            ),
             "memory_state_summary": self.memory.compression_report(),
             "sleep_state_summary": {
                 "replay_examples": len(self.sleep.replay.examples),

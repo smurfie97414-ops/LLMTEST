@@ -712,6 +712,10 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             self.assertGreater(influence["skill_expert_activations"], 0)
             self.assertGreater(influence["certificate_head_forward_events"], 0)
             self.assertGreater(influence["future_contract_decisions"], 0)
+            self.assertGreater(influence["bit_ledger_total_effective_bits"], 0.0)
+            self.assertGreater(influence["skill_ledger_states"], 0)
+            self.assertGreater(influence["causal_ledger_traces"], 0)
+            self.assertGreater(influence["uncertainty_ledger_observations"], 0)
             self.assertGreater(influence["confidence_regularization_steps"], 0)
             self.assertGreater(influence["sleep_replay_batches_available"], 0)
             self.assertGreater(influence["sleep_replay_updates"], 0)
@@ -731,6 +735,10 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 self.assertGreater(phase_replay[phase_id], 0, phase_replay)
             self.assertTrue(phase_report["phase_replay_example_ids"], phase_report)
             self.assertTrue(phase_report["objective_feedback_history"], phase_report)
+            self.assertGreater(phase_report["ledgers"]["bit_ledger"]["total_effective_bits"], 0.0)
+            self.assertTrue(phase_report["ledgers"]["skill_ledger"]["states"])
+            self.assertGreater(phase_report["ledgers"]["causal_ledger"]["trace_count"], 0)
+            self.assertGreater(phase_report["ledgers"]["uncertainty_ledger"]["observation_count"], 0)
             for sample in phase_report["batch_contract_samples"]:
                 self.assertGreaterEqual(sample["observed_token_count"], sample["horizon"])
             self.assertTrue((run_dir / "cortex_phase_report.json").exists())
@@ -833,6 +841,13 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 self.assertGreater(checkpoint["cortex_phase_state"]["objective_feedback_events"], 0)
                 self.assertGreater(checkpoint["cortex_phase_state"]["last_objective_loss_total"], 0.0)
                 self.assertGreater(checkpoint["cortex_phase_state"]["certificate_head_forward_events"], 0)
+                self.assertGreater(checkpoint["cortex_phase_state"]["ledgers"]["bit_ledger"]["total_effective_bits"], 0.0)
+                self.assertTrue(checkpoint["cortex_phase_state"]["ledgers"]["skill_ledger"]["states"])
+                self.assertGreater(checkpoint["cortex_phase_state"]["ledgers"]["causal_ledger"]["trace_count"], 0)
+                self.assertGreater(
+                    checkpoint["cortex_phase_state"]["ledgers"]["uncertainty_ledger"]["observation_count"],
+                    0,
+                )
                 self.assertGreater(len(checkpoint["cortex_phase_state"]["future_ledger"]["decisions"]), 0)
                 self.assertGreater(
                     len(checkpoint["cortex_phase_state"]["compression_trace_ledger"]["layer_forward_events"]),
@@ -877,6 +892,10 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 )
                 self.assertGreater(sidecar["cortex_phase_state_summary"]["variable_input_compression_events"], 0)
                 self.assertGreater(sidecar["cortex_phase_state_summary"]["certificate_head_forward_events"], 0)
+                self.assertGreater(sidecar["cortex_phase_state_summary"]["bit_ledger_total_effective_bits"], 0.0)
+                self.assertGreater(sidecar["cortex_phase_state_summary"]["skill_ledger_states"], 0)
+                self.assertGreater(sidecar["cortex_phase_state_summary"]["causal_ledger_traces"], 0)
+                self.assertGreater(sidecar["cortex_phase_state_summary"]["uncertainty_ledger_observations"], 0)
                 self.assertGreater(sidecar["cortex_phase_state_summary"]["memory_recent_segments"], 0)
                 self.assertGreater(sidecar["cortex_phase_state_summary"]["sleep_replay_examples"], 0)
                 self.assertGreater(
@@ -938,6 +957,22 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             self.assertGreaterEqual(
                 resumed_influence["certificate_head_forward_events"],
                 first_influence["certificate_head_forward_events"],
+            )
+            self.assertGreaterEqual(
+                resumed_influence["bit_ledger_total_effective_bits"],
+                first_influence["bit_ledger_total_effective_bits"],
+            )
+            self.assertGreaterEqual(
+                resumed_influence["skill_ledger_states"],
+                first_influence["skill_ledger_states"],
+            )
+            self.assertGreaterEqual(
+                resumed_influence["causal_ledger_traces"],
+                first_influence["causal_ledger_traces"],
+            )
+            self.assertGreaterEqual(
+                resumed_influence["uncertainty_ledger_observations"],
+                first_influence["uncertainty_ledger_observations"],
             )
             self.assertGreaterEqual(
                 resumed_influence["memory_recent_segments"],
