@@ -1,3 +1,4 @@
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -157,6 +158,28 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 )
                 with self.assertRaises(RuntimeError):
                     LLMComparisonRunner(corpus, config, run_dir=root / "cuda-required").run()
+
+    def test_distributed_runtime_can_pin_gloo_interface_without_initializing(self):
+        if not torch.distributed.is_available() or not torch.distributed.is_gloo_available():
+            self.skipTest("Gloo distributed runtime is not available")
+        saved = {name: os.environ.get(name) for name in ("WORLD_SIZE", "RANK", "LOCAL_RANK", "GLOO_SOCKET_IFNAME")}
+        try:
+            os.environ["WORLD_SIZE"] = "2"
+            os.environ["RANK"] = "1"
+            os.environ["LOCAL_RANK"] = "1"
+            os.environ.pop("GLOO_SOCKET_IFNAME", None)
+            runtime = DistributedRuntime.from_env(requested=True, device_type="cpu", gloo_interface="test-iface")
+            self.assertTrue(runtime.enabled)
+            self.assertEqual(runtime.world_size, 2)
+            self.assertEqual(runtime.rank, 1)
+            self.assertEqual(runtime.gloo_interface, "test-iface")
+            self.assertEqual(os.environ["GLOO_SOCKET_IFNAME"], "test-iface")
+        finally:
+            for name, value in saved.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
 
 
 if __name__ == "__main__":

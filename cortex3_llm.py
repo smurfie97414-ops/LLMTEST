@@ -4,11 +4,13 @@ import argparse
 import csv
 import json
 import os
+import platform
 import random
 import shutil
 import time
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field
+from datetime import timedelta
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping, Sequence
 
@@ -538,9 +540,10 @@ class DistributedRuntime:
     rank: int = 0
     local_rank: int = 0
     backend: str = "gloo"
+    gloo_interface: str | None = None
 
     @staticmethod
-    def from_env(*, requested: bool, device_type: str) -> "DistributedRuntime":
+    def from_env(*, requested: bool, device_type: str, gloo_interface: str | None = None) -> "DistributedRuntime":
         world_size = int(os.environ.get("WORLD_SIZE", "1"))
         rank = int(os.environ.get("RANK", "0"))
         local_rank = int(os.environ.get("LOCAL_RANK", "0"))
@@ -550,7 +553,22 @@ class DistributedRuntime:
         backend = "nccl" if device_type == "cuda" and torch.distributed.is_nccl_available() else "gloo"
         if enabled and not torch.distributed.is_available():
             raise RuntimeError("torch.distributed is not available")
-        return DistributedRuntime(enabled=enabled, world_size=world_size, rank=rank, local_rank=local_rank, backend=backend)
+        if enabled and backend == "gloo" and "GLOO_SOCKET_IFNAME" not in os.environ:
+            selected_interface = gloo_interface or os.environ.get("CORTEX3_GLOO_IFNAME")
+            if selected_interface is None and platform.system() == "Windows":
+                selected_interface = "Ethernet"
+            if selected_interface:
+                os.environ["GLOO_SOCKET_IFNAME"] = selected_interface
+        if enabled and backend == "gloo" and not torch.distributed.is_gloo_available():
+            raise RuntimeError("distributed=True selected Gloo but torch.distributed.is_gloo_available() is false")
+        return DistributedRuntime(
+            enabled=enabled,
+            world_size=world_size,
+            rank=rank,
+            local_rank=local_rank,
+            backend=backend,
+            gloo_interface=os.environ.get("GLOO_SOCKET_IFNAME"),
+        )
 
     @property
     def is_main(self) -> bool:
@@ -559,12 +577,42 @@ class DistributedRuntime:
     def ensure_initialized(self) -> None:
         if self.enabled and not torch.distributed.is_initialized():
             init_method = os.environ.get("DIST_INIT_METHOD")
+            timeout = timedelta(seconds=int(os.environ.get("CORTEX3_DISTRIBUTED_TIMEOUT_SECONDS", "60")))
+            if self._use_explicit_gloo_tcp_store(init_method):
+                store = torch.distributed.TCPStore(
+                    os.environ.get("MASTER_ADDR", "127.0.0.1"),
+                    int(os.environ["MASTER_PORT"]),
+                    self.world_size,
+                    self.rank == 0,
+                    timeout=timeout,
+                    wait_for_workers=False,
+                    use_libuv=False,
+                )
+                torch.distributed.init_process_group(
+                    backend=self.backend,
+                    store=store,
+                    rank=self.rank,
+                    world_size=self.world_size,
+                    timeout=timeout,
+                )
+                return
             torch.distributed.init_process_group(
                 backend=self.backend,
                 init_method=init_method,
                 rank=self.rank,
                 world_size=self.world_size,
+                timeout=timeout,
             )
+
+    def _use_explicit_gloo_tcp_store(self, init_method: str | None) -> bool:
+        if self.backend != "gloo" or "MASTER_PORT" not in os.environ:
+            return False
+        if init_method and init_method not in {"env://", "tcp://"}:
+            return False
+        forced = os.environ.get("CORTEX3_TCPSTORE_USE_LIBUV")
+        if forced is not None:
+            return forced.strip().lower() in {"0", "false", "no", "off"}
+        return platform.system() == "Windows"
 
 
 @dataclass(frozen=True)
@@ -609,6 +657,7 @@ class TrainingConfig:
     precision: str = "fp32"
     require_cuda: bool = False
     distributed: bool = False
+    gloo_interface: str | None = None
     checkpoint_interval: int = 100
     num_threads: int | None = None
 
@@ -757,7 +806,11 @@ class LLMTrainer:
         )
 
     def train(self, *, name: str) -> TrainingRunReport:
-        runtime = DistributedRuntime.from_env(requested=self.config.distributed, device_type=self.device.type)
+        runtime = DistributedRuntime.from_env(
+            requested=self.config.distributed,
+            device_type=self.device.type,
+            gloo_interface=self.config.gloo_interface,
+        )
         runtime.ensure_initialized()
         if runtime.is_main:
             self.run_dir.mkdir(parents=True, exist_ok=True)
@@ -956,7 +1009,11 @@ class LLMComparisonRunner:
     def run(self, *, require_win: bool = False) -> ComparisonReport:
         started = time.time()
         device_type = "cuda" if (self.config.training.device == "auto" and torch.cuda.is_available()) or str(self.config.training.device).startswith("cuda") else "cpu"
-        runtime = DistributedRuntime.from_env(requested=self.config.training.distributed, device_type=device_type)
+        runtime = DistributedRuntime.from_env(
+            requested=self.config.training.distributed,
+            device_type=device_type,
+            gloo_interface=self.config.training.gloo_interface,
+        )
         runtime.ensure_initialized()
         if runtime.is_main:
             if self.run_dir.exists():
@@ -1113,6 +1170,7 @@ class LLMBenchmarkSuite:
         runtime = DistributedRuntime.from_env(
             requested=self.config.training.distributed,
             device_type="cuda" if torch.cuda.is_available() and self.config.training.device in {"auto", "cuda"} else "cpu",
+            gloo_interface=self.config.training.gloo_interface,
         )
         runtime.ensure_initialized()
         if runtime.is_main:
@@ -1262,6 +1320,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     smoke.add_argument("--device", default="auto")
     smoke.add_argument("--require-cuda", action="store_true")
     smoke.add_argument("--distributed", action="store_true")
+    smoke.add_argument("--gloo-interface", default=None)
     smoke.add_argument("--require-win", action="store_true")
 
     compare = sub.add_parser("compare", help="run baseline vs Cortex comparison on text files or directories")
@@ -1278,6 +1337,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     compare.add_argument("--device", default="auto")
     compare.add_argument("--require-cuda", action="store_true")
     compare.add_argument("--distributed", action="store_true")
+    compare.add_argument("--gloo-interface", default=None)
     compare.add_argument("--require-win", action="store_true")
 
     benchmark = sub.add_parser("benchmark", help="run a deterministic multi-domain LLM benchmark suite")
@@ -1295,6 +1355,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     benchmark.add_argument("--device", default="auto")
     benchmark.add_argument("--require-cuda", action="store_true")
     benchmark.add_argument("--distributed", action="store_true")
+    benchmark.add_argument("--gloo-interface", default=None)
     benchmark.add_argument("--require-win", action="store_true")
 
     args = parser.parse_args(argv)
@@ -1303,6 +1364,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         runtime = DistributedRuntime.from_env(
             requested=args.distributed,
             device_type="cuda" if (args.device == "auto" and torch.cuda.is_available()) or str(args.device).startswith("cuda") else "cpu",
+            gloo_interface=args.gloo_interface,
         )
         runtime.ensure_initialized()
         if runtime.is_main:
@@ -1320,6 +1382,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             precision=args.precision,
             require_cuda=args.require_cuda,
             distributed=args.distributed,
+            gloo_interface=args.gloo_interface,
             num_threads=1,
         )
         config = ComparisonConfig(
@@ -1353,6 +1416,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             precision=args.precision,
             require_cuda=args.require_cuda,
             distributed=args.distributed,
+            gloo_interface=args.gloo_interface,
             num_threads=1,
         )
         config = ComparisonConfig(
@@ -1387,6 +1451,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         precision=args.precision,
         require_cuda=args.require_cuda,
         distributed=args.distributed,
+        gloo_interface=args.gloo_interface,
     )
     config = ComparisonConfig(
         vocab_size=args.vocab_size,

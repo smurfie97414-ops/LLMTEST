@@ -1,11 +1,11 @@
 ﻿{
-    "generated":  "2026-06-30T05:09:04.9220729Z",
+    "generated":  "2026-06-30T05:27:48.5215725Z",
     "root":  "C:\\Users\\hight\\Documents\\Codex\\2026-06-30\\cl\\work\\LLMTEST",
-    "fingerprint":  "174dc6393fa9554ac0aca78d30935363799e4b89345f3d4274986cebb1dcff8f",
-    "files":  48,
-    "symbols":  543,
-    "symbolCandidates":  41,
-    "symbolFilesScanned":  41,
+    "fingerprint":  "6a73c79c122cc5458651e2b4cdc360b20c9a30fdae2b5f91e99811787a982222",
+    "files":  49,
+    "symbols":  548,
+    "symbolCandidates":  42,
+    "symbolFilesScanned":  42,
     "symbolFilesOmitted":  0,
     "map":  "C:\\Users\\hight\\Documents\\Codex\\2026-06-30\\cl\\work\\LLMTEST\\.codex\\context\\repo-map.md"
 }

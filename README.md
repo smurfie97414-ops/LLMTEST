@@ -204,7 +204,15 @@ Un benchmark multi-domaines déterministe est aussi disponible :
 python tools/train_llm.py benchmark --domains sequence,anchors --precision bf16 --require-win
 ```
 
-Il génère plusieurs corpus contrôlés, entraîne baseline et Cortex sur chaque domaine, agrège les ratios Cortex/baseline et écrit `benchmark_report.json`, `benchmark_report.md` et `benchmark_ratios.png`. Sur cette machine Windows, `torch.distributed` annonce Gloo disponible, mais les tests locaux à deux ranks bloquent dans `dist.init_process_group('gloo')` avant d'entrer dans le trainer ; le code garde donc le câblage DDP/rank-zero, mais la preuve DDP réelle doit être faite sur un runtime CUDA/Linux ou un build PyTorch Windows dont Gloo initialise correctement plusieurs ranks.
+Il génère plusieurs corpus contrôlés, entraîne baseline et Cortex sur chaque domaine, agrège les ratios Cortex/baseline et écrit `benchmark_report.json`, `benchmark_report.md` et `benchmark_ratios.png`. Le runtime supporte DDP via `torch.distributed`; sur le build Windows CPU local, le chemin `torchrun` elastic échoue à cause d'un TCPStore libuv indisponible, donc le lanceur local ci-dessous utilise un TCPStore explicite `use_libuv=False` et une interface Gloo fixée.
+
+Pour valider un vrai run DDP local sans dépendre de `torchrun` elastic quand le build Windows CPU de PyTorch n'a pas le support libuv :
+
+```bash
+python tools/launch_llm_ddp.py --nproc 2 --master-port 29752 --gloo-interface Ethernet -- smoke --out-dir runs/llm-ddp-smoke-validation --steps 48 --precision bf16 --require-win
+```
+
+Le lanceur exporte `WORLD_SIZE/RANK/LOCAL_RANK`, force le backend Gloo sur l'interface réseau indiquée, désactive le TCPStore libuv via le runtime Cortex et écrit les logs par rank dans `runs/llm-ddp-worker-logs`.
 
 ## Tests
 
