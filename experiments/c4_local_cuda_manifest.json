@@ -1,0 +1,62 @@
+{
+  "name": "cortex3-c4-local-cuda",
+  "out_dir": "runs/cortex3-c4-local-cuda",
+  "doctor": {
+    "require_cuda": true,
+    "device": "cuda",
+    "precision": "bf16",
+    "distributed": false
+  },
+  "seeds": [11, 23, 37],
+  "require_win": true,
+  "model": {
+    "vocab_size": 32768,
+    "min_frequency": 2,
+    "seq_len": 1024,
+    "d_model": 768,
+    "n_heads": 12,
+    "n_layers": 12,
+    "dropout": 0.1,
+    "horizons": [1, 2, 4, 8],
+    "cortex_win_margin": 1.05,
+    "max_next_token_loss_regression": 1.2
+  },
+  "training": {
+    "steps": 20000,
+    "batch_size": 16,
+    "gradient_accumulation_steps": 8,
+    "learning_rate": 0.0003,
+    "weight_decay": 0.01,
+    "grad_clip": 1.0,
+    "eval_interval": 500,
+    "eval_batches": 16,
+    "checkpoint_interval": 500,
+    "resume": false
+  },
+  "corpora": [
+    {
+      "name": "c4-en",
+      "kind": "hf",
+      "dataset": "allenai/c4",
+      "config_name": "en",
+      "split": "train",
+      "text_field": "text",
+      "streaming": true,
+      "max_documents": 1000000,
+      "min_text_chars": 64,
+      "shard_max_chars": 67108864,
+      "min_chars_per_chunk": 4096
+    },
+    {
+      "name": "local-text",
+      "kind": "paths",
+      "paths": [
+        "README.md",
+        "docs/PIPELINE.md",
+        "docs/IMPLEMENTATION_STATUS.md",
+        "docs/ROADMAP.md"
+      ],
+      "min_chars_per_chunk": 4096
+    }
+  ]
+}

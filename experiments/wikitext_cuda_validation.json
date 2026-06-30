@@ -1,0 +1,52 @@
+{
+  "name": "cortex3-wikitext-cuda-validation",
+  "out_dir": "runs/cortex3-wikitext-cuda-validation",
+  "doctor": {
+    "require_cuda": true,
+    "device": "cuda",
+    "precision": "bf16",
+    "distributed": false
+  },
+  "seeds": [17, 29],
+  "require_win": true,
+  "model": {
+    "vocab_size": 512,
+    "min_frequency": 1,
+    "seq_len": 64,
+    "d_model": 64,
+    "n_heads": 4,
+    "n_layers": 2,
+    "dropout": 0.0,
+    "horizons": [1, 2, 4],
+    "cortex_win_margin": 1.05,
+    "max_next_token_loss_regression": 1.6
+  },
+  "training": {
+    "steps": 48,
+    "batch_size": 8,
+    "gradient_accumulation_steps": 1,
+    "learning_rate": 0.0003,
+    "weight_decay": 0.01,
+    "grad_clip": 1.0,
+    "eval_interval": 16,
+    "eval_batches": 2,
+    "checkpoint_interval": 100,
+    "resume": false,
+    "num_threads": 1
+  },
+  "corpora": [
+    {
+      "name": "wikitext",
+      "kind": "hf",
+      "dataset": "Salesforce/wikitext",
+      "config_name": "wikitext-2-raw-v1",
+      "split": "train",
+      "text_field": "text",
+      "streaming": true,
+      "max_documents": 200,
+      "min_text_chars": 20,
+      "shard_max_chars": 4096,
+      "min_chars_per_chunk": 512
+    }
+  ]
+}

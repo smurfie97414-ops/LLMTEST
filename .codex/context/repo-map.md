@@ -1,11 +1,11 @@
 ﻿# Codex Repo Map
 
 - Root: `C:\Users\hight\Documents\Codex\2026-06-30\cl\work\LLMTEST`
-- Generated: 2026-06-30T09:30:34
-- Files indexed: 49
+- Generated: 2026-06-30T09:58:08
+- Files indexed: 51
 - Symbols indexed: 560
 - Symbol files scanned: 42 of 42 candidates
-- Git: branch `main`, head `576701d`, changed entries `7`
+- Git: branch `main`, head `e182bea`, changed entries `5`
 
 ## Use
 
@@ -37,6 +37,7 @@ Read this map before broad file exploration. Prefer targeted `rg` and narrow fil
 - `cortex3_sleep.py`: 1 files
 - `cortex3_ternary.py`: 1 files
 - `docs`: 3 files
+- `experiments`: 2 files
 - `LICENSE`: 1 files
 - `pyproject.toml`: 1 files
 - `README.md`: 1 files

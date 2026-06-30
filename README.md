@@ -222,6 +222,11 @@ python tools/train_llm.py run-experiment experiments/c4_fineweb_gpu.json
 
 Le manifeste décrit `doctor`, `training`, `model`, `seeds`, `require_win` et une liste de corpus `hf` ou `paths`. `run-experiment` écrit `experiment_manifest.normalized.json`, `doctor_report.json`, prépare les corpus HF sous `prepared/<corpus>`, lance `corpus-matrix`, puis produit `experiment_report.json`, `experiment_report.md` et les courbes agrégées sous `corpus_matrix/`.
 
+Deux manifestes versionnés sont fournis :
+
+- `experiments/wikitext_cuda_validation.json` : validation GPU rapide sur Wikitext.
+- `experiments/c4_local_cuda_manifest.json` : run long CUDA large C4 + corpus local versionne du repo.
+
 Extrait minimal :
 
 ```json
