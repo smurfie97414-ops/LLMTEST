@@ -22,3 +22,5 @@ jobs:
         run: python tools/run_cycle_report.py
       - name: LLM pretraining smoke test
         run: python tools/train_llm.py smoke --out-dir runs/ci-llm-smoke --require-win
+      - name: LLM multi-domain benchmark smoke
+        run: python tools/train_llm.py benchmark --out-dir runs/ci-llm-benchmark --domains sequence,anchors --repeats 96 --steps 48 --batch-size 8 --precision bf16 --require-win

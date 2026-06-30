@@ -27,6 +27,19 @@ from tokenizers.trainers import BpeTrainer
 SPECIAL_TOKENS: tuple[str, ...] = ("<pad>", "<bos>", "<eos>", "<unk>")
 
 
+def _env_rank() -> int:
+    return int(os.environ.get("RANK", "0"))
+
+
+def _rank_zero() -> bool:
+    return _env_rank() == 0
+
+
+def _barrier_if_needed(runtime: "DistributedRuntime") -> None:
+    if runtime.enabled and torch.distributed.is_initialized():
+        torch.distributed.barrier()
+
+
 def _json_default(value: Any) -> Any:
     if isinstance(value, Path):
         return str(value)
@@ -539,6 +552,20 @@ class DistributedRuntime:
             raise RuntimeError("torch.distributed is not available")
         return DistributedRuntime(enabled=enabled, world_size=world_size, rank=rank, local_rank=local_rank, backend=backend)
 
+    @property
+    def is_main(self) -> bool:
+        return self.rank == 0
+
+    def ensure_initialized(self) -> None:
+        if self.enabled and not torch.distributed.is_initialized():
+            init_method = os.environ.get("DIST_INIT_METHOD")
+            torch.distributed.init_process_group(
+                backend=self.backend,
+                init_method=init_method,
+                rank=self.rank,
+                world_size=self.world_size,
+            )
+
 
 @dataclass(frozen=True)
 class PrecisionPolicy:
@@ -667,7 +694,11 @@ class LLMTrainer:
         if self.config.device == "auto":
             if self.config.require_cuda and not torch.cuda.is_available():
                 raise RuntimeError("CUDA was required but torch.cuda.is_available() is false")
-            return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            if torch.cuda.is_available():
+                local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+                torch.cuda.set_device(local_rank)
+                return torch.device(f"cuda:{local_rank}")
+            return torch.device("cpu")
         device = torch.device(self.config.device)
         if self.config.require_cuda and device.type != "cuda":
             raise RuntimeError("require_cuda=True needs a CUDA device")
@@ -726,17 +757,22 @@ class LLMTrainer:
         )
 
     def train(self, *, name: str) -> TrainingRunReport:
-        self.run_dir.mkdir(parents=True, exist_ok=True)
-        torch.manual_seed(self.config.seed)
-        random.seed(self.config.seed)
-        np.random.seed(self.config.seed)
-        self.model.to(self.device)
         runtime = DistributedRuntime.from_env(requested=self.config.distributed, device_type=self.device.type)
-        if runtime.enabled and not torch.distributed.is_initialized():
-            torch.distributed.init_process_group(backend=runtime.backend, rank=runtime.rank, world_size=runtime.world_size)
+        runtime.ensure_initialized()
+        if runtime.is_main:
+            self.run_dir.mkdir(parents=True, exist_ok=True)
+        _barrier_if_needed(runtime)
+        rank_seed = self.config.seed + runtime.rank * 100_003
+        torch.manual_seed(rank_seed)
+        random.seed(rank_seed)
+        np.random.seed(rank_seed)
+        self.generator.manual_seed(rank_seed)
+        self.model.to(self.device)
         trainable: nn.Module = self.model
         if runtime.enabled:
-            trainable = nn.parallel.DistributedDataParallel(self.model)
+            cuda_index = self.device.index if self.device.index is not None else runtime.local_rank
+            kwargs = {"device_ids": [cuda_index]} if self.device.type == "cuda" else {}
+            trainable = nn.parallel.DistributedDataParallel(self.model, **kwargs)
         optimizer = torch.optim.AdamW(trainable.parameters(), lr=self.config.learning_rate, weight_decay=self.config.weight_decay)
         scaler = self.precision.scaler(self.device.type)
         curve: list[TrainingPoint] = []
@@ -767,10 +803,12 @@ class LLMTrainer:
             if step % self.config.eval_interval == 0 or step == self.config.steps:
                 curve.append(self.evaluate(self.train_data, split="train", step=step))
                 curve.append(self.evaluate(self.val_data, split="val", step=step))
-            if step % self.config.checkpoint_interval == 0:
+            if runtime.is_main and step % self.config.checkpoint_interval == 0:
                 self.save_checkpoint(optimizer, self.run_dir / f"checkpoint_step_{step}.pt")
-        checkpoint_path = self.save_checkpoint(optimizer, self.run_dir / "checkpoint_final.pt")
-        self._write_curve(curve)
+        checkpoint_path = self.run_dir / "checkpoint_final.pt"
+        if runtime.is_main:
+            checkpoint_path = self.save_checkpoint(optimizer, checkpoint_path)
+            self._write_curve(curve)
         final_train = [point for point in curve if point.split == "train"][-1]
         final_val = [point for point in curve if point.split == "val"][-1]
         report = TrainingRunReport(
@@ -787,7 +825,9 @@ class LLMTrainer:
             },
             hardware=hardware_report(),
         )
-        _write_json(self.run_dir / "training_report.json", report.to_dict())
+        if runtime.is_main:
+            _write_json(self.run_dir / "training_report.json", report.to_dict())
+        _barrier_if_needed(runtime)
         return report
 
     def _write_curve(self, curve: Sequence[TrainingPoint]) -> None:
@@ -842,6 +882,63 @@ class ComparisonReport:
         return asdict(self)
 
 
+@dataclass(frozen=True)
+class BenchmarkDomainSpec:
+    name: str
+    patterns: tuple[str, ...]
+
+
+DEFAULT_BENCHMARK_DOMAINS: Mapping[str, BenchmarkDomainSpec] = {
+    "sequence": BenchmarkDomainSpec(
+        "sequence",
+        (
+            "alpha beta gamma delta epsilon zeta eta theta.",
+            "red green blue yellow red green blue yellow.",
+            "one two three five eight thirteen twenty one.",
+            "north east south west north east south west.",
+        ),
+    ),
+    "reasoning": BenchmarkDomainSpec(
+        "reasoning",
+        (
+            "if the verifier accepts the invariant then the compiled path is reused.",
+            "a slow solve creates evidence, the evidence creates a certificate.",
+            "the anchor ledger preserves exact symbols while the latent store compresses context.",
+            "regrowth changes the smallest recovering block and then checks protected skills.",
+        ),
+    ),
+    "code": BenchmarkDomainSpec(
+        "code",
+        (
+            "def add(a, b): return a + b",
+            "class Gate: def __init__(self, threshold): self.threshold = threshold",
+            "assert normalize('OK') == 'OK'",
+            "for token in stream: ledger.record(token)",
+        ),
+    ),
+    "anchors": BenchmarkDomainSpec(
+        "anchors",
+        (
+            "ticket AX-1042 belongs to Sofia and must remain exact.",
+            "identifier C3-7777-Z maps to prototype ledger alpha.",
+            "vault key QK-55-DELTA appears once and must be copied exactly.",
+            "entity Mira owns checksum 19AF and sequence tag LLM-2048.",
+        ),
+    ),
+}
+
+
+@dataclass(frozen=True)
+class BenchmarkSuiteReport:
+    run_dir: str
+    domains: tuple[Mapping[str, Any], ...]
+    proof: Mapping[str, Any]
+    hardware: Mapping[str, Any]
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
 class LLMComparisonRunner:
     def __init__(self, corpus: TextCorpusConfig, config: ComparisonConfig, *, run_dir: str | Path):
         self.corpus = corpus
@@ -858,10 +955,16 @@ class LLMComparisonRunner:
 
     def run(self, *, require_win: bool = False) -> ComparisonReport:
         started = time.time()
-        if self.run_dir.exists():
-            shutil.rmtree(self.run_dir)
-        self.run_dir.mkdir(parents=True, exist_ok=True)
-        manifest = self.prepare_corpus()
+        device_type = "cuda" if (self.config.training.device == "auto" and torch.cuda.is_available()) or str(self.config.training.device).startswith("cuda") else "cpu"
+        runtime = DistributedRuntime.from_env(requested=self.config.training.distributed, device_type=device_type)
+        runtime.ensure_initialized()
+        if runtime.is_main:
+            if self.run_dir.exists():
+                shutil.rmtree(self.run_dir)
+            self.run_dir.mkdir(parents=True, exist_ok=True)
+            manifest = self.prepare_corpus()
+        _barrier_if_needed(runtime)
+        manifest = TokenizedCorpusManifest.load(self.run_dir / "corpus" / "manifest.json")
         train_data = MemmapCausalDataset(manifest, split="train")
         val_data = MemmapCausalDataset(manifest, split="val")
         try:
@@ -897,6 +1000,8 @@ class LLMComparisonRunner:
             val_data.close()
         proof = self._proof_payload(baseline, cortex)
         proof["elapsed_seconds"] = time.time() - started
+        proof["distributed"] = runtime.enabled
+        proof["world_size"] = runtime.world_size
         report = ComparisonReport(
             run_dir=str(self.run_dir),
             manifest=manifest.to_dict(),
@@ -905,10 +1010,17 @@ class LLMComparisonRunner:
             proof=proof,
             hardware=hardware_report(),
         )
-        _write_json(self.run_dir / "comparison_report.json", report.to_dict())
-        self._write_markdown(report)
-        self._write_learning_curve_png()
-        if require_win and not proof["passed"]:
+        if runtime.is_main:
+            _write_json(self.run_dir / "comparison_report.json", report.to_dict())
+            self._write_markdown(report)
+            self._write_learning_curve_png()
+        failed = bool(require_win and not proof["passed"] and runtime.is_main)
+        if runtime.enabled:
+            flag = torch.tensor([1 if failed else 0], dtype=torch.int64)
+            torch.distributed.broadcast(flag, src=0)
+            failed = bool(int(flag.item()))
+        _barrier_if_needed(runtime)
+        if failed:
             raise RuntimeError(f"Cortex comparison did not pass: {proof}")
         return report
 
@@ -983,6 +1095,127 @@ class LLMComparisonRunner:
         plt.close(fig)
 
 
+class LLMBenchmarkSuite:
+    def __init__(
+        self,
+        *,
+        run_dir: str | Path,
+        domains: Sequence[str],
+        repeats: int,
+        config: ComparisonConfig,
+    ):
+        self.run_dir = Path(run_dir)
+        self.domains = tuple(domains)
+        self.repeats = repeats
+        self.config = config
+
+    def run(self, *, require_win: bool = False) -> BenchmarkSuiteReport:
+        runtime = DistributedRuntime.from_env(
+            requested=self.config.training.distributed,
+            device_type="cuda" if torch.cuda.is_available() and self.config.training.device in {"auto", "cuda"} else "cpu",
+        )
+        runtime.ensure_initialized()
+        if runtime.is_main:
+            if self.run_dir.exists():
+                shutil.rmtree(self.run_dir)
+            self.run_dir.mkdir(parents=True, exist_ok=True)
+        _barrier_if_needed(runtime)
+
+        domain_payloads: list[Mapping[str, Any]] = []
+        for domain in self.domains:
+            corpus_dir = self.run_dir / "corpora" / domain
+            if runtime.is_main:
+                corpus_files = build_benchmark_corpus(corpus_dir, domain=domain, repeats=self.repeats)
+            _barrier_if_needed(runtime)
+            corpus_files = (str(corpus_dir / f"{domain}.txt"),)
+            corpus = TextCorpusConfig.from_paths(corpus_files, min_chars_per_chunk=512)
+            report = LLMComparisonRunner(corpus, self.config, run_dir=self.run_dir / domain).run(require_win=False)
+            domain_payloads.append(
+                {
+                    "domain": domain,
+                    "run_dir": report.run_dir,
+                    "proof": report.proof,
+                    "baseline_final_val": report.baseline["final_val"],
+                    "cortex_final_val": report.cortex["final_val"],
+                }
+            )
+        proof = self._proof(domain_payloads)
+        report = BenchmarkSuiteReport(
+            run_dir=str(self.run_dir),
+            domains=tuple(domain_payloads),
+            proof=proof,
+            hardware=hardware_report(),
+        )
+        if runtime.is_main:
+            _write_json(self.run_dir / "benchmark_report.json", report.to_dict())
+            self._write_markdown(report)
+            self._write_bar_chart(report)
+        failed = bool(require_win and not proof["passed"] and runtime.is_main)
+        if runtime.enabled:
+            flag_device = torch.device(f"cuda:{runtime.local_rank}") if runtime.backend == "nccl" else torch.device("cpu")
+            flag = torch.tensor([1 if failed else 0], dtype=torch.int64, device=flag_device)
+            torch.distributed.broadcast(flag, src=0)
+            failed = bool(int(flag.cpu().item()))
+        _barrier_if_needed(runtime)
+        if failed:
+            raise RuntimeError(f"Cortex benchmark did not pass: {proof}")
+        return report
+
+    def _proof(self, domains: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+        ratios = [float(item["proof"]["cortex_over_baseline_ratio"]) for item in domains]
+        baseline_scores = [float(item["proof"]["baseline_score"]) for item in domains]
+        regressions = [float(item["proof"]["next_token_loss_regression_ratio"]) for item in domains]
+        all_domain_proofs = [bool(item["proof"]["passed"]) and float(item["proof"]["baseline_score"]) > 0.0 for item in domains]
+        return {
+            "metric": "benchmark_mean_cortex_over_baseline",
+            "domains": [str(item["domain"]) for item in domains],
+            "domain_count": len(domains),
+            "mean_ratio": sum(ratios) / max(1, len(ratios)),
+            "min_ratio": min(ratios) if ratios else 0.0,
+            "mean_baseline_score": sum(baseline_scores) / max(1, len(baseline_scores)),
+            "max_next_token_loss_regression": max(regressions) if regressions else 0.0,
+            "all_domains_passed": all(all_domain_proofs),
+            "passed": bool(domains) and all(all_domain_proofs),
+        }
+
+    def _write_markdown(self, report: BenchmarkSuiteReport) -> None:
+        lines = [
+            "# Cortex-3 LLM benchmark report",
+            "",
+            f"- Domains: `{', '.join(report.proof['domains'])}`",
+            f"- Mean Cortex/baseline ratio: `{report.proof['mean_ratio']:.3f}`",
+            f"- Min Cortex/baseline ratio: `{report.proof['min_ratio']:.3f}`",
+            f"- Mean baseline score: `{report.proof['mean_baseline_score']:.6f}`",
+            f"- Max next-token-loss regression: `{report.proof['max_next_token_loss_regression']:.3f}`",
+            f"- Passed: `{report.proof['passed']}`",
+            "",
+            "## Domain Results",
+            "",
+        ]
+        for item in report.domains:
+            proof = item["proof"]
+            lines.append(f"- `{item['domain']}`: ratio `{proof['cortex_over_baseline_ratio']:.3f}`, baseline `{proof['baseline_score']:.6f}`, cortex `{proof['cortex_score']:.6f}`, passed `{proof['passed']}`")
+        (self.run_dir / "benchmark_report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    def _write_bar_chart(self, report: BenchmarkSuiteReport) -> None:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        names = [str(item["domain"]) for item in report.domains]
+        ratios = [float(item["proof"]["cortex_over_baseline_ratio"]) for item in report.domains]
+        fig, ax = plt.subplots(figsize=(8, 4))
+        ax.bar(names, ratios, color="#287c71")
+        ax.axhline(1.0, color="#333333", linewidth=1)
+        ax.set_title("Cortex / baseline future-token cost ratio")
+        ax.set_ylabel("ratio")
+        ax.set_xlabel("domain")
+        fig.tight_layout()
+        fig.savefig(self.run_dir / "benchmark_ratios.png", dpi=150)
+        plt.close(fig)
+
+
 def build_seed_corpus(path: str | Path, *, repeats: int = 256) -> tuple[str, ...]:
     output = Path(path)
     output.mkdir(parents=True, exist_ok=True)
@@ -1001,6 +1234,23 @@ def build_seed_corpus(path: str | Path, *, repeats: int = 256) -> tuple[str, ...
     return (str(shard),)
 
 
+def build_benchmark_corpus(path: str | Path, *, domain: str, repeats: int = 256) -> tuple[str, ...]:
+    if repeats < 8:
+        raise ValueError("benchmark repeats must be >= 8")
+    if domain not in DEFAULT_BENCHMARK_DOMAINS:
+        raise ValueError(f"unknown benchmark domain {domain!r}; choose from {sorted(DEFAULT_BENCHMARK_DOMAINS)}")
+    output = Path(path)
+    output.mkdir(parents=True, exist_ok=True)
+    spec = DEFAULT_BENCHMARK_DOMAINS[domain]
+    shard = output / f"{domain}.txt"
+    with shard.open("w", encoding="utf-8") as handle:
+        for index in range(repeats):
+            pattern = spec.patterns[index % len(spec.patterns)]
+            handle.write(pattern + "\n")
+            handle.write(f"domain {domain} sample {index:05d} control token {index % 31:02d} repeats with stable local structure.\n")
+    return (str(shard),)
+
+
 def main(argv: Sequence[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Train and compare a real Cortex-3 LLM pretraining harness.")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1008,6 +1258,10 @@ def main(argv: Sequence[str] | None = None) -> None:
     smoke = sub.add_parser("smoke", help="run a deterministic small corpus comparison")
     smoke.add_argument("--out-dir", default="runs/llm-smoke")
     smoke.add_argument("--steps", type=int, default=48)
+    smoke.add_argument("--precision", choices=("fp32", "bf16", "fp16"), default="fp32")
+    smoke.add_argument("--device", default="auto")
+    smoke.add_argument("--require-cuda", action="store_true")
+    smoke.add_argument("--distributed", action="store_true")
     smoke.add_argument("--require-win", action="store_true")
 
     compare = sub.add_parser("compare", help="run baseline vs Cortex comparison on text files or directories")
@@ -1026,12 +1280,48 @@ def main(argv: Sequence[str] | None = None) -> None:
     compare.add_argument("--distributed", action="store_true")
     compare.add_argument("--require-win", action="store_true")
 
+    benchmark = sub.add_parser("benchmark", help="run a deterministic multi-domain LLM benchmark suite")
+    benchmark.add_argument("--out-dir", default="runs/llm-benchmark")
+    benchmark.add_argument("--domains", default="sequence,reasoning,code,anchors")
+    benchmark.add_argument("--repeats", type=int, default=160)
+    benchmark.add_argument("--steps", type=int, default=48)
+    benchmark.add_argument("--batch-size", type=int, default=8)
+    benchmark.add_argument("--vocab-size", type=int, default=256)
+    benchmark.add_argument("--seq-len", type=int, default=32)
+    benchmark.add_argument("--d-model", type=int, default=64)
+    benchmark.add_argument("--n-heads", type=int, default=4)
+    benchmark.add_argument("--n-layers", type=int, default=2)
+    benchmark.add_argument("--precision", choices=("fp32", "bf16", "fp16"), default="fp32")
+    benchmark.add_argument("--device", default="auto")
+    benchmark.add_argument("--require-cuda", action="store_true")
+    benchmark.add_argument("--distributed", action="store_true")
+    benchmark.add_argument("--require-win", action="store_true")
+
     args = parser.parse_args(argv)
     if args.command == "smoke":
         out_dir = Path(args.out_dir)
-        files = build_seed_corpus(out_dir / "seed_text", repeats=160)
+        runtime = DistributedRuntime.from_env(
+            requested=args.distributed,
+            device_type="cuda" if (args.device == "auto" and torch.cuda.is_available()) or str(args.device).startswith("cuda") else "cpu",
+        )
+        runtime.ensure_initialized()
+        if runtime.is_main:
+            files = build_seed_corpus(out_dir / "seed_text", repeats=160)
+        _barrier_if_needed(runtime)
+        files = (str(out_dir / "seed_text" / "seed_corpus.txt"),)
         corpus = TextCorpusConfig.from_paths(files, min_chars_per_chunk=512)
-        training = TrainingConfig(steps=args.steps, batch_size=8, eval_interval=max(1, args.steps // 3), eval_batches=3, seed=11, num_threads=1)
+        training = TrainingConfig(
+            steps=args.steps,
+            batch_size=8,
+            eval_interval=max(1, args.steps // 3),
+            eval_batches=3,
+            seed=11,
+            device=args.device,
+            precision=args.precision,
+            require_cuda=args.require_cuda,
+            distributed=args.distributed,
+            num_threads=1,
+        )
         config = ComparisonConfig(
             vocab_size=256,
             min_frequency=1,
@@ -1046,7 +1336,46 @@ def main(argv: Sequence[str] | None = None) -> None:
             max_next_token_loss_regression=1.50,
         )
         report = LLMComparisonRunner(corpus, config, run_dir=out_dir / "comparison").run(require_win=args.require_win)
-        print(json.dumps(report.proof, indent=2, sort_keys=True))
+        if _rank_zero():
+            print(json.dumps(report.proof, indent=2, sort_keys=True))
+        return
+
+    if args.command == "benchmark":
+        domains = tuple(part.strip() for part in args.domains.replace(",", " ").split() if part.strip())
+        resolved_domains = tuple(DEFAULT_BENCHMARK_DOMAINS.keys()) if "all" in domains else domains
+        training = TrainingConfig(
+            steps=args.steps,
+            batch_size=args.batch_size,
+            eval_interval=max(1, args.steps // 3),
+            eval_batches=3,
+            seed=23,
+            device=args.device,
+            precision=args.precision,
+            require_cuda=args.require_cuda,
+            distributed=args.distributed,
+            num_threads=1,
+        )
+        config = ComparisonConfig(
+            vocab_size=args.vocab_size,
+            min_frequency=1,
+            seq_len=args.seq_len,
+            d_model=args.d_model,
+            n_heads=args.n_heads,
+            n_layers=args.n_layers,
+            dropout=0.0,
+            horizons=(1, 2, 4),
+            training=training,
+            cortex_win_margin=1.02,
+            max_next_token_loss_regression=1.50,
+        )
+        report = LLMBenchmarkSuite(
+            run_dir=args.out_dir,
+            domains=resolved_domains,
+            repeats=args.repeats,
+            config=config,
+        ).run(require_win=args.require_win)
+        if _rank_zero():
+            print(json.dumps(report.proof, indent=2, sort_keys=True))
         return
 
     corpus = TextCorpusConfig.from_paths(args.paths)
@@ -1068,7 +1397,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         training=training,
     )
     report = LLMComparisonRunner(corpus, config, run_dir=args.out_dir).run(require_win=args.require_win)
-    print(json.dumps(report.proof, indent=2, sort_keys=True))
+    if _rank_zero():
+        print(json.dumps(report.proof, indent=2, sort_keys=True))
 
 
 if __name__ == "__main__":

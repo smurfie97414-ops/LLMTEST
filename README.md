@@ -198,6 +198,14 @@ python tools/train_llm.py compare path/to/text_shards --require-cuda --precision
 
 Le rapport compare une baseline next-token classique à Cortex-3 sur `verified_future_tokens_per_forward_cost`, tout en contrôlant la régression de loss next-token. Le smoke local validé montre une baseline non nulle et un avantage Cortex coût/qualité, mais il ne remplace pas encore un run corpus massif GPU multi-nœuds.
 
+Un benchmark multi-domaines déterministe est aussi disponible :
+
+```bash
+python tools/train_llm.py benchmark --domains sequence,anchors --precision bf16 --require-win
+```
+
+Il génère plusieurs corpus contrôlés, entraîne baseline et Cortex sur chaque domaine, agrège les ratios Cortex/baseline et écrit `benchmark_report.json`, `benchmark_report.md` et `benchmark_ratios.png`. Sur cette machine Windows, `torch.distributed` annonce Gloo disponible, mais les tests locaux à deux ranks bloquent dans `dist.init_process_group('gloo')` avant d'entrer dans le trainer ; le code garde donc le câblage DDP/rank-zero, mais la preuve DDP réelle doit être faite sur un runtime CUDA/Linux ou un build PyTorch Windows dont Gloo initialise correctement plusieurs ranks.
+
 ## Tests
 
 ```bash

@@ -373,7 +373,9 @@ Current executable coverage:
 - `LLMTrainer` supports checkpoints, CSV learning curves, deterministic random sampling, explicit device selection, mixed precision policy and DDP initialization from environment.
 - `PrecisionPolicy(require_cuda=True)` raises when CUDA is required but unavailable, preventing silent CPU fallback.
 - `LLMComparisonRunner` trains a baseline next-token Transformer and a Cortex multi-horizon Transformer on the same corpus/cache, then writes `comparison_report.json`, `report.md`, `learning_curve.png`, both final checkpoints and both learning-curve CSV files.
+- `LLMBenchmarkSuite` runs multiple deterministic domains, persists per-domain comparison artifacts and writes an aggregate `benchmark_report.json`, `benchmark_report.md` and `benchmark_ratios.png`.
 - `tools/train_llm.py` exposes `smoke` and `compare` commands for local proof runs and larger text-shard corpora.
+- `tools/train_llm.py benchmark` exposes the multi-domain proof gate and supports CPU `bf16` validation.
 - `.github/workflows/ci.yml` runs the LLM smoke command.
 
 Evidence:
@@ -381,11 +383,14 @@ Evidence:
 - Local environment: `torch==2.12.1+cpu`, `cuda_available=False`, `distributed_available=True`, `gloo_available=True`, `nccl_available=False`.
 - `.\.venv\Scripts\python.exe tools\train_llm.py smoke --out-dir runs\llm-smoke-dev-48 --steps 48 --require-win`
 - Smoke proof: baseline score `0.022321`, Cortex score `0.145833`, Cortex/baseline `6.533x`, next-token-loss regression ratio `1.020`, proof passed.
+- `.\.venv\Scripts\python.exe tools\train_llm.py benchmark --out-dir runs\llm-benchmark-validation --domains sequence,anchors --repeats 96 --steps 48 --batch-size 8 --precision bf16 --require-win`
+- Benchmark proof through `codex-test`: `2/2` domains passed, mean Cortex/baseline ratio `97.125x`, minimum domain ratio `63.583x`, mean baseline score `0.001674`, max next-token-loss regression ratio `1.000`.
+- DDP local debug: two-rank `dist.init_process_group('gloo')` reaches both workers and then blocks before trainer execution on this Windows CPU PyTorch build; `world_size=1` initializes successfully.
 - `.\.venv\Scripts\python.exe -m unittest tests.test_llm_pretraining`
 
 Remaining:
 
 - Run a genuine large-corpus experiment with a real external text shard set, not only the deterministic local smoke corpus.
-- Validate CUDA mixed precision and NCCL DDP on hardware that exposes CUDA; this machine currently exposes only CPU Torch plus Gloo distributed.
+- Validate CUDA mixed precision and NCCL/Gloo DDP on hardware/backend combinations that initialize multiple ranks; this machine currently exposes only CPU Torch, and local two-rank Gloo blocks inside PyTorch before the Cortex trainer starts.
 - Scale model sizes and training steps, then publish variance across multiple seeds and corpus domains.
 - Connect accepted recursive-improvement proposals to persisted LLM checkpoint patches with rollback archives.
