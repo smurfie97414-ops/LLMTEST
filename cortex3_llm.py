@@ -267,7 +267,16 @@ class HFDatasetTextExporter:
             kwargs["cache_dir"] = self.config.cache_dir
         if self.config.trust_remote_code:
             kwargs["trust_remote_code"] = True
-        return load_dataset(self.config.dataset, **kwargs)
+        try:
+            return load_dataset(self.config.dataset, **kwargs)
+        except Exception as exc:
+            message = str(exc)
+            if "/" not in self.config.dataset and "namespace/name" in message:
+                raise RuntimeError(
+                    f"Hugging Face rejected dataset id {self.config.dataset!r}; use the namespaced id, "
+                    "for example `Salesforce/wikitext` instead of `wikitext`."
+                ) from exc
+            raise
 
     def _extract_text(self, row: Mapping[str, Any]) -> str:
         value: Any = row

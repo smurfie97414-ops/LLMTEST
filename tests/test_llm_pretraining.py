@@ -3,6 +3,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import torch
 
@@ -191,6 +192,17 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 self.assertEqual(tuple(x.shape), (24,))
                 self.assertEqual(tuple(y.shape), (24,))
                 self.assertEqual(tuple(future.shape), (24, 4))
+
+    def test_hf_dataset_export_namespaced_id_error_is_actionable(self):
+        config = HFDatasetExportConfig(
+            dataset="wikitext",
+            split="train",
+            text_field="text",
+            streaming=True,
+        )
+        with patch("datasets.load_dataset", side_effect=ValueError("Repository id must be 'namespace/name', got 'wikitext'.")):
+            with self.assertRaisesRegex(RuntimeError, "Salesforce/wikitext"):
+                HFDatasetTextExporter(config)._load_dataset()
 
     def test_cortex_comparison_produces_checkpoints_curves_and_cost_win(self):
         with tempfile.TemporaryDirectory() as tmp:
