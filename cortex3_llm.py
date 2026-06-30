@@ -1403,6 +1403,20 @@ class CorpusMatrixReport:
         return asdict(self)
 
 
+@dataclass(frozen=True)
+class LLMExperimentReport:
+    run_dir: str
+    manifest: Mapping[str, Any]
+    doctor: Mapping[str, Any]
+    corpora: tuple[Mapping[str, Any], ...]
+    corpus_matrix: Mapping[str, Any]
+    proof: Mapping[str, Any]
+    hardware: Mapping[str, Any]
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
 class LLMComparisonRunner:
     def __init__(
         self,
@@ -2062,6 +2076,264 @@ class LLMCorpusMatrixSuite:
         plt.close(fig)
 
 
+class LLMExperimentRunner:
+    def __init__(self, manifest: Mapping[str, Any], *, manifest_path: str | Path | None = None):
+        self.manifest = self._normalize_manifest(manifest)
+        self.manifest_path = str(manifest_path) if manifest_path is not None else None
+
+    @staticmethod
+    def load(path: str | Path) -> "LLMExperimentRunner":
+        manifest_path = Path(path)
+        payload = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+        if not isinstance(payload, Mapping):
+            raise ValueError("experiment manifest root must be a JSON object")
+        return LLMExperimentRunner(payload, manifest_path=manifest_path)
+
+    def run(self) -> LLMExperimentReport:
+        run_dir = Path(str(self.manifest["out_dir"]))
+        run_dir.mkdir(parents=True, exist_ok=True)
+        _write_json(run_dir / "experiment_manifest.normalized.json", self.manifest)
+
+        doctor_config = dict(self.manifest["doctor"])
+        doctor_report = llm_doctor_report(**doctor_config)
+        _write_json(run_dir / "doctor_report.json", doctor_report)
+        if not doctor_report["passed"]:
+            failed = ", ".join(str(check["name"]) for check in doctor_report["failed_required_checks"])
+            raise RuntimeError(f"experiment doctor failed required checks: {failed}")
+
+        corpora, prepared_payloads = self._prepare_corpora(run_dir)
+        seeds = tuple(int(seed) for seed in self.manifest["seeds"])
+        config = self._comparison_config(seeds)
+        matrix_report = LLMCorpusMatrixSuite(
+            corpora,
+            config,
+            run_dir=run_dir / "corpus_matrix",
+            seeds=seeds,
+        ).run(require_win=bool(self.manifest["require_win"]))
+        report = LLMExperimentReport(
+            run_dir=str(run_dir),
+            manifest=self.manifest,
+            doctor=doctor_report,
+            corpora=tuple(prepared_payloads),
+            corpus_matrix=matrix_report.to_dict(),
+            proof=matrix_report.proof,
+            hardware=hardware_report(),
+        )
+        _write_json(run_dir / "experiment_report.json", report.to_dict())
+        self._write_markdown(report)
+        return report
+
+    def _normalize_manifest(self, manifest: Mapping[str, Any]) -> dict[str, Any]:
+        payload = dict(manifest)
+        if not str(payload.get("name", "")).strip():
+            raise ValueError("experiment manifest requires non-empty `name`")
+        if not str(payload.get("out_dir", "")).strip():
+            raise ValueError("experiment manifest requires non-empty `out_dir`")
+        seeds = payload.get("seeds")
+        if not isinstance(seeds, Sequence) or isinstance(seeds, (str, bytes)) or not seeds:
+            raise ValueError("experiment manifest requires non-empty integer `seeds`")
+        payload["seeds"] = tuple(int(seed) for seed in seeds)
+        if "corpora" not in payload or not isinstance(payload["corpora"], Sequence) or not payload["corpora"]:
+            raise ValueError("experiment manifest requires non-empty `corpora` list")
+        payload["corpora"] = tuple(self._normalize_corpus_config(item) for item in payload["corpora"])
+        payload["doctor"] = self._normalize_doctor_config(payload.get("doctor", {}))
+        payload["training"] = self._normalize_training_config(payload.get("training", {}), payload["seeds"][0], payload["doctor"])
+        payload["model"] = self._normalize_model_config(payload.get("model", {}))
+        payload["require_win"] = bool(payload.get("require_win", True))
+        return payload
+
+    def _normalize_doctor_config(self, raw: Any) -> dict[str, Any]:
+        payload = dict(raw or {})
+        return {
+            "require_cuda": bool(payload.get("require_cuda", False)),
+            "precision": str(payload.get("precision", "bf16")),
+            "device": str(payload.get("device", "auto")),
+            "distributed": bool(payload.get("distributed", False)),
+            "gloo_interface": payload.get("gloo_interface"),
+        }
+
+    def _normalize_training_config(self, raw: Any, seed: int, doctor: Mapping[str, Any]) -> dict[str, Any]:
+        payload = dict(raw or {})
+        return {
+            "steps": int(payload.get("steps", 200)),
+            "batch_size": int(payload.get("batch_size", 32)),
+            "gradient_accumulation_steps": int(payload.get("gradient_accumulation_steps", 1)),
+            "learning_rate": float(payload.get("learning_rate", 3e-4)),
+            "weight_decay": float(payload.get("weight_decay", 0.01)),
+            "grad_clip": float(payload.get("grad_clip", 1.0)),
+            "eval_interval": int(payload.get("eval_interval", max(1, int(payload.get("steps", 200)) // 10))),
+            "eval_batches": int(payload.get("eval_batches", 8)),
+            "seed": int(payload.get("seed", seed)),
+            "device": str(payload.get("device", doctor.get("device", "auto"))),
+            "precision": str(payload.get("precision", doctor.get("precision", "bf16"))),
+            "require_cuda": bool(payload.get("require_cuda", doctor.get("require_cuda", False))),
+            "distributed": bool(payload.get("distributed", doctor.get("distributed", False))),
+            "gloo_interface": payload.get("gloo_interface", doctor.get("gloo_interface")),
+            "resume": bool(payload.get("resume", False)),
+            "checkpoint_interval": int(payload.get("checkpoint_interval", 100)),
+            "num_threads": payload.get("num_threads"),
+        }
+
+    def _normalize_model_config(self, raw: Any) -> dict[str, Any]:
+        payload = dict(raw or {})
+        horizons = payload.get("horizons", (1, 2, 4))
+        return {
+            "vocab_size": int(payload.get("vocab_size", 4096)),
+            "min_frequency": int(payload.get("min_frequency", 2)),
+            "seq_len": int(payload.get("seq_len", 128)),
+            "d_model": int(payload.get("d_model", 256)),
+            "n_heads": int(payload.get("n_heads", 8)),
+            "n_layers": int(payload.get("n_layers", 6)),
+            "dropout": float(payload.get("dropout", 0.1)),
+            "horizons": tuple(int(item) for item in horizons),
+            "cortex_win_margin": float(payload.get("cortex_win_margin", 1.05)),
+            "max_next_token_loss_regression": float(payload.get("max_next_token_loss_regression", 1.20)),
+        }
+
+    def _normalize_corpus_config(self, raw: Any) -> dict[str, Any]:
+        if not isinstance(raw, Mapping):
+            raise ValueError("each corpus entry must be a JSON object")
+        payload = dict(raw)
+        name = str(payload.get("name", "")).strip()
+        if not name:
+            raise ValueError("each corpus entry requires non-empty `name`")
+        kind = str(payload.get("kind", "paths" if "paths" in payload else "hf"))
+        normalized: dict[str, Any] = {
+            "name": name,
+            "kind": kind,
+            "min_chars_per_chunk": int(payload.get("min_chars_per_chunk", 2048)),
+        }
+        if kind == "paths":
+            paths = payload.get("paths")
+            if not isinstance(paths, Sequence) or isinstance(paths, (str, bytes)) or not paths:
+                raise ValueError(f"paths corpus {name!r} requires non-empty `paths` list")
+            normalized["paths"] = tuple(str(path) for path in paths)
+            return normalized
+        if kind == "hf":
+            if not str(payload.get("dataset", "")).strip():
+                raise ValueError(f"hf corpus {name!r} requires `dataset`")
+            normalized.update(
+                {
+                    "dataset": str(payload["dataset"]),
+                    "config_name": payload.get("config_name"),
+                    "split": str(payload.get("split", "train")),
+                    "text_field": str(payload.get("text_field", "text")),
+                    "data_files": tuple(str(path) for path in payload.get("data_files", ())),
+                    "streaming": bool(payload.get("streaming", True)),
+                    "trust_remote_code": bool(payload.get("trust_remote_code", False)),
+                    "cache_dir": payload.get("cache_dir"),
+                    "max_documents": payload.get("max_documents", 100_000),
+                    "max_characters": payload.get("max_characters"),
+                    "allow_unbounded": bool(payload.get("allow_unbounded", False)),
+                    "min_text_chars": int(payload.get("min_text_chars", 1)),
+                    "shard_max_chars": int(payload.get("shard_max_chars", 64 * 1024 * 1024)),
+                }
+            )
+            return normalized
+        raise ValueError(f"unsupported corpus kind {kind!r} for corpus {name!r}")
+
+    def _prepare_corpora(self, run_dir: Path) -> tuple[tuple[tuple[str, TextCorpusConfig], ...], list[Mapping[str, Any]]]:
+        corpora: list[tuple[str, TextCorpusConfig]] = []
+        payloads: list[Mapping[str, Any]] = []
+        for corpus_payload in self.manifest["corpora"]:
+            name = str(corpus_payload["name"])
+            if corpus_payload["kind"] == "paths":
+                corpus = TextCorpusConfig.from_paths(
+                    corpus_payload["paths"],
+                    min_chars_per_chunk=int(corpus_payload["min_chars_per_chunk"]),
+                )
+                corpora.append((name, corpus))
+                payloads.append({"name": name, "kind": "paths", "files": corpus.files})
+                continue
+
+            corpus_dir = run_dir / "prepared" / _safe_run_name(name)
+            export_config = HFDatasetExportConfig(
+                dataset=str(corpus_payload["dataset"]),
+                split=str(corpus_payload["split"]),
+                text_field=str(corpus_payload["text_field"]),
+                config_name=corpus_payload.get("config_name"),
+                data_files=tuple(corpus_payload.get("data_files", ())),
+                streaming=bool(corpus_payload["streaming"]),
+                trust_remote_code=bool(corpus_payload["trust_remote_code"]),
+                cache_dir=corpus_payload.get("cache_dir"),
+                max_documents=corpus_payload.get("max_documents"),
+                max_characters=corpus_payload.get("max_characters"),
+                allow_unbounded=bool(corpus_payload["allow_unbounded"]),
+                min_text_chars=int(corpus_payload["min_text_chars"]),
+                shard_max_chars=int(corpus_payload["shard_max_chars"]),
+            )
+            export_report = HFDatasetTextExporter(export_config).export(corpus_dir)
+            corpus = TextCorpusConfig.from_paths(
+                export_report.shard_files,
+                min_chars_per_chunk=int(corpus_payload["min_chars_per_chunk"]),
+            )
+            corpora.append((name, corpus))
+            payloads.append({"name": name, "kind": "hf", "hf_export": export_report.to_dict(), "files": corpus.files})
+        return tuple(corpora), payloads
+
+    def _comparison_config(self, seeds: Sequence[int]) -> ComparisonConfig:
+        training_payload = self.manifest["training"]
+        model_payload = self.manifest["model"]
+        training = TrainingConfig(
+            steps=int(training_payload["steps"]),
+            batch_size=int(training_payload["batch_size"]),
+            gradient_accumulation_steps=int(training_payload["gradient_accumulation_steps"]),
+            learning_rate=float(training_payload["learning_rate"]),
+            weight_decay=float(training_payload["weight_decay"]),
+            grad_clip=float(training_payload["grad_clip"]),
+            eval_interval=int(training_payload["eval_interval"]),
+            eval_batches=int(training_payload["eval_batches"]),
+            seed=int(seeds[0]),
+            device=str(training_payload["device"]),
+            precision=str(training_payload["precision"]),
+            require_cuda=bool(training_payload["require_cuda"]),
+            distributed=bool(training_payload["distributed"]),
+            gloo_interface=training_payload.get("gloo_interface"),
+            resume=bool(training_payload["resume"]),
+            checkpoint_interval=int(training_payload["checkpoint_interval"]),
+            num_threads=training_payload.get("num_threads"),
+        )
+        return ComparisonConfig(
+            vocab_size=int(model_payload["vocab_size"]),
+            min_frequency=int(model_payload["min_frequency"]),
+            seq_len=int(model_payload["seq_len"]),
+            d_model=int(model_payload["d_model"]),
+            n_heads=int(model_payload["n_heads"]),
+            n_layers=int(model_payload["n_layers"]),
+            dropout=float(model_payload["dropout"]),
+            horizons=tuple(model_payload["horizons"]),
+            training=training,
+            cortex_win_margin=float(model_payload["cortex_win_margin"]),
+            max_next_token_loss_regression=float(model_payload["max_next_token_loss_regression"]),
+        )
+
+    def _write_markdown(self, report: LLMExperimentReport) -> None:
+        proof = report.proof
+        lines = [
+            "# Cortex-3 LLM experiment report",
+            "",
+            f"- Experiment: `{report.manifest['name']}`",
+            f"- Passed: `{proof['passed']}`",
+            f"- Corpora: `{', '.join(proof['corpora'])}`",
+            f"- Seeds: `{', '.join(str(seed) for seed in proof['seeds'])}`",
+            f"- Samples: `{proof['sample_count']}`",
+            f"- Mean Cortex/baseline ratio: `{proof['mean_ratio']:.3f}`",
+            f"- Min Cortex/baseline ratio: `{proof['min_ratio']:.3f}`",
+            f"- Win rate: `{proof['win_rate']:.3f}`",
+            f"- Max next-token-loss regression: `{proof['max_next_token_loss_regression']:.3f}`",
+            "",
+            "## Artifacts",
+            "",
+            "- `experiment_manifest.normalized.json`",
+            "- `doctor_report.json`",
+            "- `experiment_report.json`",
+            "- `experiment_report.md`",
+            "- `prepared/<corpus>/hf_export_report.json` for HF corpora",
+            "- `corpus_matrix/corpus_matrix_report.json`",
+        ]
+        Path(report.run_dir, "experiment_report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 class LLMBenchmarkSuite:
     def __init__(
         self,
@@ -2527,6 +2799,10 @@ def main(argv: Sequence[str] | None = None) -> None:
     doctor.add_argument("--distributed", action="store_true")
     doctor.add_argument("--gloo-interface", default=None)
 
+    experiment = sub.add_parser("run-experiment", help="run a manifest-driven HF/paths corpus-matrix experiment")
+    experiment.add_argument("manifest", help="JSON experiment manifest")
+    experiment.add_argument("--out-dir", default=None, help="override manifest out_dir")
+
     smoke = sub.add_parser("smoke", help="run a deterministic small corpus comparison")
     smoke.add_argument("--out-dir", default="runs/llm-smoke")
     smoke.add_argument("--steps", type=int, default=48)
@@ -2682,6 +2958,17 @@ def main(argv: Sequence[str] | None = None) -> None:
         if not report["passed"]:
             failed = ", ".join(str(check["name"]) for check in report["failed_required_checks"])
             raise RuntimeError(f"Cortex LLM doctor failed required checks: {failed}")
+        return
+
+    if args.command == "run-experiment":
+        runner = LLMExperimentRunner.load(args.manifest)
+        if args.out_dir is not None:
+            manifest = dict(runner.manifest)
+            manifest["out_dir"] = args.out_dir
+            runner = LLMExperimentRunner(manifest, manifest_path=args.manifest)
+        report = runner.run()
+        if _rank_zero():
+            print(json.dumps(report.proof, indent=2, sort_keys=True, default=_json_default))
         return
 
     if args.command == "smoke":

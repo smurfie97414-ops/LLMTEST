@@ -207,6 +207,32 @@ python tools/train_llm.py corpus-matrix --corpus c4=runs/c4-prepared/text_shards
 
 Chaque corpus reçoit son propre `comparison_matrix_report.json`, et le dossier racine écrit `corpus_matrix_report.json`, `corpus_matrix_report.md` et `corpus_matrix_ratios.png`. La preuve globale exige que tous les couples corpus x seed gagnent contre la baseline avec score baseline non nul.
 
+Pour exécuter le pipeline complet depuis un manifeste reproductible :
+
+```bash
+python tools/train_llm.py run-experiment experiments/c4_fineweb_gpu.json
+```
+
+Le manifeste décrit `doctor`, `training`, `model`, `seeds`, `require_win` et une liste de corpus `hf` ou `paths`. `run-experiment` écrit `experiment_manifest.normalized.json`, `doctor_report.json`, prépare les corpus HF sous `prepared/<corpus>`, lance `corpus-matrix`, puis produit `experiment_report.json` et `experiment_report.md`.
+
+Extrait minimal :
+
+```json
+{
+  "name": "cortex3-large-corpus",
+  "out_dir": "runs/cortex3-large-corpus",
+  "doctor": {"require_cuda": true, "device": "cuda", "precision": "bf16", "distributed": true},
+  "seeds": [11, 23, 37],
+  "require_win": true,
+  "model": {"vocab_size": 32768, "seq_len": 1024, "d_model": 768, "n_heads": 12, "n_layers": 12, "horizons": [1, 2, 4, 8]},
+  "training": {"steps": 20000, "batch_size": 16, "gradient_accumulation_steps": 8, "checkpoint_interval": 500},
+  "corpora": [
+    {"name": "c4", "kind": "hf", "dataset": "allenai/c4", "config_name": "en", "split": "train", "text_field": "text", "max_documents": 1000000},
+    {"name": "local", "kind": "paths", "paths": ["path/to/local_text_shards"]}
+  ]
+}
+```
+
 Pour préparer un corpus Hugging Face massif en shards texte puis memmap tokenisé :
 
 ```bash

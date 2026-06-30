@@ -16,6 +16,7 @@ from cortex3_llm import (
     LLMComparisonMatrixSuite,
     LLMComparisonRunner,
     LLMCorpusMatrixSuite,
+    LLMExperimentRunner,
     LLMStatisticalBenchmarkSuite,
     LLMTrainer,
     LLMTokenizer,
@@ -429,6 +430,86 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                         f"missing comparison report for corpus={corpus} seed={seed}",
                     )
                     self.assertTrue((root / "corpus-matrix" / corpus / f"seed_{seed}" / "cortex3" / "checkpoint_final.pt").exists())
+
+    def test_manifest_experiment_runs_doctor_prepare_and_corpus_matrix(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            jsonl = root / "manifest_hf.jsonl"
+            with jsonl.open("w", encoding="utf-8") as handle:
+                for index in range(96):
+                    handle.write(
+                        json.dumps(
+                            {
+                                "text": (
+                                    f"alpha beta gamma delta sample {index:03d}. "
+                                    f"cortex manifest experiment keeps token pattern {index % 5}."
+                                )
+                            }
+                        )
+                        + "\n"
+                    )
+            seed_files = build_seed_corpus(root / "manifest-paths", repeats=120)
+            manifest = {
+                "name": "unit-manifest-experiment",
+                "out_dir": str(root / "experiment"),
+                "doctor": {"precision": "bf16", "device": "auto", "require_cuda": False},
+                "seeds": [17, 29],
+                "require_win": True,
+                "model": {
+                    "vocab_size": 256,
+                    "min_frequency": 1,
+                    "seq_len": 32,
+                    "d_model": 64,
+                    "n_heads": 4,
+                    "n_layers": 2,
+                    "dropout": 0.0,
+                    "horizons": [1, 2, 4],
+                    "cortex_win_margin": 1.02,
+                    "max_next_token_loss_regression": 1.60,
+                },
+                "training": {
+                    "steps": 48,
+                    "batch_size": 8,
+                    "eval_interval": 16,
+                    "eval_batches": 2,
+                    "checkpoint_interval": 100,
+                    "num_threads": 1,
+                },
+                "corpora": [
+                    {
+                        "name": "hfjson",
+                        "kind": "hf",
+                        "dataset": "json",
+                        "data_files": [str(jsonl)],
+                        "split": "train",
+                        "text_field": "text",
+                        "max_documents": 80,
+                        "min_text_chars": 20,
+                        "shard_max_chars": 1024,
+                        "min_chars_per_chunk": 256,
+                    },
+                    {
+                        "name": "paths",
+                        "kind": "paths",
+                        "paths": list(seed_files),
+                        "min_chars_per_chunk": 512,
+                    },
+                ],
+            }
+            manifest_path = root / "experiment_manifest.json"
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8-sig")
+            report = LLMExperimentRunner.load(manifest_path).run()
+            self.assertTrue(report.proof["passed"], report.proof)
+            self.assertEqual(report.proof["corpus_count"], 2)
+            self.assertEqual(report.proof["seed_count"], 2)
+            self.assertEqual(report.proof["sample_count"], 4)
+            self.assertEqual(report.proof["win_rate"], 1.0)
+            self.assertTrue((root / "experiment" / "experiment_manifest.normalized.json").exists())
+            self.assertTrue((root / "experiment" / "doctor_report.json").exists())
+            self.assertTrue((root / "experiment" / "experiment_report.json").exists())
+            self.assertTrue((root / "experiment" / "experiment_report.md").exists())
+            self.assertTrue((root / "experiment" / "prepared" / "hfjson" / "hf_export_report.json").exists())
+            self.assertTrue((root / "experiment" / "corpus_matrix" / "corpus_matrix_report.json").exists())
 
     def test_cuda_requirement_is_explicit_not_silent_fallback(self):
         report = hardware_report()
