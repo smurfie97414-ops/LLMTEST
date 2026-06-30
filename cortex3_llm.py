@@ -1573,6 +1573,17 @@ class ResourceUsageMonitor:
             "last_sample": samples[-1] if samples else None,
         }
 
+    def write_snapshot(self, path: Path, *, metadata: Mapping[str, Any]) -> Mapping[str, Any]:
+        with self._lock:
+            has_samples = bool(self._samples)
+        if not has_samples:
+            self._sample()
+        payload = dict(self.summary())
+        payload["metadata"] = dict(metadata)
+        payload["written_at"] = time.time()
+        _write_json(Path(path), payload)
+        return payload
+
 
 def _cuda_memory_report() -> tuple[dict[str, Any], ...]:
     if not torch.cuda.is_available():
@@ -2557,6 +2568,7 @@ class LLMTrainer:
             resource_monitor.start()
         resumed_from = self._resolve_resume_checkpoint()
         start_step = 0
+        last_completed_step = 0
         resource_usage: Mapping[str, Any] = {"enabled": False}
         try:
             if resumed_from is not None:
@@ -2567,6 +2579,7 @@ class LLMTrainer:
                     phase_controller=phase_controller,
                     restore_rng=not runtime.enabled,
                 )
+                last_completed_step = start_step
                 if start_step > self.config.steps:
                     raise ValueError(f"checkpoint step {start_step} is greater than target steps {self.config.steps}")
                 if runtime.enabled:
@@ -2636,6 +2649,7 @@ class LLMTrainer:
                     torch.nn.utils.clip_grad_norm_(trainable.parameters(), self.config.grad_clip)
                     optimizer.step()
                 self.model.requantize_ternary_core(certify_zeros=False)
+                last_completed_step = step
                 if step % self.config.eval_interval == 0 or step == self.config.steps:
                     curve.append(self.evaluate(self.train_data, split="train", step=step))
                     curve.append(self.evaluate(self.val_data, split="val", step=step))
@@ -2650,6 +2664,16 @@ class LLMTrainer:
                         scaler=scaler,
                         phase_controller=phase_controller,
                     )
+                    if resource_monitor is not None:
+                        resource_monitor.write_snapshot(
+                            self.run_dir / "resource_usage_live.json",
+                            metadata={
+                                "model_kind": self.model_kind,
+                                "step": step,
+                                "target_steps": self.config.steps,
+                                "checkpoint": str(self.run_dir / f"checkpoint_step_{step}.pt"),
+                            },
+                        )
             checkpoint_path = self.run_dir / "checkpoint_final.pt"
             if runtime.is_main:
                 checkpoint_path = self.save_checkpoint(
@@ -2664,6 +2688,15 @@ class LLMTrainer:
         finally:
             if resource_monitor is not None:
                 resource_usage = resource_monitor.stop()
+                resource_monitor.write_snapshot(
+                    self.run_dir / "resource_usage_summary.json",
+                    metadata={
+                        "model_kind": self.model_kind,
+                        "step": last_completed_step,
+                        "target_steps": self.config.steps,
+                        "final": True,
+                    },
+                )
         final_train = [point for point in curve if point.split == "train"][-1]
         final_val = [point for point in curve if point.split == "val"][-1]
         cortex_phase_report: Mapping[str, Any] = phase_controller.summary() if phase_controller is not None else {"enabled": False}
