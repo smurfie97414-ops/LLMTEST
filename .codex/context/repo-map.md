@@ -1,11 +1,11 @@
 ﻿# Codex Repo Map
 
 - Root: `C:\Users\hight\Documents\Codex\2026-06-30\cl\work\LLMTEST`
-- Generated: 2026-06-30T09:04:38
+- Generated: 2026-06-30T09:11:22
 - Files indexed: 49
 - Symbols indexed: 555
 - Symbol files scanned: 42 of 42 candidates
-- Git: branch `main`, head `4a76aae`, changed entries `7`
+- Git: branch `main`, head `b0ed7c1`, changed entries `5`
 
 ## Use
 
@@ -65,7 +65,7 @@ Read this map before broad file exploration. Prefer targeted `rg` and narrow fil
 - `cortex3_improvement.py`: py:__call__, py:__init__, py:_calibration_gap, py:_collapse_flags, py:check, py:detect, py:DiversityPreserver, py:DynamicEvaluator, py:generate, py:ImprovementProposal, py:pareto_candidate, py:ProposalGenerator, py:ProposalKind, py:ProposalPatchedAgent, py:RewardHackingDetector, py:SandboxEvaluation, py:SandboxTrainer, py:SandboxTrial, py:to_dict, py:to_trial_proposal, py:train
 - `cortex3_inference.py`: py:__init__, py:__post_init__, py:BudgetPrediction, py:BudgetPredictor, py:decide, py:DifficultyRouter, py:DifficultySignal, py:dispatch, py:EarlyExitDecision, py:EarlyExitPolicy, py:forward_route, py:InferenceConfig, py:InferencePath, py:InferenceResult, py:InferenceRoute, py:MixtureOfDepthsCore, py:passed, py:predict, py:route, py:signal, py:TernaryKernelDispatch, py:TernaryKernelDispatcher, py:threshold, py:to_dict
 - `cortex3_ledgers.py`: py:add_certificate, py:BitLedger, py:CausalLedger, py:CausalTrace, py:expected_calibration_error, py:fragile_skills, py:get, py:ingest_cost, py:record, py:SkillLedger, py:SkillState, py:total_effective_bits, py:UncertaintyLedger, py:update_from_report
-- `cortex3_llm.py`: py:__init__, py:__post_init__, py:_barrier_if_needed, py:_env_rank, py:_extract_text, py:_json_default, py:_load_dataset, py:_rank_zero, py:_write_json, py:export, py:from_paths, py:HFDatasetExportConfig, py:HFDatasetExportReport, py:HFDatasetTextExporter, py:iter_chunks, py:LLMTokenizer, py:load, py:open_next_shard, py:TextCorpusConfig, py:TextShardReader, py:to_dict, py:train
+- `cortex3_llm.py`: py:__init__, py:__post_init__, py:_barrier_if_needed, py:_env_rank, py:_extract_text, py:_json_default, py:_load_dataset, py:_rank_zero, py:_read_validation_learning_curve_rows, py:_write_json, py:_write_learning_curve_matrix_artifacts, py:export, py:from_paths, py:HFDatasetExportConfig, py:HFDatasetExportReport, py:HFDatasetTextExporter, py:iter_chunks, py:LLMTokenizer, py:open_next_shard, py:TextCorpusConfig, py:TextShardReader, py:to_dict
 - `cortex3_memory.py`: py:__init__, py:__post_init__, py:_stable_hash_int, py:_summary_from_counts, py:AnchorFidelityResult, py:AnchorFidelityVerifier, py:CognitiveMemory, py:CognitiveMemoryConfig, py:compress_from_exact, py:compression_ratio, py:embed_text, py:embed_tokens, py:LatentKVStore, py:MemoryMode, py:MemoryReconstruction, py:MemorySegment, py:passed, py:push, py:RecentExactKV, py:rendered, py:rendered_context, py:retrieve, py:tokenize, py:verify
 - `cortex3_microtrain.py`: py:__init__, py:__post_init__, py:_loss, py:answer_index, py:CortexMicroModel, py:CortexMicroTrainer, py:examples_from_sleep_report, py:examples_from_tasks, py:forward, py:from_examples, py:MicroDataset, py:MicroModelAgent, py:MicroModelConfig, py:MicroTrainingExample, py:MicroTrainingResult, py:MicroVocabulary, py:requantize_core, py:skill_index, py:tensors, py:to_dict, py:train
 - `cortex3_objective.py`: py:_anchor_accuracy, py:_certificate_failure_rate, py:_clamp01, py:_contract_decisions_from_future, py:_contract_decisions_from_inference, py:_hardware_layout_loss, py:_mtp_rejection_rate, py:_regrowth_efficiency_loss, py:_safe_ratio, py:_sum_cost, py:_temporal_loss, py:_verifier_detection_rate, py:AbsoluteMetricsReport, py:coefficient_for, py:CortexObjectiveReport, py:EffectiveJouleModel, py:estimate, py:FinalLossReport, py:LossTermValue, py:ObjectiveWeights, py:to_dict

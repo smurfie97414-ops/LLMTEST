@@ -285,6 +285,8 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             self.assertTrue((root / "compare-matrix" / "comparison_matrix_report.json").exists())
             self.assertTrue((root / "compare-matrix" / "comparison_matrix_report.md").exists())
             self.assertTrue((root / "compare-matrix" / "comparison_matrix_ratios.png").exists())
+            self.assertTrue((root / "compare-matrix" / "comparison_matrix_learning_curves.csv").exists())
+            self.assertTrue((root / "compare-matrix" / "comparison_matrix_learning_curves.png").exists())
             for seed in (17, 29):
                 self.assertFalse((root / "compare-matrix" / f"seed_{seed}" / "corpus" / "manifest.json").exists())
                 self.assertTrue((root / "compare-matrix" / f"seed_{seed}" / "comparison_report.json").exists())
@@ -421,6 +423,8 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             self.assertTrue((root / "corpus-matrix" / "corpus_matrix_report.json").exists())
             self.assertTrue((root / "corpus-matrix" / "corpus_matrix_report.md").exists())
             self.assertTrue((root / "corpus-matrix" / "corpus_matrix_ratios.png").exists())
+            self.assertTrue((root / "corpus-matrix" / "corpus_matrix_learning_curves.csv").exists())
+            self.assertTrue((root / "corpus-matrix" / "corpus_matrix_learning_curves.png").exists())
             for corpus in ("seed", "anchors"):
                 self.assertTrue((root / "corpus-matrix" / corpus / "comparison_matrix_report.json").exists())
                 self.assertTrue((root / "corpus-matrix" / corpus / "corpus" / "manifest.json").exists())
@@ -510,6 +514,8 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             self.assertTrue((root / "experiment" / "experiment_report.md").exists())
             self.assertTrue((root / "experiment" / "prepared" / "hfjson" / "hf_export_report.json").exists())
             self.assertTrue((root / "experiment" / "corpus_matrix" / "corpus_matrix_report.json").exists())
+            self.assertTrue((root / "experiment" / "corpus_matrix" / "corpus_matrix_learning_curves.csv").exists())
+            self.assertTrue((root / "experiment" / "corpus_matrix" / "corpus_matrix_learning_curves.png").exists())
 
     def test_cuda_requirement_is_explicit_not_silent_fallback(self):
         report = hardware_report()

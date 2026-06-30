@@ -58,6 +58,91 @@ def _write_json(path: Path, payload: Mapping[str, Any]) -> None:
     path.write_text(json.dumps(payload, indent=2, sort_keys=True, default=_json_default), encoding="utf-8")
 
 
+def _read_validation_learning_curve_rows(seed_runs: Sequence[Mapping[str, Any]], *, corpus: str = "") -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for seed_run in seed_runs:
+        seed = int(seed_run["seed"])
+        run_dir = Path(str(seed_run["run_dir"]))
+        for model in ("baseline_ntp", "cortex3"):
+            csv_path = run_dir / model / "learning_curve.csv"
+            if not csv_path.exists():
+                continue
+            with csv_path.open("r", encoding="utf-8") as handle:
+                for raw in csv.DictReader(handle):
+                    if raw.get("split") != "val":
+                        continue
+                    rows.append(
+                        {
+                            "corpus": corpus,
+                            "seed": seed,
+                            "model": model,
+                            "step": int(raw["step"]),
+                            "split": "val",
+                            "next_token_loss": float(raw["next_token_loss"]),
+                            "future_tokens_per_cost": float(raw["future_tokens_per_cost"]),
+                            "token_accuracy": float(raw["token_accuracy"]),
+                        }
+                    )
+    return rows
+
+
+def _write_learning_curve_matrix_artifacts(
+    run_dir: Path,
+    *,
+    rows: Sequence[Mapping[str, Any]],
+    csv_name: str,
+    png_name: str,
+    group_by_corpus: bool,
+) -> None:
+    if not rows:
+        return
+    csv_path = run_dir / csv_name
+    fieldnames = ["corpus", "seed", "model", "step", "split", "next_token_loss", "future_tokens_per_cost", "token_accuracy"]
+    with csv_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({field: row.get(field, "") for field in fieldnames})
+
+    series: dict[tuple[str, int], dict[str, list[float]]] = {}
+    for row in rows:
+        label_parts: list[str] = []
+        if group_by_corpus and row.get("corpus"):
+            label_parts.append(str(row["corpus"]))
+        label_parts.append(str(row["model"]))
+        key = (":".join(label_parts), int(row["step"]))
+        bucket = series.setdefault(key, {"next_token_loss": [], "future_tokens_per_cost": []})
+        bucket["next_token_loss"].append(float(row["next_token_loss"]))
+        bucket["future_tokens_per_cost"].append(float(row["future_tokens_per_cost"]))
+
+    labels = sorted({label for label, _ in series})
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+    for label in labels:
+        points = sorted((step, values) for (series_label, step), values in series.items() if series_label == label)
+        steps = [step for step, _ in points]
+        next_loss = [sum(values["next_token_loss"]) / len(values["next_token_loss"]) for _, values in points]
+        future_score = [sum(values["future_tokens_per_cost"]) / len(values["future_tokens_per_cost"]) for _, values in points]
+        axes[0].plot(steps, next_loss, label=label)
+        axes[1].plot(steps, future_score, label=label)
+    axes[0].set_title("Validation next-token loss")
+    axes[0].set_xlabel("step")
+    axes[0].set_ylabel("mean loss")
+    axes[1].set_title("Validation future tokens per cost")
+    axes[1].set_xlabel("step")
+    axes[1].set_ylabel("mean score")
+    for axis in axes:
+        axis.grid(True, alpha=0.25)
+        axis.legend(fontsize=8)
+    fig.tight_layout()
+    fig.savefig(run_dir / png_name, dpi=150)
+    plt.close(fig)
+
+
 @dataclass(frozen=True)
 class TextCorpusConfig:
     files: tuple[str, ...]
@@ -1666,6 +1751,7 @@ class LLMComparisonMatrixSuite:
             _write_json(self.run_dir / "comparison_matrix_report.json", matrix_report.to_dict())
             self._write_markdown(matrix_report)
             self._write_ratio_plot(matrix_report)
+            self._write_learning_curve_summary(matrix_report)
         failed = bool(require_win and not proof["passed"] and runtime.is_main)
         if runtime.enabled:
             flag_device = torch.device(f"cuda:{runtime.local_rank}") if runtime.backend == "nccl" else torch.device("cpu")
@@ -1782,6 +1868,8 @@ class LLMComparisonMatrixSuite:
                 "- `comparison_matrix_report.json`",
                 "- `comparison_matrix_report.md`",
                 "- `comparison_matrix_ratios.png`",
+                "- `comparison_matrix_learning_curves.csv`",
+                "- `comparison_matrix_learning_curves.png`",
                 "- `corpus/manifest.json`",
                 "- `seed_<seed>/comparison_report.json`",
                 "- `seed_<seed>/baseline_ntp/checkpoint_final.pt`",
@@ -1809,6 +1897,16 @@ class LLMComparisonMatrixSuite:
         fig.tight_layout()
         fig.savefig(self.run_dir / "comparison_matrix_ratios.png", dpi=150)
         plt.close(fig)
+
+    def _write_learning_curve_summary(self, report: ComparisonMatrixReport) -> None:
+        rows = _read_validation_learning_curve_rows(report.seeds)
+        _write_learning_curve_matrix_artifacts(
+            self.run_dir,
+            rows=rows,
+            csv_name="comparison_matrix_learning_curves.csv",
+            png_name="comparison_matrix_learning_curves.png",
+            group_by_corpus=False,
+        )
 
 
 class LLMCorpusMatrixSuite:
@@ -1887,6 +1985,7 @@ class LLMCorpusMatrixSuite:
             _write_json(self.run_dir / "corpus_matrix_report.json", report.to_dict())
             self._write_markdown(report)
             self._write_ratio_plot(report)
+            self._write_learning_curve_summary(report)
         failed = bool(require_win and not proof["passed"] and runtime.is_main)
         if runtime.enabled:
             flag_device = torch.device(f"cuda:{runtime.local_rank}") if runtime.backend == "nccl" else torch.device("cpu")
@@ -2039,6 +2138,8 @@ class LLMCorpusMatrixSuite:
                 "- `corpus_matrix_report.json`",
                 "- `corpus_matrix_report.md`",
                 "- `corpus_matrix_ratios.png`",
+                "- `corpus_matrix_learning_curves.csv`",
+                "- `corpus_matrix_learning_curves.png`",
                 "- `<corpus>/comparison_matrix_report.json`",
                 "- `<corpus>/seed_<seed>/comparison_report.json`",
                 "- `<corpus>/seed_<seed>/baseline_ntp/checkpoint_final.pt`",
@@ -2074,6 +2175,18 @@ class LLMCorpusMatrixSuite:
         fig.tight_layout()
         fig.savefig(self.run_dir / "corpus_matrix_ratios.png", dpi=150)
         plt.close(fig)
+
+    def _write_learning_curve_summary(self, report: CorpusMatrixReport) -> None:
+        rows: list[dict[str, Any]] = []
+        for corpus_report in report.corpora:
+            rows.extend(_read_validation_learning_curve_rows(corpus_report["seeds"], corpus=str(corpus_report["name"])))
+        _write_learning_curve_matrix_artifacts(
+            self.run_dir,
+            rows=rows,
+            csv_name="corpus_matrix_learning_curves.csv",
+            png_name="corpus_matrix_learning_curves.png",
+            group_by_corpus=True,
+        )
 
 
 class LLMExperimentRunner:
@@ -2330,6 +2443,8 @@ class LLMExperimentRunner:
             "- `experiment_report.md`",
             "- `prepared/<corpus>/hf_export_report.json` for HF corpora",
             "- `corpus_matrix/corpus_matrix_report.json`",
+            "- `corpus_matrix/corpus_matrix_learning_curves.csv`",
+            "- `corpus_matrix/corpus_matrix_learning_curves.png`",
         ]
         Path(report.run_dir, "experiment_report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 

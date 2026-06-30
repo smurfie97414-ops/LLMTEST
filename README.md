@@ -197,7 +197,7 @@ Pour comparer plusieurs graines sur le même corpus tokenisé une seule fois :
 python tools/train_llm.py compare-matrix path/to/text_shards --out-dir runs/llm-large-matrix --seeds 11,23,37 --steps 2000 --batch-size 64 --gradient-accumulation-steps 4 --checkpoint-interval 100 --precision bf16 --require-win
 ```
 
-`compare-matrix` écrit un `corpus/manifest.json` partagé, puis un dossier `seed_<seed>` par graine avec rapports, courbes et checkpoints baseline/Cortex. Le rapport agrégé `comparison_matrix_report.json` mesure moyenne, médiane, variance, win-rate, minimum Cortex/baseline et régression next-token maximale.
+`compare-matrix` écrit un `corpus/manifest.json` partagé, puis un dossier `seed_<seed>` par graine avec rapports, courbes et checkpoints baseline/Cortex. Le rapport agrégé `comparison_matrix_report.json` mesure moyenne, médiane, variance, win-rate, minimum Cortex/baseline et régression next-token maximale. Il écrit aussi `comparison_matrix_learning_curves.csv/png`, qui agrège les courbes validation baseline/Cortex sur les seeds.
 
 Pour un banc multi-corpus déjà préparé :
 
@@ -205,7 +205,7 @@ Pour un banc multi-corpus déjà préparé :
 python tools/train_llm.py corpus-matrix --corpus c4=runs/c4-prepared/text_shards --corpus code=path/to/code_shards --out-dir runs/llm-corpus-matrix --seeds 11,23,37 --steps 2000 --batch-size 64 --gradient-accumulation-steps 4 --checkpoint-interval 100 --precision bf16 --require-win
 ```
 
-Chaque corpus reçoit son propre `comparison_matrix_report.json`, et le dossier racine écrit `corpus_matrix_report.json`, `corpus_matrix_report.md` et `corpus_matrix_ratios.png`. La preuve globale exige que tous les couples corpus x seed gagnent contre la baseline avec score baseline non nul.
+Chaque corpus reçoit son propre `comparison_matrix_report.json`, et le dossier racine écrit `corpus_matrix_report.json`, `corpus_matrix_report.md`, `corpus_matrix_ratios.png` et `corpus_matrix_learning_curves.csv/png`. La preuve globale exige que tous les couples corpus x seed gagnent contre la baseline avec score baseline non nul.
 
 Pour exécuter le pipeline complet depuis un manifeste reproductible :
 
@@ -213,7 +213,7 @@ Pour exécuter le pipeline complet depuis un manifeste reproductible :
 python tools/train_llm.py run-experiment experiments/c4_fineweb_gpu.json
 ```
 
-Le manifeste décrit `doctor`, `training`, `model`, `seeds`, `require_win` et une liste de corpus `hf` ou `paths`. `run-experiment` écrit `experiment_manifest.normalized.json`, `doctor_report.json`, prépare les corpus HF sous `prepared/<corpus>`, lance `corpus-matrix`, puis produit `experiment_report.json` et `experiment_report.md`.
+Le manifeste décrit `doctor`, `training`, `model`, `seeds`, `require_win` et une liste de corpus `hf` ou `paths`. `run-experiment` écrit `experiment_manifest.normalized.json`, `doctor_report.json`, prépare les corpus HF sous `prepared/<corpus>`, lance `corpus-matrix`, puis produit `experiment_report.json`, `experiment_report.md` et les courbes agrégées sous `corpus_matrix/`.
 
 Extrait minimal :
 
