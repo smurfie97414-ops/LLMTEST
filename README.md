@@ -245,7 +245,7 @@ Extrait minimal :
   "seeds": [11, 23, 37],
   "require_win": true,
   "model": {"vocab_size": 32768, "seq_len": 1024, "d_model": 512, "n_heads": 8, "n_layers": 8, "horizons": [1, 2, 4, 8], "min_corpus_tokens": 50000000, "max_corpus_tokens": 64000000, "tokenizer_training_chars": 64000000, "min_planned_train_tokens": 2000000000},
-  "training": {"steps": 32000, "batch_size": 4, "gradient_accumulation_steps": 16, "checkpoint_interval": 20, "max_intermediate_checkpoints": 5, "cortex_phase_interval": 500, "resume_if_exists": true},
+  "training": {"steps": 32000, "batch_size": 4, "gradient_accumulation_steps": 16, "checkpoint_interval": 5, "max_intermediate_checkpoints": 5, "cortex_phase_interval": 500, "resume_if_exists": true},
   "corpora": [
     {"name": "c4", "kind": "hf", "dataset": "allenai/c4", "config_name": "en", "split": "train", "text_field": "text", "max_documents": 1000000, "max_characters": 350000000}
   ]
