@@ -1414,6 +1414,7 @@ class TrainingRunReport:
     curve: tuple[TrainingPoint, ...]
     config: Mapping[str, Any]
     hardware: Mapping[str, Any]
+    code_state: Mapping[str, Any] = field(default_factory=dict)
     resource_usage: Mapping[str, Any] = field(default_factory=dict)
     cortex_phase_report: Mapping[str, Any] = field(default_factory=dict)
 
@@ -1622,6 +1623,43 @@ def hardware_report() -> dict[str, Any]:
         "distributed_available": bool(torch.distributed.is_available()),
         "nccl_available": bool(torch.distributed.is_available() and torch.distributed.is_nccl_available()),
         "gloo_available": bool(torch.distributed.is_available() and torch.distributed.is_gloo_available()),
+    }
+
+
+def _git_output(args: Sequence[str], *, timeout: float = 2.0) -> str | None:
+    try:
+        completed = subprocess.run(
+            ["git", *args],
+            cwd=Path(__file__).resolve().parent,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except Exception:
+        return None
+    if completed.returncode != 0:
+        return None
+    return completed.stdout.strip()
+
+
+def code_state_report() -> dict[str, Any]:
+    tracked_status = _git_output(["status", "--short", "--untracked-files=no"])
+    untracked_status = _git_output(["status", "--short", "--untracked-files=all"])
+    untracked_lines = [
+        line
+        for line in (untracked_status or "").splitlines()
+        if line.startswith("?? ") and not line.startswith("?? .codex/")
+    ]
+    return {
+        "schema_version": 1,
+        "source_file": str(Path(__file__).resolve()),
+        "git_commit": _git_output(["rev-parse", "HEAD"]),
+        "git_branch": _git_output(["branch", "--show-current"]),
+        "git_commit_time": _git_output(["show", "-s", "--format=%cI", "HEAD"]),
+        "tracked_dirty": bool((tracked_status or "").strip()),
+        "tracked_status": tuple(line for line in (tracked_status or "").splitlines() if line.strip()),
+        "untracked_file_count_excluding_codex": len(untracked_lines),
     }
 
 
@@ -2522,6 +2560,7 @@ class LLMTrainer:
                 "corpus_identity": self.corpus_identity,
             },
             hardware=hardware_report(),
+            code_state=code_state_report(),
             resource_usage=resource_usage,
             cortex_phase_report=cortex_phase_report,
         )
@@ -2639,6 +2678,7 @@ class LLMTrainer:
     ) -> Path:
         output = Path(path)
         output.parent.mkdir(parents=True, exist_ok=True)
+        code_state = code_state_report()
         torch.save(
             {
                 "schema_version": 2,
@@ -2650,10 +2690,25 @@ class LLMTrainer:
                 "training_config": asdict(self.config),
                 "model_kind": self.model_kind,
                 "corpus_identity": self.corpus_identity,
+                "code_state": code_state,
                 "curve": [point.to_dict() for point in curve],
                 "rng_state": self._rng_state(),
             },
             output,
+        )
+        _write_json(
+            output.with_name(output.name + ".json"),
+            {
+                "schema_version": 1,
+                "checkpoint": str(output),
+                "checkpoint_size_bytes": int(output.stat().st_size),
+                "step": step,
+                "model_kind": self.model_kind,
+                "curve_points": len(curve),
+                "corpus_identity_sha256": self.corpus_identity.get("identity_sha256"),
+                "code_state": code_state,
+                "written_at": time.time(),
+            },
         )
         return output
 
@@ -2886,16 +2941,20 @@ def _model_run_inspection(model_dir: Path) -> Mapping[str, Any]:
         step = _checkpoint_step_from_name(checkpoint)
         if step is None:
             continue
+        sidecar = _read_json_if_exists(checkpoint.with_name(checkpoint.name + ".json"))
         step_checkpoints.append(
             {
                 "step": step,
                 "path": str(checkpoint),
                 "size_bytes": int(checkpoint.stat().st_size),
                 "last_write_time": checkpoint.stat().st_mtime,
+                "sidecar_exists": bool(sidecar),
+                "sidecar": sidecar,
             }
         )
     step_checkpoints.sort(key=lambda item: item["step"])
     final_checkpoint = model_dir / "checkpoint_final.pt"
+    final_sidecar = _read_json_if_exists(final_checkpoint.with_name(final_checkpoint.name + ".json"))
     training_report = _read_json_if_exists(model_dir / "training_report.json")
     cortex_phase_report = _read_json_if_exists(model_dir / "cortex_phase_report.json")
     return {
@@ -2905,6 +2964,8 @@ def _model_run_inspection(model_dir: Path) -> Mapping[str, Any]:
         "latest_checkpoint": step_checkpoints[-1] if step_checkpoints else None,
         "final_checkpoint_exists": final_checkpoint.exists(),
         "final_checkpoint_size_bytes": int(final_checkpoint.stat().st_size) if final_checkpoint.exists() else 0,
+        "final_checkpoint_sidecar_exists": bool(final_sidecar),
+        "final_checkpoint_sidecar": final_sidecar,
         "learning_curve_exists": (model_dir / "learning_curve.csv").exists(),
         "last_validation": _last_validation_row(model_dir / "learning_curve.csv"),
         "training_report_exists": bool(training_report),

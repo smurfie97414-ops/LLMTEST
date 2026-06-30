@@ -501,7 +501,11 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 self.assertEqual(first.optimizer_steps, 2)
                 self.assertEqual(first.effective_batch_size, 4)
                 self.assertTrue((run_dir / "checkpoint_step_1.pt").exists())
+                self.assertTrue((run_dir / "checkpoint_step_1.pt.json").exists())
                 self.assertTrue((run_dir / "checkpoint_final.pt").exists())
+                first_sidecar = json.loads((run_dir / "checkpoint_step_1.pt.json").read_text(encoding="utf-8"))
+                self.assertEqual(first_sidecar["step"], 1)
+                self.assertIn("git_commit", first_sidecar["code_state"])
 
                 resumed_config = TrainingConfig(
                     steps=4,
@@ -531,8 +535,14 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 checkpoint = torch.load(run_dir / "checkpoint_final.pt", map_location="cpu", weights_only=False)
                 self.assertEqual(checkpoint["step"], 4)
                 self.assertEqual(checkpoint["corpus_identity"], corpus_identity)
+                self.assertIn("code_state", checkpoint)
+                self.assertIn("git_commit", checkpoint["code_state"])
                 self.assertIn("rng_state", checkpoint)
                 self.assertGreaterEqual(len(checkpoint["curve"]), len(first.curve))
+                final_sidecar = json.loads((run_dir / "checkpoint_final.pt.json").read_text(encoding="utf-8"))
+                self.assertEqual(final_sidecar["step"], 4)
+                self.assertEqual(final_sidecar["code_state"]["git_commit"], checkpoint["code_state"]["git_commit"])
+                self.assertIn("code_state", resumed.to_dict())
             finally:
                 train.close()
                 val.close()
