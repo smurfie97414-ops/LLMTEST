@@ -1037,6 +1037,7 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             self.assertEqual(report.proof["win_rate"], 1.0)
             self.assertTrue((root / "experiment" / "experiment_manifest.normalized.json").exists())
             self.assertTrue((root / "experiment" / "doctor_report.json").exists())
+            self.assertTrue((root / "experiment" / "preflight_report.json").exists())
             self.assertTrue((root / "experiment" / "experiment_report.json").exists())
             self.assertTrue((root / "experiment" / "experiment_report.md").exists())
             self.assertTrue((root / "experiment" / "prepared" / "hfjson" / "hf_export_report.json").exists())
@@ -1049,12 +1050,58 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             self.assertGreater(len(audit.checked_artifacts), 20)
             with redirect_stdout(io.StringIO()):
                 llm_main(["audit-experiment", str(root / "experiment")])
+            with redirect_stdout(io.StringIO()):
+                llm_main(["preflight-experiment", str(manifest_path), "--out-dir", str(root / "preflight-only")])
+            preflight_only = json.loads((root / "preflight-only" / "preflight_report.json").read_text(encoding="utf-8"))
+            self.assertTrue(preflight_only["passed"], preflight_only)
 
             missing_checkpoint = root / "experiment" / "corpus_matrix" / "hfjson" / "seed_17" / "cortex3" / "checkpoint_final.pt"
             missing_checkpoint.unlink()
             failed_audit = audit_llm_experiment_artifacts(root / "experiment")
             self.assertFalse(failed_audit.passed)
             self.assertTrue(any("checkpoint_final.pt" in item for item in failed_audit.failed_checks))
+
+    def test_experiment_preflight_rejects_oversized_cuda_manifest(self):
+        manifest = {
+            "name": "oversized-cuda",
+            "out_dir": "runs/oversized-cuda",
+            "doctor": {"precision": "bf16", "device": "cuda", "require_cuda": True},
+            "seeds": [1],
+            "require_win": True,
+            "model": {
+                "vocab_size": 32768,
+                "min_frequency": 1,
+                "seq_len": 1024,
+                "d_model": 768,
+                "n_heads": 12,
+                "n_layers": 12,
+                "horizons": [1, 2, 4, 8],
+            },
+            "training": {"steps": 10, "batch_size": 16, "gradient_accumulation_steps": 1},
+            "corpora": [{"name": "paths", "kind": "paths", "paths": ["README.md"]}],
+        }
+        runner = LLMExperimentRunner(manifest)
+        fake_hardware = {
+            "torch": "test",
+            "cuda_available": True,
+            "cuda_device_count": 1,
+            "cuda_current_device": 0,
+            "cuda_current_device_name": "tiny-test-gpu",
+            "cuda_current_device_total_memory_bytes": 2 * 1024 * 1024 * 1024,
+            "cuda_current_device_free_memory_bytes": 2 * 1024 * 1024 * 1024,
+            "cuda_devices": (),
+            "distributed_available": True,
+            "nccl_available": False,
+            "gloo_available": True,
+        }
+        with patch("cortex3_llm.hardware_report", return_value=fake_hardware):
+            report = runner.preflight(doctor_report={"device_type": "cuda"})
+        self.assertFalse(report.passed, report.to_dict())
+        self.assertTrue(any("cuda_memory_capacity_exceeded" in check for check in report.failed_checks))
+        self.assertGreater(
+            report.estimates["max_estimated_peak_training_bytes"],
+            report.estimates["cuda_current_device_usable_memory_bytes"],
+        )
 
     def test_ddp_launcher_detects_cuda_requests_in_args_and_manifest(self):
         with tempfile.TemporaryDirectory() as tmp:

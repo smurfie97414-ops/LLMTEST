@@ -1252,11 +1252,58 @@ class TrainingRunReport:
         return payload
 
 
+def _cuda_memory_report() -> tuple[dict[str, Any], ...]:
+    if not torch.cuda.is_available():
+        return ()
+    devices: list[dict[str, Any]] = []
+    current_device: int | None = None
+    try:
+        current_device = int(torch.cuda.current_device())
+    except Exception:
+        current_device = None
+    for index in range(int(torch.cuda.device_count())):
+        device: dict[str, Any] = {"index": index}
+        try:
+            props = torch.cuda.get_device_properties(index)
+            device.update(
+                {
+                    "name": props.name,
+                    "total_memory_bytes": int(props.total_memory),
+                    "major": int(props.major),
+                    "minor": int(props.minor),
+                }
+            )
+        except Exception as exc:
+            device["properties_error"] = str(exc)
+        if current_device == index:
+            try:
+                free_bytes, total_bytes = torch.cuda.mem_get_info(index)
+                device["free_memory_bytes"] = int(free_bytes)
+                device["mem_get_info_total_memory_bytes"] = int(total_bytes)
+            except Exception as exc:
+                device["mem_get_info_error"] = str(exc)
+        devices.append(device)
+    return tuple(devices)
+
+
 def hardware_report() -> dict[str, Any]:
+    cuda_devices = _cuda_memory_report()
+    current_device = None
+    if torch.cuda.is_available():
+        try:
+            current_device = int(torch.cuda.current_device())
+        except Exception:
+            current_device = None
+    current_payload = next((item for item in cuda_devices if item.get("index") == current_device), {})
     return {
         "torch": torch.__version__,
         "cuda_available": bool(torch.cuda.is_available()),
         "cuda_device_count": int(torch.cuda.device_count()),
+        "cuda_current_device": current_device,
+        "cuda_current_device_name": current_payload.get("name"),
+        "cuda_current_device_total_memory_bytes": current_payload.get("total_memory_bytes"),
+        "cuda_current_device_free_memory_bytes": current_payload.get("free_memory_bytes"),
+        "cuda_devices": cuda_devices,
         "distributed_available": bool(torch.distributed.is_available()),
         "nccl_available": bool(torch.distributed.is_available() and torch.distributed.is_nccl_available()),
         "gloo_available": bool(torch.distributed.is_available() and torch.distributed.is_gloo_available()),
@@ -1812,6 +1859,19 @@ class LLMExperimentAuditReport:
         return asdict(self)
 
 
+@dataclass(frozen=True)
+class LLMExperimentPreflightReport:
+    run_dir: str
+    passed: bool
+    failed_checks: tuple[str, ...]
+    warnings: tuple[str, ...]
+    estimates: Mapping[str, Any]
+    hardware: Mapping[str, Any]
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
 def _training_precision_bytes(precision: str) -> int:
     return 2 if precision in {"bf16", "fp16"} else 4
 
@@ -1832,6 +1892,73 @@ def _transformer_parameter_count(config: TransformerConfig) -> int:
         total += len(config.horizons) * (d_model * vocab_size + vocab_size)
         total += d_model + 1
     return int(total)
+
+
+def _estimate_transformer_training_memory(config: TransformerConfig, training: TrainingConfig) -> dict[str, Any]:
+    precision_bytes = _training_precision_bytes(training.precision)
+    parameters = _transformer_parameter_count(config)
+    batch_size = int(training.batch_size)
+    seq_len = int(config.seq_len)
+    d_model = int(config.d_model)
+    n_layers = int(config.n_layers)
+    n_heads = int(config.n_heads)
+    vocab_size = int(config.vocab_size)
+    training_state_bytes = parameters * 16
+    parameter_forward_bytes = parameters * precision_bytes
+    hidden_activation_bytes = batch_size * seq_len * d_model * n_layers * precision_bytes * 12
+    attention_workspace_bytes = batch_size * n_heads * seq_len * seq_len * precision_bytes * 2
+    output_heads = 1 + (len(config.horizons) if config.use_cortex_heads else 0)
+    logits_workspace_bytes = batch_size * seq_len * vocab_size * precision_bytes * output_heads
+    subtotal = (
+        training_state_bytes
+        + parameter_forward_bytes
+        + hidden_activation_bytes
+        + attention_workspace_bytes
+        + logits_workspace_bytes
+    )
+    fragmentation_margin_bytes = int(subtotal * 0.20)
+    peak_training_bytes = subtotal + fragmentation_margin_bytes
+    return {
+        "parameters": int(parameters),
+        "precision_bytes": int(precision_bytes),
+        "batch_size_per_rank": batch_size,
+        "seq_len": seq_len,
+        "d_model": d_model,
+        "n_layers": n_layers,
+        "n_heads": n_heads,
+        "vocab_size": vocab_size,
+        "output_heads": int(output_heads),
+        "training_state_bytes": int(training_state_bytes),
+        "parameter_forward_bytes": int(parameter_forward_bytes),
+        "hidden_activation_bytes": int(hidden_activation_bytes),
+        "attention_workspace_bytes": int(attention_workspace_bytes),
+        "logits_workspace_bytes": int(logits_workspace_bytes),
+        "fragmentation_margin_bytes": int(fragmentation_margin_bytes),
+        "estimated_peak_training_bytes": int(peak_training_bytes),
+    }
+
+
+def _experiment_model_memory_estimates(config: ComparisonConfig) -> dict[str, Any]:
+    baseline_config = TransformerConfig(
+        vocab_size=config.vocab_size,
+        seq_len=config.seq_len,
+        d_model=config.d_model,
+        n_heads=config.n_heads,
+        n_layers=config.n_layers,
+        dropout=config.dropout,
+        horizons=config.horizons,
+        use_cortex_heads=False,
+    )
+    cortex_config = TransformerConfig(**{**asdict(baseline_config), "use_cortex_heads": True})
+    baseline = _estimate_transformer_training_memory(baseline_config, config.training)
+    cortex = _estimate_transformer_training_memory(cortex_config, config.training)
+    return {
+        "baseline_next_token": baseline,
+        "cortex3_multi_horizon": cortex,
+        "max_estimated_peak_training_bytes": int(
+            max(baseline["estimated_peak_training_bytes"], cortex["estimated_peak_training_bytes"])
+        ),
+    }
 
 
 def _manifest_split_availability(manifest: TokenizedCorpusManifest) -> dict[str, int]:
@@ -2897,6 +3024,12 @@ class LLMExperimentRunner:
             failed = ", ".join(str(check["name"]) for check in doctor_report["failed_required_checks"])
             raise RuntimeError(f"experiment doctor failed required checks: {failed}")
 
+        preflight_report = self.preflight(doctor_report=doctor_report)
+        _write_json(run_dir / "preflight_report.json", preflight_report.to_dict())
+        if not preflight_report.passed:
+            failed = "; ".join(preflight_report.failed_checks[:10])
+            raise RuntimeError(f"experiment preflight failed: {failed}")
+
         corpora, prepared_payloads = self._prepare_corpora(run_dir)
         seeds = tuple(int(seed) for seed in self.manifest["seeds"])
         config = self._comparison_config(seeds)
@@ -2918,6 +3051,51 @@ class LLMExperimentRunner:
         _write_json(run_dir / "experiment_report.json", report.to_dict())
         self._write_markdown(report)
         return report
+
+    def preflight(self, *, doctor_report: Mapping[str, Any] | None = None) -> LLMExperimentPreflightReport:
+        run_dir = Path(str(self.manifest["out_dir"]))
+        seeds = tuple(int(seed) for seed in self.manifest["seeds"])
+        config = self._comparison_config(seeds)
+        hardware = hardware_report()
+        doctor_payload = dict(doctor_report or llm_doctor_report(**dict(self.manifest["doctor"])))
+        device_type = str(doctor_payload.get("device_type", "cuda" if hardware.get("cuda_available") else "cpu"))
+        estimates = _experiment_model_memory_estimates(config)
+        max_peak = int(estimates["max_estimated_peak_training_bytes"])
+        failed_checks: list[str] = []
+        warnings: list[str] = []
+        usable_fraction = 0.85
+        total_memory = hardware.get("cuda_current_device_total_memory_bytes")
+        usable_memory = int(float(total_memory) * usable_fraction) if total_memory else None
+
+        if device_type == "cuda":
+            if not hardware.get("cuda_available"):
+                failed_checks.append("cuda_requested_but_unavailable")
+            if total_memory is None:
+                failed_checks.append("cuda_memory_capacity_unavailable")
+            elif max_peak > int(usable_memory):
+                failed_checks.append(
+                    "cuda_memory_capacity_exceeded:"
+                    f"estimated_peak={max_peak},usable={usable_memory},total={total_memory}"
+                )
+        else:
+            warnings.append("device_type is not cuda; GPU memory capacity was not enforced")
+
+        estimates = {
+            **estimates,
+            "device_type": device_type,
+            "cuda_memory_usable_fraction": usable_fraction,
+            "cuda_current_device_total_memory_bytes": total_memory,
+            "cuda_current_device_usable_memory_bytes": usable_memory,
+            "fits_cuda_memory": bool(usable_memory is not None and max_peak <= int(usable_memory)) if device_type == "cuda" else None,
+        }
+        return LLMExperimentPreflightReport(
+            run_dir=str(run_dir),
+            passed=not failed_checks,
+            failed_checks=tuple(failed_checks),
+            warnings=tuple(warnings),
+            estimates=estimates,
+            hardware=hardware,
+        )
 
     def _normalize_manifest(self, manifest: Mapping[str, Any]) -> dict[str, Any]:
         payload = dict(manifest)
@@ -3129,6 +3307,7 @@ class LLMExperimentRunner:
             "",
             "- `experiment_manifest.normalized.json`",
             "- `doctor_report.json`",
+            "- `preflight_report.json`",
             "- `experiment_report.json`",
             "- `experiment_report.md`",
             "- `prepared/<corpus>/hf_export_report.json` for HF corpora",
@@ -3237,9 +3416,12 @@ def audit_llm_experiment_artifacts(
     _require_nonempty_artifact(root / "experiment_manifest.normalized.json", failures, checked)
     _require_nonempty_artifact(root / "experiment_report.md", failures, checked)
     doctor = _load_json_artifact(root / "doctor_report.json", failures, checked)
+    preflight = _load_json_artifact(root / "preflight_report.json", failures, checked)
     experiment = _load_json_artifact(root / "experiment_report.json", failures, checked)
     if doctor is not None and not bool(doctor.get("passed", False)):
         failures.append("doctor_report.json did not pass")
+    if preflight is not None and not bool(preflight.get("passed", False)):
+        failures.append("preflight_report.json did not pass")
     proof: Mapping[str, Any] = {}
     if experiment is not None:
         proof = experiment.get("proof", {}) if isinstance(experiment.get("proof", {}), Mapping) else {}
@@ -3849,6 +4031,10 @@ def main(argv: Sequence[str] | None = None) -> None:
     experiment.add_argument("manifest", help="JSON experiment manifest")
     experiment.add_argument("--out-dir", default=None, help="override manifest out_dir")
 
+    preflight_experiment = sub.add_parser("preflight-experiment", help="preflight a manifest's doctor and model/GPU memory plan without preparing corpora")
+    preflight_experiment.add_argument("manifest", help="JSON experiment manifest")
+    preflight_experiment.add_argument("--out-dir", default=None, help="override manifest out_dir")
+
     audit_experiment = sub.add_parser("audit-experiment", help="audit completed LLM experiment artifacts and proof gates")
     audit_experiment.add_argument("run_dir", help="experiment run directory")
     audit_experiment.add_argument("--allow-failed-proof", action="store_true", help="report missing/corrupt artifacts without failing solely on proof=false")
@@ -4032,6 +4218,27 @@ def main(argv: Sequence[str] | None = None) -> None:
         report = runner.run()
         if _rank_zero():
             print(json.dumps(report.proof, indent=2, sort_keys=True, default=_json_default))
+        return
+
+    if args.command == "preflight-experiment":
+        runner = LLMExperimentRunner.load(args.manifest)
+        if args.out_dir is not None:
+            manifest = dict(runner.manifest)
+            manifest["out_dir"] = args.out_dir
+            runner = LLMExperimentRunner(manifest, manifest_path=args.manifest)
+        doctor_report = llm_doctor_report(**dict(runner.manifest["doctor"]))
+        report = runner.preflight(doctor_report=doctor_report)
+        out_dir = Path(str(runner.manifest["out_dir"]))
+        out_dir.mkdir(parents=True, exist_ok=True)
+        _write_json(out_dir / "doctor_report.json", doctor_report)
+        _write_json(out_dir / "preflight_report.json", report.to_dict())
+        print(json.dumps(report.to_dict(), indent=2, sort_keys=True, default=_json_default))
+        if not doctor_report["passed"]:
+            failed = ", ".join(str(check["name"]) for check in doctor_report["failed_required_checks"])
+            raise RuntimeError(f"Cortex LLM preflight doctor failed required checks: {failed}")
+        if not report.passed:
+            failed = "; ".join(report.failed_checks[:10])
+            raise RuntimeError(f"Cortex LLM preflight failed: {failed}")
         return
 
     if args.command == "audit-experiment":

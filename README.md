@@ -219,11 +219,12 @@ Chaque corpus reçoit son propre `comparison_matrix_report.json`, et le dossier 
 Pour exécuter le pipeline complet depuis un manifeste reproductible :
 
 ```bash
+python tools/train_llm.py preflight-experiment experiments/c4_cuda_large_manifest.json --out-dir runs/cortex3-c4-cuda-large-preflight
 python tools/train_llm.py run-experiment experiments/c4_fineweb_gpu.json
 python tools/train_llm.py audit-experiment runs/cortex3-large-corpus
 ```
 
-Le manifeste décrit `doctor`, `training`, `model`, `seeds`, `require_win` et une liste de corpus `hf` ou `paths`. `run-experiment` écrit `experiment_manifest.normalized.json`, `doctor_report.json`, prépare les corpus HF sous `prepared/<corpus>`, lance `corpus-matrix`, puis produit `experiment_report.json`, `experiment_report.md` et les courbes agrégées sous `corpus_matrix/`. Après un long run, `audit-experiment` relit les artefacts persistés, vérifie les preuves `passed`, les manifests tokenisés, les shards HF, les courbes CSV/PNG et les checkpoints baseline/Cortex non vides.
+Le manifeste décrit `doctor`, `training`, `model`, `seeds`, `require_win` et une liste de corpus `hf` ou `paths`. `preflight-experiment` vérifie le doctor et estime le pic mémoire modèle/batch/GPU sans préparer le corpus. `run-experiment` écrit `experiment_manifest.normalized.json`, `doctor_report.json`, `preflight_report.json`, prépare les corpus HF sous `prepared/<corpus>`, lance `corpus-matrix`, puis produit `experiment_report.json`, `experiment_report.md` et les courbes agrégées sous `corpus_matrix/`. Après un long run, `audit-experiment` relit les artefacts persistés, vérifie les preuves `passed`, les manifests tokenisés, les shards HF, les courbes CSV/PNG et les checkpoints baseline/Cortex non vides.
 
 Deux manifestes versionnés sont fournis :
 
@@ -239,8 +240,8 @@ Extrait minimal :
   "doctor": {"require_cuda": true, "device": "cuda", "precision": "bf16", "distributed": true},
   "seeds": [11, 23, 37],
   "require_win": true,
-  "model": {"vocab_size": 32768, "seq_len": 1024, "d_model": 768, "n_heads": 12, "n_layers": 12, "horizons": [1, 2, 4, 8], "min_corpus_tokens": 50000000, "min_planned_train_tokens": 2000000000},
-  "training": {"steps": 20000, "batch_size": 16, "gradient_accumulation_steps": 8, "checkpoint_interval": 500},
+  "model": {"vocab_size": 32768, "seq_len": 1024, "d_model": 512, "n_heads": 8, "n_layers": 8, "horizons": [1, 2, 4, 8], "min_corpus_tokens": 50000000, "min_planned_train_tokens": 2000000000},
+  "training": {"steps": 32000, "batch_size": 4, "gradient_accumulation_steps": 16, "checkpoint_interval": 500},
   "corpora": [
     {"name": "c4", "kind": "hf", "dataset": "allenai/c4", "config_name": "en", "split": "train", "text_field": "text", "max_documents": 1000000}
   ]
