@@ -2,13 +2,45 @@
 
 This document tracks implementation progress for the project.
 
-- Phase 1: dynamic evaluation
+- Phase 1: Verifier OS before the full model
+  - Implemented baseline: SkillSpec DSL hooks, metamorphic and anti-metamorphic variants, oracle registry, exact anchor ledger, regression harness, compression adversary, true per-case verifier cost profile, oracle false-positive/false-negative auditor, strict exact-output gates, seven first skill families, versioned run JSON and persisted run/fault artifacts under `runs/`.
+  - Next hardening: broader generated grammars, a published JSON schema document, compatibility tests for downstream phase gates and wider oracle confidence probes.
 - Phase 2: compressed core instrumentation
-- Phase 3: future planning checks
-- Phase 4: memory and exact anchors
-- Phase 5: short certificates
-- Phase 6: regression analysis
-- Phase 7: budgeted repair planning
+  - Implemented baseline: PyTorch `BitLinear` sign+mask validated in `.venv` with `pip install -e .`, shared scales, zero-state lifecycle, residual synapse buffer, activation quantization logs, expert/KV/MTP/FSP trace ledger, real layer-forward events, deterministic numerical parity checks and gradient-survival checks into inputs and weights.
+  - Next: promote layer-forward traces into persisted cycle-level reports and causal attribution probes.
+- Phase 3: MTP/FSP under contract
+  - Implemented baseline: PyTorch MTP heads for horizons 1/2/4/8, confidence head, temporal consistency loss, future contracts, revision mechanism, block accept/reject gates, future-contract ledger, standalone MTP/FSP micro-task calibration, direct blockwise autoregressive token acceptance, speculative decoder-step cost accounting, persisted block-contract traces and verified answers per effective cost metric.
+  - Next: calibrate the standalone heads on larger held-out micro-task distributions, compare accepted-block speedups against verified answers per cost over checkpoint variants, and add FSP output-goal contracts beyond token IDs.
+- Phase 4: cognitive memory and exact anchors
+  - Implemented baseline: exact recent KV, compact latent old KV with Torch embeddings, Exact Anchor Ledger preservation, query-conditioned reconstruction, anchor fidelity verifier, memory-augmented inference generation for recovered anchors, audited replacement of weaker base answers and persisted memory compression/reconstruction fidelity reports.
+  - Next: add learned query-conditioned compression, promote anchor fidelity to a required cycle gate for long-context tasks, and benchmark exact KV vs latent KV cost/quality tradeoffs.
+- Phase 5: latent reasoning with certificates
+  - Implemented baseline: latent proof state, PyTorch certificate head, supervised certificate-head calibration on verifier micro-tasks, short certificate schema, checksum-backed verifier, random de-latentization probes, tool-backed arithmetic/anchor/code/exact checks, proof-carrying answer generation, calibrated uncertainty handling, token-reduction/calibration efficiency metric and inference gating that rejects tampered proof-carrying certificates.
+  - Next: expand tool verification to multi-step algebra, richer code tests and external solver hooks, then benchmark certificate-token savings over held-out reasoning traces.
+- Phase 6: causal regression attribution
+  - Implemented baseline: counterfactual probes across blocks, experts, KV mode, MTP horizon, activation precision, FSP contract and routing; real `LayerForwardEvent` probes for block restoration and activation precision; measured recovery deltas, gain per cost, normalized cause estimates, targeted repair vs global retrain cost and regression clustering.
+  - Next: learn attribution policies over repeated trace corpora rather than relying on deterministic probe ranking alone.
+- Phase 7: minimal regrowth
+  - Implemented baseline: executable repair action space, artifact edits for ternary blocks/signs/scale precision, force-anchor/MTP/expert/activation/certificate/verifier/micro-family patches, gain/cost simulation, protected non-regression gate, re-crystallization annealing and default cycle-report regrowth smoke generated from real regressions.
+  - Next: apply repairs to a real multi-layer model state and persist accepted repair archives.
 - Phase 8: fast normal careful routing
-- Phase 9: consolidation buffers
-- Phase 10: offline experiment gate
+  - Implemented baseline: executable fast/normal/careful inference loop with difficulty signals, budget predictor, early exit, Mixture-of-Depths `BitLinear`, latent KV reconstruction, route-capped MTP self-speculation, oracle-audited fast-path scoring, strong-path certificate verification, expert traces, packed ternary kernel dispatch records, persisted inference JSON and a trained autoregressive answer generator accepted by the main inference engine and cycle artifacts.
+  - Next: persist and select autoregressive checkpoints across runs, benchmark path choices over larger suites, calibrate early-exit confidence and connect hardware-specific ternary kernels beyond the CPU reference dispatch.
+- Phase 9: sleep phase anti-collapse
+  - Implemented baseline: failure replay buffer, verified synthetic pool with mandatory trust labels, real/exogenous reservoir, tool-solved examples, metamorphic/anti-metamorphic families, anti-collapse filter, rare-skill/diversity/calibration deltas and rare-skill-boosted consolidation scheduler.
+  - Next: connect accepted sleep batches to actual model updates, persist replay reservoirs across runs, add external data provenance adapters and measure post-sleep retention over repeated cycles.
+- Phase 10: recursive improvement gate
+  - Implemented baseline: proposal generator, in-memory sandbox trainer, evolutionary archive, dynamic evaluator, Pareto/protected/calibration/diversity patch acceptance gate, reward-hacking detector, cross-skill collapse detector and rollback tokens.
+  - Next: convert accepted in-memory proposals into signed patch artifacts, add persistent rollback archives, run multi-generation evolution and connect accepted updates to real model/checkpoint training.
+- Cross-phase objective and metrics
+  - Implemented baseline: executable 17-term `L_total` from the plan, objective weights, effective joule model, recursive-improvement invalidity gates, all 15 absolute metrics and persisted objective reports in `summary.json`.
+  - Next: calibrate term weights empirically and connect the loss directly to real model/checkpoint optimization.
+- Plan experiments A-E
+  - Implemented baseline: named experiments for verifier fault detection, compression adversary, minimal regrowth, SlowSolve to FastSolve and auto-improvement sandbox, all with persisted metrics and pass/fail criteria including calibration/collapse checks for Experiment E.
+  - Next: run the experiments over larger randomized suites and compare against trained checkpoint variants.
+- Frontier skill discovery
+  - Implemented baseline: fragile-skill selection, adversarial frontier task generation, slow/reference solving, oracle verification, invariant extraction, micro-example distillation and `BitLinear` micro-circuit compilation with DSV revalidation.
+  - Next: persist compiled frontier circuits and benchmark held-out frontier generalization.
+- Trainable micro-checkpoint loop
+  - Implemented baseline: PyTorch answer-class micro-model and character-level autoregressive decoder with trainable projection/recurrent/head layers around an instrumented `BitLinear` core, DSV-compatible agents, verifier/sleep dataset ingestion, generated-answer checks, compiled-circuit certificates, checkpoint save/load and `summary.json` autoregressive checkpoint reports.
+  - Next: use the final objective as the optimization target, evaluate held-out generalization, persist checkpoint selection across runs and benchmark MTP vs next-token-only variants under low precision.

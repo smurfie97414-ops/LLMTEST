@@ -10,10 +10,10 @@ readme = "README.md"
 requires-python = ">=3.10"
 authors = [{name = "LLMTEST contributors"}]
 license = {text = "MIT"}
-dependencies = []
+dependencies = ["torch>=2.0", "numpy>=1.26"]
 
 [project.scripts]
 cortex3 = "cortex3:main"
 
 [tool.setuptools]
-py-modules = ["cortex3", "cortex3_phases", "cortex3_ledgers", "cortex3_analysis", "cortex3_cycle", "cortex3_selection"]
+py-modules = ["cortex3", "cortex3_phases", "cortex3_ledgers", "cortex3_analysis", "cortex3_cycle", "cortex3_selection", "cortex3_reporting", "cortex3_ternary", "cortex3_future", "cortex3_memory", "cortex3_certificates", "cortex3_attribution", "cortex3_regrowth", "cortex3_inference", "cortex3_sleep", "cortex3_improvement", "cortex3_objective", "cortex3_experiments", "cortex3_microtrain", "cortex3_autoregressive"]

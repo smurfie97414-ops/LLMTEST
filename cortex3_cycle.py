@@ -31,7 +31,16 @@ class PathRouter:
         self.horizon_policy = horizon_policy or AdaptiveHorizonPolicy()
 
     def route(self, skill: str, confidence: float, risk: float) -> PathDecision:
-        domain = "exact_anchor" if skill == "long_context_anchor" else "math" if skill == "arithmetic" else "general"
+        if skill in {"long_context_anchor", "entity_tracking"}:
+            domain = "exact_anchor"
+        elif skill in {"arithmetic", "algebra"}:
+            domain = "math"
+        elif skill == "code_unit_tests":
+            domain = "code"
+        elif skill == "calibration":
+            domain = "calibration"
+        else:
+            domain = "general"
         horizon = self.horizon_policy.choose(confidence, risk, domain)
         if risk > 0.7 or confidence < 0.55:
             return PathDecision("careful", horizon.horizon, 3, "high risk or low confidence")

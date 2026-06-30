@@ -33,13 +33,26 @@ class RegressionAnalyzer:
         if skill == "long_context_anchor" or "anchor" in reason:
             weights["memory_or_anchor_loss"] += 4
             weights["future_horizon_too_long"] += 1
+        if skill == "entity_tracking":
+            weights["memory_or_anchor_loss"] += 3
+            weights["output_goal_missed"] += 1
         if skill == "arithmetic" or "integer" in reason:
             weights["numeric_precision"] += 3
             weights["future_horizon_too_long"] += 2
             weights["missing_specialist_path"] += 2
+        if skill == "algebra":
+            weights["numeric_precision"] += 2
+            weights["missing_specialist_path"] += 2
+            weights["future_horizon_too_long"] += 1
         if skill == "instruction_following" or "format" in reason:
             weights["output_goal_missed"] += 3
             weights["short_check_too_weak"] += 2
+        if skill == "code_unit_tests" or "unit test" in reason or "code" in reason:
+            weights["code_oracle_failure"] += 4
+            weights["short_check_too_weak"] += 2
+        if skill == "calibration" or "confidence" in reason:
+            weights["calibration_loss"] += 4
+            weights["short_check_too_weak"] += 1
         if trace:
             if trace.mtp_horizon > 1:
                 weights["future_horizon_too_long"] += trace.mtp_horizon / 2
@@ -61,6 +74,7 @@ class RegressionAnalyzer:
             "output_goal_missed": ("check output obligations", "add_goal_check"),
             "short_check_too_weak": ("request stricter short check", "add_short_check"),
             "calibration_loss": ("compare confidence to correctness", "increase_verification_level"),
+            "code_oracle_failure": ("rerun generated and hidden unit tests", "add_unit_test_oracle"),
             "unknown_interaction": ("run careful path", "run_careful_path"),
         }
         total = sum(weights.values())

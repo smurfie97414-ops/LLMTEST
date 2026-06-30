@@ -85,6 +85,21 @@ Hierarchical Dynamic Verifier
 Cette base contient maintenant :
 
 - `cortex3.py` : noyau de tâches, skills, vérificateur dynamique, adversarial checks, ternaire sign+mask, ancrage exact, horizon MTP adaptatif, regrowth minimal et CLI de démonstration ;
+- Phase 1 du Verifier OS est maintenant élargie avec registre d'oracles, anti-métamorphiques, coûts vérificateur par cas, audit faux positifs/faux négatifs d'oracle, harnais de défauts injectés et familles de compétences `arithmetic`, `algebra`, `long_context_anchor`, `entity_tracking`, `instruction_following`, `code_unit_tests`, `calibration` ;
+- `cortex3_reporting.py` : persistance des cycles dans `runs/` avec JSON structuré, rapport markdown et matrice de défauts injectés ;
+- `cortex3_ternary.py` : instrumentation Phase 2 avec quantization d'activations 8→4 bit, residual synapse buffer, compression logs et `BitLinear` PyTorch sign+mask ;
+- `cortex3_future.py` : Phase 3 MTP/FSP sous contrat avec têtes PyTorch horizons 1/2/4/8, calibration autonome, confidence head, temporal consistency loss, Future Contract, révision et accept/reject gates ;
+- `cortex3_memory.py` : Phase 4 mémoire cognitive avec KV récent exact, KV ancien latent compact, Exact Anchor Ledger, reconstruction conditionnée par requête, récupération de réponse augmentée par mémoire et vérificateur de fidélité aux ancres ;
+- `cortex3_certificates.py` : Phase 5 raisonnement latent avec `latent proof state`, tête PyTorch de certificat calibrée, génération proof-carrying, certificats courts vérifiables, dé-latentisation aléatoire et vérification par outils ;
+- `cortex3_attribution.py` : Phase 6 attribution causale avec ablations par blocs, experts, KV mode, horizon MTP, précision d'activation, contrat FSP, routage counterfactual et clustering de régressions ;
+- `cortex3_regrowth.py` : Phase 7 regrowth minimal exécutable avec action space de réparation, simulation gain/coût, gate de non-régression et annealing vers re-cristallisation ;
+- `cortex3_inference.py` : Phase 8 inférence fast/normal/careful avec routeur de difficulté, prédicteur de budget, early exit, Mixture-of-Depths `BitLinear`, KV latent, self-speculative MTP, certificats et dispatch kernel ternaire ;
+- `cortex3_sleep.py` : Phase 9 sleep anti-collapse avec replay d'échecs, données synthétiques vérifiées et labellisées, réservoir réel/exogène, familles métamorphiques, filtre anti-collapse et scheduler de consolidation ;
+- `cortex3_improvement.py` : Phase 10 Recursive Improvement Engine avec génération de propositions, sandbox en mémoire, évaluateur dynamique, gate Pareto/protection/diversité, archive évolutive et rollback ;
+- `cortex3_objective.py` : loss finale du plan avec 17 termes pondérés et les 15 métriques absolues, dont `Verified Capability per Effective Joule` ;
+- `cortex3_experiments.py` : expériences A-E du plan, de la détection de défauts injectés à la sandbox d'auto-amélioration ;
+- `cortex3_microtrain.py` : micro-modèle PyTorch entraînable avec cœur `BitLinear`, agent DSV, exemples issus du verifier/sleep phase et checkpoints `.pt` ;
+- `cortex3_autoregressive.py` : décodeur micro-autoregressif PyTorch avec vocabulaire caractère, génération greedy ou blockwise sous Future Contract, pertes comportement/MTP multi-horizons/contrat futur, agent DSV et checkpoints `.pt` ;
 - `cortex3_phases.py` : registre exécutable des 10 phases Cortex-3 ;
 - `cortex3_ledgers.py` : Bit Ledger, Skill Ledger, Causal Ledger et Uncertainty Ledger ;
 - `cortex3_analysis.py` : analyse des causes probables d'une régression ;
@@ -121,13 +136,15 @@ source .venv/bin/activate  # Windows: .venv\Scripts\activate
 pip install -e .
 ```
 
+Les dépendances de travail incluent PyTorch et NumPy ; elles sont obligatoires pour exécuter les couches modèle du plan.
+
 ## Démo noyau
 
 ```bash
 python -m cortex3 demo --seed 7 --n-per-skill 5
 ```
 
-La démo compare une référence simple à un agent « compressé » volontairement corrompu. Le vérificateur détecte les régressions, l'adversaire génère des variantes et le regrowth propose des réparations minimales.
+La démo compare une référence simple à un agent « compressé » volontairement corrompu sur les familles de compétences du Verifier OS. Le vérificateur détecte les régressions, l'adversaire génère des variantes et le regrowth propose des réparations minimales.
 
 ## Rapport de cycle
 
@@ -135,7 +152,17 @@ La démo compare une référence simple à un agent « compressé » volontairem
 python tools/run_cycle_report.py
 ```
 
-Ce rapport exécute le cycle complet : référence vs trial, régressions, ledgers, analyse des causes et actions budgetées.
+Ce rapport exécute le cycle complet : référence vs trial, régressions, ledgers, analyse des causes, actions budgetées, trace d'inférence Phase 8, plan de sleep phase Phase 9, propositions Phase 10 en sandbox, loss finale, métriques absolues, expériences A-E du plan et smoke de checkpoint autoregressif entraîné. Par défaut il écrit aussi un dossier `runs/<run-id>/` avec `summary.json`, `report.md` et `fault_matrix.json`.
+
+```bash
+python tools/run_cycle_report.py --seed 7 --n-per-skill 3
+python tools/run_cycle_report.py --no-write  # console only
+python tools/run_cycle_report.py --skip-inference  # sans trace Phase 8
+python tools/run_cycle_report.py --skip-sleep  # sans trace Phase 9
+python tools/run_cycle_report.py --skip-improvement  # sans trace Phase 10
+python tools/run_cycle_report.py --skip-experiments  # sans expériences A-E
+python tools/run_cycle_report.py --skip-autoregressive  # sans smoke checkpoint AR
+```
 
 ## Tests
 
@@ -145,13 +172,16 @@ python -m unittest discover -s tests
 
 ## Roadmap immédiate
 
-1. Étendre les skills vers le code exécutable et les tests unitaires générés.
-2. Ajouter un module PyTorch `BitLinear` sign+mask avec residual synapse buffer.
-3. Ajouter des checks courts pour FSP/output goals et les connecter au cycle.
-4. Ajouter une mémoire latente simulée + registre exact d'ancres.
-5. Ajouter la sélection de chemins fast/normal/careful dans une vraie boucle d'inférence.
-6. Ajouter des rapports JSON/markdown persistés dans `runs/`.
-7. Ajouter le premier micro-entraînement toy model pour tester MTP vs NTP en faible précision.
+1. Durcir Phase 1 jusqu'au statut Verifier OS complet : coût par cas réel, familles génératives plus larges, tests de faux positifs/faux négatifs d'oracle.
+2. Durcir Phase 2 avec `BitLinear` branché sur un micro-modèle et logs par couche.
+3. Étendre Phase 3 vers des suites held-out plus larges, benchmarks MTP vs NTP et contrats FSP orientés objectifs de sortie.
+4. Étendre Phase 4 avec compression query-conditioned apprise, gate stricte de fidélité d'ancres et benchmarks coût/qualité exact KV vs latent KV.
+5. Étendre Phase 5 avec vérification algébrique multi-étapes, tests code plus riches et mesure held-out des économies de tokens de certificat.
+6. Étendre la boucle générative autoregressive vers held-out suites, benchmarks coût/qualité plus larges et calibration de confiance.
+7. Ajouter un banc MTP vs NTP en faible précision sur variantes de checkpoints autoregressifs.
+8. Durcir Phase 6 avec ablations branchées sur de vrais forward passes multi-couches.
+9. Durcir Phase 7 avec application directe sur un micro-modèle multi-couches.
+10. Étendre le micro-entraînement vers des checkpoints plus larges, puis brancher les propositions acceptées sur des patchs signés avec rollback persistant.
 
 ## Phrase centrale
 
