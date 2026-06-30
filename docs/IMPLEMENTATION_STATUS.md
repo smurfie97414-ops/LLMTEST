@@ -373,6 +373,7 @@ Current executable coverage:
 - `CortexObjective` optimizes next-token loss plus Cortex MTP, temporal-consistency and confidence terms when the Cortex heads are enabled.
 - `LLMTrainer` supports checkpoints, strict resume, optimizer/scaler/RNG state persistence, gradient accumulation, CSV learning curves, deterministic random sampling, explicit device selection, mixed precision policy and DDP initialization from environment, including a Windows/Gloo TCPStore path that avoids unsupported libuv builds.
 - `PrecisionPolicy(require_cuda=True)` raises when CUDA is required but unavailable, preventing silent CPU fallback.
+- `llm_doctor_report` and `tools/train_llm.py doctor` audit Python dependencies, CUDA availability, requested precision, `torch.distributed`, Gloo/NCCL readiness and write a persistent `doctor_report.json`.
 - `LLMComparisonRunner` trains a baseline next-token Transformer and a Cortex multi-horizon Transformer on the same corpus/cache, then writes `comparison_report.json`, `report.md`, `learning_curve.png`, both final checkpoints and both learning-curve CSV files.
 - `LLMComparisonMatrixSuite` prepares one shared tokenizer/memmap for an arbitrary corpus, repeats the baseline-vs-Cortex comparison over multiple seeds and writes `comparison_matrix_report.json`, `comparison_matrix_report.md` and `comparison_matrix_ratios.png`.
 - `LLMCorpusMatrixSuite` repeats the comparison matrix across multiple named corpora, persists per-corpus reports and writes `corpus_matrix_report.json`, `corpus_matrix_report.md` and `corpus_matrix_ratios.png` with corpus-level, seed-level and sample-level proof metrics.
@@ -389,6 +390,8 @@ Current executable coverage:
 Evidence:
 
 - Local environment: `torch==2.12.1+cpu`, `cuda_available=False`, `distributed_available=True`, `gloo_available=True`, `nccl_available=False`.
+- Doctor validation: `tools\train_llm.py doctor --out-dir runs\llm-doctor-validation --precision bf16` passed with dependencies installed (`torch`, `numpy`, `tokenizers`, `matplotlib`, `datasets`), CPU `bf16` precision supported, `distributed_available=True`, `gloo_available=True`, `cuda_available=False`, `nccl_available=False`.
+- Doctor CUDA gate validation: `tools\train_llm.py doctor --out-dir runs\llm-doctor-require-cuda-validation --require-cuda --precision fp32 --device auto` failed as expected on this CPU-only machine with required checks `torch:cuda_available` and `torch:require_cuda`.
 - `.\.venv\Scripts\python.exe tools\train_llm.py smoke --out-dir runs\llm-smoke-dev-48 --steps 48 --require-win`
 - Smoke proof: baseline score `0.022321`, Cortex score `0.145833`, Cortex/baseline `6.533x`, next-token-loss regression ratio `1.020`, proof passed.
 - `.\.venv\Scripts\python.exe tools\train_llm.py benchmark --out-dir runs\llm-benchmark-validation --domains sequence,anchors --repeats 96 --steps 48 --batch-size 8 --precision bf16 --require-win`

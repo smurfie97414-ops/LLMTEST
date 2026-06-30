@@ -913,6 +913,75 @@ def hardware_report() -> dict[str, Any]:
     }
 
 
+def _package_versions() -> dict[str, Any]:
+    from importlib.metadata import PackageNotFoundError, version
+
+    packages = ("torch", "numpy", "tokenizers", "matplotlib", "datasets")
+    payload: dict[str, Any] = {}
+    for package in packages:
+        try:
+            payload[package] = {"installed": True, "version": version(package)}
+        except PackageNotFoundError:
+            payload[package] = {"installed": False, "version": None}
+    return payload
+
+
+def llm_doctor_report(
+    *,
+    require_cuda: bool = False,
+    precision: str = "bf16",
+    device: str = "auto",
+    distributed: bool = False,
+    gloo_interface: str | None = None,
+) -> dict[str, Any]:
+    hardware = hardware_report()
+    dependencies = _package_versions()
+    device_type = "cuda" if (device == "auto" and torch.cuda.is_available()) or str(device).startswith("cuda") else "cpu"
+    checks: list[dict[str, Any]] = []
+
+    def add_check(name: str, passed: bool, detail: str, *, required: bool = True) -> None:
+        checks.append({"name": name, "passed": bool(passed), "required": required, "detail": detail})
+
+    for package, payload in dependencies.items():
+        add_check(f"dependency:{package}", bool(payload["installed"]), f"version={payload['version']}")
+    add_check("torch:cuda_available", bool(hardware["cuda_available"]), f"cuda_device_count={hardware['cuda_device_count']}", required=require_cuda)
+    if require_cuda:
+        add_check("torch:require_cuda", device_type == "cuda" and bool(hardware["cuda_available"]), f"resolved_device_type={device_type}")
+
+    try:
+        dtype = PrecisionPolicy(precision, require_cuda=require_cuda).dtype(device_type)
+        add_check("precision", True, f"{precision} resolves to {dtype} on {device_type}")
+    except Exception as exc:
+        add_check("precision", False, str(exc))
+
+    add_check("distributed:available", bool(hardware["distributed_available"]), "torch.distributed availability", required=distributed)
+    add_check("distributed:gloo", bool(hardware["gloo_available"]), "Gloo backend availability", required=distributed and device_type != "cuda")
+    add_check("distributed:nccl", bool(hardware["nccl_available"]), "NCCL backend availability", required=distributed and device_type == "cuda")
+    if distributed:
+        try:
+            runtime = DistributedRuntime.from_env(requested=False, device_type=device_type, gloo_interface=gloo_interface)
+            add_check("distributed:env_probe", True, f"backend={runtime.backend}, world_size={runtime.world_size}, gloo_interface={runtime.gloo_interface}")
+        except Exception as exc:
+            add_check("distributed:env_probe", False, str(exc))
+
+    failed_required = [check for check in checks if check["required"] and not check["passed"]]
+    return {
+        "passed": not failed_required,
+        "device_type": device_type,
+        "requested": {
+            "require_cuda": require_cuda,
+            "precision": precision,
+            "device": device,
+            "distributed": distributed,
+            "gloo_interface": gloo_interface,
+        },
+        "hardware": hardware,
+        "dependencies": dependencies,
+        "checks": tuple(checks),
+        "failed_required_checks": tuple(failed_required),
+    }
+
+
 class LLMTrainer:
     def __init__(
         self,
@@ -2450,6 +2519,14 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Train and compare a real Cortex-3 LLM pretraining harness.")
     sub = parser.add_subparsers(dest="command", required=True)
 
+    doctor = sub.add_parser("doctor", help="audit LLM dependencies, CUDA, distributed backends and precision readiness")
+    doctor.add_argument("--out-dir", default="runs/llm-doctor")
+    doctor.add_argument("--precision", choices=("fp32", "bf16", "fp16"), default="bf16")
+    doctor.add_argument("--device", default="auto")
+    doctor.add_argument("--require-cuda", action="store_true")
+    doctor.add_argument("--distributed", action="store_true")
+    doctor.add_argument("--gloo-interface", default=None)
+
     smoke = sub.add_parser("smoke", help="run a deterministic small corpus comparison")
     smoke.add_argument("--out-dir", default="runs/llm-smoke")
     smoke.add_argument("--steps", type=int, default=48)
@@ -2591,6 +2668,22 @@ def main(argv: Sequence[str] | None = None) -> None:
     prepare_hf.add_argument("--train-fraction", type=float, default=0.9)
 
     args = parser.parse_args(argv)
+    if args.command == "doctor":
+        report = llm_doctor_report(
+            require_cuda=args.require_cuda,
+            precision=args.precision,
+            device=args.device,
+            distributed=args.distributed,
+            gloo_interface=args.gloo_interface,
+        )
+        out_dir = Path(args.out_dir)
+        _write_json(out_dir / "doctor_report.json", report)
+        print(json.dumps(report, indent=2, sort_keys=True, default=_json_default))
+        if not report["passed"]:
+            failed = ", ".join(str(check["name"]) for check in report["failed_required_checks"])
+            raise RuntimeError(f"Cortex LLM doctor failed required checks: {failed}")
+        return
+
     if args.command == "smoke":
         out_dir = Path(args.out_dir)
         runtime = DistributedRuntime.from_env(

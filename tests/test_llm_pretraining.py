@@ -29,6 +29,7 @@ from cortex3_llm import (
     build_benchmark_corpus,
     build_seed_corpus,
     hardware_report,
+    llm_doctor_report,
 )
 
 
@@ -459,6 +460,20 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 )
                 with self.assertRaises(RuntimeError):
                     LLMComparisonRunner(corpus, config, run_dir=root / "cuda-required").run()
+
+    def test_doctor_reports_dependency_and_cuda_readiness(self):
+        report = llm_doctor_report(precision="bf16", device="auto", distributed=False)
+        self.assertIn("dependencies", report)
+        self.assertIn("torch", report["dependencies"])
+        self.assertTrue(report["dependencies"]["torch"]["installed"])
+        self.assertIn("hardware", report)
+        self.assertIn("checks", report)
+        self.assertTrue(report["passed"], report)
+        if not torch.cuda.is_available():
+            cuda_report = llm_doctor_report(require_cuda=True, precision="fp32", device="auto")
+            self.assertFalse(cuda_report["passed"], cuda_report)
+            failed_names = {check["name"] for check in cuda_report["failed_required_checks"]}
+            self.assertIn("torch:require_cuda", failed_names)
 
     def test_distributed_runtime_can_pin_gloo_interface_without_initializing(self):
         if not torch.distributed.is_available() or not torch.distributed.is_gloo_available():
