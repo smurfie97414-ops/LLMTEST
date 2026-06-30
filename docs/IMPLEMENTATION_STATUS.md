@@ -388,11 +388,12 @@ Current executable coverage:
 - `tools/train_llm.py run-experiment` executes a normalized JSON manifest for reproducible large-corpus GPU/DDP experiments.
 - `tools/train_llm.py benchmark` exposes the multi-domain proof gate and supports CPU `bf16` validation.
 - `tools/train_llm.py benchmark-matrix` exposes the multi-domain x multi-seed proof gate and fails `--require-win` unless every seed-domain sample wins with a nonzero baseline and bounded next-token regression.
+- Comparison, matrix and benchmark proof gates now support `min_corpus_tokens` and `min_planned_train_tokens`; when set, `--require-win` rejects favorable Cortex/baseline ratios produced on undersized corpora or insufficient planned training volume.
 - `tools/launch_llm_ddp.py` launches true local multi-process DDP workers, pins the Gloo interface and writes per-rank logs.
 - `.github/workflows/ci.yml` runs the LLM smoke command.
 - `prepare-hf --resume` reuses only complete HF export reports and tokenized manifests whose tokenization config and preparation recipe still match; missing shards, incomplete tokenized directories and changed tokenizer args fail loudly instead of deleting or rebuilding long-running corpus preparation work.
 - Tokenized corpus manifests now carry SHA-256 hashes for the token memmap, tokenizer and source shards plus the preparation recipe (`vocab_size`, `min_frequency`, `seq_len`, max horizon, train split and chunking); `run_plan.json`, training reports and checkpoints include a corpus identity digest, and `LLMTrainer` refuses resume from missing or mismatched `corpus_identity` checkpoints.
-- Single comparison reports now require `baseline_score >= min_baseline_future_tokens_per_cost`; a Cortex ratio computed against a zero baseline is recorded with `failed_checks=["baseline_score_passed"]` and cannot pass `--require-win`.
+- Single comparison reports now require `baseline_score >= min_baseline_future_tokens_per_cost`; a Cortex ratio computed against a zero baseline is recorded with `failed_checks=["baseline_score_passed"]` and cannot pass `--require-win`. Scale gates similarly record `corpus_scale_passed` and `planned_train_tokens_passed`.
 
 Evidence:
 
@@ -404,8 +405,10 @@ Evidence:
 - CUDA smoke validation: `tools\train_llm.py smoke --out-dir runs\llm-cuda-smoke-validation --steps 48 --precision bf16 --device cuda --require-cuda --require-win` passed on RTX 5070 with baseline score `0.029576`, Cortex score `0.147135`, Cortex/baseline `4.975x`, next-token-loss regression ratio `1.017305`.
 - CUDA resume debug/fix: after installing the CUDA wheel, checkpoint resume exposed `TypeError: RNG state must be a torch.ByteTensor` when restoring CUDA RNG state loaded with `map_location=cuda`. `LLMTrainer.load_checkpoint` now normalizes saved CUDA RNG states back to CPU `uint8` tensors before `torch.cuda.set_rng_state_all`; the targeted resume test passes on CUDA.
 - CUDA external Wikitext comparison matrix: `tools\train_llm.py compare-matrix runs\hf-wikitext2-validation\text_shards --out-dir runs\llm-wikitext2-cuda-compare-matrix-validation --seeds 17,29 --vocab-size 512 --seq-len 64 --d-model 64 --n-heads 4 --n-layers 2 --steps 48 --batch-size 8 --precision bf16 --device cuda --require-cuda --require-win` passed with `2/2` seeds, mean Cortex/baseline ratio `24.864x`, min ratio `24.500x`, aggregate CSV/PNG learning curves and CUDA recorded in per-seed reports.
-- Versioned experiment manifests: `experiments/wikitext_cuda_validation.json` for fast local CUDA validation and `experiments/c4_local_cuda_manifest.json` for a runnable large C4 + repo-local text CUDA run.
+- Versioned experiment manifests: `experiments/wikitext_cuda_validation.json` for fast local CUDA validation with small scale thresholds and `experiments/c4_cuda_large_manifest.json` for a runnable large C4 CUDA run with massive corpus/training-token proof thresholds.
 - Versioned Wikitext CUDA manifest validation: `tools\train_llm.py run-experiment experiments\wikitext_cuda_validation.json` passed with `2/2` seeds, win-rate `1.0`, mean Cortex/baseline ratio `11.861x`, min ratio `10.889x`, CUDA doctor passed and aggregate CSV/PNG learning curves written.
+- Wikitext CUDA scale-gate validation: `tools\train_llm.py run-experiment experiments\wikitext_cuda_validation.json --out-dir runs\cortex3-wikitext-cuda-scale-gate-validation` passed with `2/2` seeds, min observed corpus tokens `29,104`, min observed planned train tokens `24,576`, min required corpus/train tokens `20,000/20,000`, mean Cortex/baseline ratio `18.278x`, min ratio `10.889x`, and aggregate CSV/PNG learning curves written.
+- Negative scale-gate CLI validation: a `tools\train_llm.py smoke --require-win --min-corpus-tokens 999999999 --min-planned-train-tokens 999999999` run failed as expected and exposed both `corpus_scale_passed` and `planned_train_tokens_passed` diagnostics.
 - C4 external validation: `tools\train_llm.py prepare-hf --dataset allenai/c4 --config-name en --split train --text-field text --out-dir runs\hf-c4-mini-validation --max-documents 40 --min-text-chars 64 --shard-chars 8192 --vocab-size 512 --min-frequency 1 --seq-len 64 --max-horizon 4` exported 40 real C4 documents, 72,020 characters, 10 shards and a 32,537-token memmap.
 - C4 CUDA comparison matrix: `tools\train_llm.py compare-matrix runs\hf-c4-mini-validation\text_shards --out-dir runs\llm-c4-mini-cuda-compare-matrix-validation --seeds 17,29 --vocab-size 512 --seq-len 64 --d-model 64 --n-heads 4 --n-layers 2 --steps 48 --batch-size 8 --precision bf16 --device cuda --require-cuda --require-win` passed with `2/2` seeds, win-rate `1.0`, mean Cortex/baseline ratio `19.480x`, min ratio `16.681x`, max next-token-loss regression `1.096379`.
 - C4 training-plan proof: both C4 CUDA seed runs wrote `run_plan.json` with token count `32,537`, `512` tokens per optimizer step, `24,576` planned train tokens, `136,576` baseline parameters and `269,761` Cortex parameters.
@@ -435,7 +438,7 @@ Evidence:
 - CLI resume validation: `tools\train_llm.py smoke --out-dir runs\llm-resume-cli-validation --steps 2 ...` then `--steps 4 --resume ...` resumed both `baseline_ntp` and `cortex3` from `checkpoint_final.pt` with `start_step=2`, `optimizer_steps=2`, `effective_batch_size=16` and `final_step=4`.
 - DDP accumulation validation: `tools\launch_llm_ddp.py --nproc 2 ... --gradient-accumulation-steps 2` completed with `distributed=True`, `world_size=2`, proof passed and `effective_batch_size=32` for both baseline and Cortex.
 - DDP CUDA preflight validation: `tools\launch_llm_ddp.py --nproc 2 ... --device cuda --require-cuda` now fails before spawning workers because one visible CUDA device cannot serve two local CUDA ranks; CPU/Gloo DDP still passed after the CUDA wheel install.
-- `.\.venv\Scripts\python.exe -m unittest discover -s tests`: `132` tests passed.
+- `.\.venv\Scripts\python.exe -m unittest discover -s tests`: `133` tests passed.
 
 Remaining:
 

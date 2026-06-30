@@ -1,6 +1,6 @@
 {
-  "name": "cortex3-c4-local-cuda",
-  "out_dir": "runs/cortex3-c4-local-cuda",
+  "name": "cortex3-c4-cuda-large",
+  "out_dir": "runs/cortex3-c4-cuda-large",
   "doctor": {
     "require_cuda": true,
     "device": "cuda",
@@ -19,7 +19,9 @@
     "dropout": 0.1,
     "horizons": [1, 2, 4, 8],
     "cortex_win_margin": 1.05,
-    "max_next_token_loss_regression": 1.2
+    "max_next_token_loss_regression": 1.2,
+    "min_corpus_tokens": 50000000,
+    "min_planned_train_tokens": 2000000000
   },
   "training": {
     "steps": 20000,
@@ -45,17 +47,6 @@
       "max_documents": 1000000,
       "min_text_chars": 64,
       "shard_max_chars": 67108864,
-      "min_chars_per_chunk": 4096
-    },
-    {
-      "name": "local-text",
-      "kind": "paths",
-      "paths": [
-        "README.md",
-        "docs/PIPELINE.md",
-        "docs/IMPLEMENTATION_STATUS.md",
-        "docs/ROADMAP.md"
-      ],
       "min_chars_per_chunk": 4096
     }
   ]

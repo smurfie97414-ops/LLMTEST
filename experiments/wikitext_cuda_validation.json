@@ -19,7 +19,9 @@
     "dropout": 0.0,
     "horizons": [1, 2, 4],
     "cortex_win_margin": 1.05,
-    "max_next_token_loss_regression": 1.6
+    "max_next_token_loss_regression": 1.6,
+    "min_corpus_tokens": 20000,
+    "min_planned_train_tokens": 20000
   },
   "training": {
     "steps": 48,

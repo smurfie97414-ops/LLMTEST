@@ -1670,6 +1670,14 @@ class ComparisonConfig:
     cortex_win_margin: float = 1.05
     max_next_token_loss_regression: float = 1.20
     min_baseline_future_tokens_per_cost: float = 1e-6
+    min_corpus_tokens: int = 0
+    min_planned_train_tokens: int = 0
+
+    def __post_init__(self) -> None:
+        if self.min_corpus_tokens < 0:
+            raise ValueError("min_corpus_tokens must be non-negative")
+        if self.min_planned_train_tokens < 0:
+            raise ValueError("min_planned_train_tokens must be non-negative")
 
 
 @dataclass(frozen=True)
@@ -2126,7 +2134,7 @@ class LLMComparisonRunner:
             train_data.close()
             val_data.close()
         curve_audit = audit_learning_curves(baseline, cortex, expected_final_step=self.config.training.steps)
-        proof = self._proof_payload(baseline, cortex, curve_audit)
+        proof = self._proof_payload(baseline, cortex, curve_audit, plan=plan)
         proof["elapsed_seconds"] = time.time() - started
         proof["distributed"] = runtime.enabled
         proof["world_size"] = runtime.world_size
@@ -2155,7 +2163,14 @@ class LLMComparisonRunner:
             raise RuntimeError(f"Cortex comparison did not pass: {proof}")
         return report
 
-    def _proof_payload(self, baseline: TrainingRunReport, cortex: TrainingRunReport, curve_audit: Mapping[str, Any]) -> dict[str, Any]:
+    def _proof_payload(
+        self,
+        baseline: TrainingRunReport,
+        cortex: TrainingRunReport,
+        curve_audit: Mapping[str, Any],
+        *,
+        plan: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
         baseline_score = baseline.final_val.future_tokens_per_cost
         cortex_score = cortex.final_val.future_tokens_per_cost
         ratio = cortex_score / max(1e-9, baseline_score)
@@ -2165,12 +2180,23 @@ class LLMComparisonRunner:
         ratio_passed = finite_metrics and ratio >= self.config.cortex_win_margin
         next_token_regression_passed = finite_metrics and next_token_regression <= self.config.max_next_token_loss_regression
         learning_curve_audit_passed = bool(curve_audit["passed"])
+        if plan is not None:
+            corpus_token_count = int(plan.get("corpus", {}).get("token_count") or 0)
+            planned_train_tokens = int(plan.get("training", {}).get("planned_train_tokens") or 0)
+        else:
+            corpus_identity = baseline.config.get("corpus_identity", {}) if isinstance(baseline.config, Mapping) else {}
+            corpus_token_count = int(corpus_identity.get("token_count", 0)) if isinstance(corpus_identity, Mapping) else 0
+            planned_train_tokens = 0
+        corpus_scale_passed = corpus_token_count >= int(self.config.min_corpus_tokens)
+        planned_train_tokens_passed = planned_train_tokens >= int(self.config.min_planned_train_tokens)
         checks = {
             "finite_metrics": finite_metrics,
             "baseline_score_passed": baseline_score_passed,
             "ratio_passed": ratio_passed,
             "next_token_regression_passed": next_token_regression_passed,
             "learning_curve_audit_passed": learning_curve_audit_passed,
+            "corpus_scale_passed": corpus_scale_passed,
+            "planned_train_tokens_passed": planned_train_tokens_passed,
         }
         failed_checks = tuple(name for name, passed_check in checks.items() if not passed_check)
         passed = not failed_checks
@@ -2183,10 +2209,16 @@ class LLMComparisonRunner:
             "min_baseline_future_tokens_per_cost": self.config.min_baseline_future_tokens_per_cost,
             "next_token_loss_regression_ratio": next_token_regression,
             "max_next_token_loss_regression": self.config.max_next_token_loss_regression,
+            "corpus_token_count": corpus_token_count,
+            "min_corpus_tokens": int(self.config.min_corpus_tokens),
+            "planned_train_tokens": planned_train_tokens,
+            "min_planned_train_tokens": int(self.config.min_planned_train_tokens),
             "checks": checks,
             "failed_checks": failed_checks,
             "baseline_score_passed": baseline_score_passed,
             "learning_curve_audit_passed": learning_curve_audit_passed,
+            "corpus_scale_passed": corpus_scale_passed,
+            "planned_train_tokens_passed": planned_train_tokens_passed,
             "passed": passed,
         }
 
@@ -2202,6 +2234,8 @@ class LLMComparisonRunner:
             f"- Cortex/baseline ratio: `{proof['cortex_over_baseline_ratio']:.3f}`",
             f"- Next-token loss regression ratio: `{proof['next_token_loss_regression_ratio']:.3f}`",
             f"- Learning curve audit passed: `{proof['learning_curve_audit_passed']}`",
+            f"- Corpus tokens: `{proof['corpus_token_count']}` (min `{proof['min_corpus_tokens']}`)",
+            f"- Planned train tokens: `{proof['planned_train_tokens']}` (min `{proof['min_planned_train_tokens']}`)",
             f"- Failed checks: `{', '.join(proof['failed_checks']) if proof['failed_checks'] else 'none'}`",
             f"- Passed: `{proof['passed']}`",
             "",
@@ -2374,6 +2408,12 @@ class LLMComparisonMatrixSuite:
             baseline_score_passed = bool(
                 proof.get("baseline_score_passed", baseline_score >= self.config.min_baseline_future_tokens_per_cost)
             )
+            corpus_token_count = int(proof.get("corpus_token_count", 0))
+            planned_train_tokens = int(proof.get("planned_train_tokens", 0))
+            corpus_scale_passed = bool(proof.get("corpus_scale_passed", corpus_token_count >= self.config.min_corpus_tokens))
+            planned_train_tokens_passed = bool(
+                proof.get("planned_train_tokens_passed", planned_train_tokens >= self.config.min_planned_train_tokens)
+            )
             samples.append(
                 {
                     "seed": seed,
@@ -2382,23 +2422,33 @@ class LLMComparisonMatrixSuite:
                     "baseline_score_passed": baseline_score_passed,
                     "cortex_score": float(proof["cortex_score"]),
                     "next_token_loss_regression_ratio": float(proof["next_token_loss_regression_ratio"]),
-                    "passed": bool(proof["passed"]) and baseline_score_passed,
+                    "corpus_token_count": corpus_token_count,
+                    "corpus_scale_passed": corpus_scale_passed,
+                    "planned_train_tokens": planned_train_tokens,
+                    "planned_train_tokens_passed": planned_train_tokens_passed,
+                    "passed": bool(proof["passed"]) and baseline_score_passed and corpus_scale_passed and planned_train_tokens_passed,
                 }
             )
         ratios = [sample["ratio"] for sample in samples]
         baseline_scores = [sample["baseline_score"] for sample in samples]
         regressions = [sample["next_token_loss_regression_ratio"] for sample in samples]
+        corpus_tokens = [int(sample["corpus_token_count"]) for sample in samples]
+        planned_tokens = [int(sample["planned_train_tokens"]) for sample in samples]
         passed_count = sum(1 for sample in samples if sample["passed"])
         sample_count = len(samples)
         min_ratio = min(ratios) if ratios else 0.0
         max_regression = max(regressions) if regressions else 0.0
         min_baseline = min(baseline_scores) if baseline_scores else 0.0
+        min_corpus = min(corpus_tokens) if corpus_tokens else 0
+        min_planned = min(planned_tokens) if planned_tokens else 0
         passed = (
             sample_count == len(self.seeds)
             and passed_count == sample_count
             and min_ratio >= self.config.cortex_win_margin
             and min_baseline >= self.config.min_baseline_future_tokens_per_cost
             and max_regression <= self.config.max_next_token_loss_regression
+            and min_corpus >= self.config.min_corpus_tokens
+            and min_planned >= self.config.min_planned_train_tokens
         )
         return {
             "metric": "comparison_matrix_cortex_over_baseline",
@@ -2416,6 +2466,10 @@ class LLMComparisonMatrixSuite:
             "mean_baseline_score": sum(baseline_scores) / max(1, len(baseline_scores)),
             "min_baseline_score": min_baseline,
             "min_baseline_future_tokens_per_cost": self.config.min_baseline_future_tokens_per_cost,
+            "min_corpus_tokens": int(self.config.min_corpus_tokens),
+            "min_observed_corpus_tokens": min_corpus,
+            "min_planned_train_tokens": int(self.config.min_planned_train_tokens),
+            "min_observed_planned_train_tokens": min_planned,
             "max_next_token_loss_regression": max_regression,
             "all_samples_passed": passed_count == sample_count and sample_count > 0,
             "samples": tuple(samples),
@@ -2435,6 +2489,8 @@ class LLMComparisonMatrixSuite:
             f"- Min Cortex/baseline ratio: `{proof['min_ratio']:.3f}`",
             f"- Win rate: `{proof['win_rate']:.3f}`",
             f"- Max next-token-loss regression: `{proof['max_next_token_loss_regression']:.3f}`",
+            f"- Min observed corpus tokens: `{proof['min_observed_corpus_tokens']}` (required `{proof['min_corpus_tokens']}`)",
+            f"- Min observed planned train tokens: `{proof['min_observed_planned_train_tokens']}` (required `{proof['min_planned_train_tokens']}`)",
             f"- Passed: `{proof['passed']}`",
             "",
             "## Seed Results",
@@ -2593,6 +2649,12 @@ class LLMCorpusMatrixSuite:
                 baseline_score_passed = bool(
                     sample.get("baseline_score_passed", baseline_score >= self.config.min_baseline_future_tokens_per_cost)
                 )
+                corpus_token_count = int(sample.get("corpus_token_count", 0))
+                planned_train_tokens = int(sample.get("planned_train_tokens", 0))
+                corpus_scale_passed = bool(sample.get("corpus_scale_passed", corpus_token_count >= self.config.min_corpus_tokens))
+                planned_train_tokens_passed = bool(
+                    sample.get("planned_train_tokens_passed", planned_train_tokens >= self.config.min_planned_train_tokens)
+                )
                 samples.append(
                     {
                         "corpus": corpus_name,
@@ -2602,13 +2664,19 @@ class LLMCorpusMatrixSuite:
                         "baseline_score_passed": baseline_score_passed,
                         "cortex_score": float(sample["cortex_score"]),
                         "next_token_loss_regression_ratio": float(sample["next_token_loss_regression_ratio"]),
-                        "passed": bool(sample["passed"]) and baseline_score_passed,
+                        "corpus_token_count": corpus_token_count,
+                        "corpus_scale_passed": corpus_scale_passed,
+                        "planned_train_tokens": planned_train_tokens,
+                        "planned_train_tokens_passed": planned_train_tokens_passed,
+                        "passed": bool(sample["passed"]) and baseline_score_passed and corpus_scale_passed and planned_train_tokens_passed,
                     }
                 )
 
         ratios = [sample["ratio"] for sample in samples]
         baseline_scores = [sample["baseline_score"] for sample in samples]
         regressions = [sample["next_token_loss_regression_ratio"] for sample in samples]
+        corpus_tokens = [int(sample["corpus_token_count"]) for sample in samples]
+        planned_tokens = [int(sample["planned_train_tokens"]) for sample in samples]
         passed_count = sum(1 for sample in samples if sample["passed"])
         sample_count = len(samples)
 
@@ -2650,6 +2718,8 @@ class LLMCorpusMatrixSuite:
         min_ratio = min(ratios) if ratios else 0.0
         max_regression = max(regressions) if regressions else 0.0
         min_baseline = min(baseline_scores) if baseline_scores else 0.0
+        min_corpus = min(corpus_tokens) if corpus_tokens else 0
+        min_planned = min(planned_tokens) if planned_tokens else 0
         expected_samples = len(self.corpora) * len(self.seeds)
         passed = (
             sample_count == expected_samples
@@ -2657,6 +2727,8 @@ class LLMCorpusMatrixSuite:
             and min_ratio >= self.config.cortex_win_margin
             and min_baseline >= self.config.min_baseline_future_tokens_per_cost
             and max_regression <= self.config.max_next_token_loss_regression
+            and min_corpus >= self.config.min_corpus_tokens
+            and min_planned >= self.config.min_planned_train_tokens
         )
         return {
             "metric": "corpus_matrix_cortex_over_baseline",
@@ -2676,6 +2748,10 @@ class LLMCorpusMatrixSuite:
             "mean_baseline_score": sum(baseline_scores) / max(1, len(baseline_scores)),
             "min_baseline_score": min_baseline,
             "min_baseline_future_tokens_per_cost": self.config.min_baseline_future_tokens_per_cost,
+            "min_corpus_tokens": int(self.config.min_corpus_tokens),
+            "min_observed_corpus_tokens": min_corpus,
+            "min_planned_train_tokens": int(self.config.min_planned_train_tokens),
+            "min_observed_planned_train_tokens": min_planned,
             "max_next_token_loss_regression": max_regression,
             "all_samples_passed": passed_count == sample_count and sample_count > 0,
             "corpus_results": tuple(corpus_results),
@@ -2697,6 +2773,8 @@ class LLMCorpusMatrixSuite:
             f"- Min Cortex/baseline ratio: `{proof['min_ratio']:.3f}`",
             f"- Win rate: `{proof['win_rate']:.3f}`",
             f"- Max next-token-loss regression: `{proof['max_next_token_loss_regression']:.3f}`",
+            f"- Min observed corpus tokens: `{proof['min_observed_corpus_tokens']}` (required `{proof['min_corpus_tokens']}`)",
+            f"- Min observed planned train tokens: `{proof['min_observed_planned_train_tokens']}` (required `{proof['min_planned_train_tokens']}`)",
             f"- Passed: `{proof['passed']}`",
             "",
             "## Corpus Results",
@@ -2894,6 +2972,8 @@ class LLMExperimentRunner:
             "horizons": tuple(int(item) for item in horizons),
             "cortex_win_margin": float(payload.get("cortex_win_margin", 1.05)),
             "max_next_token_loss_regression": float(payload.get("max_next_token_loss_regression", 1.20)),
+            "min_corpus_tokens": int(payload.get("min_corpus_tokens", 0)),
+            "min_planned_train_tokens": int(payload.get("min_planned_train_tokens", 0)),
         }
 
     def _normalize_corpus_config(self, raw: Any) -> dict[str, Any]:
@@ -3014,6 +3094,8 @@ class LLMExperimentRunner:
             training=training,
             cortex_win_margin=float(model_payload["cortex_win_margin"]),
             max_next_token_loss_regression=float(model_payload["max_next_token_loss_regression"]),
+            min_corpus_tokens=int(model_payload["min_corpus_tokens"]),
+            min_planned_train_tokens=int(model_payload["min_planned_train_tokens"]),
         )
 
     def _write_markdown(self, report: LLMExperimentReport) -> None:
@@ -3116,6 +3198,8 @@ class LLMBenchmarkSuite:
         ratios = [float(item["proof"]["cortex_over_baseline_ratio"]) for item in domains]
         baseline_scores = [float(item["proof"]["baseline_score"]) for item in domains]
         regressions = [float(item["proof"]["next_token_loss_regression_ratio"]) for item in domains]
+        corpus_tokens = [int(item["proof"].get("corpus_token_count", 0)) for item in domains]
+        planned_tokens = [int(item["proof"].get("planned_train_tokens", 0)) for item in domains]
         all_domain_proofs = [
             bool(item["proof"]["passed"])
             and bool(
@@ -3124,9 +3208,23 @@ class LLMBenchmarkSuite:
                     float(item["proof"]["baseline_score"]) >= self.config.min_baseline_future_tokens_per_cost,
                 )
             )
+            and bool(
+                item["proof"].get(
+                    "corpus_scale_passed",
+                    int(item["proof"].get("corpus_token_count", 0)) >= self.config.min_corpus_tokens,
+                )
+            )
+            and bool(
+                item["proof"].get(
+                    "planned_train_tokens_passed",
+                    int(item["proof"].get("planned_train_tokens", 0)) >= self.config.min_planned_train_tokens,
+                )
+            )
             for item in domains
         ]
         min_baseline = min(baseline_scores) if baseline_scores else 0.0
+        min_corpus = min(corpus_tokens) if corpus_tokens else 0
+        min_planned = min(planned_tokens) if planned_tokens else 0
         return {
             "metric": "benchmark_mean_cortex_over_baseline",
             "domains": [str(item["domain"]) for item in domains],
@@ -3136,9 +3234,18 @@ class LLMBenchmarkSuite:
             "mean_baseline_score": sum(baseline_scores) / max(1, len(baseline_scores)),
             "min_baseline_score": min_baseline,
             "min_baseline_future_tokens_per_cost": self.config.min_baseline_future_tokens_per_cost,
+            "min_corpus_tokens": int(self.config.min_corpus_tokens),
+            "min_observed_corpus_tokens": min_corpus,
+            "min_planned_train_tokens": int(self.config.min_planned_train_tokens),
+            "min_observed_planned_train_tokens": min_planned,
             "max_next_token_loss_regression": max(regressions) if regressions else 0.0,
             "all_domains_passed": all(all_domain_proofs),
-            "passed": bool(domains) and all(all_domain_proofs),
+            "passed": (
+                bool(domains)
+                and all(all_domain_proofs)
+                and min_corpus >= self.config.min_corpus_tokens
+                and min_planned >= self.config.min_planned_train_tokens
+            ),
         }
 
     def _write_markdown(self, report: BenchmarkSuiteReport) -> None:
@@ -3150,6 +3257,8 @@ class LLMBenchmarkSuite:
             f"- Min Cortex/baseline ratio: `{report.proof['min_ratio']:.3f}`",
             f"- Mean baseline score: `{report.proof['mean_baseline_score']:.6f}`",
             f"- Max next-token-loss regression: `{report.proof['max_next_token_loss_regression']:.3f}`",
+            f"- Min observed corpus tokens: `{report.proof['min_observed_corpus_tokens']}` (required `{report.proof['min_corpus_tokens']}`)",
+            f"- Min observed planned train tokens: `{report.proof['min_observed_planned_train_tokens']}` (required `{report.proof['min_planned_train_tokens']}`)",
             f"- Passed: `{report.proof['passed']}`",
             "",
             "## Domain Results",
@@ -3263,6 +3372,12 @@ class LLMStatisticalBenchmarkSuite:
                 baseline_score_passed = bool(
                     proof.get("baseline_score_passed", baseline_score >= self.config.min_baseline_future_tokens_per_cost)
                 )
+                corpus_token_count = int(proof.get("corpus_token_count", 0))
+                planned_train_tokens = int(proof.get("planned_train_tokens", 0))
+                corpus_scale_passed = bool(proof.get("corpus_scale_passed", corpus_token_count >= self.config.min_corpus_tokens))
+                planned_train_tokens_passed = bool(
+                    proof.get("planned_train_tokens_passed", planned_train_tokens >= self.config.min_planned_train_tokens)
+                )
                 samples.append(
                     {
                         "seed": seed,
@@ -3272,13 +3387,19 @@ class LLMStatisticalBenchmarkSuite:
                         "baseline_score_passed": baseline_score_passed,
                         "cortex_score": float(proof["cortex_score"]),
                         "next_token_loss_regression_ratio": float(proof["next_token_loss_regression_ratio"]),
-                        "passed": bool(proof["passed"]) and baseline_score_passed,
+                        "corpus_token_count": corpus_token_count,
+                        "corpus_scale_passed": corpus_scale_passed,
+                        "planned_train_tokens": planned_train_tokens,
+                        "planned_train_tokens_passed": planned_train_tokens_passed,
+                        "passed": bool(proof["passed"]) and baseline_score_passed and corpus_scale_passed and planned_train_tokens_passed,
                     }
                 )
 
         ratios = [sample["ratio"] for sample in samples]
         baseline_scores = [sample["baseline_score"] for sample in samples]
         regressions = [sample["next_token_loss_regression_ratio"] for sample in samples]
+        corpus_tokens = [int(sample["corpus_token_count"]) for sample in samples]
+        planned_tokens = [int(sample["planned_train_tokens"]) for sample in samples]
         passed_count = sum(1 for sample in samples if sample["passed"])
         sample_count = len(samples)
 
@@ -3318,6 +3439,8 @@ class LLMStatisticalBenchmarkSuite:
         min_ratio = min(ratios) if ratios else 0.0
         max_regression = max(regressions) if regressions else 0.0
         min_baseline = min(baseline_scores) if baseline_scores else 0.0
+        min_corpus = min(corpus_tokens) if corpus_tokens else 0
+        min_planned = min(planned_tokens) if planned_tokens else 0
         win_rate = passed_count / max(1, sample_count)
         passed = (
             sample_count == len(self.domains) * len(self.seeds)
@@ -3325,6 +3448,8 @@ class LLMStatisticalBenchmarkSuite:
             and min_ratio >= self.config.cortex_win_margin
             and min_baseline >= self.config.min_baseline_future_tokens_per_cost
             and max_regression <= self.config.max_next_token_loss_regression
+            and min_corpus >= self.config.min_corpus_tokens
+            and min_planned >= self.config.min_planned_train_tokens
         )
         return {
             "metric": "statistical_benchmark_cortex_over_baseline",
@@ -3344,6 +3469,10 @@ class LLMStatisticalBenchmarkSuite:
             "mean_baseline_score": sum(baseline_scores) / max(1, len(baseline_scores)),
             "min_baseline_score": min_baseline,
             "min_baseline_future_tokens_per_cost": self.config.min_baseline_future_tokens_per_cost,
+            "min_corpus_tokens": int(self.config.min_corpus_tokens),
+            "min_observed_corpus_tokens": min_corpus,
+            "min_planned_train_tokens": int(self.config.min_planned_train_tokens),
+            "min_observed_planned_train_tokens": min_planned,
             "max_next_token_loss_regression": max_regression,
             "all_samples_passed": passed_count == sample_count and sample_count > 0,
             "domain_results": tuple(domain_results),
@@ -3365,6 +3494,8 @@ class LLMStatisticalBenchmarkSuite:
             f"- Min Cortex/baseline ratio: `{proof['min_ratio']:.3f}`",
             f"- Win rate: `{proof['win_rate']:.3f}`",
             f"- Max next-token-loss regression: `{proof['max_next_token_loss_regression']:.3f}`",
+            f"- Min observed corpus tokens: `{proof['min_observed_corpus_tokens']}` (required `{proof['min_corpus_tokens']}`)",
+            f"- Min observed planned train tokens: `{proof['min_observed_planned_train_tokens']}` (required `{proof['min_planned_train_tokens']}`)",
             f"- Passed: `{proof['passed']}`",
             "",
             "## Domain Results",
@@ -3544,6 +3675,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     smoke.add_argument("--distributed", action="store_true")
     smoke.add_argument("--gloo-interface", default=None)
     smoke.add_argument("--require-win", action="store_true")
+    smoke.add_argument("--min-corpus-tokens", type=int, default=0)
+    smoke.add_argument("--min-planned-train-tokens", type=int, default=0)
 
     compare = sub.add_parser("compare", help="run baseline vs Cortex comparison on text files or directories")
     compare.add_argument("paths", nargs="+")
@@ -3564,6 +3697,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     compare.add_argument("--distributed", action="store_true")
     compare.add_argument("--gloo-interface", default=None)
     compare.add_argument("--require-win", action="store_true")
+    compare.add_argument("--min-corpus-tokens", type=int, default=0)
+    compare.add_argument("--min-planned-train-tokens", type=int, default=0)
 
     compare_matrix = sub.add_parser("compare-matrix", help="run baseline vs Cortex comparison across multiple seeds on one shared corpus")
     compare_matrix.add_argument("paths", nargs="+")
@@ -3585,6 +3720,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     compare_matrix.add_argument("--distributed", action="store_true")
     compare_matrix.add_argument("--gloo-interface", default=None)
     compare_matrix.add_argument("--require-win", action="store_true")
+    compare_matrix.add_argument("--min-corpus-tokens", type=int, default=0)
+    compare_matrix.add_argument("--min-planned-train-tokens", type=int, default=0)
 
     corpus_matrix = sub.add_parser("corpus-matrix", help="run compare-matrix across multiple named corpora")
     corpus_matrix.add_argument("--corpus", action="append", default=[], help="named corpus spec: NAME=PATH or NAME=PATH1;PATH2")
@@ -3606,6 +3743,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     corpus_matrix.add_argument("--distributed", action="store_true")
     corpus_matrix.add_argument("--gloo-interface", default=None)
     corpus_matrix.add_argument("--require-win", action="store_true")
+    corpus_matrix.add_argument("--min-corpus-tokens", type=int, default=0)
+    corpus_matrix.add_argument("--min-planned-train-tokens", type=int, default=0)
 
     benchmark = sub.add_parser("benchmark", help="run a deterministic multi-domain LLM benchmark suite")
     benchmark.add_argument("--out-dir", default="runs/llm-benchmark")
@@ -3627,6 +3766,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     benchmark.add_argument("--distributed", action="store_true")
     benchmark.add_argument("--gloo-interface", default=None)
     benchmark.add_argument("--require-win", action="store_true")
+    benchmark.add_argument("--min-corpus-tokens", type=int, default=0)
+    benchmark.add_argument("--min-planned-train-tokens", type=int, default=0)
 
     benchmark_matrix = sub.add_parser("benchmark-matrix", help="run a multi-domain x multi-seed statistical LLM benchmark")
     benchmark_matrix.add_argument("--out-dir", default="runs/llm-benchmark-matrix")
@@ -3649,6 +3790,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     benchmark_matrix.add_argument("--distributed", action="store_true")
     benchmark_matrix.add_argument("--gloo-interface", default=None)
     benchmark_matrix.add_argument("--require-win", action="store_true")
+    benchmark_matrix.add_argument("--min-corpus-tokens", type=int, default=0)
+    benchmark_matrix.add_argument("--min-planned-train-tokens", type=int, default=0)
 
     prepare_hf = sub.add_parser("prepare-hf", help="export a Hugging Face dataset to text shards and a token memmap corpus")
     prepare_hf.add_argument("--dataset", required=True, help="Hugging Face dataset path, e.g. allenai/c4 or json")
@@ -3742,6 +3885,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             training=training,
             cortex_win_margin=1.02,
             max_next_token_loss_regression=1.50,
+            min_corpus_tokens=args.min_corpus_tokens,
+            min_planned_train_tokens=args.min_planned_train_tokens,
         )
         report = LLMComparisonRunner(corpus, config, run_dir=out_dir / "comparison").run(require_win=args.require_win)
         if _rank_zero():
@@ -3848,6 +3993,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             training=training,
             cortex_win_margin=1.02,
             max_next_token_loss_regression=1.50,
+            min_corpus_tokens=args.min_corpus_tokens,
+            min_planned_train_tokens=args.min_planned_train_tokens,
         )
         report = LLMBenchmarkSuite(
             run_dir=args.out_dir,
@@ -3891,6 +4038,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             training=training,
             cortex_win_margin=1.02,
             max_next_token_loss_regression=1.50,
+            min_corpus_tokens=args.min_corpus_tokens,
+            min_planned_train_tokens=args.min_planned_train_tokens,
         )
         report = LLMStatisticalBenchmarkSuite(
             run_dir=args.out_dir,
@@ -3927,6 +4076,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             n_heads=args.n_heads,
             n_layers=args.n_layers,
             training=training,
+            min_corpus_tokens=args.min_corpus_tokens,
+            min_planned_train_tokens=args.min_planned_train_tokens,
         )
         report = LLMComparisonMatrixSuite(corpus, config, run_dir=args.out_dir, seeds=seeds).run(require_win=args.require_win)
         if _rank_zero():
@@ -3957,6 +4108,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             n_heads=args.n_heads,
             n_layers=args.n_layers,
             training=training,
+            min_corpus_tokens=args.min_corpus_tokens,
+            min_planned_train_tokens=args.min_planned_train_tokens,
         )
         report = LLMCorpusMatrixSuite(corpora, config, run_dir=args.out_dir, seeds=seeds).run(require_win=args.require_win)
         if _rank_zero():
@@ -3984,6 +4137,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         n_heads=args.n_heads,
         n_layers=args.n_layers,
         training=training,
+        min_corpus_tokens=args.min_corpus_tokens,
+        min_planned_train_tokens=args.min_planned_train_tokens,
     )
     report = LLMComparisonRunner(corpus, config, run_dir=args.out_dir).run(require_win=args.require_win)
     if _rank_zero():

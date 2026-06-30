@@ -203,18 +203,18 @@ python tools/train_llm.py compare path/to/text_shards --out-dir runs/llm-large -
 Pour comparer plusieurs graines sur le même corpus tokenisé une seule fois :
 
 ```bash
-python tools/train_llm.py compare-matrix path/to/text_shards --out-dir runs/llm-large-matrix --seeds 11,23,37 --steps 2000 --batch-size 64 --gradient-accumulation-steps 4 --checkpoint-interval 100 --precision bf16 --require-win
+python tools/train_llm.py compare-matrix path/to/text_shards --out-dir runs/llm-large-matrix --seeds 11,23,37 --steps 2000 --batch-size 64 --gradient-accumulation-steps 4 --checkpoint-interval 100 --precision bf16 --require-win --min-corpus-tokens 50000000 --min-planned-train-tokens 100000000
 ```
 
-`compare-matrix` écrit un `corpus/manifest.json` partagé, puis un dossier `seed_<seed>` par graine avec rapports, courbes et checkpoints baseline/Cortex. Le rapport agrégé `comparison_matrix_report.json` mesure moyenne, médiane, variance, win-rate, minimum Cortex/baseline et régression next-token maximale. Il écrit aussi `comparison_matrix_learning_curves.csv/png`, qui agrège les courbes validation baseline/Cortex sur les seeds.
+`compare-matrix` écrit un `corpus/manifest.json` partagé, puis un dossier `seed_<seed>` par graine avec rapports, courbes et checkpoints baseline/Cortex. Le rapport agrégé `comparison_matrix_report.json` mesure moyenne, médiane, variance, win-rate, minimum Cortex/baseline, régression next-token maximale, tokens corpus observés et tokens d'entraînement planifiés. Avec `--require-win`, les seuils `--min-corpus-tokens` et `--min-planned-train-tokens` deviennent bloquants : un ratio favorable sur un corpus trop petit ne peut pas passer pour une preuve large.
 
 Pour un banc multi-corpus déjà préparé :
 
 ```bash
-python tools/train_llm.py corpus-matrix --corpus c4=runs/c4-prepared/text_shards --corpus code=path/to/code_shards --out-dir runs/llm-corpus-matrix --seeds 11,23,37 --steps 2000 --batch-size 64 --gradient-accumulation-steps 4 --checkpoint-interval 100 --precision bf16 --require-win
+python tools/train_llm.py corpus-matrix --corpus c4=runs/c4-prepared/text_shards --corpus code=path/to/code_shards --out-dir runs/llm-corpus-matrix --seeds 11,23,37 --steps 2000 --batch-size 64 --gradient-accumulation-steps 4 --checkpoint-interval 100 --precision bf16 --require-win --min-corpus-tokens 50000000 --min-planned-train-tokens 100000000
 ```
 
-Chaque corpus reçoit son propre `comparison_matrix_report.json`, et le dossier racine écrit `corpus_matrix_report.json`, `corpus_matrix_report.md`, `corpus_matrix_ratios.png` et `corpus_matrix_learning_curves.csv/png`. La preuve globale exige que tous les couples corpus x seed gagnent contre la baseline avec score baseline non nul.
+Chaque corpus reçoit son propre `comparison_matrix_report.json`, et le dossier racine écrit `corpus_matrix_report.json`, `corpus_matrix_report.md`, `corpus_matrix_ratios.png` et `corpus_matrix_learning_curves.csv/png`. La preuve globale exige que tous les couples corpus x seed gagnent contre la baseline avec score baseline non nul et, si les seuils d'échelle sont fournis, que chaque corpus/seed les respecte.
 
 Pour exécuter le pipeline complet depuis un manifeste reproductible :
 
@@ -227,7 +227,7 @@ Le manifeste décrit `doctor`, `training`, `model`, `seeds`, `require_win` et un
 Deux manifestes versionnés sont fournis :
 
 - `experiments/wikitext_cuda_validation.json` : validation GPU rapide sur Wikitext.
-- `experiments/c4_local_cuda_manifest.json` : run long CUDA large C4 + corpus local versionne du repo.
+- `experiments/c4_cuda_large_manifest.json` : run long CUDA large C4 avec seuils de preuve massifs versionnes.
 
 Extrait minimal :
 
@@ -238,11 +238,10 @@ Extrait minimal :
   "doctor": {"require_cuda": true, "device": "cuda", "precision": "bf16", "distributed": true},
   "seeds": [11, 23, 37],
   "require_win": true,
-  "model": {"vocab_size": 32768, "seq_len": 1024, "d_model": 768, "n_heads": 12, "n_layers": 12, "horizons": [1, 2, 4, 8]},
+  "model": {"vocab_size": 32768, "seq_len": 1024, "d_model": 768, "n_heads": 12, "n_layers": 12, "horizons": [1, 2, 4, 8], "min_corpus_tokens": 50000000, "min_planned_train_tokens": 2000000000},
   "training": {"steps": 20000, "batch_size": 16, "gradient_accumulation_steps": 8, "checkpoint_interval": 500},
   "corpora": [
-    {"name": "c4", "kind": "hf", "dataset": "allenai/c4", "config_name": "en", "split": "train", "text_field": "text", "max_documents": 1000000},
-    {"name": "local", "kind": "paths", "paths": ["path/to/local_text_shards"]}
+    {"name": "c4", "kind": "hf", "dataset": "allenai/c4", "config_name": "en", "split": "train", "text_field": "text", "max_documents": 1000000}
   ]
 }
 ```
@@ -254,8 +253,8 @@ python tools/train_llm.py prepare-hf --dataset allenai/c4 --config-name en --spl
 python tools/train_llm.py prepare-hf --dataset allenai/c4 --config-name en --split train --text-field text --out-dir runs/c4-prepared --max-documents 1000000 --vocab-size 32768 --seq-len 1024 --max-horizon 8 --resume
 python tools/train_llm.py prepare-hf --dataset Salesforce/wikitext --config-name wikitext-2-raw-v1 --split train --text-field text --out-dir runs/wikitext2-prepared --max-documents 200 --vocab-size 512 --seq-len 64 --max-horizon 4
 python tools/train_llm.py compare runs/c4-prepared/text_shards --out-dir runs/c4-cortex-vs-ntp --steps 2000 --batch-size 64 --gradient-accumulation-steps 4 --checkpoint-interval 100 --precision bf16
-python tools/train_llm.py compare-matrix runs/c4-prepared/text_shards --out-dir runs/c4-cortex-vs-ntp-matrix --seeds 11,23,37 --steps 2000 --batch-size 64 --gradient-accumulation-steps 4 --checkpoint-interval 100 --precision bf16 --require-win
-python tools/train_llm.py corpus-matrix --corpus c4=runs/c4-prepared/text_shards --corpus local=path/to/local_text_shards --out-dir runs/corpus-suite --seeds 11,23,37 --steps 2000 --batch-size 64 --gradient-accumulation-steps 4 --checkpoint-interval 100 --precision bf16 --require-win
+python tools/train_llm.py compare-matrix runs/c4-prepared/text_shards --out-dir runs/c4-cortex-vs-ntp-matrix --seeds 11,23,37 --steps 2000 --batch-size 64 --gradient-accumulation-steps 4 --checkpoint-interval 100 --precision bf16 --require-win --min-corpus-tokens 50000000 --min-planned-train-tokens 100000000
+python tools/train_llm.py corpus-matrix --corpus c4=runs/c4-prepared/text_shards --out-dir runs/corpus-suite --seeds 11,23,37 --steps 2000 --batch-size 64 --gradient-accumulation-steps 4 --checkpoint-interval 100 --precision bf16 --require-win --min-corpus-tokens 50000000 --min-planned-train-tokens 100000000
 ```
 
 Utilise les identifiants Hugging Face namespacés (`Salesforce/wikitext`, `allenai/c4`, etc.). Si Hub rejette un ancien ID court comme `wikitext`, le CLI échoue maintenant avec un message indiquant l'ID namespacé à utiliser.
