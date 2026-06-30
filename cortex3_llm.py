@@ -42,7 +42,7 @@ from cortex3 import (
     default_skill_specs,
 )
 from cortex3_attribution import CausalAttributionEngine
-from cortex3_certificates import CertificateType, CertificateVerifier, LatentProofState, build_certificate, evaluate_certificate_efficiency
+from cortex3_certificates import CertificateHead, CertificateHeadOutput, CertificateType, CertificateVerifier, LatentProofState, build_certificate, evaluate_certificate_efficiency
 from cortex3_cycle import CortexCycle
 from cortex3_future import ContractDecision, FutureContract, FutureContractEngine, FutureContractLedger, MTPFSPConfig
 from cortex3_improvement import RecursiveImprovementEngine, RollbackEvent
@@ -1340,6 +1340,10 @@ class TransformerConfig:
     use_skill_aware_experts: bool = False
     skill_expert_count: int = 4
     skill_expert_top_k: int = 2
+    use_variable_in_compressor: bool = False
+    variable_compression_wide_kernel: int = 8
+    use_certificate_head: bool = False
+    certificate_latent_size: int = 64
 
     def __post_init__(self) -> None:
         if self.vocab_size <= len(SPECIAL_TOKENS):
@@ -1360,6 +1364,10 @@ class TransformerConfig:
             raise ValueError("skill_expert_count must be positive")
         if not 1 <= self.skill_expert_top_k <= self.skill_expert_count:
             raise ValueError("skill_expert_top_k must be between 1 and skill_expert_count")
+        if self.variable_compression_wide_kernel < 2:
+            raise ValueError("variable_compression_wide_kernel must be >= 2")
+        if self.certificate_latent_size < 1:
+            raise ValueError("certificate_latent_size must be positive")
 
 
 def _make_transformer_linear(
@@ -1456,6 +1464,79 @@ class TransformerBlock(nn.Module):
         return x
 
 
+@dataclass(frozen=True)
+class VariableCompressionState:
+    keep_prob: torch.Tensor
+    critical_weight: torch.Tensor
+    normal_weight: torch.Tensor
+    redundant_weight: torch.Tensor
+    estimated_ratio: torch.Tensor
+
+    def to_summary(self) -> dict[str, float]:
+        return {
+            "critical_weight_mean": float(self.critical_weight.detach().mean().cpu()),
+            "normal_weight_mean": float(self.normal_weight.detach().mean().cpu()),
+            "redundant_weight_mean": float(self.redundant_weight.detach().mean().cpu()),
+            "estimated_ratio_mean": float(self.estimated_ratio.detach().mean().cpu()),
+        }
+
+
+class VariableInCompressor(nn.Module):
+    def __init__(self, config: TransformerConfig, *, ledger: CompressionTraceLedger | None = None):
+        super().__init__()
+        self.config = config
+        self.ledger = ledger
+        self.scorer = nn.Linear(config.d_model, 1)
+        self.output = _make_transformer_linear(
+            config,
+            config.d_model,
+            config.d_model,
+            ledger=ledger,
+            log_prefix="variable_in.output",
+        )
+
+    def _local_average(self, hidden: torch.Tensor, kernel: int) -> torch.Tensor:
+        time_steps = hidden.shape[1]
+        kernel = max(1, min(int(kernel), int(time_steps)))
+        left = kernel // 2
+        right = kernel - 1 - left
+        padded = F.pad(hidden.transpose(1, 2), (left, right), mode="replicate")
+        return F.avg_pool1d(padded, kernel_size=kernel, stride=1).transpose(1, 2)
+
+    def forward(self, hidden: torch.Tensor) -> tuple[torch.Tensor, VariableCompressionState]:
+        keep_prob = torch.sigmoid(self.scorer(hidden))
+        critical = keep_prob.square()
+        redundant = (1.0 - keep_prob).square()
+        normal = (1.0 - critical - redundant).clamp_min(0.0)
+        norm = (critical + normal + redundant).clamp_min(1e-6)
+        critical = critical / norm
+        normal = normal / norm
+        redundant = redundant / norm
+        pair_context = self._local_average(hidden, 2)
+        wide_context = self._local_average(hidden, self.config.variable_compression_wide_kernel)
+        compressed = critical * hidden + normal * pair_context + redundant * wide_context
+        compressed = self.output(compressed)
+        estimated_ratio = critical + 0.5 * normal + (1.0 / float(self.config.variable_compression_wide_kernel)) * redundant
+        state = VariableCompressionState(
+            keep_prob=keep_prob,
+            critical_weight=critical,
+            normal_weight=normal,
+            redundant_weight=redundant,
+            estimated_ratio=estimated_ratio,
+        )
+        if self.ledger is not None:
+            batch, time_steps, channels = hidden.shape
+            ratio = float(estimated_ratio.detach().mean().cpu())
+            self.ledger.record_kv(
+                "llm-variable-in",
+                "variable_latent",
+                bytes_used=float(batch * time_steps * channels * 2 * ratio),
+                exact_anchors=0,
+                note=f"Variable-In compressor estimated ratio {ratio:.4f}",
+            )
+        return compressed, state
+
+
 class SkillAwareExpertMoE(nn.Module):
     def __init__(self, config: TransformerConfig, *, ledger: CompressionTraceLedger | None = None):
         super().__init__()
@@ -1515,6 +1596,8 @@ class LLMForwardOutput:
     hidden: torch.Tensor
     mtp_logits: Mapping[int, torch.Tensor]
     confidence: torch.Tensor | None
+    certificate: CertificateHeadOutput | None = None
+    variable_compression: VariableCompressionState | None = None
 
 
 class CortexTransformerLM(nn.Module):
@@ -1522,9 +1605,15 @@ class CortexTransformerLM(nn.Module):
         super().__init__()
         self.config = config
         self.compression_ledger = CompressionTraceLedger() if config.use_ternary_core else None
+        self.certificate_forward_events = 0
         self.token_embedding = nn.Embedding(config.vocab_size, config.d_model)
         self.position_embedding = nn.Embedding(config.seq_len, config.d_model)
         self.drop = nn.Dropout(config.dropout)
+        self.variable_in = (
+            VariableInCompressor(config, ledger=self.compression_ledger)
+            if config.use_variable_in_compressor
+            else None
+        )
         self.blocks = nn.ModuleList([
             TransformerBlock(config, ledger=self.compression_ledger, layer_index=index)
             for index in range(config.n_layers)
@@ -1553,6 +1642,11 @@ class CortexTransformerLM(nn.Module):
             ledger=self.compression_ledger,
             log_prefix="confidence",
         ) if config.use_cortex_heads else None
+        self.certificate_head = (
+            CertificateHead(config.d_model, config.certificate_latent_size, config.vocab_size)
+            if config.use_certificate_head
+            else None
+        )
         self.lm_head.weight = self.token_embedding.weight
 
     def forward(self, input_ids: torch.Tensor) -> LLMForwardOutput:
@@ -1564,6 +1658,9 @@ class CortexTransformerLM(nn.Module):
         positions = torch.arange(0, time_steps, device=input_ids.device).unsqueeze(0)
         hidden = self.token_embedding(input_ids) + self.position_embedding(positions)
         hidden = self.drop(hidden)
+        variable_compression = None
+        if self.variable_in is not None:
+            hidden, variable_compression = self.variable_in(hidden)
         for block in self.blocks:
             hidden = block(hidden)
         hidden = self.ln_f(hidden)
@@ -1575,7 +1672,17 @@ class CortexTransformerLM(nn.Module):
             for horizon, head in ((int(key), module) for key, module in self.mtp_heads.items())
         }
         confidence = torch.sigmoid(self.confidence_head(hidden)).squeeze(-1) if self.confidence_head else None
-        return LLMForwardOutput(logits=logits, hidden=hidden, mtp_logits=mtp_logits, confidence=confidence)
+        certificate = self.certificate_head(hidden) if self.certificate_head is not None else None
+        if certificate is not None:
+            self.certificate_forward_events += 1
+        return LLMForwardOutput(
+            logits=logits,
+            hidden=hidden,
+            mtp_logits=mtp_logits,
+            confidence=confidence,
+            certificate=certificate,
+            variable_compression=variable_compression,
+        )
 
     def requantize_ternary_core(self, *, certify_zeros: bool = False) -> None:
         if not self.config.use_ternary_core:
@@ -1596,6 +1703,8 @@ class LossWeights:
     mtp: float = 0.35
     temporal_consistency: float = 0.05
     confidence: float = 0.05
+    variable_input: float = 0.01
+    certificate: float = 0.04
 
 
 @dataclass(frozen=True)
@@ -1605,6 +1714,8 @@ class LossBreakdown:
     mtp: float = 0.0
     temporal_consistency: float = 0.0
     confidence: float = 0.0
+    variable_input: float = 0.0
+    certificate: float = 0.0
 
     def to_dict(self) -> dict[str, float]:
         return asdict(self)
@@ -1628,6 +1739,8 @@ class CortexObjective:
         mtp_loss = output.logits.new_tensor(0.0)
         temporal_loss = output.logits.new_tensor(0.0)
         confidence_loss = output.logits.new_tensor(0.0)
+        variable_loss = output.logits.new_tensor(0.0)
+        certificate_loss = output.logits.new_tensor(0.0)
         if use_cortex_terms:
             if not output.mtp_logits:
                 raise ValueError("Cortex objective requires multi-horizon heads")
@@ -1654,6 +1767,18 @@ class CortexObjective:
                     token_correct = output.logits.argmax(dim=-1).eq(next_targets).float()
                 confidence_loss = F.mse_loss(output.confidence, token_correct)
                 total = total + self.weights.confidence * confidence_loss
+            if output.variable_compression is not None:
+                variable_loss = output.variable_compression.estimated_ratio.mean()
+                total = total + self.weights.variable_input * variable_loss
+            if output.certificate is not None:
+                final_targets = next_targets[:, -1]
+                cert_answer_loss = F.cross_entropy(output.certificate.answer_logits, final_targets)
+                with torch.no_grad():
+                    sequence_correct = output.logits.argmax(dim=-1).eq(next_targets).float().mean(dim=1)
+                    uncertainty_target = 1.0 - sequence_correct
+                cert_uncertainty_loss = F.mse_loss(output.certificate.uncertainty, uncertainty_target)
+                certificate_loss = cert_answer_loss + cert_uncertainty_loss
+                total = total + self.weights.certificate * certificate_loss
             total = total + self.weights.temporal_consistency * temporal_loss
         return total, LossBreakdown(
             total=float(total.detach().cpu()),
@@ -1661,6 +1786,8 @@ class CortexObjective:
             mtp=float(mtp_loss.detach().cpu()),
             temporal_consistency=float(temporal_loss.detach().cpu()),
             confidence=float(confidence_loss.detach().cpu()),
+            variable_input=float(variable_loss.detach().cpu()),
+            certificate=float(certificate_loss.detach().cpu()),
         )
 
 
@@ -2219,6 +2346,10 @@ class CortexTrainingPhaseController:
             raise ValueError("CortexTrainingPhaseController requires a Cortex model with use_cortex_heads=True")
         if not model.config.use_skill_aware_experts:
             raise ValueError("CortexTrainingPhaseController requires skill-aware experts for full Cortex training")
+        if not model.config.use_variable_in_compressor:
+            raise ValueError("CortexTrainingPhaseController requires a Variable-In compressor for full Cortex training")
+        if not model.config.use_certificate_head:
+            raise ValueError("CortexTrainingPhaseController requires a certificate head for full Cortex training")
         self.model = model
         self.tokenizer = tokenizer
         self.config = config
@@ -2508,6 +2639,7 @@ class CortexTrainingPhaseController:
             "objective_feedback_total": float(self.objective_feedback_total),
             "last_objective_loss_total": float(self.last_objective_loss_total),
             "objective_feedback_history": list(self.objective_feedback_history),
+            "certificate_head_forward_events": int(self.model.certificate_forward_events),
             "future_ledger": self.future_ledger.to_dict(),
             "compression_trace_ledger": (
                 self.model.compression_ledger.to_dict()
@@ -2549,6 +2681,7 @@ class CortexTrainingPhaseController:
             dict(item)
             for item in payload.get("objective_feedback_history", ())
         ]
+        self.model.certificate_forward_events = int(payload.get("certificate_head_forward_events", 0))
         _restore_future_contract_ledger(self.future_ledger, payload.get("future_ledger"))
         _restore_compression_trace_ledger(self.model.compression_ledger, payload.get("compression_trace_ledger"))
         _restore_memory_state(self.memory, payload.get("memory_state"))
@@ -2583,6 +2716,8 @@ class CortexTrainingPhaseController:
             "last_objective_loss_total": float(self.last_objective_loss_total),
             "future_contract_decisions": len(self.future_ledger.decisions),
             "compression_trace_counts": compression_trace_counts,
+            "variable_input_compression_events": compression_trace_counts.get("kv_events", 0),
+            "certificate_head_forward_events": int(self.model.certificate_forward_events),
             "memory_recent_segments": len(self.memory.recent.segments),
             "memory_latent_segments": len(self.memory.latent.segments),
             "sleep_replay_examples": len(self.sleep.replay.examples),
@@ -2883,7 +3018,9 @@ class CortexTrainingPhaseController:
             "phase_event_counts": dict(self.phase_counts),
             "training_influence": {
                 "ternary_core_forward_events": trace_counts.get("layer_forward_events", 0),
+                "variable_input_compression_events": trace_counts.get("kv_events", 0),
                 "skill_expert_activations": trace_counts.get("expert_activations", 0),
+                "certificate_head_forward_events": int(self.model.certificate_forward_events),
                 "future_contract_decisions": len(self.future_ledger.decisions),
                 "confidence_regularization_steps": self.regularization_steps,
                 "sleep_replay_batches_available": len(self.replay_batches),
@@ -3065,6 +3202,8 @@ class LLMTrainer:
                 self.model.config.use_cortex_heads
                 and self.model.config.use_ternary_core
                 and self.model.config.use_skill_aware_experts
+                and self.model.config.use_variable_in_compressor
+                and self.model.config.use_certificate_head
                 and self.model.config.horizons == (1, 2, 4, 8)
             )
             else None
@@ -3291,6 +3430,10 @@ class LLMTrainer:
         checkpoint_model_config.setdefault("use_skill_aware_experts", False)
         checkpoint_model_config.setdefault("skill_expert_count", 4)
         checkpoint_model_config.setdefault("skill_expert_top_k", 2)
+        checkpoint_model_config.setdefault("use_variable_in_compressor", False)
+        checkpoint_model_config.setdefault("variable_compression_wide_kernel", 8)
+        checkpoint_model_config.setdefault("use_certificate_head", False)
+        checkpoint_model_config.setdefault("certificate_latent_size", 64)
         if checkpoint_model_config != asdict(self.model.config):
             raise ValueError("checkpoint model_config does not match the current model")
         checkpoint_corpus_identity = payload.get("corpus_identity")
@@ -3826,6 +3969,16 @@ def _transformer_parameter_count(config: TransformerConfig) -> int:
         router = d_model * int(config.skill_expert_count) + int(config.skill_expert_count)
         expert = (d_model * d_model * 2 + d_model * 2) + (d_model * 2 * d_model + d_model)
         total += router + int(config.skill_expert_count) * expert
+    if config.use_variable_in_compressor:
+        total += d_model + 1
+        total += d_model * d_model + d_model
+    if config.use_certificate_head:
+        latent = int(config.certificate_latent_size)
+        total += d_model * latent + latent
+        total += latent * latent + latent
+        total += latent * vocab_size + vocab_size
+        total += latent * len(CertificateType) + len(CertificateType)
+        total += latent + 1
     return int(total)
 
 
@@ -3866,6 +4019,9 @@ def _estimate_transformer_training_memory(config: TransformerConfig, training: T
         "skill_aware_experts": bool(config.use_skill_aware_experts),
         "skill_expert_count": int(config.skill_expert_count) if config.use_skill_aware_experts else 0,
         "skill_expert_top_k": int(config.skill_expert_top_k) if config.use_skill_aware_experts else 0,
+        "variable_in_compressor": bool(config.use_variable_in_compressor),
+        "certificate_head": bool(config.use_certificate_head),
+        "certificate_latent_size": int(config.certificate_latent_size) if config.use_certificate_head else 0,
         "training_state_bytes": int(training_state_bytes),
         "parameter_forward_bytes": int(parameter_forward_bytes),
         "hidden_activation_bytes": int(hidden_activation_bytes),
@@ -3892,6 +4048,8 @@ def _experiment_model_memory_estimates(config: ComparisonConfig) -> dict[str, An
         "use_cortex_heads": True,
         "use_ternary_core": True,
         "use_skill_aware_experts": True,
+        "use_variable_in_compressor": True,
+        "use_certificate_head": True,
     })
     baseline = _estimate_transformer_training_memory(baseline_config, config.training)
     cortex = _estimate_transformer_training_memory(cortex_config, config.training)
@@ -3944,6 +4102,8 @@ def build_training_plan(
         "use_cortex_heads": True,
         "use_ternary_core": True,
         "use_skill_aware_experts": True,
+        "use_variable_in_compressor": True,
+        "use_certificate_head": True,
     })
     baseline_parameters = _transformer_parameter_count(baseline_config)
     cortex_parameters = _transformer_parameter_count(cortex_config)
@@ -4000,6 +4160,8 @@ def build_training_plan(
             "cortex_skill_aware_experts": bool(cortex_config.use_skill_aware_experts),
             "cortex_skill_expert_count": int(cortex_config.skill_expert_count),
             "cortex_skill_expert_top_k": int(cortex_config.skill_expert_top_k),
+            "cortex_variable_in_compressor": bool(cortex_config.use_variable_in_compressor),
+            "cortex_certificate_head": bool(cortex_config.use_certificate_head),
         },
         "training": {
             "steps": optimizer_steps,
@@ -4223,6 +4385,8 @@ class LLMComparisonRunner:
                 "use_cortex_heads": True,
                 "use_ternary_core": True,
                 "use_skill_aware_experts": True,
+                "use_variable_in_compressor": True,
+                "use_certificate_head": True,
             })
             cortex = LLMTrainer(
                 CortexTransformerLM(cortex_config),

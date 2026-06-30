@@ -208,6 +208,8 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 "use_cortex_heads": True,
                 "use_ternary_core": True,
                 "use_skill_aware_experts": True,
+                "use_variable_in_compressor": True,
+                "use_certificate_head": True,
             })
             baseline_parameters = sum(parameter.numel() for parameter in CortexTransformerLM(baseline_config).parameters())
             cortex_parameters = sum(parameter.numel() for parameter in CortexTransformerLM(cortex_config).parameters())
@@ -215,6 +217,8 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             self.assertEqual(plan["model"]["cortex_parameters"], cortex_parameters)
             self.assertTrue(plan["model"]["cortex_skill_aware_experts"])
             self.assertEqual(plan["model"]["cortex_skill_expert_count"], 4)
+            self.assertTrue(plan["model"]["cortex_variable_in_compressor"])
+            self.assertTrue(plan["model"]["cortex_certificate_head"])
             self.assertGreater(plan["model"]["cortex_parameters"], plan["model"]["baseline_parameters"])
             self.assertEqual(plan["training"]["tokens_per_optimizer_step"], 3 * 2 * 2 * 24)
             self.assertEqual(plan["training"]["planned_train_tokens"], 3 * 2 * 2 * 24 * 10)
@@ -516,7 +520,15 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 self.assertEqual(first_sidecar["step"], 1)
                 self.assertIn("git_commit", first_sidecar["code_state"])
                 legacy_checkpoint = torch.load(run_dir / "checkpoint_final.pt", map_location="cpu", weights_only=False)
-                for key in ("use_skill_aware_experts", "skill_expert_count", "skill_expert_top_k"):
+                for key in (
+                    "use_skill_aware_experts",
+                    "skill_expert_count",
+                    "skill_expert_top_k",
+                    "use_variable_in_compressor",
+                    "variable_compression_wide_kernel",
+                    "use_certificate_head",
+                    "certificate_latent_size",
+                ):
                     legacy_checkpoint["model_config"].pop(key, None)
                 torch.save(legacy_checkpoint, run_dir / "checkpoint_final.pt")
 
@@ -656,6 +668,8 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 use_cortex_heads=True,
                 use_ternary_core=True,
                 use_skill_aware_experts=True,
+                use_variable_in_compressor=True,
+                use_certificate_head=True,
             )
             train = MemmapCausalDataset(manifest, split="train")
             val = MemmapCausalDataset(manifest, split="val")
@@ -694,7 +708,9 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 self.assertGreater(count, 0, phase_id)
             influence = phase_report["training_influence"]
             self.assertGreater(influence["ternary_core_forward_events"], 0)
+            self.assertGreater(influence["variable_input_compression_events"], 0)
             self.assertGreater(influence["skill_expert_activations"], 0)
+            self.assertGreater(influence["certificate_head_forward_events"], 0)
             self.assertGreater(influence["future_contract_decisions"], 0)
             self.assertGreater(influence["confidence_regularization_steps"], 0)
             self.assertGreater(influence["sleep_replay_batches_available"], 0)
@@ -742,6 +758,8 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 use_cortex_heads=True,
                 use_ternary_core=True,
                 use_skill_aware_experts=True,
+                use_variable_in_compressor=True,
+                use_certificate_head=True,
             )
             controller = CortexTrainingPhaseController(
                 CortexTransformerLM(config),
@@ -777,6 +795,8 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 use_cortex_heads=True,
                 use_ternary_core=True,
                 use_skill_aware_experts=True,
+                use_variable_in_compressor=True,
+                use_certificate_head=True,
             )
             train = MemmapCausalDataset(manifest, split="train")
             val = MemmapCausalDataset(manifest, split="val")
@@ -812,6 +832,7 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 self.assertGreater(len(checkpoint["cortex_phase_state"]["replay_batches"]), 0)
                 self.assertGreater(checkpoint["cortex_phase_state"]["objective_feedback_events"], 0)
                 self.assertGreater(checkpoint["cortex_phase_state"]["last_objective_loss_total"], 0.0)
+                self.assertGreater(checkpoint["cortex_phase_state"]["certificate_head_forward_events"], 0)
                 self.assertGreater(len(checkpoint["cortex_phase_state"]["future_ledger"]["decisions"]), 0)
                 self.assertGreater(
                     len(checkpoint["cortex_phase_state"]["compression_trace_ledger"]["layer_forward_events"]),
@@ -827,6 +848,10 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 )
                 self.assertGreater(
                     checkpoint["cortex_phase_state"]["compression_trace_ledger"]["total_event_counts"]["expert_activations"],
+                    0,
+                )
+                self.assertGreater(
+                    checkpoint["cortex_phase_state"]["compression_trace_ledger"]["total_event_counts"]["kv_events"],
                     0,
                 )
                 self.assertGreater(len(checkpoint["cortex_phase_state"]["memory_state"]["recent"]), 0)
@@ -850,6 +875,8 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                     sidecar["cortex_phase_state_summary"]["compression_trace_counts"]["expert_activations"],
                     0,
                 )
+                self.assertGreater(sidecar["cortex_phase_state_summary"]["variable_input_compression_events"], 0)
+                self.assertGreater(sidecar["cortex_phase_state_summary"]["certificate_head_forward_events"], 0)
                 self.assertGreater(sidecar["cortex_phase_state_summary"]["memory_recent_segments"], 0)
                 self.assertGreater(sidecar["cortex_phase_state_summary"]["sleep_replay_examples"], 0)
                 self.assertGreater(
@@ -903,6 +930,14 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             self.assertGreaterEqual(
                 resumed_influence["skill_expert_activations"],
                 first_influence["skill_expert_activations"],
+            )
+            self.assertGreaterEqual(
+                resumed_influence["variable_input_compression_events"],
+                first_influence["variable_input_compression_events"],
+            )
+            self.assertGreaterEqual(
+                resumed_influence["certificate_head_forward_events"],
+                first_influence["certificate_head_forward_events"],
             )
             self.assertGreaterEqual(
                 resumed_influence["memory_recent_segments"],
