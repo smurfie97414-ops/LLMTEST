@@ -44,3 +44,6 @@ This document tracks implementation progress for the project.
 - Trainable micro-checkpoint loop
   - Implemented baseline: PyTorch answer-class micro-model and character-level autoregressive decoder with trainable projection/recurrent/head layers around an instrumented `BitLinear` core, DSV-compatible agents, verifier/sleep dataset ingestion, generated-answer checks, compiled-circuit certificates, checkpoint save/load and `summary.json` autoregressive checkpoint reports.
   - Next: use the final objective as the optimization target, evaluate held-out generalization, persist checkpoint selection across runs and benchmark MTP vs next-token-only variants under low precision.
+- Full LLM pretraining bridge
+  - Implemented baseline: BPE tokenizer training, streaming text-shard reader, memmap causal dataset, complete causal Transformer baseline, Cortex multi-horizon Transformer, next-token plus Cortex objective terms, explicit no-silent-fallback CUDA requirement, mixed precision policy, DDP environment wiring, checkpoint persistence, CSV/PNG learning curves and baseline-vs-Cortex comparison report.
+  - Next: run real large-corpus GPU/DDP training, validate CUDA fp16/bf16 and NCCL on hardware, publish multi-seed/domain learning curves, scale checkpoint size and connect recursive-improvement proposals to persisted LLM checkpoint patches.

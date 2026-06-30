@@ -100,12 +100,14 @@ Cette base contient maintenant :
 - `cortex3_experiments.py` : expériences A-E du plan, de la détection de défauts injectés à la sandbox d'auto-amélioration ;
 - `cortex3_microtrain.py` : micro-modèle PyTorch entraînable avec cœur `BitLinear`, agent DSV, exemples issus du verifier/sleep phase et checkpoints `.pt` ;
 - `cortex3_autoregressive.py` : décodeur micro-autoregressif PyTorch avec vocabulaire caractère, génération greedy ou blockwise sous Future Contract, pertes comportement/MTP multi-horizons/contrat futur, agent DSV et checkpoints `.pt` ;
+- `cortex3_llm.py` : harness de pré-entraînement LLM réel avec tokenizer BPE Hugging Face `tokenizers`, corpus texte streamé vers memmap, dataset causal, Transformer complet, baseline next-token, objectif Cortex multi-horizon, AMP/DDP, checkpoints, courbes et rapport comparatif ;
 - `cortex3_phases.py` : registre exécutable des 10 phases Cortex-3 ;
 - `cortex3_ledgers.py` : Bit Ledger, Skill Ledger, Causal Ledger et Uncertainty Ledger ;
 - `cortex3_analysis.py` : analyse des causes probables d'une régression ;
 - `cortex3_cycle.py` : cycle complet référence/trial → vérification → ledgers → analyse → actions budgetées → rapport ;
 - `cortex3_selection.py` : sélection offline de trials et choix des compétences frontières ;
 - `tools/run_cycle_report.py` : génération d'un rapport markdown du cycle ;
+- `tools/train_llm.py` : CLI de préparation/entraînement/comparaison baseline-vs-Cortex pour corpus texte ;
 - `tests/` : tests unitaires pour le noyau et les nouveaux modules ;
 - `.github/workflows/ci.yml` : CI GitHub Actions.
 
@@ -136,7 +138,7 @@ source .venv/bin/activate  # Windows: .venv\Scripts\activate
 pip install -e .
 ```
 
-Les dépendances de travail incluent PyTorch et NumPy ; elles sont obligatoires pour exécuter les couches modèle du plan.
+Les dépendances de travail incluent PyTorch, NumPy, `tokenizers` et Matplotlib ; elles sont obligatoires pour exécuter les couches modèle, le tokenizer BPE et les courbes d'apprentissage.
 
 ## Démo noyau
 
@@ -164,6 +166,38 @@ python tools/run_cycle_report.py --skip-experiments  # sans expériences A-E
 python tools/run_cycle_report.py --skip-autoregressive  # sans smoke checkpoint AR
 ```
 
+## Pré-entraînement LLM comparatif
+
+Le pont LLM complet se lance avec :
+
+```bash
+python tools/train_llm.py smoke --require-win
+```
+
+Ce smoke construit un corpus texte déterministe, entraîne un tokenizer BPE, écrit les tokens dans un memmap, entraîne deux Transformers causaux sur les mêmes données, sauvegarde les checkpoints et produit :
+
+- `comparison_report.json`
+- `report.md`
+- `learning_curve.png`
+- `baseline_ntp/learning_curve.csv`
+- `cortex3/learning_curve.csv`
+- `baseline_ntp/checkpoint_final.pt`
+- `cortex3/checkpoint_final.pt`
+
+Pour un corpus plus large :
+
+```bash
+python tools/train_llm.py compare path/to/text_shards --out-dir runs/llm-large --steps 2000 --batch-size 64 --precision bf16
+```
+
+Pour refuser tout fallback CPU quand un run GPU est obligatoire :
+
+```bash
+python tools/train_llm.py compare path/to/text_shards --require-cuda --precision fp16 --device cuda
+```
+
+Le rapport compare une baseline next-token classique à Cortex-3 sur `verified_future_tokens_per_forward_cost`, tout en contrôlant la régression de loss next-token. Le smoke local validé montre une baseline non nulle et un avantage Cortex coût/qualité, mais il ne remplace pas encore un run corpus massif GPU multi-nœuds.
+
 ## Tests
 
 ```bash
@@ -178,10 +212,10 @@ python -m unittest discover -s tests
 4. Étendre Phase 4 avec compression query-conditioned apprise, gate stricte de fidélité d'ancres et benchmarks coût/qualité exact KV vs latent KV.
 5. Étendre Phase 5 avec vérification algébrique multi-étapes, tests code plus riches et mesure held-out des économies de tokens de certificat.
 6. Étendre la boucle générative autoregressive vers held-out suites, benchmarks coût/qualité plus larges et calibration de confiance.
-7. Ajouter un banc MTP vs NTP en faible précision sur variantes de checkpoints autoregressifs.
+7. Étendre le banc MTP vs NTP en faible précision sur variantes de checkpoints autoregressifs et LLM.
 8. Durcir Phase 6 avec ablations branchées sur de vrais forward passes multi-couches.
 9. Durcir Phase 7 avec application directe sur un micro-modèle multi-couches.
-10. Étendre le micro-entraînement vers des checkpoints plus larges, puis brancher les propositions acceptées sur des patchs signés avec rollback persistant.
+10. Étendre le harness LLM vers des checkpoints plus larges, puis brancher les propositions acceptées sur des patchs signés avec rollback persistant.
 
 ## Phrase centrale
 

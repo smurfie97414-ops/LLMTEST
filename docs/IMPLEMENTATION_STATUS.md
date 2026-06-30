@@ -359,3 +359,33 @@ Remaining:
 - Optimize the final Cortex objective directly during training.
 - Evaluate generalization on held-out randomized suites and trained checkpoint variants.
 - Benchmark MTP vs next-token-only variants under low precision.
+
+## Full LLM pretraining bridge
+
+Current executable coverage:
+
+- `cortex3_llm.LLMTokenizer` trains and persists a Hugging Face `tokenizers` BPE tokenizer with required special tokens.
+- `TextShardReader` streams text shards without loading the whole corpus into memory.
+- `TokenizedCorpusBuilder` performs a two-pass corpus tokenization and writes a `uint32` memmap plus `manifest.json`.
+- `MemmapCausalDataset` samples causal next-token targets and multi-horizon future targets directly from the memmap.
+- `CortexTransformerLM` is a complete causal Transformer with tied embeddings, causal self-attention, MLP blocks and optional Cortex multi-horizon heads.
+- `CortexObjective` optimizes next-token loss plus Cortex MTP, temporal-consistency and confidence terms when the Cortex heads are enabled.
+- `LLMTrainer` supports checkpoints, CSV learning curves, deterministic random sampling, explicit device selection, mixed precision policy and DDP initialization from environment.
+- `PrecisionPolicy(require_cuda=True)` raises when CUDA is required but unavailable, preventing silent CPU fallback.
+- `LLMComparisonRunner` trains a baseline next-token Transformer and a Cortex multi-horizon Transformer on the same corpus/cache, then writes `comparison_report.json`, `report.md`, `learning_curve.png`, both final checkpoints and both learning-curve CSV files.
+- `tools/train_llm.py` exposes `smoke` and `compare` commands for local proof runs and larger text-shard corpora.
+- `.github/workflows/ci.yml` runs the LLM smoke command.
+
+Evidence:
+
+- Local environment: `torch==2.12.1+cpu`, `cuda_available=False`, `distributed_available=True`, `gloo_available=True`, `nccl_available=False`.
+- `.\.venv\Scripts\python.exe tools\train_llm.py smoke --out-dir runs\llm-smoke-dev-48 --steps 48 --require-win`
+- Smoke proof: baseline score `0.022321`, Cortex score `0.145833`, Cortex/baseline `6.533x`, next-token-loss regression ratio `1.020`, proof passed.
+- `.\.venv\Scripts\python.exe -m unittest tests.test_llm_pretraining`
+
+Remaining:
+
+- Run a genuine large-corpus experiment with a real external text shard set, not only the deterministic local smoke corpus.
+- Validate CUDA mixed precision and NCCL DDP on hardware that exposes CUDA; this machine currently exposes only CPU Torch plus Gloo distributed.
+- Scale model sizes and training steps, then publish variance across multiple seeds and corpus domains.
+- Connect accepted recursive-improvement proposals to persisted LLM checkpoint patches with rollback archives.
