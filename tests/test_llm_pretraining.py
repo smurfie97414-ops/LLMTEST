@@ -1201,6 +1201,14 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                     + sidecar["cortex_phase_state_summary"]["improvement_archive_rejected"],
                     0,
                 )
+                legacy_state = checkpoint["cortex_phase_state"]
+                legacy_state.pop("last_objective_loss_terms", None)
+                legacy_state.pop("objective_feedback_term_totals", None)
+                for item in legacy_state["objective_feedback_history"]:
+                    item.pop("term_count", None)
+                    item.pop("term_names", None)
+                    item.pop("weighted_terms", None)
+                torch.save(checkpoint, run_dir / "checkpoint_final.pt")
 
                 resumed = LLMTrainer(
                     CortexTransformerLM(model_config),
@@ -1236,6 +1244,12 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 first_influence["objective_feedback_events"],
             )
             self.assertGreater(resumed_influence["objective_feedback_scale"], 1.0)
+            self.assertEqual(resumed_influence["objective_feedback_term_count"], len(FINAL_LOSS_TERMS))
+            self.assertEqual(tuple(resumed_influence["objective_feedback_term_names"]), FINAL_LOSS_TERMS)
+            self.assertAlmostEqual(
+                resumed_influence["last_objective_loss_weighted_total"],
+                resumed_influence["last_objective_loss_total"],
+            )
             self.assertGreaterEqual(
                 resumed_influence["future_contract_decisions"],
                 first_influence["future_contract_decisions"],

@@ -3468,6 +3468,33 @@ class CortexTrainingPhaseController:
             dict(item)
             for item in payload.get("objective_feedback_history", ())
         ]
+        if not self.last_objective_loss_terms:
+            for audit in reversed(self.phase_audits):
+                objective = dict(audit.get("objective") or {})
+                loss = dict(objective.get("loss") or {})
+                terms = dict(loss.get("terms") or {})
+                restored = {
+                    name: dict(terms[name])
+                    for name in FINAL_LOSS_TERMS
+                    if name in terms
+                }
+                if restored:
+                    self.last_objective_loss_terms = restored
+                    break
+        if self.last_objective_loss_terms and not self.objective_feedback_term_totals:
+            self.objective_feedback_term_totals = {
+                name: float(term.get("weighted", 0.0))
+                for name, term in self.last_objective_loss_terms.items()
+            }
+        if self.last_objective_loss_terms:
+            weighted_terms = {
+                name: float(term.get("weighted", 0.0))
+                for name, term in self.last_objective_loss_terms.items()
+            }
+            for item in self.objective_feedback_history:
+                item.setdefault("term_count", len(self.last_objective_loss_terms))
+                item.setdefault("term_names", tuple(self.last_objective_loss_terms))
+                item.setdefault("weighted_terms", dict(weighted_terms))
         self.integration_counts.update({
             str(key): int(value)
             for key, value in dict(payload.get("integration_counts") or {}).items()
