@@ -637,6 +637,62 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             self.assertEqual(checkpoint["code_state"]["git_commit"], "start-commit")
             self.assertEqual(sidecar["code_state"]["git_commit"], "start-commit")
 
+    def test_intermediate_checkpoint_retention_prunes_old_steps(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            corpus = self._corpus(root, repeats=40)
+            tokenizer = LLMTokenizer.train(corpus, vocab_size=128, min_frequency=1)
+            manifest = TokenizedCorpusBuilder(corpus, tokenizer).build(
+                root / "prepared",
+                seq_len=16,
+                max_horizon=4,
+            )
+            train = MemmapCausalDataset(manifest, split="train")
+            val = MemmapCausalDataset(manifest, split="val")
+            run_dir = root / "retained-checkpoints"
+            try:
+                LLMTrainer(
+                    CortexTransformerLM(
+                        TransformerConfig(
+                            vocab_size=manifest.vocab_size,
+                            seq_len=16,
+                            d_model=32,
+                            n_heads=4,
+                            n_layers=1,
+                            dropout=0.0,
+                            horizons=(1, 2, 4),
+                            use_cortex_heads=False,
+                            use_ternary_core=False,
+                        )
+                    ),
+                    train,
+                    val,
+                    TrainingConfig(
+                        steps=3,
+                        batch_size=2,
+                        eval_interval=1,
+                        eval_batches=1,
+                        checkpoint_interval=1,
+                        max_intermediate_checkpoints=2,
+                        seed=17,
+                        num_threads=1,
+                    ),
+                    run_dir=run_dir,
+                    model_kind="baseline_next_token",
+                    corpus_identity=manifest.identity(),
+                ).train(name="baseline")
+            finally:
+                train.close()
+                val.close()
+
+            self.assertFalse((run_dir / "checkpoint_step_1.pt").exists())
+            self.assertFalse((run_dir / "checkpoint_step_1.pt.json").exists())
+            self.assertTrue((run_dir / "checkpoint_step_2.pt").exists())
+            self.assertTrue((run_dir / "checkpoint_step_2.pt.json").exists())
+            self.assertTrue((run_dir / "checkpoint_step_3.pt").exists())
+            self.assertTrue((run_dir / "checkpoint_step_3.pt.json").exists())
+            self.assertTrue((run_dir / "checkpoint_final.pt").exists())
+
     def test_training_config_rejects_strict_and_auto_resume_together(self):
         with self.assertRaisesRegex(ValueError, "mutually exclusive"):
             TrainingConfig(resume=True, resume_if_exists=True)

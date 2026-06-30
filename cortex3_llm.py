@@ -2055,6 +2055,7 @@ class TrainingConfig:
     resume_if_exists: bool = False
     resume_from_checkpoint: str | None = None
     checkpoint_interval: int = 100
+    max_intermediate_checkpoints: int = 0
     resource_monitor_interval: float = 2.0
     cortex_phase_interval: int = 0
     cortex_phase_probe_tasks: int = 1
@@ -2077,6 +2078,8 @@ class TrainingConfig:
             raise ValueError("eval_interval must be positive")
         if self.checkpoint_interval < 1:
             raise ValueError("checkpoint_interval must be positive")
+        if self.max_intermediate_checkpoints < 0:
+            raise ValueError("max_intermediate_checkpoints must be non-negative")
         if self.resource_monitor_interval <= 0:
             raise ValueError("resource_monitor_interval must be positive")
         if self.cortex_phase_interval < 0:
@@ -3692,6 +3695,7 @@ class LLMTrainer:
                         scaler=scaler,
                         phase_controller=phase_controller,
                     )
+                    self._prune_intermediate_checkpoints()
                     if resource_monitor is not None:
                         resource_monitor.write_snapshot(
                             self.run_dir / "resource_usage_live.json",
@@ -3788,6 +3792,19 @@ class LLMTrainer:
         if self.config.resume_if_exists:
             return None
         raise FileNotFoundError(f"resume=True but no checkpoint was found in {self.run_dir}")
+
+    def _prune_intermediate_checkpoints(self) -> None:
+        limit = int(self.config.max_intermediate_checkpoints)
+        if limit <= 0:
+            return
+        candidates: list[tuple[int, Path]] = []
+        for path in self.run_dir.glob("checkpoint_step_*.pt"):
+            raw_step = path.stem.removeprefix("checkpoint_step_")
+            if raw_step.isdigit():
+                candidates.append((int(raw_step), path))
+        for _, checkpoint in sorted(candidates)[:-limit]:
+            checkpoint.unlink(missing_ok=True)
+            checkpoint.with_name(checkpoint.name + ".json").unlink(missing_ok=True)
 
     def load_checkpoint(
         self,
@@ -5672,6 +5689,7 @@ class LLMExperimentRunner:
             "resume": bool(payload.get("resume", False)),
             "resume_if_exists": bool(payload.get("resume_if_exists", False)),
             "checkpoint_interval": int(payload.get("checkpoint_interval", 100)),
+            "max_intermediate_checkpoints": int(payload.get("max_intermediate_checkpoints", 0)),
             "resource_monitor_interval": float(payload.get("resource_monitor_interval", 2.0)),
             "cortex_phase_interval": int(payload.get("cortex_phase_interval", 0)),
             "cortex_phase_probe_tasks": int(payload.get("cortex_phase_probe_tasks", 1)),
