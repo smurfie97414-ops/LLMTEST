@@ -62,6 +62,12 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             )
             self.assertGreater(manifest.token_count, 24)
             self.assertEqual(Path(manifest.token_file).stat().st_size, manifest.token_count * 4)
+            self.assertRegex(manifest.token_file_sha256, r"^[0-9a-f]{64}$")
+            self.assertRegex(manifest.tokenizer_file_sha256, r"^[0-9a-f]{64}$")
+            self.assertEqual(len(manifest.source_file_fingerprints), len(manifest.source_files))
+            identity = manifest.identity()
+            self.assertRegex(identity["identity_sha256"], r"^[0-9a-f]{64}$")
+            self.assertEqual(identity["token_file_sha256"], manifest.token_file_sha256)
             train = MemmapCausalDataset(manifest, split="train")
             try:
                 x, y, future = train.item(0)
@@ -84,6 +90,10 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                     train.batch_at([len(train)], device=torch.device("cpu"))
             finally:
                 train.close()
+            first_source = Path(manifest.source_files[0])
+            first_source.write_text(first_source.read_text(encoding="utf-8") + "\ncorpus mutation", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "source file size changed|source file sha256 changed"):
+                manifest.identity()
 
     def test_tokenized_corpus_builder_streams_tokens_once(self):
         class CountingTokenizer:
@@ -236,6 +246,7 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             )
             train = MemmapCausalDataset(manifest, split="train")
             val = MemmapCausalDataset(manifest, split="val")
+            corpus_identity = manifest.identity()
             try:
                 first_config = TrainingConfig(
                     steps=2,
@@ -255,6 +266,7 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                     first_config,
                     run_dir=run_dir,
                     model_kind="cortex3_multi_horizon",
+                    corpus_identity=corpus_identity,
                 ).train(name="cortex3")
                 self.assertEqual(first.start_step, 0)
                 self.assertEqual(first.optimizer_steps, 2)
@@ -280,6 +292,7 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                     resumed_config,
                     run_dir=run_dir,
                     model_kind="cortex3_multi_horizon",
+                    corpus_identity=corpus_identity,
                 ).train(name="cortex3")
                 self.assertEqual(resumed.start_step, 2)
                 self.assertEqual(resumed.optimizer_steps, 2)
@@ -288,11 +301,102 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 self.assertEqual(Path(resumed.resumed_from).name, "checkpoint_final.pt")
                 checkpoint = torch.load(run_dir / "checkpoint_final.pt", map_location="cpu", weights_only=False)
                 self.assertEqual(checkpoint["step"], 4)
+                self.assertEqual(checkpoint["corpus_identity"], corpus_identity)
                 self.assertIn("rng_state", checkpoint)
                 self.assertGreaterEqual(len(checkpoint["curve"]), len(first.curve))
             finally:
                 train.close()
                 val.close()
+
+    def test_trainer_rejects_resume_when_corpus_identity_changes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source_a = root / "a.txt"
+            source_b = root / "b.txt"
+            source_a.write_text(
+                ("cortex corpus alpha preserves one verified token stream for checkpoint identity.\n" * 80),
+                encoding="utf-8",
+            )
+            source_b.write_text(
+                ("cortex corpus beta changes the token stream and must reject checkpoint resume.\n" * 80),
+                encoding="utf-8",
+            )
+            corpus_a = TextCorpusConfig.from_paths([source_a], min_chars_per_chunk=512)
+            tokenizer = LLMTokenizer.train(corpus_a, vocab_size=192, min_frequency=1)
+            manifest_a = TokenizedCorpusBuilder(corpus_a, tokenizer).build(
+                root / "prepared-a",
+                seq_len=16,
+                max_horizon=2,
+            )
+            model_config = TransformerConfig(
+                vocab_size=manifest_a.vocab_size,
+                seq_len=16,
+                d_model=32,
+                n_heads=4,
+                n_layers=1,
+                dropout=0.0,
+                horizons=(1, 2),
+                use_cortex_heads=True,
+            )
+            train_a = MemmapCausalDataset(manifest_a, split="train")
+            val_a = MemmapCausalDataset(manifest_a, split="val")
+            identity_a = manifest_a.identity()
+            run_dir = root / "resume-run"
+            try:
+                LLMTrainer(
+                    CortexTransformerLM(model_config),
+                    train_a,
+                    val_a,
+                    TrainingConfig(
+                        steps=1,
+                        batch_size=2,
+                        eval_interval=1,
+                        eval_batches=1,
+                        checkpoint_interval=1,
+                        seed=41,
+                        num_threads=1,
+                    ),
+                    run_dir=run_dir,
+                    model_kind="cortex3_multi_horizon",
+                    corpus_identity=identity_a,
+                ).train(name="cortex3")
+            finally:
+                train_a.close()
+                val_a.close()
+
+            corpus_b = TextCorpusConfig.from_paths([source_b], min_chars_per_chunk=512)
+            manifest_b = TokenizedCorpusBuilder(corpus_b, tokenizer).build(
+                root / "prepared-b",
+                seq_len=16,
+                max_horizon=2,
+            )
+            identity_b = manifest_b.identity()
+            self.assertNotEqual(identity_a["identity_sha256"], identity_b["identity_sha256"])
+            train_b = MemmapCausalDataset(manifest_b, split="train")
+            val_b = MemmapCausalDataset(manifest_b, split="val")
+            try:
+                with self.assertRaisesRegex(ValueError, "corpus_identity"):
+                    LLMTrainer(
+                        CortexTransformerLM(model_config),
+                        train_b,
+                        val_b,
+                        TrainingConfig(
+                            steps=2,
+                            batch_size=2,
+                            eval_interval=1,
+                            eval_batches=1,
+                            checkpoint_interval=1,
+                            seed=41,
+                            resume=True,
+                            num_threads=1,
+                        ),
+                        run_dir=run_dir,
+                        model_kind="cortex3_multi_horizon",
+                        corpus_identity=identity_b,
+                    ).train(name="cortex3")
+            finally:
+                train_b.close()
+                val_b.close()
 
     def test_hf_dataset_export_builds_real_text_shards_and_token_memmap(self):
         with tempfile.TemporaryDirectory() as tmp:

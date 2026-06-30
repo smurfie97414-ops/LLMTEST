@@ -390,6 +390,7 @@ Current executable coverage:
 - `tools/train_llm.py benchmark-matrix` exposes the multi-domain x multi-seed proof gate and fails `--require-win` unless every seed-domain sample wins with a nonzero baseline and bounded next-token regression.
 - `tools/launch_llm_ddp.py` launches true local multi-process DDP workers, pins the Gloo interface and writes per-rank logs.
 - `.github/workflows/ci.yml` runs the LLM smoke command.
+- Tokenized corpus manifests now carry SHA-256 hashes for the token memmap, tokenizer and source shards; `run_plan.json`, training reports and checkpoints include a corpus identity digest, and `LLMTrainer` refuses resume from missing or mismatched `corpus_identity` checkpoints.
 
 Evidence:
 
@@ -428,11 +429,11 @@ Evidence:
 - External HF corpus matrix proof through `codex-test`: `4/4` corpus-seed samples passed, win-rate `1.0`, mean Cortex/baseline ratio `15.538x`, median ratio `16.127x`, minimum ratio `6.805x`, mean baseline score `0.010824`, max next-token-loss regression ratio `1.099396`.
 - Manifest experiment validation: `tools\train_llm.py run-experiment runs\experiment-manifest-validation.json` ran doctor, prepared one local JSON Hugging Face corpus plus one paths corpus, executed corpus-matrix and wrote final experiment artifacts. A Windows PowerShell UTF-8 BOM manifest bug was reproduced and fixed by reading manifests with `utf-8-sig`.
 - Manifest experiment proof through `codex-test`: `4/4` corpus-seed samples passed, win-rate `1.0`, minimum ratio `6.813x`, max next-token-loss regression ratio `1.001864`; the run wrote `corpus_matrix_learning_curves.csv/png` and per-corpus `comparison_matrix_learning_curves.csv/png`.
-- Checkpoint resume unit coverage: a Cortex trainer runs two optimizer steps with `gradient_accumulation_steps=2`, writes step/final checkpoints, resumes from `checkpoint_final.pt` to step 4 and preserves curve plus RNG state in the checkpoint payload.
+- Checkpoint resume unit coverage: a Cortex trainer runs two optimizer steps with `gradient_accumulation_steps=2`, writes step/final checkpoints carrying `corpus_identity`, resumes from `checkpoint_final.pt` to step 4 and preserves curve plus RNG state in the checkpoint payload. A separate test rebuilds a different tokenized corpus and verifies that resume is rejected on identity mismatch.
 - CLI resume validation: `tools\train_llm.py smoke --out-dir runs\llm-resume-cli-validation --steps 2 ...` then `--steps 4 --resume ...` resumed both `baseline_ntp` and `cortex3` from `checkpoint_final.pt` with `start_step=2`, `optimizer_steps=2`, `effective_batch_size=16` and `final_step=4`.
 - DDP accumulation validation: `tools\launch_llm_ddp.py --nproc 2 ... --gradient-accumulation-steps 2` completed with `distributed=True`, `world_size=2`, proof passed and `effective_batch_size=32` for both baseline and Cortex.
 - DDP CUDA preflight validation: `tools\launch_llm_ddp.py --nproc 2 ... --device cuda --require-cuda` now fails before spawning workers because one visible CUDA device cannot serve two local CUDA ranks; CPU/Gloo DDP still passed after the CUDA wheel install.
-- `.\.venv\Scripts\python.exe -m unittest discover -s tests`: `127` tests passed.
+- `.\.venv\Scripts\python.exe -m unittest discover -s tests`: `128` tests passed.
 
 Remaining:
 

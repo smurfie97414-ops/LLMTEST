@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import math
 import os
@@ -57,6 +58,33 @@ def _json_default(value: Any) -> Any:
 def _write_json(path: Path, payload: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, sort_keys=True, default=_json_default), encoding="utf-8")
+
+
+def _sha256_file(path: str | Path, *, chunk_size: int = 1024 * 1024) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(chunk_size), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _sha256_json(payload: Mapping[str, Any]) -> str:
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=_json_default).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _fingerprint_file(path: str | Path) -> dict[str, Any]:
+    item = Path(path)
+    stat = item.stat()
+    return {
+        "path": str(item),
+        "size_bytes": int(stat.st_size),
+        "sha256": _sha256_file(item),
+    }
+
+
+def _fingerprint_files(paths: Sequence[str | Path]) -> tuple[dict[str, Any], ...]:
+    return tuple(_fingerprint_file(path) for path in paths)
 
 
 def _read_validation_learning_curve_rows(seed_runs: Sequence[Mapping[str, Any]], *, corpus: str = "") -> list[dict[str, Any]]:
@@ -461,14 +489,72 @@ class TokenizedCorpusManifest:
     seq_len: int
     max_horizon: int
     train_fraction: float
+    token_file_sha256: str = ""
+    tokenizer_file_sha256: str = ""
+    source_file_fingerprints: tuple[Mapping[str, Any], ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+    def validate_fingerprints(self) -> None:
+        missing_fields = [
+            name
+            for name, value in (
+                ("token_file_sha256", self.token_file_sha256),
+                ("tokenizer_file_sha256", self.tokenizer_file_sha256),
+                ("source_file_fingerprints", self.source_file_fingerprints),
+            )
+            if not value
+        ]
+        if missing_fields:
+            joined = ", ".join(missing_fields)
+            raise ValueError(f"tokenized corpus manifest is missing cryptographic identity fields: {joined}; rebuild the corpus")
+        token_sha = _sha256_file(self.token_file)
+        if token_sha != self.token_file_sha256:
+            raise ValueError("tokenized corpus token_file sha256 does not match manifest")
+        tokenizer_sha = _sha256_file(self.tokenizer_file)
+        if tokenizer_sha != self.tokenizer_file_sha256:
+            raise ValueError("tokenized corpus tokenizer_file sha256 does not match manifest")
+        if len(self.source_file_fingerprints) != len(self.source_files):
+            raise ValueError("tokenized corpus source fingerprint count does not match source_files")
+        for fingerprint in self.source_file_fingerprints:
+            source_path = Path(str(fingerprint["path"]))
+            if not source_path.exists():
+                raise FileNotFoundError(f"tokenized corpus source file is missing: {source_path}")
+            expected_size = int(fingerprint["size_bytes"])
+            actual_size = int(source_path.stat().st_size)
+            if actual_size != expected_size:
+                raise ValueError(f"tokenized corpus source file size changed: {source_path}")
+            expected_sha = str(fingerprint["sha256"])
+            actual_sha = _sha256_file(source_path)
+            if actual_sha != expected_sha:
+                raise ValueError(f"tokenized corpus source file sha256 changed: {source_path}")
+
+    def identity(self, *, verify: bool = True) -> dict[str, Any]:
+        if verify:
+            self.validate_fingerprints()
+        payload: dict[str, Any] = {
+            "schema_version": 1,
+            "token_count": int(self.token_count),
+            "dtype": str(self.dtype),
+            "vocab_size": int(self.vocab_size),
+            "seq_len": int(self.seq_len),
+            "max_horizon": int(self.max_horizon),
+            "train_fraction": float(self.train_fraction),
+            "token_file_sha256": str(self.token_file_sha256),
+            "tokenizer_file_sha256": str(self.tokenizer_file_sha256),
+            "source_file_fingerprints": [dict(item) for item in self.source_file_fingerprints],
+        }
+        payload["identity_sha256"] = _sha256_json(payload)
+        return payload
 
     @staticmethod
     def load(path: str | Path) -> "TokenizedCorpusManifest":
         payload = json.loads(Path(path).read_text(encoding="utf-8"))
         payload["source_files"] = tuple(payload["source_files"])
+        payload.setdefault("token_file_sha256", "")
+        payload.setdefault("tokenizer_file_sha256", "")
+        payload["source_file_fingerprints"] = tuple(dict(item) for item in payload.get("source_file_fingerprints", ()))
         return TokenizedCorpusManifest(**payload)
 
     def save(self, path: str | Path) -> Path:
@@ -530,6 +616,9 @@ class TokenizedCorpusBuilder:
             seq_len=seq_len,
             max_horizon=max_horizon,
             train_fraction=train_fraction,
+            token_file_sha256=_sha256_file(token_path),
+            tokenizer_file_sha256=_sha256_file(tokenizer_path),
+            source_file_fingerprints=_fingerprint_files(self.corpus.files),
         )
         manifest.save(manifest_path)
         return manifest
@@ -1099,6 +1188,7 @@ class LLMTrainer:
         *,
         run_dir: str | Path,
         model_kind: str,
+        corpus_identity: Mapping[str, Any] | None = None,
     ):
         self.model = model
         self.train_data = train_data
@@ -1109,6 +1199,9 @@ class LLMTrainer:
         self.objective = CortexObjective()
         self.device = self._resolve_device()
         self.precision = PrecisionPolicy(config.precision, require_cuda=config.require_cuda)
+        self.corpus_identity = dict(corpus_identity or train_data.manifest.identity())
+        if self.val_data.manifest.identity(verify=False) != self.train_data.manifest.identity(verify=False):
+            raise ValueError("train and validation datasets must come from the same tokenized corpus manifest")
         if config.num_threads is not None:
             torch.set_num_threads(config.num_threads)
         self.generator = torch.Generator(device="cpu").manual_seed(config.seed)
@@ -1276,6 +1369,7 @@ class LLMTrainer:
             config={
                 "training": asdict(self.config),
                 "model": asdict(self.model.config),
+                "corpus_identity": self.corpus_identity,
             },
             hardware=hardware_report(),
         )
@@ -1327,6 +1421,16 @@ class LLMTrainer:
         checkpoint_model_config = payload.get("model_config")
         if checkpoint_model_config != asdict(self.model.config):
             raise ValueError("checkpoint model_config does not match the current model")
+        checkpoint_corpus_identity = payload.get("corpus_identity")
+        if checkpoint_corpus_identity is None:
+            raise ValueError("checkpoint is missing corpus_identity; rebuild or restart with a checkpoint produced by this harness version")
+        if checkpoint_corpus_identity != self.corpus_identity:
+            checkpoint_digest = checkpoint_corpus_identity.get("identity_sha256") if isinstance(checkpoint_corpus_identity, Mapping) else None
+            current_digest = self.corpus_identity.get("identity_sha256")
+            raise ValueError(
+                "checkpoint corpus_identity does not match the current corpus "
+                f"(checkpoint={checkpoint_digest!r}, current={current_digest!r})"
+            )
         self.model.load_state_dict(payload["model_state_dict"])
         optimizer.load_state_dict(payload["optimizer_state_dict"])
         if scaler is not None and payload.get("scaler_state_dict") is not None:
@@ -1389,6 +1493,7 @@ class LLMTrainer:
                 "model_config": asdict(self.model.config),
                 "training_config": asdict(self.config),
                 "model_kind": self.model_kind,
+                "corpus_identity": self.corpus_identity,
                 "curve": [point.to_dict() for point in curve],
                 "rng_state": self._rng_state(),
             },
@@ -1576,7 +1681,9 @@ def build_training_plan(
     *,
     world_size: int = 1,
     distributed: bool = False,
+    corpus_identity: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
+    identity = dict(corpus_identity or manifest.identity())
     baseline_config = TransformerConfig(
         vocab_size=manifest.vocab_size,
         seq_len=config.seq_len,
@@ -1626,6 +1733,10 @@ def build_training_plan(
             "max_horizon": int(manifest.max_horizon),
             "vocab_size": int(manifest.vocab_size),
             "source_file_count": len(manifest.source_files),
+            "source_fingerprint_count": len(manifest.source_file_fingerprints),
+            "identity_sha256": str(identity["identity_sha256"]),
+            "token_file_sha256": str(identity["token_file_sha256"]),
+            "tokenizer_file_sha256": str(identity["tokenizer_file_sha256"]),
             **split,
         },
         "model": {
@@ -1798,7 +1909,14 @@ class LLMComparisonRunner:
                     manifest = self.prepare_corpus()
             _barrier_if_needed(runtime)
             manifest = TokenizedCorpusManifest.load(self.run_dir / "corpus" / "manifest.json")
-        plan = build_training_plan(manifest, self.config, world_size=runtime.world_size, distributed=runtime.enabled)
+        corpus_identity = manifest.identity()
+        plan = build_training_plan(
+            manifest,
+            self.config,
+            world_size=runtime.world_size,
+            distributed=runtime.enabled,
+            corpus_identity=corpus_identity,
+        )
         if runtime.is_main:
             _write_json(self.run_dir / "run_plan.json", plan)
         train_data = MemmapCausalDataset(manifest, split="train")
@@ -1821,6 +1939,7 @@ class LLMComparisonRunner:
                 self.config.training,
                 run_dir=self.run_dir / "baseline_ntp",
                 model_kind="baseline_next_token",
+                corpus_identity=corpus_identity,
             ).train(name="baseline_ntp")
             cortex_config = TransformerConfig(**{**asdict(model_config), "use_cortex_heads": True})
             cortex = LLMTrainer(
@@ -1830,6 +1949,7 @@ class LLMComparisonRunner:
                 self.config.training,
                 run_dir=self.run_dir / "cortex3",
                 model_kind="cortex3_multi_horizon",
+                corpus_identity=corpus_identity,
             ).train(name="cortex3")
         finally:
             train_data.close()

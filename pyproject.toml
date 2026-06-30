@@ -12,6 +12,9 @@ authors = [{name = "LLMTEST contributors"}]
 license = {text = "MIT"}
 dependencies = ["torch>=2.0", "numpy>=1.26", "tokenizers>=0.23", "matplotlib>=3.8", "datasets>=5.0"]
 
+[project.optional-dependencies]
+test = ["pytest>=9.0"]
+
 [project.scripts]
 cortex3 = "cortex3:main"
 cortex3-llm = "cortex3_llm:main"

@@ -100,7 +100,7 @@ Cette base contient maintenant :
 - `cortex3_experiments.py` : expériences A-E du plan, de la détection de défauts injectés à la sandbox d'auto-amélioration ;
 - `cortex3_microtrain.py` : micro-modèle PyTorch entraînable avec cœur `BitLinear`, agent DSV, exemples issus du verifier/sleep phase et checkpoints `.pt` ;
 - `cortex3_autoregressive.py` : décodeur micro-autoregressif PyTorch avec vocabulaire caractère, génération greedy ou blockwise sous Future Contract, pertes comportement/MTP multi-horizons/contrat futur, agent DSV et checkpoints `.pt` ;
-- `cortex3_llm.py` : harness de pré-entraînement LLM réel avec export Hugging Face `datasets`, tokenizer BPE `tokenizers`, corpus texte streamé vers memmap, dataset causal, Transformer complet, baseline next-token, objectif Cortex multi-horizon, AMP/DDP, checkpoints, courbes et rapport comparatif ;
+- `cortex3_llm.py` : harness de pré-entraînement LLM réel avec export Hugging Face `datasets`, tokenizer BPE `tokenizers`, corpus texte streamé vers memmap avec identité SHA-256, dataset causal, Transformer complet, baseline next-token, objectif Cortex multi-horizon, AMP/DDP, checkpoints strictement liés au corpus, courbes et rapport comparatif ;
 - `cortex3_phases.py` : registre exécutable des 10 phases Cortex-3 ;
 - `cortex3_ledgers.py` : Bit Ledger, Skill Ledger, Causal Ledger et Uncertainty Ledger ;
 - `cortex3_analysis.py` : analyse des causes probables d'une régression ;
@@ -181,7 +181,7 @@ Le pont LLM complet se lance avec :
 python tools/train_llm.py smoke --require-win
 ```
 
-Ce smoke construit un corpus texte déterministe, entraîne un tokenizer BPE, écrit les tokens en streaming dans un fichier `uint32` memmap, échantillonne les batches causaux de façon vectorisée, entraîne deux Transformers causaux sur les mêmes données, sauvegarde les checkpoints et produit :
+Ce smoke construit un corpus texte déterministe, entraîne un tokenizer BPE, écrit les tokens en streaming dans un fichier `uint32` memmap, hashe le memmap, le tokenizer et les shards source, échantillonne les batches causaux de façon vectorisée, entraîne deux Transformers causaux sur les mêmes données, sauvegarde les checkpoints liés à l'identité du corpus et produit :
 
 - `comparison_report.json`
 - `run_plan.json`
@@ -267,7 +267,7 @@ python tools/train_llm.py prepare-hf --dataset json --data-file path/to/corpus.j
 
 Sans limite explicite, `prepare-hf` plafonne l'export à 100 000 documents pour éviter un lancement massif accidentel. Pour un vrai job complet, passe une limite de caractères/documents adaptée ou `--allow-unbounded` de façon explicite.
 
-`--resume` reprend strictement depuis `checkpoint_final.pt` ou le plus récent `checkpoint_step_*.pt` du dossier baseline/Cortex. Si le corpus manifest ou le checkpoint attendu manque, la commande échoue au lieu de repartir de zéro silencieusement.
+`--resume` reprend strictement depuis `checkpoint_final.pt` ou le plus récent `checkpoint_step_*.pt` du dossier baseline/Cortex. Si le corpus manifest, l'identité SHA-256 du corpus, le checkpoint attendu ou le champ `corpus_identity` manque, ou si le checkpoint ne correspond pas au corpus courant, la commande échoue au lieu de repartir de zéro silencieusement.
 
 Pour refuser tout fallback CPU quand un run GPU est obligatoire :
 
@@ -308,6 +308,7 @@ Le lanceur exporte `WORLD_SIZE/RANK/LOCAL_RANK`, force le backend Gloo sur l'int
 
 ```bash
 python -m unittest discover -s tests
+python -m pytest tests/test_llm_pretraining.py -q
 ```
 
 ## Roadmap immédiate
