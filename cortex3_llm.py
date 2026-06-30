@@ -1800,6 +1800,18 @@ class LLMExperimentReport:
         return asdict(self)
 
 
+@dataclass(frozen=True)
+class LLMExperimentAuditReport:
+    run_dir: str
+    passed: bool
+    failed_checks: tuple[str, ...]
+    checked_artifacts: tuple[str, ...]
+    proof: Mapping[str, Any]
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
 def _training_precision_bytes(precision: str) -> int:
     return 2 if precision in {"bf16", "fp16"} else 4
 
@@ -3127,6 +3139,180 @@ class LLMExperimentRunner:
         Path(report.run_dir, "experiment_report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def _load_json_artifact(path: Path, failures: list[str], checked: list[str]) -> dict[str, Any] | None:
+    checked.append(str(path))
+    if not path.exists():
+        failures.append(f"missing artifact: {path}")
+        return None
+    if path.stat().st_size <= 0:
+        failures.append(f"empty artifact: {path}")
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        failures.append(f"invalid JSON artifact {path}: {exc}")
+        return None
+    if not isinstance(payload, dict):
+        failures.append(f"JSON artifact root is not an object: {path}")
+        return None
+    return payload
+
+
+def _require_nonempty_artifact(path: Path, failures: list[str], checked: list[str]) -> None:
+    checked.append(str(path))
+    if not path.exists():
+        failures.append(f"missing artifact: {path}")
+        return
+    if path.stat().st_size <= 0:
+        failures.append(f"empty artifact: {path}")
+
+
+def _resolve_recorded_path(raw_path: Any, *, run_dir: Path) -> Path:
+    if raw_path is None or not str(raw_path).strip():
+        return run_dir / "__missing_recorded_path__"
+    path = Path(str(raw_path))
+    if path.is_absolute() or path.exists():
+        return path
+    candidate = run_dir / path
+    if candidate.exists():
+        return candidate
+    return path
+
+
+def _audit_comparison_run_artifacts(
+    seed_dir: Path,
+    *,
+    require_passed: bool,
+    failures: list[str],
+    checked: list[str],
+) -> None:
+    comparison = _load_json_artifact(seed_dir / "comparison_report.json", failures, checked)
+    _require_nonempty_artifact(seed_dir / "report.md", failures, checked)
+    _require_nonempty_artifact(seed_dir / "run_plan.json", failures, checked)
+    _require_nonempty_artifact(seed_dir / "learning_curve_audit.json", failures, checked)
+    _require_nonempty_artifact(seed_dir / "learning_curve.png", failures, checked)
+    if comparison is not None:
+        proof = comparison.get("proof", {})
+        if require_passed and not bool(proof.get("passed", False)):
+            failures.append(f"comparison proof did not pass: {seed_dir}")
+        curve_audit = comparison.get("curve_audit", {})
+        if not bool(curve_audit.get("passed", False)):
+            failures.append(f"comparison curve audit did not pass: {seed_dir}")
+        for model_name in ("baseline", "cortex"):
+            report_payload = comparison.get(model_name, {})
+            checkpoint_path = report_payload.get("checkpoint_path")
+            if checkpoint_path:
+                _require_nonempty_artifact(
+                    _resolve_recorded_path(checkpoint_path, run_dir=seed_dir),
+                    failures,
+                    checked,
+                )
+            else:
+                failures.append(f"comparison report is missing {model_name}.checkpoint_path: {seed_dir}")
+    for model_dir in ("baseline_ntp", "cortex3"):
+        model_path = seed_dir / model_dir
+        _require_nonempty_artifact(model_path / "training_report.json", failures, checked)
+        _require_nonempty_artifact(model_path / "learning_curve.csv", failures, checked)
+        _require_nonempty_artifact(model_path / "checkpoint_final.pt", failures, checked)
+
+
+def audit_llm_experiment_artifacts(
+    run_dir: str | Path,
+    *,
+    require_passed: bool = True,
+) -> LLMExperimentAuditReport:
+    root = Path(run_dir)
+    failures: list[str] = []
+    checked: list[str] = []
+    if not root.exists():
+        failures.append(f"missing run_dir: {root}")
+        return LLMExperimentAuditReport(
+            run_dir=str(root),
+            passed=False,
+            failed_checks=tuple(failures),
+            checked_artifacts=tuple(checked),
+            proof={},
+        )
+
+    _require_nonempty_artifact(root / "experiment_manifest.normalized.json", failures, checked)
+    _require_nonempty_artifact(root / "experiment_report.md", failures, checked)
+    doctor = _load_json_artifact(root / "doctor_report.json", failures, checked)
+    experiment = _load_json_artifact(root / "experiment_report.json", failures, checked)
+    if doctor is not None and not bool(doctor.get("passed", False)):
+        failures.append("doctor_report.json did not pass")
+    proof: Mapping[str, Any] = {}
+    if experiment is not None:
+        proof = experiment.get("proof", {}) if isinstance(experiment.get("proof", {}), Mapping) else {}
+        if require_passed and not bool(proof.get("passed", False)):
+            failures.append("experiment proof did not pass")
+        for corpus_payload in experiment.get("corpora", ()):
+            if not isinstance(corpus_payload, Mapping):
+                failures.append("experiment corpus payload is not an object")
+                continue
+            for file_path in corpus_payload.get("files", ()):
+                _require_nonempty_artifact(_resolve_recorded_path(file_path, run_dir=root), failures, checked)
+            if corpus_payload.get("kind") == "hf":
+                hf_report = corpus_payload.get("hf_export", {})
+                output_dir = hf_report.get("output_dir") if isinstance(hf_report, Mapping) else None
+                if output_dir:
+                    report_path = _resolve_recorded_path(Path(str(output_dir)) / "hf_export_report.json", run_dir=root)
+                    _require_nonempty_artifact(report_path, failures, checked)
+                    try:
+                        HFDatasetExportReport.load(report_path).validate_artifacts()
+                    except Exception as exc:
+                        failures.append(f"HF export artifact validation failed for {report_path}: {exc}")
+
+    matrix_dir = root / "corpus_matrix"
+    matrix = _load_json_artifact(matrix_dir / "corpus_matrix_report.json", failures, checked)
+    _require_nonempty_artifact(matrix_dir / "corpus_matrix_report.md", failures, checked)
+    _require_nonempty_artifact(matrix_dir / "corpus_matrix_ratios.png", failures, checked)
+    _require_nonempty_artifact(matrix_dir / "corpus_matrix_learning_curves.csv", failures, checked)
+    _require_nonempty_artifact(matrix_dir / "corpus_matrix_learning_curves.png", failures, checked)
+    if matrix is not None:
+        matrix_proof = matrix.get("proof", {})
+        if require_passed and not bool(matrix_proof.get("passed", False)):
+            failures.append("corpus_matrix proof did not pass")
+        for corpus_report in matrix.get("corpora", ()):
+            if not isinstance(corpus_report, Mapping):
+                failures.append("corpus_matrix corpus payload is not an object")
+                continue
+            corpus_dir = _resolve_recorded_path(corpus_report.get("run_dir", ""), run_dir=matrix_dir)
+            _require_nonempty_artifact(corpus_dir / "comparison_matrix_report.json", failures, checked)
+            _require_nonempty_artifact(corpus_dir / "comparison_matrix_report.md", failures, checked)
+            _require_nonempty_artifact(corpus_dir / "comparison_matrix_ratios.png", failures, checked)
+            _require_nonempty_artifact(corpus_dir / "comparison_matrix_learning_curves.csv", failures, checked)
+            _require_nonempty_artifact(corpus_dir / "comparison_matrix_learning_curves.png", failures, checked)
+            manifest_path = corpus_dir / "corpus" / "manifest.json"
+            _require_nonempty_artifact(manifest_path, failures, checked)
+            if manifest_path.exists() and manifest_path.stat().st_size > 0:
+                try:
+                    TokenizedCorpusManifest.load(manifest_path).identity()
+                except Exception as exc:
+                    failures.append(f"tokenized corpus manifest validation failed for {manifest_path}: {exc}")
+            corpus_proof = corpus_report.get("proof", {})
+            if require_passed and not bool(corpus_proof.get("passed", False)):
+                failures.append(f"comparison matrix proof did not pass: {corpus_dir}")
+            for seed_report in corpus_report.get("seeds", ()):
+                if not isinstance(seed_report, Mapping):
+                    failures.append(f"seed payload is not an object under {corpus_dir}")
+                    continue
+                seed_dir = _resolve_recorded_path(seed_report.get("run_dir", ""), run_dir=corpus_dir)
+                _audit_comparison_run_artifacts(
+                    seed_dir,
+                    require_passed=require_passed,
+                    failures=failures,
+                    checked=checked,
+                )
+
+    return LLMExperimentAuditReport(
+        run_dir=str(root),
+        passed=not failures,
+        failed_checks=tuple(failures),
+        checked_artifacts=tuple(dict.fromkeys(checked)),
+        proof=dict(proof),
+    )
+
+
 class LLMBenchmarkSuite:
     def __init__(
         self,
@@ -3663,6 +3849,10 @@ def main(argv: Sequence[str] | None = None) -> None:
     experiment.add_argument("manifest", help="JSON experiment manifest")
     experiment.add_argument("--out-dir", default=None, help="override manifest out_dir")
 
+    audit_experiment = sub.add_parser("audit-experiment", help="audit completed LLM experiment artifacts and proof gates")
+    audit_experiment.add_argument("run_dir", help="experiment run directory")
+    audit_experiment.add_argument("--allow-failed-proof", action="store_true", help="report missing/corrupt artifacts without failing solely on proof=false")
+
     smoke = sub.add_parser("smoke", help="run a deterministic small corpus comparison")
     smoke.add_argument("--out-dir", default="runs/llm-smoke")
     smoke.add_argument("--steps", type=int, default=48)
@@ -3842,6 +4032,17 @@ def main(argv: Sequence[str] | None = None) -> None:
         report = runner.run()
         if _rank_zero():
             print(json.dumps(report.proof, indent=2, sort_keys=True, default=_json_default))
+        return
+
+    if args.command == "audit-experiment":
+        report = audit_llm_experiment_artifacts(
+            args.run_dir,
+            require_passed=not args.allow_failed_proof,
+        )
+        print(json.dumps(report.to_dict(), indent=2, sort_keys=True, default=_json_default))
+        if not report.passed:
+            failed = "; ".join(report.failed_checks[:10])
+            raise RuntimeError(f"Cortex LLM experiment audit failed: {failed}")
         return
 
     if args.command == "smoke":

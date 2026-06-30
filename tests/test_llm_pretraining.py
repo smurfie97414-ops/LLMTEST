@@ -33,6 +33,7 @@ from cortex3_llm import (
     CortexTransformerLM,
     TrainingPoint,
     TrainingRunReport,
+    audit_llm_experiment_artifacts,
     audit_learning_curves,
     build_training_plan,
     build_benchmark_corpus,
@@ -1042,6 +1043,18 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             self.assertTrue((root / "experiment" / "corpus_matrix" / "corpus_matrix_report.json").exists())
             self.assertTrue((root / "experiment" / "corpus_matrix" / "corpus_matrix_learning_curves.csv").exists())
             self.assertTrue((root / "experiment" / "corpus_matrix" / "corpus_matrix_learning_curves.png").exists())
+            audit = audit_llm_experiment_artifacts(root / "experiment")
+            self.assertTrue(audit.passed, audit.failed_checks)
+            self.assertFalse(audit.failed_checks)
+            self.assertGreater(len(audit.checked_artifacts), 20)
+            with redirect_stdout(io.StringIO()):
+                llm_main(["audit-experiment", str(root / "experiment")])
+
+            missing_checkpoint = root / "experiment" / "corpus_matrix" / "hfjson" / "seed_17" / "cortex3" / "checkpoint_final.pt"
+            missing_checkpoint.unlink()
+            failed_audit = audit_llm_experiment_artifacts(root / "experiment")
+            self.assertFalse(failed_audit.passed)
+            self.assertTrue(any("checkpoint_final.pt" in item for item in failed_audit.failed_checks))
 
     def test_ddp_launcher_detects_cuda_requests_in_args_and_manifest(self):
         with tempfile.TemporaryDirectory() as tmp:

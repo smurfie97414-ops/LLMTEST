@@ -220,9 +220,10 @@ Pour exécuter le pipeline complet depuis un manifeste reproductible :
 
 ```bash
 python tools/train_llm.py run-experiment experiments/c4_fineweb_gpu.json
+python tools/train_llm.py audit-experiment runs/cortex3-large-corpus
 ```
 
-Le manifeste décrit `doctor`, `training`, `model`, `seeds`, `require_win` et une liste de corpus `hf` ou `paths`. `run-experiment` écrit `experiment_manifest.normalized.json`, `doctor_report.json`, prépare les corpus HF sous `prepared/<corpus>`, lance `corpus-matrix`, puis produit `experiment_report.json`, `experiment_report.md` et les courbes agrégées sous `corpus_matrix/`.
+Le manifeste décrit `doctor`, `training`, `model`, `seeds`, `require_win` et une liste de corpus `hf` ou `paths`. `run-experiment` écrit `experiment_manifest.normalized.json`, `doctor_report.json`, prépare les corpus HF sous `prepared/<corpus>`, lance `corpus-matrix`, puis produit `experiment_report.json`, `experiment_report.md` et les courbes agrégées sous `corpus_matrix/`. Après un long run, `audit-experiment` relit les artefacts persistés, vérifie les preuves `passed`, les manifests tokenisés, les shards HF, les courbes CSV/PNG et les checkpoints baseline/Cortex non vides.
 
 Deux manifestes versionnés sont fournis :
 
