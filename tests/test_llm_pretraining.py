@@ -1,3 +1,4 @@
+import json
 import os
 import tempfile
 import unittest
@@ -8,6 +9,8 @@ import torch
 from cortex3_llm import (
     ComparisonConfig,
     DistributedRuntime,
+    HFDatasetExportConfig,
+    HFDatasetTextExporter,
     LLMBenchmarkSuite,
     LLMComparisonRunner,
     LLMTokenizer,
@@ -51,6 +54,56 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 self.assertEqual(int(y[0]), int(future[0, 0]))
             finally:
                 train.close()
+
+    def test_hf_dataset_export_builds_real_text_shards_and_token_memmap(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            jsonl = root / "dataset.jsonl"
+            with jsonl.open("w", encoding="utf-8") as handle:
+                for index in range(36):
+                    handle.write(
+                        json.dumps(
+                            {
+                                "text": (
+                                    f"document {index:03d} carries a stable corpus token stream. "
+                                    f"cortex validates anchors and next-token baselines in shard {index % 4}."
+                                )
+                            }
+                        )
+                        + "\n"
+                    )
+            export_config = HFDatasetExportConfig(
+                dataset="json",
+                split="train",
+                text_field="text",
+                data_files=(str(jsonl),),
+                streaming=True,
+                max_documents=30,
+                shard_max_chars=768,
+                min_text_chars=20,
+            )
+            export_report = HFDatasetTextExporter(export_config).export(root / "hf")
+            self.assertEqual(export_report.document_count, 30)
+            self.assertEqual(export_report.truncated_reason, "max_documents")
+            self.assertGreaterEqual(export_report.shard_count, 2)
+            for shard in export_report.shard_files:
+                self.assertTrue(Path(shard).exists(), shard)
+            self.assertTrue((root / "hf" / "hf_export_report.json").exists())
+
+            corpus = TextCorpusConfig.from_paths(export_report.shard_files, min_chars_per_chunk=128)
+            tokenizer = LLMTokenizer.train(corpus, vocab_size=192, min_frequency=1)
+            manifest = TokenizedCorpusBuilder(corpus, tokenizer).build(
+                root / "hf" / "tokenized",
+                seq_len=24,
+                max_horizon=4,
+            )
+            self.assertGreater(manifest.token_count, 24)
+            self.assertEqual(manifest.source_files, export_report.shard_files)
+            with MemmapCausalDataset(manifest, split="train") as train:
+                x, y, future = train.item(0)
+                self.assertEqual(tuple(x.shape), (24,))
+                self.assertEqual(tuple(y.shape), (24,))
+                self.assertEqual(tuple(future.shape), (24, 4))
 
     def test_cortex_comparison_produces_checkpoints_curves_and_cost_win(self):
         with tempfile.TemporaryDirectory() as tmp:

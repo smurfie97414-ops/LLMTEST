@@ -107,6 +107,183 @@ class TextShardReader:
                 yield "".join(buffer)
 
 
+@dataclass(frozen=True)
+class HFDatasetExportConfig:
+    dataset: str
+    split: str = "train"
+    text_field: str = "text"
+    config_name: str | None = None
+    data_files: tuple[str, ...] = ()
+    streaming: bool = True
+    trust_remote_code: bool = False
+    cache_dir: str | None = None
+    max_documents: int | None = 100_000
+    max_characters: int | None = None
+    allow_unbounded: bool = False
+    min_text_chars: int = 1
+    shard_max_chars: int = 64 * 1024 * 1024
+    encoding: str = "utf-8"
+
+    def __post_init__(self) -> None:
+        if not self.dataset:
+            raise ValueError("dataset is required")
+        if not self.split:
+            raise ValueError("split is required")
+        if not self.text_field:
+            raise ValueError("text_field is required")
+        if self.max_documents is not None and self.max_documents < 1:
+            raise ValueError("max_documents must be positive when provided")
+        if self.max_characters is not None and self.max_characters < 1:
+            raise ValueError("max_characters must be positive when provided")
+        if self.max_documents is None and self.max_characters is None and not self.allow_unbounded:
+            raise ValueError("unbounded HF export requires allow_unbounded=True")
+        if self.min_text_chars < 0:
+            raise ValueError("min_text_chars must be >= 0")
+        if self.shard_max_chars < 256:
+            raise ValueError("shard_max_chars must be >= 256")
+
+
+@dataclass(frozen=True)
+class HFDatasetExportReport:
+    dataset: str
+    split: str
+    text_field: str
+    output_dir: str
+    shard_files: tuple[str, ...]
+    document_count: int
+    skipped_documents: int
+    character_count: int
+    shard_count: int
+    streaming: bool
+    config_name: str | None = None
+    data_files: tuple[str, ...] = ()
+    truncated_reason: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+class HFDatasetTextExporter:
+    def __init__(self, config: HFDatasetExportConfig):
+        self.config = config
+
+    def export(self, output_dir: str | Path) -> HFDatasetExportReport:
+        output = Path(output_dir)
+        shard_dir = output / "text_shards"
+        output.mkdir(parents=True, exist_ok=True)
+        shard_dir.mkdir(parents=True, exist_ok=True)
+        for stale in shard_dir.glob("shard_*.txt"):
+            stale.unlink()
+
+        dataset = self._load_dataset()
+        shard_files: list[str] = []
+        shard_index = 0
+        current_chars = 0
+        document_count = 0
+        skipped_documents = 0
+        character_count = 0
+        truncated_reason: str | None = None
+        handle = None
+
+        def open_next_shard() -> Any:
+            nonlocal shard_index, current_chars
+            path = shard_dir / f"shard_{shard_index:05d}.txt"
+            shard_index += 1
+            current_chars = 0
+            shard_files.append(str(path))
+            return path.open("w", encoding=self.config.encoding, newline="\n")
+
+        try:
+            for row in dataset:
+                text = self._extract_text(row).strip()
+                if len(text) < self.config.min_text_chars:
+                    skipped_documents += 1
+                    continue
+                if self.config.max_characters is not None:
+                    remaining = self.config.max_characters - character_count
+                    if remaining <= 0:
+                        truncated_reason = "max_characters"
+                        break
+                    if len(text) > remaining:
+                        text = text[:remaining]
+                        truncated_reason = "max_characters"
+                payload = text.rstrip() + "\n\n"
+                if handle is None or (current_chars > 0 and current_chars + len(payload) > self.config.shard_max_chars):
+                    if handle is not None:
+                        handle.close()
+                    handle = open_next_shard()
+                handle.write(payload)
+                current_chars += len(payload)
+                document_count += 1
+                character_count += len(text)
+                if self.config.max_documents is not None and document_count >= self.config.max_documents:
+                    truncated_reason = "max_documents"
+                    break
+                if truncated_reason == "max_characters":
+                    break
+        finally:
+            if handle is not None:
+                handle.close()
+
+        if document_count == 0:
+            raise ValueError(
+                f"HF dataset export produced zero usable documents from field {self.config.text_field!r}; "
+                f"skipped={skipped_documents}"
+            )
+        report = HFDatasetExportReport(
+            dataset=self.config.dataset,
+            split=self.config.split,
+            text_field=self.config.text_field,
+            output_dir=str(output),
+            shard_files=tuple(shard_files),
+            document_count=document_count,
+            skipped_documents=skipped_documents,
+            character_count=character_count,
+            shard_count=len(shard_files),
+            streaming=self.config.streaming,
+            config_name=self.config.config_name,
+            data_files=self.config.data_files,
+            truncated_reason=truncated_reason,
+        )
+        _write_json(output / "hf_export_report.json", report.to_dict())
+        return report
+
+    def _load_dataset(self) -> Iterable[Mapping[str, Any]]:
+        try:
+            from datasets import load_dataset
+        except ImportError as exc:
+            raise RuntimeError("Hugging Face datasets is required: install with `pip install -e .`") from exc
+
+        kwargs: dict[str, Any] = {
+            "split": self.config.split,
+            "streaming": self.config.streaming,
+        }
+        if self.config.config_name is not None:
+            kwargs["name"] = self.config.config_name
+        if self.config.data_files:
+            kwargs["data_files"] = list(self.config.data_files)
+        if self.config.cache_dir is not None:
+            kwargs["cache_dir"] = self.config.cache_dir
+        if self.config.trust_remote_code:
+            kwargs["trust_remote_code"] = True
+        return load_dataset(self.config.dataset, **kwargs)
+
+    def _extract_text(self, row: Mapping[str, Any]) -> str:
+        value: Any = row
+        for part in self.config.text_field.split("."):
+            if not isinstance(value, Mapping) or part not in value:
+                available = sorted(value.keys()) if isinstance(value, Mapping) else type(value).__name__
+                raise KeyError(f"text field {self.config.text_field!r} missing at {part!r}; available={available}")
+            value = value[part]
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value
+        if isinstance(value, (list, tuple)) and all(isinstance(item, str) for item in value):
+            return "\n".join(value)
+        raise TypeError(f"text field {self.config.text_field!r} must be str or list[str], got {type(value).__name__}")
+
+
 class LLMTokenizer:
     def __init__(self, tokenizer: Tokenizer):
         self.tokenizer = tokenizer
@@ -1358,6 +1535,28 @@ def main(argv: Sequence[str] | None = None) -> None:
     benchmark.add_argument("--gloo-interface", default=None)
     benchmark.add_argument("--require-win", action="store_true")
 
+    prepare_hf = sub.add_parser("prepare-hf", help="export a Hugging Face dataset to text shards and a token memmap corpus")
+    prepare_hf.add_argument("--dataset", required=True, help="Hugging Face dataset path, e.g. allenai/c4 or json")
+    prepare_hf.add_argument("--config-name", default=None, help="dataset config/subset name")
+    prepare_hf.add_argument("--split", default="train")
+    prepare_hf.add_argument("--text-field", default="text", help="text column name, supports dotted nested fields")
+    prepare_hf.add_argument("--data-file", action="append", default=[], help="local data file for builders such as json")
+    prepare_hf.add_argument("--out-dir", default="runs/hf-corpus")
+    prepare_hf.add_argument("--streaming", action=argparse.BooleanOptionalAction, default=True)
+    prepare_hf.add_argument("--trust-remote-code", action="store_true")
+    prepare_hf.add_argument("--cache-dir", default=None)
+    prepare_hf.add_argument("--max-documents", type=int, default=None)
+    prepare_hf.add_argument("--max-characters", type=int, default=None)
+    prepare_hf.add_argument("--allow-unbounded", action="store_true")
+    prepare_hf.add_argument("--min-text-chars", type=int, default=1)
+    prepare_hf.add_argument("--shard-chars", type=int, default=64 * 1024 * 1024)
+    prepare_hf.add_argument("--min-chars-per-chunk", type=int, default=2048)
+    prepare_hf.add_argument("--vocab-size", type=int, default=8192)
+    prepare_hf.add_argument("--min-frequency", type=int, default=2)
+    prepare_hf.add_argument("--seq-len", type=int, default=128)
+    prepare_hf.add_argument("--max-horizon", type=int, default=8)
+    prepare_hf.add_argument("--train-fraction", type=float, default=0.9)
+
     args = parser.parse_args(argv)
     if args.command == "smoke":
         out_dir = Path(args.out_dir)
@@ -1401,6 +1600,44 @@ def main(argv: Sequence[str] | None = None) -> None:
         report = LLMComparisonRunner(corpus, config, run_dir=out_dir / "comparison").run(require_win=args.require_win)
         if _rank_zero():
             print(json.dumps(report.proof, indent=2, sort_keys=True))
+        return
+
+    if args.command == "prepare-hf":
+        out_dir = Path(args.out_dir)
+        max_documents = args.max_documents
+        if max_documents is None and args.max_characters is None and not args.allow_unbounded:
+            max_documents = 100_000
+        hf_config = HFDatasetExportConfig(
+            dataset=args.dataset,
+            config_name=args.config_name,
+            split=args.split,
+            text_field=args.text_field,
+            data_files=tuple(args.data_file),
+            streaming=args.streaming,
+            trust_remote_code=args.trust_remote_code,
+            cache_dir=args.cache_dir,
+            max_documents=max_documents,
+            max_characters=args.max_characters,
+            allow_unbounded=args.allow_unbounded,
+            min_text_chars=args.min_text_chars,
+            shard_max_chars=args.shard_chars,
+        )
+        export_report = HFDatasetTextExporter(hf_config).export(out_dir)
+        corpus = TextCorpusConfig.from_paths(export_report.shard_files, min_chars_per_chunk=args.min_chars_per_chunk)
+        tokenizer = LLMTokenizer.train(corpus, vocab_size=args.vocab_size, min_frequency=args.min_frequency)
+        manifest = TokenizedCorpusBuilder(corpus, tokenizer).build(
+            out_dir / "tokenized",
+            seq_len=args.seq_len,
+            max_horizon=args.max_horizon,
+            train_fraction=args.train_fraction,
+        )
+        payload = {
+            "hf_export": export_report.to_dict(),
+            "manifest": manifest.to_dict(),
+            "command": "prepare-hf",
+        }
+        _write_json(out_dir / "prepare_report.json", payload)
+        print(json.dumps(payload, indent=2, sort_keys=True, default=_json_default))
         return
 
     if args.command == "benchmark":

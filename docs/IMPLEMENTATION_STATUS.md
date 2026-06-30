@@ -365,6 +365,7 @@ Remaining:
 Current executable coverage:
 
 - `cortex3_llm.LLMTokenizer` trains and persists a Hugging Face `tokenizers` BPE tokenizer with required special tokens.
+- `HFDatasetTextExporter` streams Hugging Face `datasets` sources or local JSONL builders into bounded text shards with export reports, document/character counts and explicit unbounded-run opt-in.
 - `TextShardReader` streams text shards without loading the whole corpus into memory.
 - `TokenizedCorpusBuilder` performs a two-pass corpus tokenization and writes a `uint32` memmap plus `manifest.json`.
 - `MemmapCausalDataset` samples causal next-token targets and multi-horizon future targets directly from the memmap.
@@ -374,7 +375,7 @@ Current executable coverage:
 - `PrecisionPolicy(require_cuda=True)` raises when CUDA is required but unavailable, preventing silent CPU fallback.
 - `LLMComparisonRunner` trains a baseline next-token Transformer and a Cortex multi-horizon Transformer on the same corpus/cache, then writes `comparison_report.json`, `report.md`, `learning_curve.png`, both final checkpoints and both learning-curve CSV files.
 - `LLMBenchmarkSuite` runs multiple deterministic domains, persists per-domain comparison artifacts and writes an aggregate `benchmark_report.json`, `benchmark_report.md` and `benchmark_ratios.png`.
-- `tools/train_llm.py` exposes `smoke` and `compare` commands for local proof runs and larger text-shard corpora.
+- `tools/train_llm.py` exposes `smoke`, `prepare-hf` and `compare` commands for local proof runs, Hugging Face corpus preparation and larger text-shard corpora.
 - `tools/train_llm.py benchmark` exposes the multi-domain proof gate and supports CPU `bf16` validation.
 - `tools/launch_llm_ddp.py` launches true local multi-process DDP workers, pins the Gloo interface and writes per-rank logs.
 - `.github/workflows/ci.yml` runs the LLM smoke command.
@@ -385,15 +386,18 @@ Evidence:
 - `.\.venv\Scripts\python.exe tools\train_llm.py smoke --out-dir runs\llm-smoke-dev-48 --steps 48 --require-win`
 - Smoke proof: baseline score `0.022321`, Cortex score `0.145833`, Cortex/baseline `6.533x`, next-token-loss regression ratio `1.020`, proof passed.
 - `.\.venv\Scripts\python.exe tools\train_llm.py benchmark --out-dir runs\llm-benchmark-validation --domains sequence,anchors --repeats 96 --steps 48 --batch-size 8 --precision bf16 --require-win`
-- Benchmark proof through `codex-test`: `2/2` domains passed, mean Cortex/baseline ratio `34.304x`, minimum domain ratio `5.026x`, mean baseline score `0.015625`, max next-token-loss regression ratio `1.000093`.
+- Benchmark proof through `codex-test`: `2/2` domains passed, mean Cortex/baseline ratio `35.751x`, minimum domain ratio `7.919x`, mean baseline score `0.010324`, max next-token-loss regression ratio `1.000093`.
 - DDP root cause and fix: the local Windows CPU PyTorch build exposes Gloo but `torchrun` elastic requests TCPStore libuv that is not compiled in; when Gloo auto-selected a bad host route it tried `kubernetes.docker.internal`. Cortex now pins `GLOO_SOCKET_IFNAME` and uses an explicit `TCPStore(..., use_libuv=False)` for local Gloo env initialization.
 - `.\.venv\Scripts\python.exe tools\launch_llm_ddp.py --nproc 2 --master-port 29752 --gloo-interface Ethernet --timeout 240 -- smoke --out-dir runs\llm-ddp-smoke-validation --steps 48 --precision bf16 --require-win`
 - DDP smoke proof through `codex-test`: `world_size=2`, `distributed=True`, proof passed, baseline score `0.002790`, Cortex score `0.149740`, Cortex/baseline `53.667x`, next-token-loss regression ratio `0.952`.
-- `.\.venv\Scripts\python.exe -m unittest tests.test_llm_pretraining`
+- `prepare-hf` is covered with a local Hugging Face JSONL dataset path that exports 30 documents into multiple shards, writes `hf_export_report.json`, trains a BPE tokenizer and builds a causal memmap manifest.
+- CLI HF/text validation: `tools\train_llm.py prepare-hf --dataset text --data-file README.md ...` exported 148 documents into 15 shards and built a 9,331-token `uint32` memmap.
+- HF-prepared compare smoke: `tools\train_llm.py compare runs\hf-text-cli-default-cap\text_shards ... --precision bf16` passed with baseline score `0.002778`, Cortex score `0.011719`, Cortex/baseline `4.219x`, next-token-loss regression ratio `0.976`.
+- `.\.venv\Scripts\python.exe -m unittest discover -s tests`: `116` tests passed.
 
 Remaining:
 
-- Run a genuine large-corpus experiment with a real external text shard set, not only the deterministic local smoke corpus.
+- Run a genuine long large-corpus experiment from an external Hugging Face dataset such as C4/FineWeb, not only the deterministic local smoke corpus or local JSONL export test.
 - Validate CUDA mixed precision and NCCL multi-GPU runs on hardware that exposes real CUDA devices; this machine currently exposes only CPU Torch, so CUDA/NCCL claims remain unvalidated locally.
 - Scale model sizes and training steps, then publish variance across multiple seeds and corpus domains.
 - Connect accepted recursive-improvement proposals to persisted LLM checkpoint patches with rollback archives.

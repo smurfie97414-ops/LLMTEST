@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 authors = [{name = "LLMTEST contributors"}]
 license = {text = "MIT"}
-dependencies = ["torch>=2.0", "numpy>=1.26", "tokenizers>=0.23", "matplotlib>=3.8"]
+dependencies = ["torch>=2.0", "numpy>=1.26", "tokenizers>=0.23", "matplotlib>=3.8", "datasets>=5.0"]
 
 [project.scripts]
 cortex3 = "cortex3:main"
