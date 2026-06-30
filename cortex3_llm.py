@@ -3287,7 +3287,10 @@ class LLMTrainer:
         payload = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
         if payload.get("model_kind") != self.model_kind:
             raise ValueError(f"checkpoint model_kind={payload.get('model_kind')!r} does not match {self.model_kind!r}")
-        checkpoint_model_config = payload.get("model_config")
+        checkpoint_model_config = dict(payload.get("model_config") or {})
+        checkpoint_model_config.setdefault("use_skill_aware_experts", False)
+        checkpoint_model_config.setdefault("skill_expert_count", 4)
+        checkpoint_model_config.setdefault("skill_expert_top_k", 2)
         if checkpoint_model_config != asdict(self.model.config):
             raise ValueError("checkpoint model_config does not match the current model")
         checkpoint_corpus_identity = payload.get("corpus_identity")

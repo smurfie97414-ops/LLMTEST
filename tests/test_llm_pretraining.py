@@ -515,6 +515,10 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 first_sidecar = json.loads((run_dir / "checkpoint_step_1.pt.json").read_text(encoding="utf-8"))
                 self.assertEqual(first_sidecar["step"], 1)
                 self.assertIn("git_commit", first_sidecar["code_state"])
+                legacy_checkpoint = torch.load(run_dir / "checkpoint_final.pt", map_location="cpu", weights_only=False)
+                for key in ("use_skill_aware_experts", "skill_expert_count", "skill_expert_top_k"):
+                    legacy_checkpoint["model_config"].pop(key, None)
+                torch.save(legacy_checkpoint, run_dir / "checkpoint_final.pt")
 
                 resumed_config = TrainingConfig(
                     steps=4,
