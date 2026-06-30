@@ -1197,6 +1197,7 @@ class TrainingConfig:
     distributed: bool = False
     gloo_interface: str | None = None
     resume: bool = False
+    resume_if_exists: bool = False
     resume_from_checkpoint: str | None = None
     checkpoint_interval: int = 100
     num_threads: int | None = None
@@ -1212,6 +1213,12 @@ class TrainingConfig:
             raise ValueError("eval_interval must be positive")
         if self.checkpoint_interval < 1:
             raise ValueError("checkpoint_interval must be positive")
+        if self.resume and self.resume_if_exists:
+            raise ValueError("resume and resume_if_exists are mutually exclusive")
+
+
+def _training_allows_existing_artifacts(training: TrainingConfig) -> bool:
+    return bool(training.resume or training.resume_if_exists)
 
 
 @dataclass(frozen=True)
@@ -1593,7 +1600,7 @@ class LLMTrainer:
             if not checkpoint.exists():
                 raise FileNotFoundError(f"resume checkpoint does not exist: {checkpoint}")
             return checkpoint
-        if not self.config.resume:
+        if not (self.config.resume or self.config.resume_if_exists):
             return None
         final_checkpoint = self.run_dir / "checkpoint_final.pt"
         if final_checkpoint.exists():
@@ -1605,6 +1612,8 @@ class LLMTrainer:
                 candidates.append((int(raw_step), path))
         if candidates:
             return sorted(candidates)[-1][1]
+        if self.config.resume_if_exists:
+            return None
         raise FileNotFoundError(f"resume=True but no checkpoint was found in {self.run_dir}")
 
     def load_checkpoint(
@@ -2202,14 +2211,14 @@ class LLMComparisonRunner:
         runtime.ensure_initialized()
         if self.prepared_manifest is not None:
             if runtime.is_main:
-                if self.run_dir.exists() and not self.config.training.resume:
+                if self.run_dir.exists() and not _training_allows_existing_artifacts(self.config.training):
                     shutil.rmtree(self.run_dir)
                 self.run_dir.mkdir(parents=True, exist_ok=True)
             _barrier_if_needed(runtime)
             manifest = self.prepared_manifest
         else:
             if runtime.is_main:
-                if self.run_dir.exists() and not self.config.training.resume:
+                if self.run_dir.exists() and not _training_allows_existing_artifacts(self.config.training):
                     shutil.rmtree(self.run_dir)
                 self.run_dir.mkdir(parents=True, exist_ok=True)
                 manifest_path = self.run_dir / "corpus" / "manifest.json"
@@ -2448,7 +2457,7 @@ class LLMComparisonMatrixSuite:
         )
         runtime.ensure_initialized()
         if runtime.is_main:
-            if self.run_dir.exists() and not self.config.training.resume:
+            if self.run_dir.exists() and not _training_allows_existing_artifacts(self.config.training):
                 shutil.rmtree(self.run_dir)
             self.run_dir.mkdir(parents=True, exist_ok=True)
         _barrier_if_needed(runtime)
@@ -2732,7 +2741,7 @@ class LLMCorpusMatrixSuite:
         )
         runtime.ensure_initialized()
         if runtime.is_main:
-            if self.run_dir.exists() and not self.config.training.resume:
+            if self.run_dir.exists() and not _training_allows_existing_artifacts(self.config.training):
                 shutil.rmtree(self.run_dir)
             self.run_dir.mkdir(parents=True, exist_ok=True)
         _barrier_if_needed(runtime)
@@ -3144,6 +3153,7 @@ class LLMExperimentRunner:
             "distributed": bool(payload.get("distributed", doctor.get("distributed", False))),
             "gloo_interface": payload.get("gloo_interface", doctor.get("gloo_interface")),
             "resume": bool(payload.get("resume", False)),
+            "resume_if_exists": bool(payload.get("resume_if_exists", False)),
             "checkpoint_interval": int(payload.get("checkpoint_interval", 100)),
             "num_threads": payload.get("num_threads"),
         }
@@ -3240,7 +3250,7 @@ class LLMExperimentRunner:
             )
             export_report = HFDatasetTextExporter(export_config).export(
                 corpus_dir,
-                resume=bool(self.manifest["training"]["resume"]),
+                resume=bool(self.manifest["training"]["resume"] or self.manifest["training"]["resume_if_exists"]),
             )
             corpus = TextCorpusConfig.from_paths(
                 export_report.shard_files,
@@ -3269,6 +3279,7 @@ class LLMExperimentRunner:
             distributed=bool(training_payload["distributed"]),
             gloo_interface=training_payload.get("gloo_interface"),
             resume=bool(training_payload["resume"]),
+            resume_if_exists=bool(training_payload["resume_if_exists"]),
             checkpoint_interval=int(training_payload["checkpoint_interval"]),
             num_threads=training_payload.get("num_threads"),
         )
@@ -3517,7 +3528,7 @@ class LLMBenchmarkSuite:
         )
         runtime.ensure_initialized()
         if runtime.is_main:
-            if self.run_dir.exists() and not self.config.training.resume:
+            if self.run_dir.exists() and not _training_allows_existing_artifacts(self.config.training):
                 shutil.rmtree(self.run_dir)
             self.run_dir.mkdir(parents=True, exist_ok=True)
         _barrier_if_needed(runtime)
@@ -3684,7 +3695,7 @@ class LLMStatisticalBenchmarkSuite:
         )
         runtime.ensure_initialized()
         if runtime.is_main:
-            if self.run_dir.exists() and not self.config.training.resume:
+            if self.run_dir.exists() and not _training_allows_existing_artifacts(self.config.training):
                 shutil.rmtree(self.run_dir)
             self.run_dir.mkdir(parents=True, exist_ok=True)
         _barrier_if_needed(runtime)
@@ -4045,6 +4056,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     smoke.add_argument("--gradient-accumulation-steps", type=int, default=1)
     smoke.add_argument("--checkpoint-interval", type=int, default=100)
     smoke.add_argument("--resume", action="store_true")
+    smoke.add_argument("--resume-if-exists", action="store_true", help="resume from existing verified artifacts if present, otherwise start fresh")
     smoke.add_argument("--precision", choices=("fp32", "bf16", "fp16"), default="fp32")
     smoke.add_argument("--device", default="auto")
     smoke.add_argument("--require-cuda", action="store_true")
@@ -4064,6 +4076,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     compare.add_argument("--gradient-accumulation-steps", type=int, default=1)
     compare.add_argument("--checkpoint-interval", type=int, default=100)
     compare.add_argument("--resume", action="store_true")
+    compare.add_argument("--resume-if-exists", action="store_true", help="resume from existing verified artifacts if present, otherwise start fresh")
     compare.add_argument("--d-model", type=int, default=256)
     compare.add_argument("--n-heads", type=int, default=8)
     compare.add_argument("--n-layers", type=int, default=6)
@@ -4087,6 +4100,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     compare_matrix.add_argument("--gradient-accumulation-steps", type=int, default=1)
     compare_matrix.add_argument("--checkpoint-interval", type=int, default=100)
     compare_matrix.add_argument("--resume", action="store_true")
+    compare_matrix.add_argument("--resume-if-exists", action="store_true", help="resume from existing verified artifacts if present, otherwise start fresh")
     compare_matrix.add_argument("--d-model", type=int, default=256)
     compare_matrix.add_argument("--n-heads", type=int, default=8)
     compare_matrix.add_argument("--n-layers", type=int, default=6)
@@ -4110,6 +4124,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     corpus_matrix.add_argument("--gradient-accumulation-steps", type=int, default=1)
     corpus_matrix.add_argument("--checkpoint-interval", type=int, default=100)
     corpus_matrix.add_argument("--resume", action="store_true")
+    corpus_matrix.add_argument("--resume-if-exists", action="store_true", help="resume from existing verified artifacts if present, otherwise start fresh")
     corpus_matrix.add_argument("--d-model", type=int, default=256)
     corpus_matrix.add_argument("--n-heads", type=int, default=8)
     corpus_matrix.add_argument("--n-layers", type=int, default=6)
@@ -4131,6 +4146,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     benchmark.add_argument("--gradient-accumulation-steps", type=int, default=1)
     benchmark.add_argument("--checkpoint-interval", type=int, default=100)
     benchmark.add_argument("--resume", action="store_true")
+    benchmark.add_argument("--resume-if-exists", action="store_true", help="resume from existing verified artifacts if present, otherwise start fresh")
     benchmark.add_argument("--vocab-size", type=int, default=256)
     benchmark.add_argument("--seq-len", type=int, default=32)
     benchmark.add_argument("--d-model", type=int, default=64)
@@ -4155,6 +4171,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     benchmark_matrix.add_argument("--gradient-accumulation-steps", type=int, default=1)
     benchmark_matrix.add_argument("--checkpoint-interval", type=int, default=100)
     benchmark_matrix.add_argument("--resume", action="store_true")
+    benchmark_matrix.add_argument("--resume-if-exists", action="store_true", help="resume from existing verified artifacts if present, otherwise start fresh")
     benchmark_matrix.add_argument("--vocab-size", type=int, default=256)
     benchmark_matrix.add_argument("--seq-len", type=int, default=32)
     benchmark_matrix.add_argument("--d-model", type=int, default=64)
@@ -4278,6 +4295,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             distributed=args.distributed,
             gloo_interface=args.gloo_interface,
             resume=args.resume,
+            resume_if_exists=args.resume_if_exists,
             checkpoint_interval=args.checkpoint_interval,
             num_threads=1,
         )
@@ -4386,6 +4404,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             distributed=args.distributed,
             gloo_interface=args.gloo_interface,
             resume=args.resume,
+            resume_if_exists=args.resume_if_exists,
             checkpoint_interval=args.checkpoint_interval,
             num_threads=1,
         )
@@ -4431,6 +4450,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             distributed=args.distributed,
             gloo_interface=args.gloo_interface,
             resume=args.resume,
+            resume_if_exists=args.resume_if_exists,
             checkpoint_interval=args.checkpoint_interval,
             num_threads=1,
         )
@@ -4474,6 +4494,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             distributed=args.distributed,
             gloo_interface=args.gloo_interface,
             resume=args.resume,
+            resume_if_exists=args.resume_if_exists,
             checkpoint_interval=args.checkpoint_interval,
             seed=seeds[0],
         )
@@ -4506,6 +4527,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             distributed=args.distributed,
             gloo_interface=args.gloo_interface,
             resume=args.resume,
+            resume_if_exists=args.resume_if_exists,
             checkpoint_interval=args.checkpoint_interval,
             seed=seeds[0],
         )
@@ -4536,6 +4558,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         distributed=args.distributed,
         gloo_interface=args.gloo_interface,
         resume=args.resume,
+        resume_if_exists=args.resume_if_exists,
         checkpoint_interval=args.checkpoint_interval,
     )
     config = ComparisonConfig(

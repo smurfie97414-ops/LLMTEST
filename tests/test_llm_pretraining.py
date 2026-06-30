@@ -442,6 +442,10 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 train.close()
                 val.close()
 
+    def test_training_config_rejects_strict_and_auto_resume_together(self):
+        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+            TrainingConfig(resume=True, resume_if_exists=True)
+
     def test_trainer_rejects_resume_when_corpus_identity_changes(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1004,6 +1008,7 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                     "eval_interval": 16,
                     "eval_batches": 2,
                     "checkpoint_interval": 100,
+                    "resume_if_exists": True,
                     "num_threads": 1,
                 },
                 "corpora": [
@@ -1054,6 +1059,24 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 llm_main(["preflight-experiment", str(manifest_path), "--out-dir", str(root / "preflight-only")])
             preflight_only = json.loads((root / "preflight-only" / "preflight_report.json").read_text(encoding="utf-8"))
             self.assertTrue(preflight_only["passed"], preflight_only)
+
+            with patch("datasets.load_dataset", side_effect=AssertionError("auto-resume should reuse the HF export report")):
+                resumed_report = LLMExperimentRunner.load(manifest_path).run()
+            self.assertTrue(resumed_report.proof["passed"], resumed_report.proof)
+            resumed_training = json.loads(
+                (
+                    root
+                    / "experiment"
+                    / "corpus_matrix"
+                    / "hfjson"
+                    / "seed_17"
+                    / "baseline_ntp"
+                    / "training_report.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(resumed_training["start_step"], 48)
+            self.assertEqual(resumed_training["optimizer_steps"], 0)
+            self.assertTrue(resumed_training["resumed_from"].endswith("checkpoint_final.pt"))
 
             missing_checkpoint = root / "experiment" / "corpus_matrix" / "hfjson" / "seed_17" / "cortex3" / "checkpoint_final.pt"
             missing_checkpoint.unlink()

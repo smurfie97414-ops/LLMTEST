@@ -33,7 +33,8 @@
     "eval_interval": 500,
     "eval_batches": 8,
     "checkpoint_interval": 500,
-    "resume": false
+    "resume": false,
+    "resume_if_exists": true
   },
   "corpora": [
     {
