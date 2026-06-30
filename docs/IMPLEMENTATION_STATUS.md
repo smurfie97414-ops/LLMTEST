@@ -216,16 +216,17 @@ Current executable coverage:
 - `SleepPhaseReport` now records baseline, accepted and scheduled rare-skill fractions plus rare-skill gain, diversity delta and calibration-gap delta, making the Phase 9 success criteria directly inspectable.
 - `write_cycle_run` can persist sleep phase reports into `summary.json`.
 - `tools/run_cycle_report.py` writes Phase 9 sleep traces by default unless `--skip-sleep` is passed.
+- The full LLM trainer tokenizes accepted sleep examples with the active BPE tokenizer and replays them as causal batches in the Cortex loss.
 
 Evidence:
 
 - `.\.venv\Scripts\python.exe -m unittest tests.test_sleep_phase`
 - `.\.venv\Scripts\python.exe -m unittest discover -s tests`
 - Temporary artifact write with `tools\run_cycle_report.py --out-dir <temp> --run-id final-smoke` includes both `inference` and `sleep_phase`.
+- `tests/test_llm_pretraining.py::LLMPretrainingHarnessTest::test_full_cortex_phase_controller_uses_all_modules_during_training` verifies nonzero sleep replay batches and replay updates during LLM training.
 
 Remaining:
 
-- Apply accepted sleep batches to a real model update step.
 - Persist replay buffers and real/exogenous reservoirs across runs.
 - Add external provenance adapters for real data sources.
 - Measure rare-skill retention, diversity and calibration over repeated sleep/wake cycles.
@@ -369,10 +370,12 @@ Current executable coverage:
 - `TextShardReader` streams text shards without loading the whole corpus into memory.
 - `TokenizedCorpusBuilder` streams encoded chunks once into a `uint32` token file and writes a coherent `manifest.json`.
 - `MemmapCausalDataset` samples causal next-token targets and multi-horizon future targets directly from the memmap with vectorized batch window reads.
-- `CortexTransformerLM` is a complete causal Transformer with tied embeddings, causal self-attention, MLP blocks and optional Cortex multi-horizon heads.
+- `CortexTransformerLM` is a complete causal Transformer with tied embeddings, causal self-attention, MLP blocks, optional Cortex multi-horizon heads and an optional `BitLinear` ternary core for the Cortex model.
 - `CortexObjective` optimizes next-token loss plus Cortex MTP, temporal-consistency and confidence terms when the Cortex heads are enabled.
+- `CortexTrainingPhaseController` integrates P1-P10 into full LLM training when horizons are `[1, 2, 4, 8]`: verifier cycle, ternary forward traces, MTP/FSP contract ledger, cognitive memory reconstruction, certificate verification, causal attribution, minimal regrowth planning, fast/normal/careful inference, sleep replay batches and recursive-improvement gates.
+- The full Cortex trainer adds confidence/contract regularization to the loss, tokenizes accepted sleep examples into causal replay batches and writes `cortex_phase_report.json` with per-phase event counts.
 - `build_training_plan` writes `run_plan.json` before training starts, with real token-count, split-window, parameter-count, planned-token, checkpoint and optimizer-memory estimates for the baseline and Cortex models.
-- `LLMTrainer` supports checkpoints, strict resume, first-run-safe auto-resume, optimizer/scaler/RNG state persistence, gradient accumulation, CSV learning curves, deterministic random sampling, explicit device selection, mixed precision policy and DDP initialization from environment, including a Windows/Gloo TCPStore path that avoids unsupported libuv builds.
+- `LLMTrainer` supports checkpoints, strict resume, first-run-safe auto-resume, optimizer/scaler/RNG state persistence, gradient accumulation, CSV learning curves, resource usage monitoring, deterministic random sampling, explicit device selection, mixed precision policy and DDP initialization from environment, including a Windows/Gloo TCPStore path that avoids unsupported libuv builds.
 - `audit_learning_curves` writes `learning_curve_audit.json` and makes the proof gate require real finite baseline/Cortex validation curves with initial and final validation steps.
 - `PrecisionPolicy(require_cuda=True)` raises when CUDA is required but unavailable, preventing silent CPU fallback.
 - `llm_doctor_report` and `tools/train_llm.py doctor` audit Python dependencies, CUDA availability, requested precision, `torch.distributed`, Gloo/NCCL readiness and write a persistent `doctor_report.json`.
@@ -396,6 +399,7 @@ Current executable coverage:
 - `prepare-hf --resume` reuses only complete HF export reports and tokenized manifests whose tokenization config and preparation recipe still match; missing shards, incomplete tokenized directories and changed tokenizer args fail loudly instead of deleting or rebuilding long-running corpus preparation work.
 - Tokenized corpus manifests now carry SHA-256 hashes for the token memmap, tokenizer and source shards plus the preparation recipe (`vocab_size`, `min_frequency`, `seq_len`, max horizon, train split and chunking); `run_plan.json`, training reports and checkpoints include a corpus identity digest, and `LLMTrainer` refuses resume from missing or mismatched `corpus_identity` checkpoints.
 - Single comparison reports now require `baseline_score >= min_baseline_future_tokens_per_cost`; a Cortex ratio computed against a zero baseline is recorded with `failed_checks=["baseline_score_passed"]` and cannot pass `--require-win`. Scale gates similarly record `corpus_scale_passed` and `planned_train_tokens_passed`.
+- Single comparison reports now also require `cortex_phase_integration_passed` when the model claims full Cortex mode (`use_cortex_heads`, `use_ternary_core`, horizons `[1, 2, 4, 8]`), so a full-architecture run with missing P1-P10 traces cannot pass.
 
 Evidence:
 
@@ -410,9 +414,12 @@ Evidence:
 - CUDA external Wikitext comparison matrix: `tools\train_llm.py compare-matrix runs\hf-wikitext2-validation\text_shards --out-dir runs\llm-wikitext2-cuda-compare-matrix-validation --seeds 17,29 --vocab-size 512 --seq-len 64 --d-model 64 --n-heads 4 --n-layers 2 --steps 48 --batch-size 8 --precision bf16 --device cuda --require-cuda --require-win` passed with `2/2` seeds, mean Cortex/baseline ratio `24.864x`, min ratio `24.500x`, aggregate CSV/PNG learning curves and CUDA recorded in per-seed reports.
 - Versioned experiment manifests: `experiments/wikitext_cuda_validation.json` for fast local CUDA validation with small scale thresholds and `experiments/c4_cuda_large_manifest.json` for a preflighted, auto-resumable large C4 CUDA run with massive corpus/training-token proof thresholds.
 - Versioned Wikitext CUDA manifest validation: `tools\train_llm.py run-experiment experiments\wikitext_cuda_validation.json` passed with `2/2` seeds, win-rate `1.0`, mean Cortex/baseline ratio `11.861x`, min ratio `10.889x`, CUDA doctor passed and aggregate CSV/PNG learning curves written.
+- Full Cortex phase integration unit validation: `.\.venv\Scripts\python.exe -m pytest tests\test_llm_pretraining.py::LLMPretrainingHarnessTest::test_full_cortex_phase_controller_uses_all_modules_during_training -q` passed and verified P1-P10 event counts, ternary forward events, future contract decisions, confidence regularization, sleep replay batches and replay updates.
+- Full Cortex proof-gate negative validation: `tests/test_llm_pretraining.py::LLMPretrainingHarnessTest::test_comparison_proof_requires_full_cortex_phase_report_for_full_architecture` verifies that a full-Cortex config fails proof when `all_phases_active=false`.
+- LLM pretraining test suite after full phase integration: `.\.venv\Scripts\python.exe -m pytest tests\test_llm_pretraining.py -q` passed with `28` tests.
 - Wikitext CUDA scale-gate validation: `tools\train_llm.py run-experiment experiments\wikitext_cuda_validation.json --out-dir runs\cortex3-wikitext-cuda-scale-gate-validation` passed with `2/2` seeds, min observed corpus tokens `29,104`, min observed planned train tokens `24,576`, min required corpus/train tokens `20,000/20,000`, mean Cortex/baseline ratio `10.257x`, min ratio `9.625x`, preflight artifact written and aggregate CSV/PNG learning curves written.
 - Post-run audit validation: `tools\train_llm.py audit-experiment runs\cortex3-wikitext-cuda-scale-gate-validation` passed with no failed checks and revalidated preflight, proof, HF shards, tokenized corpus manifests, learning curves and checkpoints.
-- C4 large manifest preflight: `tools\train_llm.py preflight-experiment experiments\c4_cuda_large_manifest.json --out-dir runs\cortex3-c4-cuda-large-preflight` passed on RTX 5070 with estimated Cortex peak `4,625,452,668` bytes under `10,897,408,000` usable CUDA bytes, while preserving `2,097,152,000` planned train tokens and `50,000,000` minimum corpus tokens.
+- C4 large manifest preflight after full phase integration: `tools\train_llm.py preflight-experiment experiments\c4_cuda_large_manifest.json --out-dir runs\cortex3-c4-cuda-large-preflight-current` passed on RTX 5070 with estimated Cortex peak `6,880,310,498` bytes under `10,897,408,000` usable CUDA bytes, while preserving `2,097,152,000` planned train tokens and `50,000,000` minimum corpus tokens.
 - Negative scale-gate CLI validation: a `tools\train_llm.py smoke --require-win --min-corpus-tokens 999999999 --min-planned-train-tokens 999999999` run failed as expected and exposed both `corpus_scale_passed` and `planned_train_tokens_passed` diagnostics.
 - C4 external validation: `tools\train_llm.py prepare-hf --dataset allenai/c4 --config-name en --split train --text-field text --out-dir runs\hf-c4-mini-validation --max-documents 40 --min-text-chars 64 --shard-chars 8192 --vocab-size 512 --min-frequency 1 --seq-len 64 --max-horizon 4` exported 40 real C4 documents, 72,020 characters, 10 shards and a 32,537-token memmap.
 - C4 CUDA comparison matrix: `tools\train_llm.py compare-matrix runs\hf-c4-mini-validation\text_shards --out-dir runs\llm-c4-mini-cuda-compare-matrix-validation --seeds 17,29 --vocab-size 512 --seq-len 64 --d-model 64 --n-heads 4 --n-layers 2 --steps 48 --batch-size 8 --precision bf16 --device cuda --require-cuda --require-win` passed with `2/2` seeds, win-rate `1.0`, mean Cortex/baseline ratio `19.480x`, min ratio `16.681x`, max next-token-loss regression `1.096379`.
@@ -443,7 +450,7 @@ Evidence:
 - CLI resume validation: `tools\train_llm.py smoke --out-dir runs\llm-resume-cli-validation --steps 2 ...` then `--steps 4 --resume ...` resumed both `baseline_ntp` and `cortex3` from `checkpoint_final.pt` with `start_step=2`, `optimizer_steps=2`, `effective_batch_size=16` and `final_step=4`.
 - DDP accumulation validation: `tools\launch_llm_ddp.py --nproc 2 ... --gradient-accumulation-steps 2` completed with `distributed=True`, `world_size=2`, proof passed and `effective_batch_size=32` for both baseline and Cortex.
 - DDP CUDA preflight validation: `tools\launch_llm_ddp.py --nproc 2 ... --device cuda --require-cuda` now fails before spawning workers because one visible CUDA device cannot serve two local CUDA ranks; CPU/Gloo DDP still passed after the CUDA wheel install.
-- `.\.venv\Scripts\python.exe -m unittest discover -s tests`: `133` tests passed.
+- `.\.venv\Scripts\python.exe -m unittest discover -s tests`: `138` tests passed.
 
 Remaining:
 

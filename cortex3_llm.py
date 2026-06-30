@@ -10,6 +10,8 @@ import platform
 import random
 import shutil
 import statistics
+import subprocess
+import threading
 import time
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field, replace
@@ -18,6 +20,7 @@ from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping, Sequence
 
 import numpy as np
+import psutil
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -27,6 +30,28 @@ from tokenizers.models import BPE
 from tokenizers.pre_tokenizers import ByteLevel
 from tokenizers.processors import TemplateProcessing
 from tokenizers.trainers import BpeTrainer
+
+from cortex3 import (
+    CandidateAnswer,
+    CostTrace,
+    CorruptedCompressedAgent,
+    DynamicSkillVerifier,
+    ReferenceRuleAgent,
+    Task,
+    default_skill_specs,
+)
+from cortex3_attribution import CausalAttributionEngine
+from cortex3_certificates import CertificateType, CertificateVerifier, LatentProofState, build_certificate, evaluate_certificate_efficiency
+from cortex3_cycle import CortexCycle
+from cortex3_future import FutureContractEngine, FutureContractLedger, MTPFSPConfig
+from cortex3_improvement import RecursiveImprovementEngine
+from cortex3_inference import InferenceConfig, UltraFastInferenceEngine
+from cortex3_memory import CognitiveMemory, CognitiveMemoryConfig
+from cortex3_objective import build_objective_report
+from cortex3_phases import CORTEX3_PHASES
+from cortex3_regrowth import MinimalRegrowthEngine
+from cortex3_sleep import SleepPhaseConsolidator, TrainingExample
+from cortex3_ternary import BitLinear, BitLinearConfig, CompressionTraceLedger
 
 
 SPECIAL_TOKENS: tuple[str, ...] = ("<pad>", "<bos>", "<eos>", "<unk>")
@@ -95,6 +120,8 @@ def _tokenized_preparation_config(
     seq_len: int,
     max_horizon: int,
     train_fraction: float = 0.9,
+    max_tokens: int | None = None,
+    tokenizer_training_chars: int | None = None,
 ) -> dict[str, Any]:
     return {
         "schema_version": 1,
@@ -103,6 +130,8 @@ def _tokenized_preparation_config(
         "seq_len": int(seq_len),
         "max_horizon": int(max_horizon),
         "train_fraction": float(train_fraction),
+        "max_tokens": int(max_tokens) if max_tokens is not None else None,
+        "tokenizer_training_chars": int(tokenizer_training_chars) if tokenizer_training_chars is not None else None,
         "min_chars_per_chunk": int(corpus.min_chars_per_chunk),
         "encoding": str(corpus.encoding),
     }
@@ -553,9 +582,17 @@ class LLMTokenizer:
         self.tokenizer = tokenizer
 
     @staticmethod
-    def train(config: TextCorpusConfig, *, vocab_size: int = 4096, min_frequency: int = 2) -> "LLMTokenizer":
+    def train(
+        config: TextCorpusConfig,
+        *,
+        vocab_size: int = 4096,
+        min_frequency: int = 2,
+        max_training_chars: int | None = None,
+    ) -> "LLMTokenizer":
         if vocab_size < len(SPECIAL_TOKENS) + 16:
             raise ValueError("vocab_size is too small for a useful BPE tokenizer")
+        if max_training_chars is not None and max_training_chars < 1:
+            raise ValueError("max_training_chars must be positive when provided")
         tokenizer = Tokenizer(BPE(unk_token="<unk>"))
         tokenizer.pre_tokenizer = ByteLevel(add_prefix_space=False)
         tokenizer.decoder = ByteLevelDecoder()
@@ -566,7 +603,24 @@ class LLMTokenizer:
             show_progress=False,
         )
         reader = TextShardReader(config)
-        tokenizer.train_from_iterator(reader.iter_chunks(), trainer=trainer)
+        iterator: Iterable[str]
+        if max_training_chars is None:
+            iterator = reader.iter_chunks()
+        else:
+            def capped_chunks() -> Iterator[str]:
+                consumed = 0
+                for chunk in reader.iter_chunks():
+                    remaining = int(max_training_chars) - consumed
+                    if remaining <= 0:
+                        break
+                    if len(chunk) > remaining:
+                        chunk = chunk[:remaining]
+                    consumed += len(chunk)
+                    if chunk:
+                        yield chunk
+
+            iterator = capped_chunks()
+        tokenizer.train_from_iterator(iterator, trainer=trainer)
         tokenizer.post_processor = TemplateProcessing(
             single="<bos> $A <eos>",
             special_tokens=[
@@ -723,6 +777,7 @@ class TokenizedCorpusBuilder:
         seq_len: int,
         max_horizon: int,
         train_fraction: float = 0.9,
+        max_tokens: int | None = None,
         preparation_config: Mapping[str, Any] | None = None,
     ) -> TokenizedCorpusManifest:
         if seq_len < 8:
@@ -731,6 +786,8 @@ class TokenizedCorpusBuilder:
             raise ValueError("max_horizon must be positive")
         if not 0.1 <= train_fraction < 1.0:
             raise ValueError("train_fraction must be in [0.1, 1.0)")
+        if max_tokens is not None and max_tokens < seq_len + max_horizon + 2:
+            raise ValueError("max_tokens must be large enough for one causal window")
         out = Path(output_dir)
         out.mkdir(parents=True, exist_ok=True)
         token_path = out / "tokens.uint32"
@@ -741,9 +798,17 @@ class TokenizedCorpusBuilder:
         token_count = 0
         with token_path.open("wb") as handle:
             for tokens in self._iter_token_chunks():
+                if max_tokens is not None:
+                    remaining = int(max_tokens) - token_count
+                    if remaining <= 0:
+                        break
+                    if len(tokens) > remaining:
+                        tokens = tokens[:remaining]
                 array = np.asarray(tokens, dtype=np.uint32)
                 handle.write(array.tobytes(order="C"))
                 token_count += int(array.size)
+                if max_tokens is not None and token_count >= int(max_tokens):
+                    break
         minimum = seq_len + max_horizon + 2
         if token_count < minimum:
             token_path.unlink(missing_ok=True)
@@ -771,6 +836,7 @@ class TokenizedCorpusBuilder:
                     seq_len=seq_len,
                     max_horizon=max_horizon,
                     train_fraction=train_fraction,
+                    max_tokens=max_tokens,
                 )
             ),
         )
@@ -888,6 +954,8 @@ class TransformerConfig:
     dropout: float = 0.1
     horizons: tuple[int, ...] = (1, 2, 4, 8)
     use_cortex_heads: bool = False
+    use_ternary_core: bool = False
+    ternary_activation_bits: int = 4
 
     def __post_init__(self) -> None:
         if self.vocab_size <= len(SPECIAL_TOKENS):
@@ -902,15 +970,53 @@ class TransformerConfig:
             raise ValueError("horizons must be unique and sorted")
         if not self.horizons or min(self.horizons) < 1:
             raise ValueError("horizons must be positive")
+        if self.use_ternary_core and self.ternary_activation_bits < 2:
+            raise ValueError("ternary_activation_bits must be >= 2")
+
+
+def _make_transformer_linear(
+    config: TransformerConfig,
+    in_features: int,
+    out_features: int,
+    *,
+    bias: bool = True,
+    ledger: CompressionTraceLedger | None = None,
+    log_prefix: str,
+) -> nn.Module:
+    if not config.use_ternary_core:
+        return nn.Linear(in_features, out_features, bias=bias)
+    return BitLinear(
+        BitLinearConfig(
+            in_features=in_features,
+            out_features=out_features,
+            bias=bias,
+            activation_bits=config.ternary_activation_bits,
+            log_prefix=log_prefix,
+        ),
+        ledger=ledger,
+    )
 
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self, config: TransformerConfig):
+    def __init__(self, config: TransformerConfig, *, ledger: CompressionTraceLedger | None = None, layer_index: int = 0):
         super().__init__()
         self.n_heads = config.n_heads
         self.head_dim = config.d_model // config.n_heads
-        self.qkv = nn.Linear(config.d_model, config.d_model * 3, bias=False)
-        self.proj = nn.Linear(config.d_model, config.d_model)
+        self.qkv = _make_transformer_linear(
+            config,
+            config.d_model,
+            config.d_model * 3,
+            bias=False,
+            ledger=ledger,
+            log_prefix=f"layer_{layer_index}.attn.qkv",
+        )
+        self.proj = _make_transformer_linear(
+            config,
+            config.d_model,
+            config.d_model,
+            ledger=ledger,
+            log_prefix=f"layer_{layer_index}.attn.proj",
+        )
         self.dropout = config.dropout
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -932,15 +1038,27 @@ class CausalSelfAttention(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, config: TransformerConfig):
+    def __init__(self, config: TransformerConfig, *, ledger: CompressionTraceLedger | None = None, layer_index: int = 0):
         super().__init__()
         self.ln1 = nn.LayerNorm(config.d_model)
-        self.attn = CausalSelfAttention(config)
+        self.attn = CausalSelfAttention(config, ledger=ledger, layer_index=layer_index)
         self.ln2 = nn.LayerNorm(config.d_model)
         self.mlp = nn.Sequential(
-            nn.Linear(config.d_model, config.d_model * 4),
+            _make_transformer_linear(
+                config,
+                config.d_model,
+                config.d_model * 4,
+                ledger=ledger,
+                log_prefix=f"layer_{layer_index}.mlp.up",
+            ),
             nn.GELU(),
-            nn.Linear(config.d_model * 4, config.d_model),
+            _make_transformer_linear(
+                config,
+                config.d_model * 4,
+                config.d_model,
+                ledger=ledger,
+                log_prefix=f"layer_{layer_index}.mlp.down",
+            ),
             nn.Dropout(config.dropout),
         )
 
@@ -962,17 +1080,33 @@ class CortexTransformerLM(nn.Module):
     def __init__(self, config: TransformerConfig):
         super().__init__()
         self.config = config
+        self.compression_ledger = CompressionTraceLedger() if config.use_ternary_core else None
         self.token_embedding = nn.Embedding(config.vocab_size, config.d_model)
         self.position_embedding = nn.Embedding(config.seq_len, config.d_model)
         self.drop = nn.Dropout(config.dropout)
-        self.blocks = nn.ModuleList([TransformerBlock(config) for _ in range(config.n_layers)])
+        self.blocks = nn.ModuleList([
+            TransformerBlock(config, ledger=self.compression_ledger, layer_index=index)
+            for index in range(config.n_layers)
+        ])
         self.ln_f = nn.LayerNorm(config.d_model)
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
         self.mtp_heads = nn.ModuleDict({
-            str(horizon): nn.Linear(config.d_model, config.vocab_size)
+            str(horizon): _make_transformer_linear(
+                config,
+                config.d_model,
+                config.vocab_size,
+                ledger=self.compression_ledger,
+                log_prefix=f"mtp.horizon_{horizon}",
+            )
             for horizon in config.horizons
         }) if config.use_cortex_heads else nn.ModuleDict()
-        self.confidence_head = nn.Linear(config.d_model, 1) if config.use_cortex_heads else None
+        self.confidence_head = _make_transformer_linear(
+            config,
+            config.d_model,
+            1,
+            ledger=self.compression_ledger,
+            log_prefix="confidence",
+        ) if config.use_cortex_heads else None
         self.lm_head.weight = self.token_embedding.weight
 
     def forward(self, input_ids: torch.Tensor) -> LLMForwardOutput:
@@ -994,6 +1128,18 @@ class CortexTransformerLM(nn.Module):
         }
         confidence = torch.sigmoid(self.confidence_head(hidden)).squeeze(-1) if self.confidence_head else None
         return LLMForwardOutput(logits=logits, hidden=hidden, mtp_logits=mtp_logits, confidence=confidence)
+
+    def requantize_ternary_core(self, *, certify_zeros: bool = False) -> None:
+        if not self.config.use_ternary_core:
+            return
+        for module in self.modules():
+            if isinstance(module, BitLinear):
+                module.requantize(certify_zeros=certify_zeros)
+
+    def compression_trace(self) -> Mapping[str, Any]:
+        if self.compression_ledger is None:
+            return {"enabled": False}
+        return {"enabled": True, **self.compression_ledger.to_dict()}
 
 
 @dataclass(frozen=True)
@@ -1200,6 +1346,12 @@ class TrainingConfig:
     resume_if_exists: bool = False
     resume_from_checkpoint: str | None = None
     checkpoint_interval: int = 100
+    resource_monitor_interval: float = 2.0
+    cortex_phase_interval: int = 0
+    cortex_phase_probe_tasks: int = 1
+    cortex_phase_max_proposals: int = 1
+    cortex_phase_regularization_weight: float = 0.001
+    cortex_phase_replay_weight: float = 0.05
     num_threads: int | None = None
 
     def __post_init__(self) -> None:
@@ -1213,6 +1365,18 @@ class TrainingConfig:
             raise ValueError("eval_interval must be positive")
         if self.checkpoint_interval < 1:
             raise ValueError("checkpoint_interval must be positive")
+        if self.resource_monitor_interval <= 0:
+            raise ValueError("resource_monitor_interval must be positive")
+        if self.cortex_phase_interval < 0:
+            raise ValueError("cortex_phase_interval must be non-negative")
+        if self.cortex_phase_probe_tasks < 1:
+            raise ValueError("cortex_phase_probe_tasks must be positive")
+        if self.cortex_phase_max_proposals < 0:
+            raise ValueError("cortex_phase_max_proposals must be non-negative")
+        if self.cortex_phase_regularization_weight < 0:
+            raise ValueError("cortex_phase_regularization_weight must be non-negative")
+        if self.cortex_phase_replay_weight < 0:
+            raise ValueError("cortex_phase_replay_weight must be non-negative")
         if self.resume and self.resume_if_exists:
             raise ValueError("resume and resume_if_exists are mutually exclusive")
 
@@ -1250,6 +1414,8 @@ class TrainingRunReport:
     curve: tuple[TrainingPoint, ...]
     config: Mapping[str, Any]
     hardware: Mapping[str, Any]
+    resource_usage: Mapping[str, Any] = field(default_factory=dict)
+    cortex_phase_report: Mapping[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -1257,6 +1423,148 @@ class TrainingRunReport:
         payload["final_train"] = self.final_train.to_dict()
         payload["final_val"] = self.final_val.to_dict()
         return payload
+
+
+class ResourceUsageMonitor:
+    def __init__(self, *, device: torch.device, interval_seconds: float):
+        self.device = device
+        self.interval_seconds = float(interval_seconds)
+        self.process = psutil.Process(os.getpid())
+        self.logical_cpu_count = max(1, int(psutil.cpu_count(logical=True) or 1))
+        self._samples: list[dict[str, Any]] = []
+        self._errors: list[str] = []
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._started_at = 0.0
+        self._stopped_at = 0.0
+
+    def start(self) -> None:
+        self._started_at = time.time()
+        psutil.cpu_percent(interval=None)
+        self.process.cpu_percent(interval=None)
+        self._thread = threading.Thread(target=self._run, name="cortex3-resource-monitor", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> Mapping[str, Any]:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=max(2.0, self.interval_seconds + 1.0))
+        self._stopped_at = time.time()
+        if not self._samples:
+            self._sample()
+        return self.summary()
+
+    def _run(self) -> None:
+        while not self._stop.wait(self.interval_seconds):
+            self._sample()
+
+    def _sample(self) -> None:
+        try:
+            sample: dict[str, Any] = {
+                "timestamp": time.time(),
+                "cpu_total_percent": float(psutil.cpu_percent(interval=None)),
+                "process_cpu_percent": float(self.process.cpu_percent(interval=None)),
+                "process_memory_rss_bytes": int(self.process.memory_info().rss),
+            }
+            sample["process_cpu_percent_of_total"] = float(sample["process_cpu_percent"]) / float(self.logical_cpu_count)
+            gpu_sample = self._nvidia_smi_sample()
+            if gpu_sample:
+                sample.update(gpu_sample)
+            with self._lock:
+                self._samples.append(sample)
+        except Exception as exc:
+            with self._lock:
+                self._errors.append(f"{type(exc).__name__}: {exc}")
+
+    def _nvidia_smi_sample(self) -> dict[str, Any]:
+        if self.device.type != "cuda":
+            return {}
+        device_index = self.device.index
+        if device_index is None:
+            try:
+                device_index = int(torch.cuda.current_device())
+            except Exception:
+                device_index = 0
+        command = [
+            "nvidia-smi",
+            "--query-gpu=index,utilization.gpu,utilization.memory,memory.used,memory.total",
+            "--format=csv,noheader,nounits",
+        ]
+        try:
+            completed = subprocess.run(command, capture_output=True, text=True, timeout=2.0, check=False)
+        except FileNotFoundError:
+            return {"gpu_monitor_error": "nvidia-smi not found"}
+        except Exception as exc:
+            return {"gpu_monitor_error": f"{type(exc).__name__}: {exc}"}
+        if completed.returncode != 0:
+            return {"gpu_monitor_error": completed.stderr.strip() or f"nvidia-smi exited {completed.returncode}"}
+        for raw_line in completed.stdout.splitlines():
+            parts = [part.strip() for part in raw_line.split(",")]
+            if len(parts) < 5:
+                continue
+            try:
+                index = int(parts[0])
+            except ValueError:
+                continue
+            if index != device_index:
+                continue
+            return {
+                "gpu_index": index,
+                "gpu_utilization_percent": float(parts[1]),
+                "gpu_memory_utilization_percent": float(parts[2]),
+                "gpu_memory_used_mb": float(parts[3]),
+                "gpu_memory_total_mb": float(parts[4]),
+            }
+        return {"gpu_monitor_error": f"cuda device index {device_index} not reported by nvidia-smi"}
+
+    def summary(self) -> Mapping[str, Any]:
+        with self._lock:
+            samples = list(self._samples)
+            errors = list(self._errors)
+        duration = (self._stopped_at or time.time()) - (self._started_at or time.time())
+
+        def values(key: str) -> list[float]:
+            out: list[float] = []
+            for sample in samples:
+                value = sample.get(key)
+                if isinstance(value, (int, float)):
+                    out.append(float(value))
+            return out
+
+        def stats(key: str) -> dict[str, float] | None:
+            vals = values(key)
+            if not vals:
+                return None
+            return {
+                "avg": sum(vals) / len(vals),
+                "min": min(vals),
+                "max": max(vals),
+            }
+
+        keys = (
+            "cpu_total_percent",
+            "process_cpu_percent",
+            "process_cpu_percent_of_total",
+            "process_memory_rss_bytes",
+            "gpu_utilization_percent",
+            "gpu_memory_utilization_percent",
+            "gpu_memory_used_mb",
+            "gpu_memory_total_mb",
+        )
+        metric_stats = {key: stats(key) for key in keys}
+        return {
+            "schema_version": 1,
+            "enabled": True,
+            "sample_interval_seconds": self.interval_seconds,
+            "duration_seconds": duration,
+            "sample_count": len(samples),
+            "logical_cpu_count": self.logical_cpu_count,
+            "metrics": {key: value for key, value in metric_stats.items() if value is not None},
+            "errors": errors + sorted({str(sample["gpu_monitor_error"]) for sample in samples if sample.get("gpu_monitor_error")}),
+            "first_sample": samples[0] if samples else None,
+            "last_sample": samples[-1] if samples else None,
+        }
 
 
 def _cuda_memory_report() -> tuple[dict[str, Any], ...]:
@@ -1320,7 +1628,7 @@ def hardware_report() -> dict[str, Any]:
 def _package_versions() -> dict[str, Any]:
     from importlib.metadata import PackageNotFoundError, version
 
-    packages = ("torch", "numpy", "tokenizers", "matplotlib", "datasets")
+    packages = ("torch", "numpy", "tokenizers", "matplotlib", "datasets", "psutil")
     payload: dict[str, Any] = {}
     for package in packages:
         try:
@@ -1386,6 +1694,381 @@ def llm_doctor_report(
     }
 
 
+def _last_items(items: Sequence[Any], limit: int = 3) -> list[Any]:
+    if limit <= 0:
+        return []
+    return list(items[-limit:])
+
+
+class CortexTrainingPhaseController:
+    def __init__(
+        self,
+        model: CortexTransformerLM,
+        tokenizer: LLMTokenizer,
+        config: TrainingConfig,
+        *,
+        run_dir: str | Path,
+    ):
+        if not model.config.use_cortex_heads:
+            raise ValueError("CortexTrainingPhaseController requires a Cortex model with use_cortex_heads=True")
+        self.model = model
+        self.tokenizer = tokenizer
+        self.config = config
+        self.run_dir = Path(run_dir)
+        self.verifier = DynamicSkillVerifier(default_skill_specs())
+        self.reference_agent = ReferenceRuleAgent()
+        self.trial_agent = CorruptedCompressedAgent()
+        self.cycle = CortexCycle(self.verifier)
+        self.future_ledger = FutureContractLedger()
+        self.future_engine = FutureContractEngine(
+            MTPFSPConfig(
+                hidden_size=model.config.d_model,
+                vocab_size=model.config.vocab_size,
+                horizons=model.config.horizons,
+            ),
+            ledger=self.future_ledger,
+            trace_ledger=model.compression_ledger,
+        )
+        self.memory = CognitiveMemory(CognitiveMemoryConfig())
+        self.certificate_verifier = CertificateVerifier()
+        self.attribution = CausalAttributionEngine(self.verifier)
+        self.regrowth = MinimalRegrowthEngine(self.verifier)
+        self.inference = UltraFastInferenceEngine(
+            self.verifier,
+            self.reference_agent,
+            memory=self.memory,
+            config=InferenceConfig(
+                hidden_size=max(32, model.config.d_model),
+                vocab_size=max(64, min(model.config.vocab_size, 4096)),
+                max_layers=max(4, model.config.n_layers),
+                careful_layers=max(4, model.config.n_layers),
+                normal_layers=max(3, min(max(4, model.config.n_layers), max(3, model.config.n_layers - 1))),
+                fast_layers=1,
+            ),
+        )
+        self.sleep = SleepPhaseConsolidator(self.verifier)
+        self.improvement = RecursiveImprovementEngine(self.verifier)
+        self.phase_counts: dict[str, int] = {phase.id: 0 for phase in CORTEX3_PHASES}
+        self.errors: list[dict[str, Any]] = []
+        self.batch_contract_samples: list[dict[str, Any]] = []
+        self.phase_audits: list[dict[str, Any]] = []
+        self.replay_batches: list[torch.Tensor] = []
+        self.replay_cursor = 0
+        self.regularization_steps = 0
+        self.replay_updates = 0
+
+    def _touch(self, phase_id: str) -> None:
+        self.phase_counts[phase_id] = self.phase_counts.get(phase_id, 0) + 1
+
+    def _record_error(self, phase_id: str, exc: Exception) -> None:
+        self.errors.append({"phase": phase_id, "type": type(exc).__name__, "message": str(exc)})
+
+    def interval(self) -> int:
+        return int(self.config.cortex_phase_interval or self.config.eval_interval)
+
+    def should_sample_step(self, step: int) -> bool:
+        return step == 0 or step % self.interval() == 0 or step == self.config.steps
+
+    def auxiliary_loss(self, output: LLMForwardOutput) -> torch.Tensor:
+        if output.confidence is None or self.config.cortex_phase_regularization_weight <= 0:
+            return output.logits.new_tensor(0.0)
+        self.regularization_steps += 1
+        confidence_pressure = (1.0 - output.confidence.mean()).clamp_min(0.0)
+        return confidence_pressure * float(self.config.cortex_phase_regularization_weight)
+
+    def observe_batch_contract(
+        self,
+        *,
+        step: int,
+        output: LLMForwardOutput,
+        future_targets: torch.Tensor,
+        breakdown: LossBreakdown,
+    ) -> None:
+        if not output.mtp_logits or output.confidence is None:
+            return
+        try:
+            logits_by_horizon: dict[int, torch.Tensor] = {}
+            for horizon, logits in output.mtp_logits.items():
+                if logits.shape[1] >= horizon:
+                    logits_by_horizon[int(horizon)] = logits[:, -int(horizon):, :].detach()
+            if not logits_by_horizon:
+                return
+            confidence = float(output.confidence.detach().mean().cpu())
+            contract = self.future_engine.draft_contract_from_logits(
+                logits_by_horizon,
+                confidence=confidence,
+                domain="llm_pretraining",
+                risk=max(0.0, min(1.0, float(breakdown.next_token))),
+                contract_id=f"llm-step-{step}-{len(self.batch_contract_samples)}",
+                temporal_loss=float(breakdown.temporal_consistency),
+            )
+            observed = future_targets[0, -1, : contract.accepted_horizon].detach().cpu().tolist()
+            decision = self.future_engine.gate_contract(contract, observed_tokens=[int(token) for token in observed])
+            self._touch("P3")
+            self.batch_contract_samples.append(
+                {
+                    "step": step,
+                    "accepted": decision.accepted,
+                    "horizon": decision.contract.accepted_horizon,
+                    "confidence": decision.contract.confidence,
+                    "reason": decision.reason,
+                }
+            )
+        except Exception as exc:
+            self._record_error("P3", exc)
+
+    def replay_loss(
+        self,
+        model_forward: nn.Module,
+        objective: CortexObjective,
+        precision: PrecisionPolicy,
+        device: torch.device,
+    ) -> torch.Tensor | None:
+        if not self.replay_batches or self.config.cortex_phase_replay_weight <= 0:
+            return None
+        batch = self.replay_batches[self.replay_cursor % len(self.replay_batches)].to(device)
+        self.replay_cursor += 1
+        x = batch[:, :-1]
+        y = batch[:, 1:]
+        future = self._future_targets_from_next_tokens(y)
+        with precision.autocast(device.type):
+            output = model_forward(x)
+            loss, _ = objective.compute(output, y, future, use_cortex_terms=self.model.config.use_cortex_heads)
+        self.replay_updates += 1
+        return loss * float(self.config.cortex_phase_replay_weight)
+
+    def _future_targets_from_next_tokens(self, y: torch.Tensor) -> torch.Tensor:
+        horizons = tuple(int(horizon) for horizon in self.model.config.horizons)
+        future = []
+        for horizon in horizons:
+            if horizon <= 1:
+                shifted = y
+            else:
+                tail = y[:, -1:].expand(-1, horizon - 1)
+                shifted = torch.cat((y[:, horizon - 1:], tail), dim=1)
+            future.append(shifted)
+        return torch.stack(future, dim=-1)
+
+    def _batch_from_example(self, example: TrainingExample) -> torch.Tensor:
+        text = (
+            f"Skill: {example.targeted_skill}\n"
+            f"Task: {example.task.prompt}\n"
+            f"Verified answer: {example.answer.text}\n"
+        )
+        ids = list(self.tokenizer.encode(text))
+        if not ids:
+            ids = [self.tokenizer.bos_id, self.tokenizer.eos_id]
+        while len(ids) < self.model.config.seq_len + 1:
+            ids.extend(ids)
+        ids = ids[: self.model.config.seq_len + 1]
+        return torch.tensor([ids], dtype=torch.long)
+
+    def _add_sleep_replay(self, examples: Sequence[TrainingExample]) -> None:
+        for example in examples[:8]:
+            self.replay_batches.append(self._batch_from_example(example))
+
+    def run_phase_audit(self, *, step: int) -> Mapping[str, Any]:
+        audit: dict[str, Any] = {"step": step}
+        cycle_report = None
+        first_failure = None
+        try:
+            cycle_report = self.cycle.run(
+                self.reference_agent,
+                self.trial_agent,
+                seed=self.config.seed + step,
+                n_per_skill=self.config.cortex_phase_probe_tasks,
+            )
+            self._touch("P1")
+            audit["verifier"] = {
+                "total": cycle_report.trial.total,
+                "passed": cycle_report.trial.passed,
+                "regressions": len(cycle_report.regressions),
+                "aggregate_score": cycle_report.trial.aggregate_score,
+            }
+            first_failure = cycle_report.regressions[0] if cycle_report.regressions else None
+        except Exception as exc:
+            self._record_error("P1", exc)
+
+        try:
+            if first_failure is not None:
+                self.memory.ingest(
+                    f"step-{step}-{first_failure.task.task_id}",
+                    f"{first_failure.task.prompt}\nExpected: {first_failure.expected}",
+                    extra_anchors=first_failure.task.anchors,
+                )
+                reconstruction = self.memory.reconstruct(first_failure.task.prompt, required_anchors=first_failure.task.anchors)
+            else:
+                self.memory.ingest(f"step-{step}-general", "Cortex-3 LLM training memory anchor C3-LLM-ANCHOR.")
+                reconstruction = self.memory.reconstruct("C3-LLM-ANCHOR")
+            self._touch("P4")
+            audit["memory"] = {
+                "selected_segment_ids": reconstruction.selected_segment_ids,
+                "fidelity": asdict(reconstruction.fidelity),
+                "compression": self.memory.compression_report(),
+            }
+        except Exception as exc:
+            self._record_error("P4", exc)
+
+        try:
+            task = first_failure.task if first_failure is not None else Task("phase-cert", "instruction_following", "Output OK exactly.", "OK")
+            answer_text = str(task.expected)
+            latent_state = LatentProofState(
+                state_id=f"llm-phase-{step}",
+                task_id=task.task_id,
+                skill=task.skill,
+                tensor=torch.tensor([[float(step), 1.0]], dtype=torch.float32),
+                latent_steps=2,
+                visible_reasoning_tokens=16,
+            )
+            certificate = build_certificate(
+                certificate_id=f"llm-cert-{step}",
+                task_id=task.task_id,
+                skill=task.skill,
+                certificate_type=CertificateType.FORMAT,
+                answer=answer_text,
+                claims={"calibrated_uncertainty": True, "llm_training_step": step},
+                uncertainty=0.05,
+                latent_state=latent_state,
+                anchors=task.anchors,
+                tool="exact_match",
+                tool_args={"expected": answer_text},
+            )
+            verification = self.certificate_verifier.verify(certificate, latent_state)
+            efficiency = evaluate_certificate_efficiency(
+                "slow visible reasoning " * 32,
+                certificate,
+                verification,
+                reference_uncertainty=0.05,
+            )
+            self._touch("P5")
+            audit["certificate"] = {
+                "verified": verification.to_dict(),
+                "efficiency": asdict(efficiency),
+                "certificate": certificate.to_dict(),
+            }
+        except Exception as exc:
+            self._record_error("P5", exc)
+
+        attribution_report = None
+        try:
+            if first_failure is not None:
+                attribution_report = self.attribution.attribute(
+                    first_failure,
+                    compression_ledger=self.model.compression_ledger,
+                    future_ledger=self.future_ledger,
+                )
+                self._touch("P6")
+                audit["attribution"] = attribution_report.to_dict()
+        except Exception as exc:
+            self._record_error("P6", exc)
+
+        try:
+            if attribution_report is not None:
+                regrowth_plan = self.regrowth.plan(
+                    attribution_report,
+                    self.trial_agent,
+                    (attribution_report.failure.task,),
+                    budget=10.0,
+                )
+                self._touch("P7")
+                audit["regrowth"] = regrowth_plan.to_dict()
+        except Exception as exc:
+            self._record_error("P7", exc)
+
+        inference_results: list[Any] = []
+        try:
+            task = first_failure.task if first_failure is not None else Task("phase-infer", "instruction_following", "Output OK exactly.", "OK")
+            inferred = self.inference.infer(task)
+            inference_results.append(inferred)
+            self._touch("P8")
+            audit["inference"] = inferred.to_dict()
+        except Exception as exc:
+            self._record_error("P8", exc)
+
+        sleep_report = None
+        try:
+            if cycle_report is not None:
+                sleep_report = self.sleep.ingest_cycle(cycle_report, seed=self.config.seed + step)
+                self._add_sleep_replay(sleep_report.accepted_examples)
+                self._touch("P9")
+                audit["sleep"] = sleep_report.to_dict()
+        except Exception as exc:
+            self._record_error("P9", exc)
+
+        improvement_report = None
+        try:
+            if cycle_report is not None and self.config.cortex_phase_max_proposals > 0:
+                improvement_report = self.improvement.run(
+                    cycle_report,
+                    baseline_agent=self.trial_agent,
+                    reference_agent=self.reference_agent,
+                    max_proposals=self.config.cortex_phase_max_proposals,
+                    seed=self.config.seed + step,
+                    n_per_skill=self.config.cortex_phase_probe_tasks,
+                )
+                self._touch("P10")
+                audit["recursive_improvement"] = improvement_report.to_dict()
+        except Exception as exc:
+            self._record_error("P10", exc)
+
+        try:
+            if cycle_report is not None:
+                objective_report = build_objective_report(
+                    cycle_report,
+                    future_ledger=self.future_ledger,
+                    inference_results=inference_results,
+                    improvement_report=improvement_report,
+                )
+                audit["objective"] = objective_report.to_dict()
+        except Exception as exc:
+            self._record_error("objective", exc)
+
+        self.phase_audits.append(audit)
+        return audit
+
+    def summary(self) -> Mapping[str, Any]:
+        compression_trace = self.model.compression_trace()
+        trace_counts = {}
+        if compression_trace.get("enabled"):
+            trace_counts = {
+                "compression_decisions": len(compression_trace.get("compression_decisions", ())),
+                "activation_quantizations": len(compression_trace.get("activation_quantizations", ())),
+                "kv_events": len(compression_trace.get("kv_events", ())),
+                "mtp_fsp_events": len(compression_trace.get("mtp_fsp_events", ())),
+                "layer_forward_events": len(compression_trace.get("layer_forward_events", ())),
+            }
+            if trace_counts["layer_forward_events"] > 0:
+                self.phase_counts["P2"] = max(self.phase_counts.get("P2", 0), trace_counts["layer_forward_events"])
+        phases = []
+        for phase in CORTEX3_PHASES:
+            count = int(self.phase_counts.get(phase.id, 0))
+            phases.append({
+                "id": phase.id,
+                "title": phase.title,
+                "active_in_llm_training": count > 0,
+                "event_count": count,
+            })
+        return {
+            "schema_version": 1,
+            "enabled": True,
+            "all_phases_active": all(item["active_in_llm_training"] for item in phases),
+            "phases": phases,
+            "phase_event_counts": dict(self.phase_counts),
+            "training_influence": {
+                "ternary_core_forward_events": trace_counts.get("layer_forward_events", 0),
+                "future_contract_decisions": len(self.future_ledger.decisions),
+                "confidence_regularization_steps": self.regularization_steps,
+                "sleep_replay_batches_available": len(self.replay_batches),
+                "sleep_replay_updates": self.replay_updates,
+            },
+            "trace_counts": trace_counts,
+            "future_ledger": self.future_ledger.to_dict(),
+            "phase_audits": _last_items(self.phase_audits, 2),
+            "batch_contract_samples": _last_items(self.batch_contract_samples, 5),
+            "errors": list(self.errors),
+        }
+
+
 class LLMTrainer:
     def __init__(
         self,
@@ -1408,6 +2091,7 @@ class LLMTrainer:
         self.device = self._resolve_device()
         self.precision = PrecisionPolicy(config.precision, require_cuda=config.require_cuda)
         self.corpus_identity = dict(corpus_identity or train_data.manifest.identity())
+        self.tokenizer = LLMTokenizer.load(self.train_data.manifest.tokenizer_file)
         if self.val_data.manifest.identity(verify=False) != self.train_data.manifest.identity(verify=False):
             raise ValueError("train and validation datasets must come from the same tokenized corpus manifest")
         if config.num_threads is not None:
@@ -1480,6 +2164,26 @@ class LLMTrainer:
             future_tokens_per_cost=future_correct / max(1.0, future_cost),
         )
 
+    def _prime_phase_controller(self, phase_controller: CortexTrainingPhaseController, *, step: int) -> None:
+        self.model.eval()
+        with torch.no_grad():
+            x, y, future = self._batch(self.val_data)
+            with self.precision.autocast(self.device.type):
+                output = self.model(x)
+                _, breakdown = self.objective.compute(
+                    output,
+                    y,
+                    future,
+                    use_cortex_terms=self.model.config.use_cortex_heads,
+                )
+            phase_controller.observe_batch_contract(
+                step=step,
+                output=output,
+                future_targets=future,
+                breakdown=breakdown,
+            )
+        phase_controller.run_phase_audit(step=step)
+
     def train(self, *, name: str) -> TrainingRunReport:
         runtime = DistributedRuntime.from_env(
             requested=self.config.distributed,
@@ -1501,67 +2205,119 @@ class LLMTrainer:
             cuda_index = self.device.index if self.device.index is not None else runtime.local_rank
             kwargs = {"device_ids": [cuda_index]} if self.device.type == "cuda" else {}
             trainable = nn.parallel.DistributedDataParallel(self.model, **kwargs)
+        phase_controller = (
+            CortexTrainingPhaseController(self.model, self.tokenizer, self.config, run_dir=self.run_dir)
+            if (
+                self.model.config.use_cortex_heads
+                and self.model.config.use_ternary_core
+                and self.model.config.horizons == (1, 2, 4, 8)
+            )
+            else None
+        )
         optimizer = torch.optim.AdamW(trainable.parameters(), lr=self.config.learning_rate, weight_decay=self.config.weight_decay)
         scaler = self.precision.scaler(self.device.type)
         curve: list[TrainingPoint] = []
+        resource_monitor = (
+            ResourceUsageMonitor(device=self.device, interval_seconds=self.config.resource_monitor_interval)
+            if runtime.is_main
+            else None
+        )
+        if resource_monitor is not None:
+            resource_monitor.start()
         resumed_from = self._resolve_resume_checkpoint()
         start_step = 0
-        if resumed_from is not None:
-            start_step, curve = self.load_checkpoint(resumed_from, optimizer=optimizer, scaler=scaler, restore_rng=not runtime.enabled)
-            if start_step > self.config.steps:
-                raise ValueError(f"checkpoint step {start_step} is greater than target steps {self.config.steps}")
-            if runtime.enabled:
-                resumed_seed = self.config.seed + runtime.rank * 100_003 + start_step * 997
-                torch.manual_seed(resumed_seed)
-                random.seed(resumed_seed)
-                np.random.seed(resumed_seed)
-                self.generator.manual_seed(resumed_seed)
-        else:
-            curve.append(self.evaluate(self.train_data, split="train", step=0))
-            curve.append(self.evaluate(self.val_data, split="val", step=0))
-        for step in range(start_step + 1, self.config.steps + 1):
-            self.model.train()
-            optimizer.zero_grad(set_to_none=True)
-            for micro_step in range(self.config.gradient_accumulation_steps):
-                x, y, future = self._batch(self.train_data)
-                sync_context = (
-                    trainable.no_sync()
-                    if runtime.enabled and micro_step < self.config.gradient_accumulation_steps - 1
-                    else nullcontext()
-                )
-                with sync_context:
-                    with self.precision.autocast(self.device.type):
-                        output = trainable(x) if runtime.enabled else self.model(x)
-                        loss, _ = self.objective.compute(
-                            output,
-                            y,
-                            future,
-                            use_cortex_terms=self.model.config.use_cortex_heads,
-                        )
-                        loss = loss / self.config.gradient_accumulation_steps
-                    if scaler is not None:
-                        scaler.scale(loss).backward()
-                    else:
-                        loss.backward()
-            if scaler is not None:
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(trainable.parameters(), self.config.grad_clip)
-                scaler.step(optimizer)
-                scaler.update()
+        resource_usage: Mapping[str, Any] = {"enabled": False}
+        try:
+            if resumed_from is not None:
+                start_step, curve = self.load_checkpoint(resumed_from, optimizer=optimizer, scaler=scaler, restore_rng=not runtime.enabled)
+                if start_step > self.config.steps:
+                    raise ValueError(f"checkpoint step {start_step} is greater than target steps {self.config.steps}")
+                if runtime.enabled:
+                    resumed_seed = self.config.seed + runtime.rank * 100_003 + start_step * 997
+                    torch.manual_seed(resumed_seed)
+                    random.seed(resumed_seed)
+                    np.random.seed(resumed_seed)
+                    self.generator.manual_seed(resumed_seed)
+                if phase_controller is not None and start_step >= self.config.steps:
+                    self._prime_phase_controller(phase_controller, step=start_step)
             else:
-                torch.nn.utils.clip_grad_norm_(trainable.parameters(), self.config.grad_clip)
-                optimizer.step()
-            if step % self.config.eval_interval == 0 or step == self.config.steps:
-                curve.append(self.evaluate(self.train_data, split="train", step=step))
-                curve.append(self.evaluate(self.val_data, split="val", step=step))
-            if runtime.is_main and step % self.config.checkpoint_interval == 0:
-                self.save_checkpoint(optimizer, self.run_dir / f"checkpoint_step_{step}.pt", step=step, curve=curve, scaler=scaler)
-        checkpoint_path = self.run_dir / "checkpoint_final.pt"
-        if runtime.is_main:
-            checkpoint_path = self.save_checkpoint(optimizer, checkpoint_path, step=self.config.steps, curve=curve, scaler=scaler)
-            self._write_curve(curve)
+                curve.append(self.evaluate(self.train_data, split="train", step=0))
+                curve.append(self.evaluate(self.val_data, split="val", step=0))
+                if phase_controller is not None:
+                    self._prime_phase_controller(phase_controller, step=0)
+            for step in range(start_step + 1, self.config.steps + 1):
+                self.model.train()
+                optimizer.zero_grad(set_to_none=True)
+                for micro_step in range(self.config.gradient_accumulation_steps):
+                    x, y, future = self._batch(self.train_data)
+                    sync_context = (
+                        trainable.no_sync()
+                        if runtime.enabled and micro_step < self.config.gradient_accumulation_steps - 1
+                        else nullcontext()
+                    )
+                    with sync_context:
+                        with self.precision.autocast(self.device.type):
+                            output = trainable(x) if runtime.enabled else self.model(x)
+                            loss, breakdown = self.objective.compute(
+                                output,
+                                y,
+                                future,
+                                use_cortex_terms=self.model.config.use_cortex_heads,
+                            )
+                            if phase_controller is not None:
+                                loss = loss + phase_controller.auxiliary_loss(output)
+                                replay_loss = phase_controller.replay_loss(
+                                    trainable if runtime.enabled else self.model,
+                                    self.objective,
+                                    self.precision,
+                                    self.device,
+                                )
+                                if replay_loss is not None:
+                                    loss = loss + replay_loss
+                            loss = loss / self.config.gradient_accumulation_steps
+                        if (
+                            phase_controller is not None
+                            and micro_step == 0
+                            and phase_controller.should_sample_step(step)
+                        ):
+                            phase_controller.observe_batch_contract(
+                                step=step,
+                                output=output,
+                                future_targets=future,
+                                breakdown=breakdown,
+                            )
+                        if scaler is not None:
+                            scaler.scale(loss).backward()
+                        else:
+                            loss.backward()
+                if scaler is not None:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(trainable.parameters(), self.config.grad_clip)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    torch.nn.utils.clip_grad_norm_(trainable.parameters(), self.config.grad_clip)
+                    optimizer.step()
+                self.model.requantize_ternary_core(certify_zeros=False)
+                if step % self.config.eval_interval == 0 or step == self.config.steps:
+                    curve.append(self.evaluate(self.train_data, split="train", step=step))
+                    curve.append(self.evaluate(self.val_data, split="val", step=step))
+                    if phase_controller is not None:
+                        phase_controller.run_phase_audit(step=step)
+                if runtime.is_main and step % self.config.checkpoint_interval == 0:
+                    self.save_checkpoint(optimizer, self.run_dir / f"checkpoint_step_{step}.pt", step=step, curve=curve, scaler=scaler)
+            checkpoint_path = self.run_dir / "checkpoint_final.pt"
+            if runtime.is_main:
+                checkpoint_path = self.save_checkpoint(optimizer, checkpoint_path, step=self.config.steps, curve=curve, scaler=scaler)
+                self._write_curve(curve)
+        finally:
+            if resource_monitor is not None:
+                resource_usage = resource_monitor.stop()
         final_train = [point for point in curve if point.split == "train"][-1]
         final_val = [point for point in curve if point.split == "val"][-1]
+        cortex_phase_report: Mapping[str, Any] = phase_controller.summary() if phase_controller is not None else {"enabled": False}
+        if cortex_phase_report.get("errors"):
+            raise RuntimeError(f"Cortex phase integration errors: {cortex_phase_report['errors']}")
         report = TrainingRunReport(
             name=name,
             model_kind=self.model_kind,
@@ -1580,9 +2336,13 @@ class LLMTrainer:
                 "corpus_identity": self.corpus_identity,
             },
             hardware=hardware_report(),
+            resource_usage=resource_usage,
+            cortex_phase_report=cortex_phase_report,
         )
         if runtime.is_main:
             _write_json(self.run_dir / "training_report.json", report.to_dict())
+            if phase_controller is not None:
+                _write_json(self.run_dir / "cortex_phase_report.json", cortex_phase_report)
         _barrier_if_needed(runtime)
         return report
 
@@ -1727,11 +2487,19 @@ class ComparisonConfig:
     max_next_token_loss_regression: float = 1.20
     min_baseline_future_tokens_per_cost: float = 1e-6
     min_corpus_tokens: int = 0
+    max_corpus_tokens: int | None = None
+    tokenizer_training_chars: int | None = None
     min_planned_train_tokens: int = 0
 
     def __post_init__(self) -> None:
         if self.min_corpus_tokens < 0:
             raise ValueError("min_corpus_tokens must be non-negative")
+        if self.max_corpus_tokens is not None and self.max_corpus_tokens < 1:
+            raise ValueError("max_corpus_tokens must be positive when provided")
+        if self.max_corpus_tokens is not None and self.max_corpus_tokens < self.min_corpus_tokens:
+            raise ValueError("max_corpus_tokens must be >= min_corpus_tokens")
+        if self.tokenizer_training_chars is not None and self.tokenizer_training_chars < 1:
+            raise ValueError("tokenizer_training_chars must be positive when provided")
         if self.min_planned_train_tokens < 0:
             raise ValueError("min_planned_train_tokens must be non-negative")
 
@@ -1958,7 +2726,7 @@ def _experiment_model_memory_estimates(config: ComparisonConfig) -> dict[str, An
         horizons=config.horizons,
         use_cortex_heads=False,
     )
-    cortex_config = TransformerConfig(**{**asdict(baseline_config), "use_cortex_heads": True})
+    cortex_config = TransformerConfig(**{**asdict(baseline_config), "use_cortex_heads": True, "use_ternary_core": True})
     baseline = _estimate_transformer_training_memory(baseline_config, config.training)
     cortex = _estimate_transformer_training_memory(cortex_config, config.training)
     return {
@@ -2005,7 +2773,7 @@ def build_training_plan(
         horizons=config.horizons,
         use_cortex_heads=False,
     )
-    cortex_config = TransformerConfig(**{**asdict(baseline_config), "use_cortex_heads": True})
+    cortex_config = TransformerConfig(**{**asdict(baseline_config), "use_cortex_heads": True, "use_ternary_core": True})
     baseline_parameters = _transformer_parameter_count(baseline_config)
     cortex_parameters = _transformer_parameter_count(cortex_config)
     effective_world_size = max(1, int(world_size))
@@ -2183,11 +2951,17 @@ class LLMComparisonRunner:
         self.prepared_manifest = prepared_manifest
 
     def prepare_corpus(self) -> TokenizedCorpusManifest:
-        tokenizer = LLMTokenizer.train(self.corpus, vocab_size=self.config.vocab_size, min_frequency=self.config.min_frequency)
+        tokenizer = LLMTokenizer.train(
+            self.corpus,
+            vocab_size=self.config.vocab_size,
+            min_frequency=self.config.min_frequency,
+            max_training_chars=self.config.tokenizer_training_chars,
+        )
         return TokenizedCorpusBuilder(self.corpus, tokenizer).build(
             self.run_dir / "corpus",
             seq_len=self.config.seq_len,
             max_horizon=max(self.config.horizons),
+            max_tokens=self.config.max_corpus_tokens,
             preparation_config=self._expected_preparation_config(),
         )
 
@@ -2198,6 +2972,8 @@ class LLMComparisonRunner:
             min_frequency=self.config.min_frequency,
             seq_len=self.config.seq_len,
             max_horizon=max(self.config.horizons),
+            max_tokens=self.config.max_corpus_tokens,
+            tokenizer_training_chars=self.config.tokenizer_training_chars,
         )
 
     def run(self, *, require_win: bool = False) -> ComparisonReport:
@@ -2268,7 +3044,7 @@ class LLMComparisonRunner:
                 model_kind="baseline_next_token",
                 corpus_identity=corpus_identity,
             ).train(name="baseline_ntp")
-            cortex_config = TransformerConfig(**{**asdict(model_config), "use_cortex_heads": True})
+            cortex_config = TransformerConfig(**{**asdict(model_config), "use_cortex_heads": True, "use_ternary_core": True})
             cortex = LLMTrainer(
                 CortexTransformerLM(cortex_config),
                 train_data,
@@ -2337,6 +3113,19 @@ class LLMComparisonRunner:
             planned_train_tokens = 0
         corpus_scale_passed = corpus_token_count >= int(self.config.min_corpus_tokens)
         planned_train_tokens_passed = planned_train_tokens >= int(self.config.min_planned_train_tokens)
+        cortex_model_config = cortex.config.get("model", {}) if isinstance(cortex.config, Mapping) else {}
+        raw_horizons = cortex_model_config.get("horizons", ()) if isinstance(cortex_model_config, Mapping) else ()
+        cortex_full_phase_required = bool(
+            isinstance(cortex_model_config, Mapping)
+            and cortex_model_config.get("use_cortex_heads")
+            and cortex_model_config.get("use_ternary_core")
+            and tuple(int(value) for value in raw_horizons) == (1, 2, 4, 8)
+        )
+        phase_report = cortex.cortex_phase_report if isinstance(cortex.cortex_phase_report, Mapping) else {}
+        cortex_phase_integration_passed = (
+            (not cortex_full_phase_required)
+            or (bool(phase_report.get("all_phases_active")) and not phase_report.get("errors"))
+        )
         checks = {
             "finite_metrics": finite_metrics,
             "baseline_score_passed": baseline_score_passed,
@@ -2345,6 +3134,7 @@ class LLMComparisonRunner:
             "learning_curve_audit_passed": learning_curve_audit_passed,
             "corpus_scale_passed": corpus_scale_passed,
             "planned_train_tokens_passed": planned_train_tokens_passed,
+            "cortex_phase_integration_passed": cortex_phase_integration_passed,
         }
         failed_checks = tuple(name for name, passed_check in checks.items() if not passed_check)
         passed = not failed_checks
@@ -2361,6 +3151,8 @@ class LLMComparisonRunner:
             "min_corpus_tokens": int(self.config.min_corpus_tokens),
             "planned_train_tokens": planned_train_tokens,
             "min_planned_train_tokens": int(self.config.min_planned_train_tokens),
+            "cortex_full_phase_required": cortex_full_phase_required,
+            "cortex_phase_integration_passed": cortex_phase_integration_passed,
             "checks": checks,
             "failed_checks": failed_checks,
             "baseline_score_passed": baseline_score_passed,
@@ -2384,6 +3176,8 @@ class LLMComparisonRunner:
             f"- Learning curve audit passed: `{proof['learning_curve_audit_passed']}`",
             f"- Corpus tokens: `{proof['corpus_token_count']}` (min `{proof['min_corpus_tokens']}`)",
             f"- Planned train tokens: `{proof['planned_train_tokens']}` (min `{proof['min_planned_train_tokens']}`)",
+            f"- Full Cortex phases required: `{proof['cortex_full_phase_required']}`",
+            f"- Cortex phase integration passed: `{proof['cortex_phase_integration_passed']}`",
             f"- Failed checks: `{', '.join(proof['failed_checks']) if proof['failed_checks'] else 'none'}`",
             f"- Passed: `{proof['passed']}`",
             "",
@@ -2522,11 +3316,13 @@ class LLMComparisonMatrixSuite:
                     self.corpus,
                     vocab_size=self.config.vocab_size,
                     min_frequency=self.config.min_frequency,
+                    max_training_chars=self.config.tokenizer_training_chars,
                 )
                 manifest = TokenizedCorpusBuilder(self.corpus, tokenizer).build(
                     self.run_dir / "corpus",
                     seq_len=self.config.seq_len,
                     max_horizon=max(self.config.horizons),
+                    max_tokens=self.config.max_corpus_tokens,
                     preparation_config=self._expected_preparation_config(),
                 )
         _barrier_if_needed(runtime)
@@ -2545,6 +3341,8 @@ class LLMComparisonMatrixSuite:
             min_frequency=self.config.min_frequency,
             seq_len=self.config.seq_len,
             max_horizon=max(self.config.horizons),
+            max_tokens=self.config.max_corpus_tokens,
+            tokenizer_training_chars=self.config.tokenizer_training_chars,
         )
 
     def _proof(self, seed_reports: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
@@ -3155,12 +3953,18 @@ class LLMExperimentRunner:
             "resume": bool(payload.get("resume", False)),
             "resume_if_exists": bool(payload.get("resume_if_exists", False)),
             "checkpoint_interval": int(payload.get("checkpoint_interval", 100)),
+            "resource_monitor_interval": float(payload.get("resource_monitor_interval", 2.0)),
+            "cortex_phase_interval": int(payload.get("cortex_phase_interval", 0)),
+            "cortex_phase_probe_tasks": int(payload.get("cortex_phase_probe_tasks", 1)),
+            "cortex_phase_max_proposals": int(payload.get("cortex_phase_max_proposals", 1)),
+            "cortex_phase_regularization_weight": float(payload.get("cortex_phase_regularization_weight", 0.001)),
+            "cortex_phase_replay_weight": float(payload.get("cortex_phase_replay_weight", 0.05)),
             "num_threads": payload.get("num_threads"),
         }
 
     def _normalize_model_config(self, raw: Any) -> dict[str, Any]:
         payload = dict(raw or {})
-        horizons = payload.get("horizons", (1, 2, 4))
+        horizons = payload.get("horizons", (1, 2, 4, 8))
         return {
             "vocab_size": int(payload.get("vocab_size", 4096)),
             "min_frequency": int(payload.get("min_frequency", 2)),
@@ -3173,6 +3977,10 @@ class LLMExperimentRunner:
             "cortex_win_margin": float(payload.get("cortex_win_margin", 1.05)),
             "max_next_token_loss_regression": float(payload.get("max_next_token_loss_regression", 1.20)),
             "min_corpus_tokens": int(payload.get("min_corpus_tokens", 0)),
+            "max_corpus_tokens": int(payload["max_corpus_tokens"]) if payload.get("max_corpus_tokens") is not None else None,
+            "tokenizer_training_chars": (
+                int(payload["tokenizer_training_chars"]) if payload.get("tokenizer_training_chars") is not None else None
+            ),
             "min_planned_train_tokens": int(payload.get("min_planned_train_tokens", 0)),
         }
 
@@ -3281,6 +4089,12 @@ class LLMExperimentRunner:
             resume=bool(training_payload["resume"]),
             resume_if_exists=bool(training_payload["resume_if_exists"]),
             checkpoint_interval=int(training_payload["checkpoint_interval"]),
+            resource_monitor_interval=float(training_payload["resource_monitor_interval"]),
+            cortex_phase_interval=int(training_payload["cortex_phase_interval"]),
+            cortex_phase_probe_tasks=int(training_payload["cortex_phase_probe_tasks"]),
+            cortex_phase_max_proposals=int(training_payload["cortex_phase_max_proposals"]),
+            cortex_phase_regularization_weight=float(training_payload["cortex_phase_regularization_weight"]),
+            cortex_phase_replay_weight=float(training_payload["cortex_phase_replay_weight"]),
             num_threads=training_payload.get("num_threads"),
         )
         return ComparisonConfig(
@@ -3296,6 +4110,14 @@ class LLMExperimentRunner:
             cortex_win_margin=float(model_payload["cortex_win_margin"]),
             max_next_token_loss_regression=float(model_payload["max_next_token_loss_regression"]),
             min_corpus_tokens=int(model_payload["min_corpus_tokens"]),
+            max_corpus_tokens=(
+                int(model_payload["max_corpus_tokens"]) if model_payload.get("max_corpus_tokens") is not None else None
+            ),
+            tokenizer_training_chars=(
+                int(model_payload["tokenizer_training_chars"])
+                if model_payload.get("tokenizer_training_chars") is not None
+                else None
+            ),
             min_planned_train_tokens=int(model_payload["min_planned_train_tokens"]),
         )
 
@@ -4064,6 +4886,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     smoke.add_argument("--gloo-interface", default=None)
     smoke.add_argument("--require-win", action="store_true")
     smoke.add_argument("--min-corpus-tokens", type=int, default=0)
+    smoke.add_argument("--max-corpus-tokens", type=int, default=None)
+    smoke.add_argument("--tokenizer-training-chars", type=int, default=None)
     smoke.add_argument("--min-planned-train-tokens", type=int, default=0)
 
     compare = sub.add_parser("compare", help="run baseline vs Cortex comparison on text files or directories")
@@ -4087,6 +4911,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     compare.add_argument("--gloo-interface", default=None)
     compare.add_argument("--require-win", action="store_true")
     compare.add_argument("--min-corpus-tokens", type=int, default=0)
+    compare.add_argument("--max-corpus-tokens", type=int, default=None)
+    compare.add_argument("--tokenizer-training-chars", type=int, default=None)
     compare.add_argument("--min-planned-train-tokens", type=int, default=0)
 
     compare_matrix = sub.add_parser("compare-matrix", help="run baseline vs Cortex comparison across multiple seeds on one shared corpus")
@@ -4111,6 +4937,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     compare_matrix.add_argument("--gloo-interface", default=None)
     compare_matrix.add_argument("--require-win", action="store_true")
     compare_matrix.add_argument("--min-corpus-tokens", type=int, default=0)
+    compare_matrix.add_argument("--max-corpus-tokens", type=int, default=None)
+    compare_matrix.add_argument("--tokenizer-training-chars", type=int, default=None)
     compare_matrix.add_argument("--min-planned-train-tokens", type=int, default=0)
 
     corpus_matrix = sub.add_parser("corpus-matrix", help="run compare-matrix across multiple named corpora")
@@ -4135,6 +4963,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     corpus_matrix.add_argument("--gloo-interface", default=None)
     corpus_matrix.add_argument("--require-win", action="store_true")
     corpus_matrix.add_argument("--min-corpus-tokens", type=int, default=0)
+    corpus_matrix.add_argument("--max-corpus-tokens", type=int, default=None)
+    corpus_matrix.add_argument("--tokenizer-training-chars", type=int, default=None)
     corpus_matrix.add_argument("--min-planned-train-tokens", type=int, default=0)
 
     benchmark = sub.add_parser("benchmark", help="run a deterministic multi-domain LLM benchmark suite")
@@ -4159,6 +4989,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     benchmark.add_argument("--gloo-interface", default=None)
     benchmark.add_argument("--require-win", action="store_true")
     benchmark.add_argument("--min-corpus-tokens", type=int, default=0)
+    benchmark.add_argument("--max-corpus-tokens", type=int, default=None)
+    benchmark.add_argument("--tokenizer-training-chars", type=int, default=None)
     benchmark.add_argument("--min-planned-train-tokens", type=int, default=0)
 
     benchmark_matrix = sub.add_parser("benchmark-matrix", help="run a multi-domain x multi-seed statistical LLM benchmark")
@@ -4184,6 +5016,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     benchmark_matrix.add_argument("--gloo-interface", default=None)
     benchmark_matrix.add_argument("--require-win", action="store_true")
     benchmark_matrix.add_argument("--min-corpus-tokens", type=int, default=0)
+    benchmark_matrix.add_argument("--max-corpus-tokens", type=int, default=None)
+    benchmark_matrix.add_argument("--tokenizer-training-chars", type=int, default=None)
     benchmark_matrix.add_argument("--min-planned-train-tokens", type=int, default=0)
 
     prepare_hf = sub.add_parser("prepare-hf", help="export a Hugging Face dataset to text shards and a token memmap corpus")
@@ -4206,6 +5040,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     prepare_hf.add_argument("--min-frequency", type=int, default=2)
     prepare_hf.add_argument("--seq-len", type=int, default=128)
     prepare_hf.add_argument("--max-horizon", type=int, default=8)
+    prepare_hf.add_argument("--max-tokens", type=int, default=None, help="cap the tokenized memmap after this many tokens")
+    prepare_hf.add_argument("--tokenizer-training-chars", type=int, default=None)
     prepare_hf.add_argument("--train-fraction", type=float, default=0.9)
     prepare_hf.add_argument("--resume", action="store_true", help="reuse a verified existing HF export and tokenized corpus")
 
@@ -4307,11 +5143,13 @@ def main(argv: Sequence[str] | None = None) -> None:
             n_heads=4,
             n_layers=2,
             dropout=0.0,
-            horizons=(1, 2, 4),
+            horizons=(1, 2, 4, 8),
             training=training,
             cortex_win_margin=1.02,
             max_next_token_loss_regression=1.50,
             min_corpus_tokens=args.min_corpus_tokens,
+            max_corpus_tokens=args.max_corpus_tokens,
+            tokenizer_training_chars=args.tokenizer_training_chars,
             min_planned_train_tokens=args.min_planned_train_tokens,
         )
         report = LLMComparisonRunner(corpus, config, run_dir=out_dir / "comparison").run(require_win=args.require_win)
@@ -4347,6 +5185,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             min_frequency=args.min_frequency,
             seq_len=args.seq_len,
             max_horizon=args.max_horizon,
+            max_tokens=args.max_tokens,
+            tokenizer_training_chars=args.tokenizer_training_chars,
             train_fraction=args.train_fraction,
         )
         tokenized_dir = out_dir / "tokenized"
@@ -4370,11 +5210,17 @@ def main(argv: Sequence[str] | None = None) -> None:
         else:
             if args.resume and tokenized_dir.exists() and any(tokenized_dir.iterdir()):
                 raise FileExistsError(f"resume=True found incomplete tokenized artifacts without manifest: {tokenized_dir}")
-            tokenizer = LLMTokenizer.train(corpus, vocab_size=args.vocab_size, min_frequency=args.min_frequency)
+            tokenizer = LLMTokenizer.train(
+                corpus,
+                vocab_size=args.vocab_size,
+                min_frequency=args.min_frequency,
+                max_training_chars=args.tokenizer_training_chars,
+            )
             manifest = TokenizedCorpusBuilder(corpus, tokenizer).build(
                 tokenized_dir,
                 seq_len=args.seq_len,
                 max_horizon=args.max_horizon,
+                max_tokens=args.max_tokens,
                 train_fraction=args.train_fraction,
                 preparation_config=tokenization_config,
             )
@@ -4416,11 +5262,13 @@ def main(argv: Sequence[str] | None = None) -> None:
             n_heads=args.n_heads,
             n_layers=args.n_layers,
             dropout=0.0,
-            horizons=(1, 2, 4),
+            horizons=(1, 2, 4, 8),
             training=training,
             cortex_win_margin=1.02,
             max_next_token_loss_regression=1.50,
             min_corpus_tokens=args.min_corpus_tokens,
+            max_corpus_tokens=args.max_corpus_tokens,
+            tokenizer_training_chars=args.tokenizer_training_chars,
             min_planned_train_tokens=args.min_planned_train_tokens,
         )
         report = LLMBenchmarkSuite(
@@ -4462,11 +5310,13 @@ def main(argv: Sequence[str] | None = None) -> None:
             n_heads=args.n_heads,
             n_layers=args.n_layers,
             dropout=0.0,
-            horizons=(1, 2, 4),
+            horizons=(1, 2, 4, 8),
             training=training,
             cortex_win_margin=1.02,
             max_next_token_loss_regression=1.50,
             min_corpus_tokens=args.min_corpus_tokens,
+            max_corpus_tokens=args.max_corpus_tokens,
+            tokenizer_training_chars=args.tokenizer_training_chars,
             min_planned_train_tokens=args.min_planned_train_tokens,
         )
         report = LLMStatisticalBenchmarkSuite(
@@ -4506,6 +5356,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             n_layers=args.n_layers,
             training=training,
             min_corpus_tokens=args.min_corpus_tokens,
+            max_corpus_tokens=args.max_corpus_tokens,
+            tokenizer_training_chars=args.tokenizer_training_chars,
             min_planned_train_tokens=args.min_planned_train_tokens,
         )
         report = LLMComparisonMatrixSuite(corpus, config, run_dir=args.out_dir, seeds=seeds).run(require_win=args.require_win)
@@ -4539,6 +5391,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             n_layers=args.n_layers,
             training=training,
             min_corpus_tokens=args.min_corpus_tokens,
+            max_corpus_tokens=args.max_corpus_tokens,
+            tokenizer_training_chars=args.tokenizer_training_chars,
             min_planned_train_tokens=args.min_planned_train_tokens,
         )
         report = LLMCorpusMatrixSuite(corpora, config, run_dir=args.out_dir, seeds=seeds).run(require_win=args.require_win)
@@ -4569,6 +5423,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         n_layers=args.n_layers,
         training=training,
         min_corpus_tokens=args.min_corpus_tokens,
+        max_corpus_tokens=args.max_corpus_tokens,
+        tokenizer_training_chars=args.tokenizer_training_chars,
         min_planned_train_tokens=args.min_planned_train_tokens,
     )
     report = LLMComparisonRunner(corpus, config, run_dir=args.out_dir).run(require_win=args.require_win)

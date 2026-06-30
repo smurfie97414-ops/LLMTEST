@@ -100,6 +100,33 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "source file size changed|source file sha256 changed"):
                 manifest.identity()
 
+    def test_tokenized_corpus_builder_can_cap_prepared_tokens(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            corpus = self._corpus(root, repeats=120)
+            tokenizer = LLMTokenizer.train(corpus, vocab_size=192, min_frequency=1)
+            manifest = TokenizedCorpusBuilder(corpus, tokenizer).build(
+                root / "prepared-capped",
+                seq_len=24,
+                max_horizon=4,
+                max_tokens=128,
+            )
+            self.assertEqual(manifest.token_count, 128)
+            self.assertEqual(Path(manifest.token_file).stat().st_size, 128 * 4)
+            self.assertEqual(manifest.preparation_config["max_tokens"], 128)
+            train = MemmapCausalDataset(manifest, split="train")
+            try:
+                self.assertGreater(len(train), 0)
+            finally:
+                train.close()
+            with self.assertRaisesRegex(ValueError, "max_tokens"):
+                TokenizedCorpusBuilder(corpus, tokenizer).build(
+                    root / "prepared-too-small",
+                    seq_len=24,
+                    max_horizon=4,
+                    max_tokens=16,
+                )
+
     def test_tokenized_corpus_builder_streams_tokens_once(self):
         class CountingTokenizer:
             vocab_size = 64
@@ -358,6 +385,72 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
         self.assertIn("corpus_scale_passed", proof["failed_checks"])
         self.assertIn("planned_train_tokens_passed", proof["failed_checks"])
 
+    def test_comparison_proof_requires_full_cortex_phase_report_for_full_architecture(self):
+        config = ComparisonConfig(
+            cortex_win_margin=1.02,
+            max_next_token_loss_regression=1.50,
+            min_baseline_future_tokens_per_cost=0.001,
+        )
+        runner = object.__new__(LLMComparisonRunner)
+        runner.config = config
+        baseline = TrainingRunReport(
+            name="baseline_ntp",
+            model_kind="baseline_next_token",
+            run_dir="baseline",
+            checkpoint_path="baseline/checkpoint_final.pt",
+            start_step=0,
+            optimizer_steps=4,
+            effective_batch_size=2,
+            resumed_from=None,
+            final_train=TrainingPoint(step=4, split="train", loss=1.0, next_token_loss=1.0, token_accuracy=0.1),
+            final_val=TrainingPoint(
+                step=4,
+                split="val",
+                loss=1.0,
+                next_token_loss=1.0,
+                token_accuracy=0.1,
+                future_tokens_per_cost=0.05,
+            ),
+            curve=(),
+            config={},
+            hardware={},
+        )
+        cortex = TrainingRunReport(
+            name="cortex3",
+            model_kind="cortex3_multi_horizon",
+            run_dir="cortex",
+            checkpoint_path="cortex/checkpoint_final.pt",
+            start_step=0,
+            optimizer_steps=4,
+            effective_batch_size=2,
+            resumed_from=None,
+            final_train=TrainingPoint(step=4, split="train", loss=1.0, next_token_loss=1.0, token_accuracy=0.1),
+            final_val=TrainingPoint(
+                step=4,
+                split="val",
+                loss=0.8,
+                next_token_loss=0.8,
+                token_accuracy=0.2,
+                future_tokens_per_cost=0.25,
+            ),
+            curve=(),
+            config={"model": {"use_cortex_heads": True, "use_ternary_core": True, "horizons": [1, 2, 4, 8]}},
+            hardware={},
+            cortex_phase_report={"enabled": True, "all_phases_active": False, "errors": []},
+        )
+
+        proof = runner._proof_payload(
+            baseline,
+            cortex,
+            {"passed": True},
+            plan={"corpus": {"token_count": 10_000}, "training": {"planned_train_tokens": 10_000}},
+        )
+
+        self.assertFalse(proof["passed"], proof)
+        self.assertTrue(proof["cortex_full_phase_required"], proof)
+        self.assertFalse(proof["cortex_phase_integration_passed"], proof)
+        self.assertIn("cortex_phase_integration_passed", proof["failed_checks"])
+
     def test_trainer_resumes_checkpoint_with_gradient_accumulation(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -445,6 +538,73 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
     def test_training_config_rejects_strict_and_auto_resume_together(self):
         with self.assertRaisesRegex(ValueError, "mutually exclusive"):
             TrainingConfig(resume=True, resume_if_exists=True)
+
+    def test_full_cortex_phase_controller_uses_all_modules_during_training(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            corpus = self._corpus(root, repeats=90)
+            tokenizer = LLMTokenizer.train(corpus, vocab_size=192, min_frequency=1)
+            manifest = TokenizedCorpusBuilder(corpus, tokenizer).build(
+                root / "prepared",
+                seq_len=24,
+                max_horizon=8,
+            )
+            model_config = TransformerConfig(
+                vocab_size=manifest.vocab_size,
+                seq_len=24,
+                d_model=32,
+                n_heads=4,
+                n_layers=1,
+                dropout=0.0,
+                horizons=(1, 2, 4, 8),
+                use_cortex_heads=True,
+                use_ternary_core=True,
+            )
+            train = MemmapCausalDataset(manifest, split="train")
+            val = MemmapCausalDataset(manifest, split="val")
+            run_dir = root / "full-cortex"
+            try:
+                report = LLMTrainer(
+                    CortexTransformerLM(model_config),
+                    train,
+                    val,
+                    TrainingConfig(
+                        steps=1,
+                        batch_size=2,
+                        eval_interval=1,
+                        eval_batches=1,
+                        checkpoint_interval=1,
+                        seed=53,
+                        num_threads=1,
+                        cortex_phase_interval=1,
+                        cortex_phase_probe_tasks=1,
+                        cortex_phase_max_proposals=1,
+                    ),
+                    run_dir=run_dir,
+                    model_kind="cortex3_multi_horizon",
+                    corpus_identity=manifest.identity(),
+                ).train(name="cortex3")
+            finally:
+                train.close()
+                val.close()
+
+            phase_report = report.cortex_phase_report
+            self.assertTrue(phase_report["enabled"], phase_report)
+            self.assertFalse(phase_report["errors"], phase_report)
+            self.assertTrue(phase_report["all_phases_active"], phase_report)
+            self.assertEqual(set(phase_report["phase_event_counts"]), {f"P{index}" for index in range(1, 11)})
+            for phase_id, count in phase_report["phase_event_counts"].items():
+                self.assertGreater(count, 0, phase_id)
+            influence = phase_report["training_influence"]
+            self.assertGreater(influence["ternary_core_forward_events"], 0)
+            self.assertGreater(influence["future_contract_decisions"], 0)
+            self.assertGreater(influence["confidence_regularization_steps"], 0)
+            self.assertGreater(influence["sleep_replay_batches_available"], 0)
+            self.assertGreater(influence["sleep_replay_updates"], 0)
+            self.assertTrue((run_dir / "cortex_phase_report.json").exists())
+            persisted = json.loads((run_dir / "cortex_phase_report.json").read_text(encoding="utf-8"))
+            self.assertTrue(persisted["all_phases_active"], persisted)
+            self.assertEqual(persisted["training_influence"]["sleep_replay_updates"], influence["sleep_replay_updates"])
 
     def test_trainer_rejects_resume_when_corpus_identity_changes(self):
         with tempfile.TemporaryDirectory() as tmp:

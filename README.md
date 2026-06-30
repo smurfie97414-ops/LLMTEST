@@ -181,7 +181,7 @@ Le pont LLM complet se lance avec :
 python tools/train_llm.py smoke --require-win
 ```
 
-Ce smoke construit un corpus texte déterministe, entraîne un tokenizer BPE, écrit les tokens en streaming dans un fichier `uint32` memmap, hashe le memmap, le tokenizer et les shards source, échantillonne les batches causaux de façon vectorisée, entraîne deux Transformers causaux sur les mêmes données, sauvegarde les checkpoints liés à l'identité du corpus et produit :
+Ce smoke construit un corpus texte déterministe, entraîne un tokenizer BPE, écrit les tokens en streaming dans un fichier `uint32` memmap, hashe le memmap, le tokenizer et les shards source, échantillonne les batches causaux de façon vectorisée, entraîne une baseline Transformer next-token et un Transformer Cortex complet sur les mêmes données, sauvegarde les checkpoints liés à l'identité du corpus et produit :
 
 - `comparison_report.json`
 - `run_plan.json`
@@ -190,8 +190,11 @@ Ce smoke construit un corpus texte déterministe, entraîne un tokenizer BPE, é
 - `learning_curve.png`
 - `baseline_ntp/learning_curve.csv`
 - `cortex3/learning_curve.csv`
+- `cortex3/cortex_phase_report.json`
 - `baseline_ntp/checkpoint_final.pt`
 - `cortex3/checkpoint_final.pt`
+
+Quand les horizons sont complets `[1, 2, 4, 8]`, le modèle Cortex active aussi le core ternaire `BitLinear` et le contrôleur de phases P1-P10 pendant l'entraînement. Ce contrôleur exécute le Verifier OS, les contrats MTP/FSP, la mémoire cognitive, les certificats, l'attribution, le regrowth, le routage fast/normal/careful, la sleep phase et le gate d'amélioration récursive. Il ajoute une régularisation Cortex au loss, transforme les exemples sleep acceptés en replay causal tokenisé, écrit `cortex_phase_report.json`, et la preuve comparative exige `cortex_phase_integration_passed=true` dès qu'un run annonce l'architecture Cortex complète.
 
 Pour un corpus plus large :
 
@@ -224,7 +227,7 @@ python tools/train_llm.py run-experiment experiments/c4_cuda_large_manifest.json
 python tools/train_llm.py audit-experiment runs/cortex3-c4-cuda-large
 ```
 
-Le manifeste décrit `doctor`, `training`, `model`, `seeds`, `require_win` et une liste de corpus `hf` ou `paths`. `preflight-experiment` vérifie le doctor et estime le pic mémoire modèle/batch/GPU sans préparer le corpus. `run-experiment` écrit `experiment_manifest.normalized.json`, `doctor_report.json`, `preflight_report.json`, prépare les corpus HF sous `prepared/<corpus>`, lance `corpus-matrix`, puis produit `experiment_report.json`, `experiment_report.md` et les courbes agrégées sous `corpus_matrix/`. Pour les runs longs, `training.resume_if_exists` réutilise les exports HF, manifests tokenisés et checkpoints vérifiés quand ils existent, tout en démarrant proprement si aucun artefact n'est encore présent. Après un long run, `audit-experiment` relit les artefacts persistés, vérifie les preuves `passed`, les manifests tokenisés, les shards HF, les courbes CSV/PNG et les checkpoints baseline/Cortex non vides.
+Le manifeste décrit `doctor`, `training`, `model`, `seeds`, `require_win` et une liste de corpus `hf` ou `paths`. `preflight-experiment` vérifie le doctor et estime le pic mémoire modèle/batch/GPU sans préparer le corpus. `run-experiment` écrit `experiment_manifest.normalized.json`, `doctor_report.json`, `preflight_report.json`, prépare les corpus HF sous `prepared/<corpus>`, lance `corpus-matrix`, puis produit `experiment_report.json`, `experiment_report.md` et les courbes agrégées sous `corpus_matrix/`. Pour les runs longs, `training.resume_if_exists` réutilise les exports HF, manifests tokenisés et checkpoints vérifiés quand ils existent, tout en démarrant proprement si aucun artefact n'est encore présent. `model.tokenizer_training_chars` borne l'échantillon CPU utilisé pour entraîner le BPE, et `model.max_corpus_tokens` arrête le memmap tokenisé dès que le corpus massif utile est atteint. Chaque `training_report.json` inclut aussi `resource_usage` avec CPU moyen, CPU process, GPU moyen, mémoire GPU moyenne/max et nombre d'échantillons pour vérifier si le run exploite vraiment la machine. Chaque run Cortex complet écrit aussi `cortex_phase_report.json`; si une phase P1-P10 manque ou échoue, `cortex_phase_integration_passed` devient faux et le proof ne passe pas. Après un long run, `audit-experiment` relit les artefacts persistés, vérifie les preuves `passed`, les manifests tokenisés, les shards HF, les courbes CSV/PNG et les checkpoints baseline/Cortex non vides.
 
 Deux manifestes versionnés sont fournis :
 
@@ -240,10 +243,10 @@ Extrait minimal :
   "doctor": {"require_cuda": true, "device": "cuda", "precision": "bf16", "distributed": true},
   "seeds": [11, 23, 37],
   "require_win": true,
-  "model": {"vocab_size": 32768, "seq_len": 1024, "d_model": 512, "n_heads": 8, "n_layers": 8, "horizons": [1, 2, 4, 8], "min_corpus_tokens": 50000000, "min_planned_train_tokens": 2000000000},
-  "training": {"steps": 32000, "batch_size": 4, "gradient_accumulation_steps": 16, "checkpoint_interval": 500, "resume_if_exists": true},
+  "model": {"vocab_size": 32768, "seq_len": 1024, "d_model": 512, "n_heads": 8, "n_layers": 8, "horizons": [1, 2, 4, 8], "min_corpus_tokens": 50000000, "max_corpus_tokens": 64000000, "tokenizer_training_chars": 64000000, "min_planned_train_tokens": 2000000000},
+  "training": {"steps": 32000, "batch_size": 8, "gradient_accumulation_steps": 8, "checkpoint_interval": 500, "cortex_phase_interval": 500, "resume_if_exists": true},
   "corpora": [
-    {"name": "c4", "kind": "hf", "dataset": "allenai/c4", "config_name": "en", "split": "train", "text_field": "text", "max_documents": 1000000}
+    {"name": "c4", "kind": "hf", "dataset": "allenai/c4", "config_name": "en", "split": "train", "text_field": "text", "max_documents": 1000000, "max_characters": 350000000}
   ]
 }
 ```
@@ -251,12 +254,12 @@ Extrait minimal :
 Pour préparer un corpus Hugging Face massif en shards texte puis memmap tokenisé :
 
 ```bash
-python tools/train_llm.py prepare-hf --dataset allenai/c4 --config-name en --split train --text-field text --out-dir runs/c4-prepared --max-documents 1000000 --vocab-size 32768 --seq-len 1024 --max-horizon 8
-python tools/train_llm.py prepare-hf --dataset allenai/c4 --config-name en --split train --text-field text --out-dir runs/c4-prepared --max-documents 1000000 --vocab-size 32768 --seq-len 1024 --max-horizon 8 --resume
+python tools/train_llm.py prepare-hf --dataset allenai/c4 --config-name en --split train --text-field text --out-dir runs/c4-prepared --max-documents 1000000 --max-characters 350000000 --vocab-size 32768 --seq-len 1024 --max-horizon 8 --tokenizer-training-chars 64000000 --max-tokens 64000000
+python tools/train_llm.py prepare-hf --dataset allenai/c4 --config-name en --split train --text-field text --out-dir runs/c4-prepared --max-documents 1000000 --max-characters 350000000 --vocab-size 32768 --seq-len 1024 --max-horizon 8 --tokenizer-training-chars 64000000 --max-tokens 64000000 --resume
 python tools/train_llm.py prepare-hf --dataset Salesforce/wikitext --config-name wikitext-2-raw-v1 --split train --text-field text --out-dir runs/wikitext2-prepared --max-documents 200 --vocab-size 512 --seq-len 64 --max-horizon 4
-python tools/train_llm.py compare runs/c4-prepared/text_shards --out-dir runs/c4-cortex-vs-ntp --steps 2000 --batch-size 64 --gradient-accumulation-steps 4 --checkpoint-interval 100 --precision bf16 --resume-if-exists
-python tools/train_llm.py compare-matrix runs/c4-prepared/text_shards --out-dir runs/c4-cortex-vs-ntp-matrix --seeds 11,23,37 --steps 2000 --batch-size 64 --gradient-accumulation-steps 4 --checkpoint-interval 100 --precision bf16 --resume-if-exists --require-win --min-corpus-tokens 50000000 --min-planned-train-tokens 100000000
-python tools/train_llm.py corpus-matrix --corpus c4=runs/c4-prepared/text_shards --out-dir runs/corpus-suite --seeds 11,23,37 --steps 2000 --batch-size 64 --gradient-accumulation-steps 4 --checkpoint-interval 100 --precision bf16 --resume-if-exists --require-win --min-corpus-tokens 50000000 --min-planned-train-tokens 100000000
+python tools/train_llm.py compare runs/c4-prepared/text_shards --out-dir runs/c4-cortex-vs-ntp --steps 2000 --batch-size 8 --gradient-accumulation-steps 8 --checkpoint-interval 100 --precision bf16 --resume-if-exists --max-corpus-tokens 64000000 --tokenizer-training-chars 64000000
+python tools/train_llm.py compare-matrix runs/c4-prepared/text_shards --out-dir runs/c4-cortex-vs-ntp-matrix --seeds 11,23,37 --steps 2000 --batch-size 8 --gradient-accumulation-steps 8 --checkpoint-interval 100 --precision bf16 --resume-if-exists --require-win --min-corpus-tokens 50000000 --max-corpus-tokens 64000000 --tokenizer-training-chars 64000000 --min-planned-train-tokens 100000000
+python tools/train_llm.py corpus-matrix --corpus c4=runs/c4-prepared/text_shards --out-dir runs/corpus-suite --seeds 11,23,37 --steps 2000 --batch-size 8 --gradient-accumulation-steps 8 --checkpoint-interval 100 --precision bf16 --resume-if-exists --require-win --min-corpus-tokens 50000000 --max-corpus-tokens 64000000 --tokenizer-training-chars 64000000 --min-planned-train-tokens 100000000
 ```
 
 Utilise les identifiants Hugging Face namespacés (`Salesforce/wikitext`, `allenai/c4`, etc.). Si Hub rejette un ancien ID court comme `wikitext`, le CLI échoue maintenant avec un message indiquant l'ID namespacé à utiliser.
@@ -267,7 +270,7 @@ Pour un dataset local JSONL compatible Hugging Face :
 python tools/train_llm.py prepare-hf --dataset json --data-file path/to/corpus.jsonl --split train --text-field text --out-dir runs/json-prepared
 ```
 
-Sans limite explicite, `prepare-hf` plafonne l'export à 100 000 documents pour éviter un lancement massif accidentel. Pour un vrai job complet, passe une limite de caractères/documents adaptée ou `--allow-unbounded` de façon explicite. `prepare-hf --resume` réutilise uniquement un export HF complet avec `hf_export_report.json`, shards présents, `prepare_report.json` et manifest tokenisé vérifié ; si les shards, le rapport, la recette de préparation du tokenizer/memmap ou la config de tokenization ne correspondent pas, la commande échoue au lieu d'écraser ou de reconstruire silencieusement.
+Sans limite explicite, `prepare-hf` plafonne l'export à 100 000 documents pour éviter un lancement massif accidentel. Pour un vrai job complet, passe une limite de caractères/documents adaptée ou `--allow-unbounded` de façon explicite. Si tu as un token Hugging Face, exporte `HF_TOKEN` avant le run pour éviter les limites du mode anonyme. `prepare-hf --resume` réutilise uniquement un export HF complet avec `hf_export_report.json`, shards présents, `prepare_report.json` et manifest tokenisé vérifié ; si les shards, le rapport, la recette de préparation du tokenizer/memmap ou la config de tokenization ne correspondent pas, la commande échoue au lieu d'écraser ou de reconstruire silencieusement.
 
 Pour l'entraînement, `--resume` reprend strictement depuis `checkpoint_final.pt` ou le plus récent `checkpoint_step_*.pt` du dossier baseline/Cortex. `--resume-if-exists` est le mode adapté aux runs longs : il démarre proprement au premier lancement, puis réutilise les corpus/tokenizers/checkpoints vérifiés quand ils existent. Si le corpus manifest, la recette tokenisée (`vocab_size`, `min_frequency`, `seq_len`, horizon, chunking), l'identité SHA-256 du corpus, le checkpoint attendu ou le champ `corpus_identity` manque en mode strict, ou si le checkpoint ne correspond pas au corpus courant, la commande échoue au lieu de repartir de zéro silencieusement.
 
