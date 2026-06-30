@@ -43,7 +43,7 @@ from cortex3 import (
 from cortex3_attribution import CausalAttributionEngine
 from cortex3_certificates import CertificateType, CertificateVerifier, LatentProofState, build_certificate, evaluate_certificate_efficiency
 from cortex3_cycle import CortexCycle
-from cortex3_future import FutureContractEngine, FutureContractLedger, MTPFSPConfig
+from cortex3_future import ContractDecision, FutureContract, FutureContractEngine, FutureContractLedger, MTPFSPConfig
 from cortex3_improvement import RecursiveImprovementEngine
 from cortex3_inference import InferenceConfig, UltraFastInferenceEngine
 from cortex3_memory import CognitiveMemory, CognitiveMemoryConfig
@@ -51,7 +51,17 @@ from cortex3_objective import build_objective_report
 from cortex3_phases import CORTEX3_PHASES
 from cortex3_regrowth import MinimalRegrowthEngine
 from cortex3_sleep import ExampleOrigin, SleepPhaseConsolidator, TrainingExample
-from cortex3_ternary import BitLinear, BitLinearConfig, CompressionTraceLedger
+from cortex3_ternary import (
+    ActivationQuantization,
+    BitLinear,
+    BitLinearConfig,
+    CompressionDecision,
+    CompressionTraceLedger,
+    ExpertActivation,
+    KVModeEvent,
+    LayerForwardEvent,
+    MTPFSPEvent,
+)
 
 
 SPECIAL_TOKENS: tuple[str, ...] = ("<pad>", "<bos>", "<eos>", "<unk>")
@@ -83,6 +93,139 @@ def _json_default(value: Any) -> Any:
 def _write_json(path: Path, payload: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, sort_keys=True, default=_json_default), encoding="utf-8")
+
+
+def _cost_trace_from_payload(payload: Mapping[str, Any] | None) -> CostTrace:
+    data = dict(payload or {})
+    return CostTrace(
+        weight_bits_read=float(data.get("weight_bits_read", 0.0)),
+        activation_bits=float(data.get("activation_bits", 0.0)),
+        kv_bytes=float(data.get("kv_bytes", 0.0)),
+        generated_tokens=int(data.get("generated_tokens", 0)),
+        latent_steps=int(data.get("latent_steps", 0)),
+        experts_activated=int(data.get("experts_activated", 0)),
+        verifier_steps=int(data.get("verifier_steps", 0)),
+        wall_time_ms=float(data.get("wall_time_ms", 0.0)),
+    )
+
+
+def _restore_future_contract_ledger(ledger: FutureContractLedger, payload: Mapping[str, Any] | None) -> None:
+    ledger.decisions.clear()
+    if not payload:
+        return
+    for raw_decision in payload.get("decisions", ()):
+        decision_data = dict(raw_decision)
+        contract_data = dict(decision_data.get("contract") or {})
+        cost_data = dict(decision_data.get("cost") or {})
+        contract = FutureContract(
+            contract_id=str(contract_data.get("contract_id", "")),
+            domain=str(contract_data.get("domain", "")),
+            risk=float(contract_data.get("risk", 0.0)),
+            requested_horizon=int(contract_data.get("requested_horizon", 1)),
+            accepted_horizon=int(contract_data.get("accepted_horizon", 1)),
+            token_ids=tuple(int(token) for token in contract_data.get("token_ids", ())),
+            confidence=float(contract_data.get("confidence", 0.0)),
+            temporal_loss=float(contract_data.get("temporal_loss", 0.0)),
+            revision=int(contract_data.get("revision", 0)),
+            accepted=bool(contract_data.get("accepted", False)),
+            reason=str(contract_data.get("reason", "")),
+        )
+        ledger.decisions.append(
+            ContractDecision(
+                contract=contract,
+                accepted=bool(decision_data.get("accepted", contract.accepted)),
+                reason=str(decision_data.get("reason", contract.reason)),
+                cost=_cost_trace_from_payload(cost_data),
+            )
+        )
+
+
+def _restore_compression_trace_ledger(ledger: CompressionTraceLedger | None, payload: Mapping[str, Any] | None) -> None:
+    if ledger is None:
+        return
+    ledger.compression_decisions.clear()
+    ledger.activation_quantizations.clear()
+    ledger.expert_activations.clear()
+    ledger.kv_events.clear()
+    ledger.mtp_fsp_events.clear()
+    ledger.layer_forward_events.clear()
+    if not payload:
+        return
+    for item in payload.get("compression_decisions", ()):
+        data = dict(item)
+        ledger.compression_decisions.append(
+            CompressionDecision(
+                block_id=str(data.get("block_id", "")),
+                source=str(data.get("source", "")),
+                original_count=int(data.get("original_count", 0)),
+                active_count=int(data.get("active_count", 0)),
+                provisional_zero_count=int(data.get("provisional_zero_count", 0)),
+                certified_zero_count=int(data.get("certified_zero_count", 0)),
+                scale=float(data.get("scale", 0.0)),
+                threshold=float(data.get("threshold", 0.0)),
+                estimated_bits=float(data.get("estimated_bits", 0.0)),
+                residual_l1=float(data.get("residual_l1", 0.0)),
+                note=str(data.get("note", "")),
+            )
+        )
+    for item in payload.get("activation_quantizations", ()):
+        data = dict(item)
+        ledger.activation_quantizations.append(
+            ActivationQuantization(
+                original=tuple(float(value) for value in data.get("original", ())),
+                quantized=tuple(int(value) for value in data.get("quantized", ())),
+                dequantized=tuple(float(value) for value in data.get("dequantized", ())),
+                bits=int(data.get("bits", 0)),
+                scale=float(data.get("scale", 0.0)),
+                saturated=int(data.get("saturated", 0)),
+            )
+        )
+    for item in payload.get("expert_activations", ()):
+        data = dict(item)
+        ledger.expert_activations.append(
+            ExpertActivation(
+                expert_id=str(data.get("expert_id", "")),
+                reason=str(data.get("reason", "")),
+                cost=float(data.get("cost", 1.0)),
+            )
+        )
+    for item in payload.get("kv_events", ()):
+        data = dict(item)
+        ledger.kv_events.append(
+            KVModeEvent(
+                segment_id=str(data.get("segment_id", "")),
+                mode=str(data.get("mode", "")),
+                bytes_used=float(data.get("bytes_used", 0.0)),
+                exact_anchors=int(data.get("exact_anchors", 0)),
+                note=str(data.get("note", "")),
+            )
+        )
+    for item in payload.get("mtp_fsp_events", ()):
+        data = dict(item)
+        ledger.mtp_fsp_events.append(
+            MTPFSPEvent(
+                block_id=str(data.get("block_id", "")),
+                horizon=int(data.get("horizon", 1)),
+                accepted=bool(data.get("accepted", False)),
+                confidence=float(data.get("confidence", 0.0)),
+                contract_revision=int(data.get("contract_revision", 0)),
+                reason=str(data.get("reason", "")),
+            )
+        )
+    for item in payload.get("layer_forward_events", ()):
+        data = dict(item)
+        ledger.layer_forward_events.append(
+            LayerForwardEvent(
+                layer_id=str(data.get("layer_id", "")),
+                input_shape=tuple(int(value) for value in data.get("input_shape", ())),
+                output_shape=tuple(int(value) for value in data.get("output_shape", ())),
+                active_weights=int(data.get("active_weights", 0)),
+                total_weights=int(data.get("total_weights", 0)),
+                estimated_weight_bits=float(data.get("estimated_weight_bits", 0.0)),
+                activation_bits=float(data.get("activation_bits", 0.0)),
+                note=str(data.get("note", "")),
+            )
+        )
 
 
 def _sha256_file(path: str | Path, *, chunk_size: int = 1024 * 1024) -> str:
@@ -2051,6 +2194,12 @@ class CortexTrainingPhaseController:
             "objective_feedback_total": float(self.objective_feedback_total),
             "last_objective_loss_total": float(self.last_objective_loss_total),
             "objective_feedback_history": list(self.objective_feedback_history),
+            "future_ledger": self.future_ledger.to_dict(),
+            "compression_trace_ledger": (
+                self.model.compression_ledger.to_dict()
+                if self.model.compression_ledger is not None
+                else None
+            ),
         }
 
     def load_state_dict(self, payload: Mapping[str, Any] | None) -> None:
@@ -2083,8 +2232,21 @@ class CortexTrainingPhaseController:
             dict(item)
             for item in payload.get("objective_feedback_history", ())
         ]
+        _restore_future_contract_ledger(self.future_ledger, payload.get("future_ledger"))
+        _restore_compression_trace_ledger(self.model.compression_ledger, payload.get("compression_trace_ledger"))
 
     def checkpoint_state_summary(self) -> dict[str, Any]:
+        compression_trace = self.model.compression_trace()
+        compression_trace_counts = {}
+        if compression_trace.get("enabled"):
+            compression_trace_counts = {
+                "compression_decisions": len(compression_trace.get("compression_decisions", ())),
+                "activation_quantizations": len(compression_trace.get("activation_quantizations", ())),
+                "expert_activations": len(compression_trace.get("expert_activations", ())),
+                "kv_events": len(compression_trace.get("kv_events", ())),
+                "mtp_fsp_events": len(compression_trace.get("mtp_fsp_events", ())),
+                "layer_forward_events": len(compression_trace.get("layer_forward_events", ())),
+            }
         return {
             "schema_version": 1,
             "phase_event_counts": dict(self.phase_counts),
@@ -2097,6 +2259,8 @@ class CortexTrainingPhaseController:
             "objective_feedback_events": int(self.objective_feedback_events),
             "objective_feedback_scale": self.objective_feedback_scale(),
             "last_objective_loss_total": float(self.last_objective_loss_total),
+            "future_contract_decisions": len(self.future_ledger.decisions),
+            "compression_trace_counts": compression_trace_counts,
             "error_count": len(self.errors),
         }
 

@@ -217,7 +217,7 @@ Current executable coverage:
 - `write_cycle_run` can persist sleep phase reports into `summary.json`.
 - `tools/run_cycle_report.py` writes Phase 9 sleep traces by default unless `--skip-sleep` is passed.
 - The full LLM trainer tokenizes accepted sleep examples with the active BPE tokenizer and replays them as causal batches in the Cortex loss.
-- Cortex phase replay batches are now saved in checkpoints and restored on resume, so long runs do not lose sleep/consolidation training state after interruption.
+- Cortex phase replay batches, future-contract ledger decisions and ternary compression trace histories are now saved in checkpoints and restored on resume, so long runs do not lose sleep/consolidation, P2 instrumentation or P3 contract state after interruption.
 
 Evidence:
 
@@ -254,7 +254,7 @@ Evidence:
 
 - `.\.venv\Scripts\python.exe -m unittest tests.test_recursive_improvement`
 - `.\.venv\Scripts\python.exe -m unittest discover -s tests`
-- `tests/test_llm_pretraining.py::LLMPretrainingHarnessTest::test_cortex_phase_state_survives_checkpoint_resume` verifies that P1-P10 replay state persists through a checkpoint resume and keeps influencing optimizer steps.
+- `tests/test_llm_pretraining.py::LLMPretrainingHarnessTest::test_cortex_phase_state_survives_checkpoint_resume` verifies that P1-P10 replay state plus P2/P3 internal ledgers persist through a checkpoint resume and keep influencing optimizer steps.
 - Smoke: `RecursiveImprovementEngine(...).run(..., max_proposals=3)` accepted Pareto-improving sandbox proposals with no touched files.
 - Temporary artifact write with `tools\run_cycle_report.py --out-dir <temp> --run-id final-smoke` includes `recursive_improvement` with accepted sandbox proposals and rollback data.
 
@@ -379,6 +379,7 @@ Current executable coverage:
 - `CortexObjective` optimizes next-token loss plus Cortex MTP, temporal-consistency and confidence terms when the Cortex heads are enabled.
 - `CortexTrainingPhaseController` integrates P1-P10 into full LLM training when horizons are `[1, 2, 4, 8]`: verifier cycle, ternary forward traces, MTP/FSP contract ledger, cognitive memory reconstruction, certificate verification, causal attribution, minimal regrowth planning, fast/normal/careful inference, sleep replay batches and recursive-improvement gates.
 - The full Cortex trainer adds confidence/contract regularization to the loss, tokenizes accepted sleep/phase examples into causal replay batches, scales Cortex trainable losses with bounded cross-phase objective feedback and writes `cortex_phase_report.json` with per-phase event counts.
+- Cortex checkpoints persist and restore the phase controller's replay state, objective feedback state, future-contract ledger and ternary compression trace ledger, so interrupted full-architecture training keeps the same P2/P3 audit context instead of resetting those modules.
 - `build_training_plan` writes `run_plan.json` before training starts, with real token-count, split-window, parameter-count, planned-token, checkpoint and optimizer-memory estimates for the baseline and Cortex models.
 - `LLMTrainer` supports checkpoints, strict resume, first-run-safe auto-resume, optimizer/scaler/RNG state persistence, gradient accumulation, CSV learning curves, resource usage monitoring, deterministic random sampling, explicit device selection, mixed precision policy and DDP initialization from environment, including a Windows/Gloo TCPStore path that avoids unsupported libuv builds.
 - Long LLM runs persist live resource monitoring to `resource_usage_live.json` at checkpoints and `resource_usage_summary.json` at shutdown/finalization, including CPU total/process averages, RSS memory and CUDA utilization/memory averages when `nvidia-smi` is available.
@@ -421,6 +422,7 @@ Evidence:
 - Versioned experiment manifests: `experiments/wikitext_cuda_validation.json` for fast local CUDA validation with small scale thresholds and `experiments/c4_cuda_large_manifest.json` for a preflighted, auto-resumable large C4 CUDA run with massive corpus/training-token proof thresholds.
 - Versioned Wikitext CUDA manifest validation: `tools\train_llm.py run-experiment experiments\wikitext_cuda_validation.json` passed with `2/2` seeds, win-rate `1.0`, mean Cortex/baseline ratio `11.861x`, min ratio `10.889x`, CUDA doctor passed and aggregate CSV/PNG learning curves written.
 - Full Cortex phase integration unit validation: `.\.venv\Scripts\python.exe -m pytest tests\test_llm_pretraining.py::LLMPretrainingHarnessTest::test_full_cortex_phase_controller_uses_all_modules_during_training -q` passed and verified P1-P10 event counts, ternary forward events, future contract decisions, confidence regularization, sleep replay batches, replay updates and objective-feedback scaling.
+- Cortex phase checkpoint-resume validation: `tests/test_llm_pretraining.py::LLMPretrainingHarnessTest::test_cortex_phase_state_survives_checkpoint_resume` verifies replay batches, objective feedback, future-contract decisions and ternary layer-forward trace history survive checkpoint reload.
 - Full Cortex proof-gate negative validation: `tests/test_llm_pretraining.py::LLMPretrainingHarnessTest::test_comparison_proof_requires_full_cortex_phase_report_for_full_architecture` verifies that a full-Cortex config fails proof when `all_phases_active=false`.
 - LLM pretraining test suite after full phase integration: `.\.venv\Scripts\python.exe -m pytest tests\test_llm_pretraining.py -q` passed with `32` tests.
 - Wikitext CUDA scale-gate validation: `tools\train_llm.py run-experiment experiments\wikitext_cuda_validation.json --out-dir runs\cortex3-wikitext-cuda-scale-gate-validation` passed with `2/2` seeds, min observed corpus tokens `29,104`, min observed planned train tokens `24,576`, min required corpus/train tokens `20,000/20,000`, mean Cortex/baseline ratio `10.257x`, min ratio `9.625x`, preflight artifact written and aggregate CSV/PNG learning curves written.

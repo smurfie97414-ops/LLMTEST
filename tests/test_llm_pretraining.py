@@ -780,15 +780,27 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 first_influence = first.cortex_phase_report["training_influence"]
                 self.assertGreater(first_influence["phase_replay_examples"], 0)
                 self.assertGreater(first_influence["objective_feedback_events"], 0)
+                self.assertGreater(first_influence["future_contract_decisions"], 0)
+                self.assertGreater(first_influence["ternary_core_forward_events"], 0)
                 checkpoint = torch.load(run_dir / "checkpoint_final.pt", map_location="cpu", weights_only=False)
                 self.assertIn("cortex_phase_state", checkpoint)
                 self.assertGreater(len(checkpoint["cortex_phase_state"]["replay_batches"]), 0)
                 self.assertGreater(checkpoint["cortex_phase_state"]["objective_feedback_events"], 0)
                 self.assertGreater(checkpoint["cortex_phase_state"]["last_objective_loss_total"], 0.0)
+                self.assertGreater(len(checkpoint["cortex_phase_state"]["future_ledger"]["decisions"]), 0)
+                self.assertGreater(
+                    len(checkpoint["cortex_phase_state"]["compression_trace_ledger"]["layer_forward_events"]),
+                    0,
+                )
                 sidecar = json.loads((run_dir / "checkpoint_final.pt.json").read_text(encoding="utf-8"))
                 self.assertTrue(sidecar["cortex_phase_state_present"])
                 self.assertGreater(sidecar["cortex_phase_state_summary"]["replay_batch_count"], 0)
                 self.assertGreater(sidecar["cortex_phase_state_summary"]["objective_feedback_events"], 0)
+                self.assertGreater(sidecar["cortex_phase_state_summary"]["future_contract_decisions"], 0)
+                self.assertGreater(
+                    sidecar["cortex_phase_state_summary"]["compression_trace_counts"]["layer_forward_events"],
+                    0,
+                )
 
                 resumed = LLMTrainer(
                     CortexTransformerLM(model_config),
@@ -824,6 +836,14 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 first_influence["objective_feedback_events"],
             )
             self.assertGreater(resumed_influence["objective_feedback_scale"], 1.0)
+            self.assertGreaterEqual(
+                resumed_influence["future_contract_decisions"],
+                first_influence["future_contract_decisions"],
+            )
+            self.assertGreaterEqual(
+                resumed_influence["ternary_core_forward_events"],
+                first_influence["ternary_core_forward_events"],
+            )
 
     def test_inspect_experiment_reports_partial_run_without_loading_checkpoints(self):
         with tempfile.TemporaryDirectory() as tmp:
