@@ -140,6 +140,13 @@ pip install -e .
 
 Les dépendances de travail incluent PyTorch, NumPy, Hugging Face `datasets`, `tokenizers` et Matplotlib ; elles sont obligatoires pour exécuter les couches modèle, exporter des corpus réels, entraîner le tokenizer BPE et générer les courbes d'apprentissage.
 
+Pour remplacer un build PyTorch CPU par le build CUDA validé localement :
+
+```bash
+pip install -r requirements-cuda-cu128.txt
+python tools/train_llm.py doctor --require-cuda --precision bf16 --device cuda
+```
+
 ## Démo noyau
 
 ```bash
@@ -272,7 +279,7 @@ Un benchmark multi-domaines déterministe est aussi disponible :
 python tools/train_llm.py benchmark --domains sequence,anchors --precision bf16 --require-win
 ```
 
-Il génère plusieurs corpus contrôlés, entraîne baseline et Cortex sur chaque domaine, agrège les ratios Cortex/baseline et écrit `benchmark_report.json`, `benchmark_report.md` et `benchmark_ratios.png`. Le runtime supporte DDP via `torch.distributed`; sur le build Windows CPU local, le chemin `torchrun` elastic échoue à cause d'un TCPStore libuv indisponible, donc le lanceur local ci-dessous utilise un TCPStore explicite `use_libuv=False` et une interface Gloo fixée.
+Il génère plusieurs corpus contrôlés, entraîne baseline et Cortex sur chaque domaine, agrège les ratios Cortex/baseline et écrit `benchmark_report.json`, `benchmark_report.md` et `benchmark_ratios.png`. Le runtime supporte DDP via `torch.distributed`; sur Windows/Gloo, le lanceur local ci-dessous utilise un TCPStore explicite `use_libuv=False` et une interface Gloo fixée.
 
 Pour une preuve plus robuste avec variance inter-seeds :
 

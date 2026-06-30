@@ -29,7 +29,7 @@ Evidence:
 - `.\.venv\Scripts\python.exe -m pip check`
 - `.\.venv\Scripts\python.exe -m unittest discover -s tests`
 - `.\.venv\Scripts\python.exe -m py_compile cortex3.py cortex3_analysis.py cortex3_cycle.py cortex3_ledgers.py cortex3_phases.py cortex3_selection.py cortex3_reporting.py cortex3_ternary.py cortex3_future.py cortex3_memory.py cortex3_certificates.py cortex3_attribution.py cortex3_regrowth.py tools\run_cycle_report.py`
-- Direct Torch validation in `.venv`: `torch==2.12.1+cpu`, `numpy==2.5.0`, `BitLinear(...)(torch.ones(1, 3)) -> shape (1, 2)` with compression and activation logs recorded.
+- Direct Torch validation in `.venv`: CUDA PyTorch `torch==2.11.0+cu128`, `numpy==2.5.0`, `BitLinear(...)(torch.ones(1, 3)) -> shape (1, 2)` with compression and activation logs recorded.
 
 Remaining Phase 1 hardening:
 
@@ -391,16 +391,18 @@ Current executable coverage:
 
 Evidence:
 
-- Local environment: `torch==2.12.1+cpu`, `cuda_available=False`, `distributed_available=True`, `gloo_available=True`, `nccl_available=False`.
-- Doctor validation: `tools\train_llm.py doctor --out-dir runs\llm-doctor-validation --precision bf16` passed with dependencies installed (`torch`, `numpy`, `tokenizers`, `matplotlib`, `datasets`), CPU `bf16` precision supported, `distributed_available=True`, `gloo_available=True`, `cuda_available=False`, `nccl_available=False`.
-- Doctor CUDA gate validation: `tools\train_llm.py doctor --out-dir runs\llm-doctor-require-cuda-validation --require-cuda --precision fp32 --device auto` failed as expected on this CPU-only machine with required checks `torch:cuda_available` and `torch:require_cuda`.
+- Local GPU environment after dependency correction: NVIDIA GeForce RTX 5070, driver CUDA `13.2`, `torch==2.11.0+cu128`, `torch.version.cuda==12.8`, `cuda_available=True`, `cuda_device_count=1`, `distributed_available=True`, `gloo_available=True`, `nccl_available=False` on Windows.
+- CUDA dependency correction: the previous environment had `torch==2.12.1+cpu` despite a visible RTX 5070. Installed the official CUDA wheel with `pip install --force-reinstall torch==2.11.0+cu128 --index-url https://download.pytorch.org/whl/cu128`; `requirements-cuda-cu128.txt` records the reproducible install command.
+- Doctor validation: `tools\train_llm.py doctor --out-dir runs\llm-doctor-cuda-validation --require-cuda --precision bf16 --device cuda` passed with CUDA visible and bf16 resolving on `cuda`.
 - `.\.venv\Scripts\python.exe tools\train_llm.py smoke --out-dir runs\llm-smoke-dev-48 --steps 48 --require-win`
 - Smoke proof: baseline score `0.022321`, Cortex score `0.145833`, Cortex/baseline `6.533x`, next-token-loss regression ratio `1.020`, proof passed.
+- CUDA smoke validation: `tools\train_llm.py smoke --out-dir runs\llm-cuda-smoke-validation --steps 48 --precision bf16 --device cuda --require-cuda --require-win` passed on RTX 5070 with baseline score `0.029576`, Cortex score `0.147135`, Cortex/baseline `4.975x`, next-token-loss regression ratio `1.017305`.
+- CUDA resume debug/fix: after installing the CUDA wheel, checkpoint resume exposed `TypeError: RNG state must be a torch.ByteTensor` when restoring CUDA RNG state loaded with `map_location=cuda`. `LLMTrainer.load_checkpoint` now normalizes saved CUDA RNG states back to CPU `uint8` tensors before `torch.cuda.set_rng_state_all`; the targeted resume test passes on CUDA.
 - `.\.venv\Scripts\python.exe tools\train_llm.py benchmark --out-dir runs\llm-benchmark-validation --domains sequence,anchors --repeats 96 --steps 48 --batch-size 8 --precision bf16 --require-win`
 - Benchmark proof through `codex-test` with `gradient_accumulation_steps=2`: `2/2` domains passed, mean Cortex/baseline ratio `32.097x`, minimum domain ratio `25.861x`, mean baseline score `0.005301`, max next-token-loss regression ratio `1.001049`.
 - `.\.venv\Scripts\python.exe tools\train_llm.py benchmark-matrix --out-dir runs\llm-benchmark-matrix-validation --domains sequence,anchors --seeds 11,23 --repeats 96 --steps 48 --batch-size 8 --precision bf16 --require-win`
 - Statistical benchmark proof through `codex-test`: `4/4` seed-domain samples passed, win-rate `1.0`, mean Cortex/baseline ratio `26.520x`, median ratio `18.829x`, minimum ratio `4.840x`, mean baseline score `0.012835`, max next-token-loss regression ratio `1.067812`.
-- DDP root cause and fix: the local Windows CPU PyTorch build exposes Gloo but `torchrun` elastic requests TCPStore libuv that is not compiled in; when Gloo auto-selected a bad host route it tried `kubernetes.docker.internal`. Cortex now pins `GLOO_SOCKET_IFNAME` and uses an explicit `TCPStore(..., use_libuv=False)` for local Gloo env initialization.
+- DDP root cause and fix: the local Windows/Gloo path needs explicit TCPStore `use_libuv=False`; when Gloo auto-selected a bad host route it tried `kubernetes.docker.internal`. Cortex now pins `GLOO_SOCKET_IFNAME` and uses an explicit `TCPStore(..., use_libuv=False)` for local Gloo env initialization.
 - `.\.venv\Scripts\python.exe tools\launch_llm_ddp.py --nproc 2 --master-port 29752 --gloo-interface Ethernet --timeout 240 -- smoke --out-dir runs\llm-ddp-smoke-validation --steps 48 --precision bf16 --require-win`
 - DDP smoke proof through `codex-test`: `world_size=2`, `distributed=True`, proof passed, baseline score `0.002790`, Cortex score `0.149740`, Cortex/baseline `53.667x`, next-token-loss regression ratio `0.952`.
 - `prepare-hf` is covered with a local Hugging Face JSONL dataset path that exports 30 documents into multiple shards, writes `hf_export_report.json`, trains a BPE tokenizer and builds a causal memmap manifest.
@@ -420,11 +422,12 @@ Evidence:
 - Checkpoint resume unit coverage: a Cortex trainer runs two optimizer steps with `gradient_accumulation_steps=2`, writes step/final checkpoints, resumes from `checkpoint_final.pt` to step 4 and preserves curve plus RNG state in the checkpoint payload.
 - CLI resume validation: `tools\train_llm.py smoke --out-dir runs\llm-resume-cli-validation --steps 2 ...` then `--steps 4 --resume ...` resumed both `baseline_ntp` and `cortex3` from `checkpoint_final.pt` with `start_step=2`, `optimizer_steps=2`, `effective_batch_size=16` and `final_step=4`.
 - DDP accumulation validation: `tools\launch_llm_ddp.py --nproc 2 ... --gradient-accumulation-steps 2` completed with `distributed=True`, `world_size=2`, proof passed and `effective_batch_size=32` for both baseline and Cortex.
-- `.\.venv\Scripts\python.exe -m unittest discover -s tests`: `117` tests passed.
+- DDP CUDA preflight validation: `tools\launch_llm_ddp.py --nproc 2 ... --device cuda --require-cuda` now fails before spawning workers because one visible CUDA device cannot serve two local CUDA ranks; CPU/Gloo DDP still passed after the CUDA wheel install.
+- `.\.venv\Scripts\python.exe -m unittest discover -s tests`: `124` tests passed.
 
 Remaining:
 
 - Run a genuine long large-corpus experiment from an external Hugging Face dataset such as C4/FineWeb, not only the deterministic local smoke corpus or local JSONL export test.
-- Validate CUDA mixed precision and NCCL multi-GPU runs on hardware that exposes real CUDA devices; this machine currently exposes only CPU Torch, so CUDA/NCCL claims remain unvalidated locally.
+- Validate NCCL multi-GPU runs on hardware exposing at least two CUDA devices; this Windows machine validates single-GPU CUDA bf16 and CPU/Gloo DDP, but `nccl_available=False` and only one CUDA device is visible.
 - Scale model sizes and training steps, then publish the same statistical benchmark on broad external corpora instead of only deterministic local domains.
 - Connect accepted recursive-improvement proposals to persisted LLM checkpoint patches with rollback archives.

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import platform
 import subprocess
@@ -40,6 +41,42 @@ def _default_gloo_interface(value: str | None) -> str | None:
     return None
 
 
+def _value_after(args: list[str], flag: str) -> str | None:
+    if flag not in args:
+        return None
+    index = args.index(flag)
+    if index + 1 >= len(args):
+        return None
+    return args[index + 1]
+
+
+def _manifest_requests_cuda(path: str | Path) -> bool:
+    manifest = json.loads(Path(path).read_text(encoding="utf-8-sig"))
+    doctor = manifest.get("doctor", {}) if isinstance(manifest, dict) else {}
+    training = manifest.get("training", {}) if isinstance(manifest, dict) else {}
+    device = str(training.get("device", doctor.get("device", "auto")))
+    require_cuda = bool(training.get("require_cuda", doctor.get("require_cuda", False)))
+    return require_cuda or device.startswith("cuda")
+
+
+def _train_args_request_cuda(args: list[str]) -> bool:
+    if not args:
+        return False
+    if args[0] == "run-experiment" and len(args) >= 2:
+        return _manifest_requests_cuda(args[1])
+    device = _value_after(args, "--device")
+    return "--require-cuda" in args or (device is not None and device.startswith("cuda"))
+
+
+def _cuda_device_count(python: str) -> tuple[bool, int, str | None, str]:
+    script = "import json, torch; print(json.dumps({'available': torch.cuda.is_available(), 'count': torch.cuda.device_count(), 'torch': torch.__version__, 'cuda': getattr(torch.version, 'cuda', None)}))"
+    result = subprocess.run([python, "-c", script], cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"failed to probe CUDA with {python}: {result.stderr.strip()}")
+    payload = json.loads(result.stdout)
+    return bool(payload["available"]), int(payload["count"]), payload.get("cuda"), str(payload["torch"])
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Launch tools/train_llm.py under a local multi-process DDP environment.")
     parser.add_argument("--nproc", type=int, default=2)
@@ -62,7 +99,18 @@ def main(argv: list[str] | None = None) -> None:
     log_dir = (ROOT / args.log_dir).resolve()
     log_dir.mkdir(parents=True, exist_ok=True)
 
-    command = [str(Path(args.python).resolve()), str(ROOT / "tools" / "train_llm.py"), *train_args]
+    python_path = str(Path(args.python).resolve())
+    if _train_args_request_cuda(train_args):
+        cuda_available, cuda_count, cuda_runtime, torch_version = _cuda_device_count(python_path)
+        if not cuda_available:
+            raise SystemExit(f"CUDA was requested but torch.cuda.is_available() is false for {python_path} (torch={torch_version}).")
+        if args.nproc > cuda_count:
+            raise SystemExit(
+                f"CUDA DDP requested {args.nproc} workers but only {cuda_count} CUDA device(s) are visible "
+                f"for {python_path} (torch={torch_version}, cuda={cuda_runtime}). Use --nproc <= {cuda_count} or run a CPU/Gloo validation."
+            )
+
+    command = [python_path, str(ROOT / "tools" / "train_llm.py"), *train_args]
     print("Launching DDP workers:")
     print("  command:", " ".join(command))
     print("  world_size:", args.nproc)

@@ -32,6 +32,7 @@ from cortex3_llm import (
     hardware_report,
     llm_doctor_report,
 )
+from tools.launch_llm_ddp import _manifest_requests_cuda, _train_args_request_cuda
 
 
 class LLMPretrainingHarnessTest(unittest.TestCase):
@@ -516,6 +517,27 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             self.assertTrue((root / "experiment" / "corpus_matrix" / "corpus_matrix_report.json").exists())
             self.assertTrue((root / "experiment" / "corpus_matrix" / "corpus_matrix_learning_curves.csv").exists())
             self.assertTrue((root / "experiment" / "corpus_matrix" / "corpus_matrix_learning_curves.png").exists())
+
+    def test_ddp_launcher_detects_cuda_requests_in_args_and_manifest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest_path = root / "cuda_manifest.json"
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "name": "cuda-ddp-preflight",
+                        "out_dir": str(root / "out"),
+                        "doctor": {"require_cuda": True, "device": "cuda", "precision": "bf16"},
+                        "seeds": [1],
+                        "corpora": [{"name": "paths", "kind": "paths", "paths": [str(root / "missing.txt")]}],
+                    }
+                ),
+                encoding="utf-8-sig",
+            )
+            self.assertTrue(_manifest_requests_cuda(manifest_path))
+            self.assertTrue(_train_args_request_cuda(["run-experiment", str(manifest_path)]))
+            self.assertTrue(_train_args_request_cuda(["smoke", "--device", "cuda"]))
+            self.assertFalse(_train_args_request_cuda(["smoke", "--device", "cpu"]))
 
     def test_cuda_requirement_is_explicit_not_silent_fallback(self):
         report = hardware_report()

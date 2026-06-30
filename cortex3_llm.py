@@ -1314,7 +1314,13 @@ class LLMTrainer:
             if "torch" in rng_state:
                 torch.set_rng_state(rng_state["torch"].cpu())
             if self.device.type == "cuda" and rng_state.get("torch_cuda_all"):
-                torch.cuda.set_rng_state_all(rng_state["torch_cuda_all"])
+                cuda_states: list[torch.Tensor] = []
+                for state in rng_state["torch_cuda_all"]:
+                    if isinstance(state, torch.Tensor):
+                        cuda_states.append(state.detach().cpu().to(dtype=torch.uint8))
+                    else:
+                        cuda_states.append(torch.as_tensor(state, dtype=torch.uint8))
+                torch.cuda.set_rng_state_all(cuda_states[: torch.cuda.device_count()])
             if "python" in rng_state:
                 random.setstate(rng_state["python"])
             if "numpy" in rng_state:
