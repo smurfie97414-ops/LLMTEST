@@ -195,6 +195,11 @@ def _restore_compression_trace_ledger(ledger: CompressionTraceLedger | None, pay
                 bits=int(data.get("bits", 0)),
                 scale=float(data.get("scale", 0.0)),
                 saturated=int(data.get("saturated", 0)),
+                total_values=(
+                    None
+                    if data.get("total_values") is None
+                    else int(data.get("total_values", 0))
+                ),
             )
         )
     ledger._trim(ledger.activation_quantizations)

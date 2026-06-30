@@ -20,10 +20,11 @@ class ActivationQuantization:
     bits: int
     scale: float
     saturated: int = 0
+    total_values: int | None = None
 
     @property
     def activation_bits(self) -> float:
-        return len(self.quantized) * self.bits
+        return (self.total_values if self.total_values is not None else len(self.quantized)) * self.bits
 
 
 @dataclass(frozen=True)
@@ -309,6 +310,9 @@ class BitLinear(nn.Module):
         self.register_buffer("mask", torch.ones(config.out_features, config.in_features))
         self.register_buffer("scales", torch.ones(config.out_features, 1))
         self.register_buffer("residual_weight", torch.zeros(config.out_features, config.in_features))
+        self._last_active_weights = int(config.out_features * config.in_features)
+        self._last_total_weights = int(config.out_features * config.in_features)
+        self._last_estimated_bits = float(config.out_features * config.in_features)
         nn.init.kaiming_uniform_(self.float_weight, a=5 ** 0.5)
         self.requantize()
 
@@ -339,19 +343,36 @@ class BitLinear(nn.Module):
             self.scales.copy_(scale if self.config.shared_scale else torch.ones_like(self.scales) * scale)
             self.residual_weight.copy_(residual)
 
-            flat = values.flatten().tolist()
-            buffer = ResidualSynapseBuffer(self.config.residual_threshold)
-            _, decision = make_compression_decision(
-                self.config.log_prefix,
-                flat,
-                threshold=float(self.config.threshold) if self.config.threshold is not None else None,
-                residual_buffer=buffer,
-                certify_zeros=certify_zeros,
-                note="torch BitLinear requantize",
+            active_count = int(mask.sum().item())
+            total_count = int(mask.numel())
+            zero_count = total_count - active_count
+            scale_count = values.shape[0] if self.config.shared_scale else 1
+            estimated_bits = float(
+                total_count
+                + active_count
+                + scale_count * 16
+                + ((self.bias.numel() * 16) if self.bias is not None else 0)
+            )
+            self._last_active_weights = active_count
+            self._last_total_weights = total_count
+            self._last_estimated_bits = estimated_bits
+            threshold_value = threshold.detach().mean() if isinstance(threshold, torch.Tensor) else torch.as_tensor(threshold)
+            decision = CompressionDecision(
+                block_id=self.config.log_prefix,
+                source="weights",
+                original_count=total_count,
+                active_count=active_count,
+                provisional_zero_count=0 if certify_zeros else zero_count,
+                certified_zero_count=zero_count if certify_zeros else 0,
+                scale=float(scale.detach().mean().item()),
+                threshold=float(threshold_value.item()),
+                estimated_bits=estimated_bits,
+                residual_l1=float(residual.detach().abs().sum().item()),
+                note="torch BitLinear requantize tensor-stats",
             )
             self.ledger.record_compression(decision)
 
-    def _runtime_weight_ste(self) -> tuple[Any, Any, float]:
+    def _runtime_weight_ste(self) -> Any:
         values = self.float_weight
         scale = values.detach().abs().mean(dim=1, keepdim=True).clamp_min(1e-12) if self.config.shared_scale else values.detach().abs().mean().clamp_min(1e-12)
         threshold = self.config.threshold if self.config.threshold is not None else 0.5 * scale
@@ -363,11 +384,7 @@ class BitLinear(nn.Module):
             residual = torch.where(residual.detach().abs() > self.config.residual_threshold, residual, torch.zeros_like(residual))
         runtime = quantized + residual
         weight = values + (runtime - values).detach()
-        active = int(mask.detach().sum().item())
-        total = int(mask.numel())
-        scale_count = values.shape[0] if self.config.shared_scale else 1
-        estimated_bits = float(total + active + scale_count * 16 + ((self.bias.numel() * 16) if self.bias is not None else 0))
-        return weight, mask, estimated_bits
+        return weight
 
     def _quantize_input(self, x: Any) -> Any:
         if self.config.activation_bits <= 0:
@@ -378,27 +395,29 @@ class BitLinear(nn.Module):
         q = torch.clamp(torch.round(x / scale), -qmax, qmax)
         quantized = q * scale
         dq = x + (quantized - x).detach()
+        sample_limit = min(16, int(q.numel()))
         self.ledger.record_activation(ActivationQuantization(
-            original=tuple(float(value) for value in x.detach().flatten().tolist()[:64]),
-            quantized=tuple(int(value) for value in q.detach().flatten().tolist()[:64]),
-            dequantized=tuple(float(value) for value in quantized.detach().flatten().tolist()[:64]),
+            original=tuple(float(value) for value in x.detach().flatten()[:sample_limit].cpu().tolist()),
+            quantized=tuple(int(value) for value in q.detach().flatten()[:sample_limit].cpu().tolist()),
+            dequantized=tuple(float(value) for value in quantized.detach().flatten()[:sample_limit].cpu().tolist()),
             bits=self.config.activation_bits,
             scale=float(scale),
             saturated=int((q.abs() >= qmax).sum().item()),
+            total_values=int(q.numel()),
         ))
         return dq
 
     def forward(self, x: Any) -> Any:
         xq = self._quantize_input(x)
-        weight, runtime_mask, estimated_bits = self._runtime_weight_ste()
+        weight = self._runtime_weight_ste()
         output = F.linear(xq, weight, self.bias)
         self.ledger.record_layer_forward(LayerForwardEvent(
             layer_id=self.config.log_prefix,
             input_shape=tuple(int(dim) for dim in x.shape),
             output_shape=tuple(int(dim) for dim in output.shape),
-            active_weights=int(runtime_mask.detach().sum().item()),
-            total_weights=int(runtime_mask.numel()),
-            estimated_weight_bits=estimated_bits,
+            active_weights=self._last_active_weights,
+            total_weights=self._last_total_weights,
+            estimated_weight_bits=self._last_estimated_bits,
             activation_bits=float(x.numel() * max(self.config.activation_bits, 0)),
             note="BitLinear real forward",
         ))
