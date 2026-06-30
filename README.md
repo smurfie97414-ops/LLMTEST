@@ -185,6 +185,7 @@ Ce smoke construit un corpus texte déterministe, entraîne un tokenizer BPE, é
 
 - `comparison_report.json`
 - `run_plan.json`
+- `learning_curve_audit.json`
 - `report.md`
 - `learning_curve.png`
 - `baseline_ntp/learning_curve.csv`

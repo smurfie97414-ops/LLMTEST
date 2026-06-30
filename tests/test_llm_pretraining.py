@@ -28,6 +28,9 @@ from cortex3_llm import (
     TrainingConfig,
     TransformerConfig,
     CortexTransformerLM,
+    TrainingPoint,
+    TrainingRunReport,
+    audit_learning_curves,
     build_training_plan,
     build_benchmark_corpus,
     build_seed_corpus,
@@ -164,6 +167,52 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             self.assertEqual(plan["training"]["tokens_per_optimizer_step"], 3 * 2 * 2 * 24)
             self.assertEqual(plan["training"]["planned_train_tokens"], 3 * 2 * 2 * 24 * 10)
             self.assertGreater(plan["training"]["effective_epochs_over_train_split"], 0.0)
+
+    def test_learning_curve_audit_rejects_missing_final_validation_point(self):
+        baseline = TrainingRunReport(
+            name="baseline_ntp",
+            model_kind="baseline_next_token",
+            run_dir="baseline",
+            checkpoint_path="baseline/checkpoint_final.pt",
+            start_step=0,
+            optimizer_steps=4,
+            effective_batch_size=2,
+            resumed_from=None,
+            final_train=TrainingPoint(step=4, split="train", loss=1.0, next_token_loss=1.0, token_accuracy=0.1),
+            final_val=TrainingPoint(step=0, split="val", loss=1.2, next_token_loss=1.2, token_accuracy=0.1),
+            curve=(
+                TrainingPoint(step=0, split="train", loss=1.3, next_token_loss=1.3, token_accuracy=0.1),
+                TrainingPoint(step=0, split="val", loss=1.2, next_token_loss=1.2, token_accuracy=0.1),
+            ),
+            config={},
+            hardware={},
+        )
+        cortex = TrainingRunReport(
+            name="cortex3",
+            model_kind="cortex3_multi_horizon",
+            run_dir="cortex",
+            checkpoint_path="cortex/checkpoint_final.pt",
+            start_step=0,
+            optimizer_steps=4,
+            effective_batch_size=2,
+            resumed_from=None,
+            final_train=TrainingPoint(step=4, split="train", loss=1.0, next_token_loss=1.0, token_accuracy=0.1),
+            final_val=TrainingPoint(step=4, split="val", loss=1.1, next_token_loss=1.1, token_accuracy=0.1),
+            curve=(
+                TrainingPoint(step=0, split="train", loss=1.3, next_token_loss=1.3, token_accuracy=0.1),
+                TrainingPoint(step=0, split="val", loss=1.2, next_token_loss=1.2, token_accuracy=0.1),
+                TrainingPoint(step=4, split="train", loss=1.0, next_token_loss=1.0, token_accuracy=0.1),
+                TrainingPoint(step=4, split="val", loss=1.1, next_token_loss=1.1, token_accuracy=0.1),
+            ),
+            config={},
+            hardware={},
+        )
+
+        audit = audit_learning_curves(baseline, cortex, expected_final_step=4)
+
+        self.assertFalse(audit["passed"], audit)
+        self.assertIn("baseline_ntp", audit["failed_models"])
+        self.assertIn("missing_final_validation_step", audit["baseline"]["failed_checks"])
 
     def test_trainer_resumes_checkpoint_with_gradient_accumulation(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -335,8 +384,10 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             self.assertTrue(proof["passed"], proof)
             self.assertGreater(proof["baseline_score"], 0.0)
             self.assertGreater(proof["cortex_over_baseline_ratio"], 1.02)
+            self.assertTrue(proof["learning_curve_audit_passed"], proof)
             for rel in [
                 "run_plan.json",
+                "learning_curve_audit.json",
                 "comparison_report.json",
                 "report.md",
                 "learning_curve.png",
@@ -350,6 +401,12 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             self.assertEqual(plan["training"]["tokens_per_optimizer_step"], 8 * 32)
             self.assertEqual(plan["training"]["planned_train_tokens"], 8 * 32 * 48)
             self.assertEqual(report.plan["corpus"]["token_count"], plan["corpus"]["token_count"])
+            curve_audit = json.loads((root / "run" / "learning_curve_audit.json").read_text(encoding="utf-8"))
+            self.assertTrue(curve_audit["passed"], curve_audit)
+            self.assertEqual(curve_audit["baseline"]["expected_final_step"], 48)
+            self.assertGreaterEqual(curve_audit["baseline"]["validation_point_count"], 2)
+            self.assertGreaterEqual(curve_audit["cortex"]["validation_point_count"], 2)
+            self.assertTrue(report.curve_audit["passed"])
 
     def test_comparison_matrix_reuses_shared_corpus_across_seeds(self):
         with tempfile.TemporaryDirectory() as tmp:

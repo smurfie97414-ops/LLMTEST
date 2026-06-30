@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import os
 import platform
 import random
@@ -1420,6 +1421,7 @@ class ComparisonReport:
     proof: Mapping[str, Any]
     hardware: Mapping[str, Any]
     plan: Mapping[str, Any]
+    curve_audit: Mapping[str, Any]
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -1664,6 +1666,86 @@ def build_training_plan(
     }
 
 
+def _finite_float(value: float) -> bool:
+    return math.isfinite(float(value))
+
+
+def _audit_model_learning_curve(report: TrainingRunReport, *, expected_final_step: int) -> dict[str, Any]:
+    val_points = sorted((point for point in report.curve if point.split == "val"), key=lambda point: point.step)
+    train_points = sorted((point for point in report.curve if point.split == "train"), key=lambda point: point.step)
+    steps = [int(point.step) for point in val_points]
+    failed_checks: list[str] = []
+    if len(val_points) < 2:
+        failed_checks.append("validation_point_count<2")
+    if not steps or steps[0] != 0:
+        failed_checks.append("missing_initial_validation_step")
+    if expected_final_step not in steps:
+        failed_checks.append("missing_final_validation_step")
+    if steps != sorted(set(steps)):
+        failed_checks.append("validation_steps_not_strictly_increasing")
+    finite = all(
+        _finite_float(value)
+        for point in tuple(val_points) + tuple(train_points)
+        for value in (point.loss, point.next_token_loss, point.token_accuracy, point.mtp_loss, point.future_tokens_per_cost)
+    )
+    if not finite:
+        failed_checks.append("non_finite_metric")
+
+    if val_points:
+        first = val_points[0]
+        final = val_points[-1]
+        best_loss = min(point.next_token_loss for point in val_points)
+        best_future = max(point.future_tokens_per_cost for point in val_points)
+        first_loss = first.next_token_loss
+        final_loss = final.next_token_loss
+        first_future = first.future_tokens_per_cost
+        final_future = final.future_tokens_per_cost
+    else:
+        best_loss = best_future = first_loss = final_loss = first_future = final_future = 0.0
+
+    return {
+        "model": report.name,
+        "model_kind": report.model_kind,
+        "validation_point_count": len(val_points),
+        "train_point_count": len(train_points),
+        "validation_steps": tuple(steps),
+        "expected_final_step": int(expected_final_step),
+        "first_next_token_loss": float(first_loss),
+        "final_next_token_loss": float(final_loss),
+        "best_next_token_loss": float(best_loss),
+        "next_token_loss_delta": float(final_loss - first_loss),
+        "first_future_tokens_per_cost": float(first_future),
+        "final_future_tokens_per_cost": float(final_future),
+        "best_future_tokens_per_cost": float(best_future),
+        "future_tokens_per_cost_delta": float(final_future - first_future),
+        "failed_checks": tuple(failed_checks),
+        "passed": not failed_checks,
+    }
+
+
+def audit_learning_curves(
+    baseline: TrainingRunReport,
+    cortex: TrainingRunReport,
+    *,
+    expected_final_step: int,
+) -> dict[str, Any]:
+    baseline_audit = _audit_model_learning_curve(baseline, expected_final_step=expected_final_step)
+    cortex_audit = _audit_model_learning_curve(cortex, expected_final_step=expected_final_step)
+    failed_models = tuple(
+        item["model"]
+        for item in (baseline_audit, cortex_audit)
+        if not bool(item["passed"])
+    )
+    return {
+        "schema_version": 1,
+        "expected_final_step": int(expected_final_step),
+        "baseline": baseline_audit,
+        "cortex": cortex_audit,
+        "failed_models": failed_models,
+        "passed": not failed_models,
+    }
+
+
 class LLMComparisonRunner:
     def __init__(
         self,
@@ -1752,7 +1834,8 @@ class LLMComparisonRunner:
         finally:
             train_data.close()
             val_data.close()
-        proof = self._proof_payload(baseline, cortex)
+        curve_audit = audit_learning_curves(baseline, cortex, expected_final_step=self.config.training.steps)
+        proof = self._proof_payload(baseline, cortex, curve_audit)
         proof["elapsed_seconds"] = time.time() - started
         proof["distributed"] = runtime.enabled
         proof["world_size"] = runtime.world_size
@@ -1764,8 +1847,10 @@ class LLMComparisonRunner:
             proof=proof,
             hardware=hardware_report(),
             plan=plan,
+            curve_audit=curve_audit,
         )
         if runtime.is_main:
+            _write_json(self.run_dir / "learning_curve_audit.json", curve_audit)
             _write_json(self.run_dir / "comparison_report.json", report.to_dict())
             self._write_markdown(report)
             self._write_learning_curve_png()
@@ -1779,12 +1864,16 @@ class LLMComparisonRunner:
             raise RuntimeError(f"Cortex comparison did not pass: {proof}")
         return report
 
-    def _proof_payload(self, baseline: TrainingRunReport, cortex: TrainingRunReport) -> dict[str, Any]:
+    def _proof_payload(self, baseline: TrainingRunReport, cortex: TrainingRunReport, curve_audit: Mapping[str, Any]) -> dict[str, Any]:
         baseline_score = baseline.final_val.future_tokens_per_cost
         cortex_score = cortex.final_val.future_tokens_per_cost
         ratio = cortex_score / max(1e-9, baseline_score)
         next_token_regression = cortex.final_val.next_token_loss / max(1e-9, baseline.final_val.next_token_loss)
-        passed = ratio >= self.config.cortex_win_margin and next_token_regression <= self.config.max_next_token_loss_regression
+        passed = (
+            ratio >= self.config.cortex_win_margin
+            and next_token_regression <= self.config.max_next_token_loss_regression
+            and bool(curve_audit["passed"])
+        )
         return {
             "metric": "verified_future_tokens_per_forward_cost",
             "baseline_score": baseline_score,
@@ -1793,6 +1882,7 @@ class LLMComparisonRunner:
             "required_margin": self.config.cortex_win_margin,
             "next_token_loss_regression_ratio": next_token_regression,
             "max_next_token_loss_regression": self.config.max_next_token_loss_regression,
+            "learning_curve_audit_passed": bool(curve_audit["passed"]),
             "passed": passed,
         }
 
@@ -1806,11 +1896,13 @@ class LLMComparisonRunner:
             f"- Cortex score: `{proof['cortex_score']:.6f}`",
             f"- Cortex/baseline ratio: `{proof['cortex_over_baseline_ratio']:.3f}`",
             f"- Next-token loss regression ratio: `{proof['next_token_loss_regression_ratio']:.3f}`",
+            f"- Learning curve audit passed: `{proof['learning_curve_audit_passed']}`",
             f"- Passed: `{proof['passed']}`",
             "",
             "## Artifacts",
             "",
             "- `run_plan.json`",
+            "- `learning_curve_audit.json`",
             "- `comparison_report.json`",
             "- `baseline_ntp/learning_curve.csv`",
             "- `cortex3/learning_curve.csv`",
