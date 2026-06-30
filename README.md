@@ -194,7 +194,7 @@ Ce smoke construit un corpus texte déterministe, entraîne un tokenizer BPE, é
 - `baseline_ntp/checkpoint_final.pt`
 - `cortex3/checkpoint_final.pt`
 
-Quand les horizons sont complets `[1, 2, 4, 8]`, le modèle Cortex active aussi le core ternaire `BitLinear` et le contrôleur de phases P1-P10 pendant l'entraînement. Ce contrôleur exécute le Verifier OS, les contrats MTP/FSP, la mémoire cognitive, les certificats, l'attribution, le regrowth, le routage fast/normal/careful, la sleep phase et le gate d'amélioration récursive. Il ajoute une régularisation Cortex au loss, transforme les exemples sleep acceptés en replay causal tokenisé, écrit `cortex_phase_report.json`, et la preuve comparative exige `cortex_phase_integration_passed=true` dès qu'un run annonce l'architecture Cortex complète.
+Quand les horizons sont complets `[1, 2, 4, 8]`, le modèle Cortex active aussi le core ternaire `BitLinear` et le contrôleur de phases P1-P10 pendant l'entraînement. Ce contrôleur exécute le Verifier OS, les contrats MTP/FSP, la mémoire cognitive, les certificats, l'attribution, le regrowth, le routage fast/normal/careful, la sleep phase et le gate d'amélioration récursive. Il ajoute une régularisation Cortex au loss, transforme les exemples sleep acceptés en replay causal tokenisé, applique les réparations P7 acceptées directement au Transformer via un patch borné et non-régressif des paramètres ciblés, convertit les propositions P10 acceptées en patchs signés avec rollback token, écrit `cortex_phase_report.json`, et la preuve comparative exige `cortex_phase_integration_passed=true` dès qu'un run annonce l'architecture Cortex complète.
 
 Pour un corpus plus large :
 
@@ -327,8 +327,8 @@ python -m pytest tests/test_llm_pretraining.py -q
 6. Étendre la boucle générative autoregressive vers held-out suites, benchmarks coût/qualité plus larges et calibration de confiance.
 7. Étendre le banc MTP vs NTP en faible précision sur variantes de checkpoints autoregressifs et LLM.
 8. Durcir Phase 6 avec ablations branchées sur de vrais forward passes multi-couches.
-9. Durcir Phase 7 avec application directe sur un micro-modèle multi-couches.
-10. Étendre le harness LLM vers des checkpoints plus larges, puis brancher les propositions acceptées sur des patchs signés avec rollback persistant.
+9. Calibrer Phase 7 sur des runs longs multi-corpus : fréquence des patchs, bornes de delta, effet cumulé et rollback persistant signé.
+10. Étendre le harness LLM vers des checkpoints plus larges, puis auditer les propositions acceptées sur des patchs signés avec rollback persistant.
 
 ## Phrase centrale
 

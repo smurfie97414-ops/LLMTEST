@@ -22,7 +22,8 @@ This document tracks implementation progress for the project.
   - Next: learn attribution policies over repeated trace corpora rather than relying on deterministic probe ranking alone.
 - Phase 7: minimal regrowth
   - Implemented baseline: executable repair action space, artifact edits for ternary blocks/signs/scale precision, force-anchor/MTP/expert/activation/certificate/verifier/micro-family patches, gain/cost simulation, protected non-regression gate, re-crystallization annealing and default cycle-report regrowth smoke generated from real regressions.
-  - Next: apply repairs to a real multi-layer model state and persist accepted repair archives.
+  - Full LLM integration: accepted repairs are now applied to real Transformer state through a bounded targeted gradient patch, verified by repair-loss improvement, protected-loss non-regression, parameter delta evidence, ternary requantization and persisted checkpoint/report audit fields.
+  - Next: calibrate repeated regrowth schedules across long multi-corpus training runs.
 - Phase 8: fast normal careful routing
   - Implemented baseline: executable fast/normal/careful inference loop with difficulty signals, budget predictor, early exit, Mixture-of-Depths `BitLinear`, latent KV reconstruction, route-capped MTP self-speculation, oracle-audited fast-path scoring, strong-path certificate verification, expert traces, packed ternary kernel dispatch records, persisted inference JSON and a trained autoregressive answer generator accepted by the main inference engine and cycle artifacts.
   - Next: persist and select autoregressive checkpoints across runs, benchmark path choices over larger suites, calibrate early-exit confidence and connect hardware-specific ternary kernels beyond the CPU reference dispatch.
@@ -31,7 +32,8 @@ This document tracks implementation progress for the project.
   - Next: persist external real/exogenous provenance adapters and measure post-sleep retention over repeated cycles.
 - Phase 10: recursive improvement gate
   - Implemented baseline: proposal generator, in-memory sandbox trainer, evolutionary archive, dynamic evaluator, Pareto/protected/calibration/diversity patch acceptance gate, reward-hacking detector, cross-skill collapse detector, rollback tokens and verifier-approved proposal replay examples that feed the full LLM Cortex loss.
-  - Next: convert accepted in-memory proposals into signed patch artifacts, add persistent rollback archives and run multi-generation evolution.
+  - Full LLM integration: accepted proposals now become signed bounded Transformer-parameter patches with rollback token, repair-loss improvement, protected-loss non-regression, parameter delta evidence and checkpoint/report persistence.
+  - Next: persist evolutionary/rollback archives across independent long runs and run multi-generation evolution with diversity pressure.
 - Cross-phase objective and metrics
   - Implemented baseline: executable 17-term `L_total` from the plan, objective weights, effective joule model, recursive-improvement invalidity gates, all 15 absolute metrics, persisted objective reports in `summary.json`, and bounded objective-feedback scaling for the trainable Cortex LLM confidence regularization and phase replay losses.
   - Next: calibrate term weights empirically against long real training runs and compare checkpoint selection policies.

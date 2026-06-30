@@ -45,13 +45,13 @@ from cortex3_attribution import CausalAttributionEngine
 from cortex3_certificates import CertificateHead, CertificateHeadOutput, CertificateType, CertificateVerifier, LatentProofState, RandomDelatentizer, build_certificate, evaluate_certificate_efficiency
 from cortex3_cycle import CortexCycle
 from cortex3_future import ContractDecision, FutureContract, FutureContractEngine, FutureContractLedger, MTPFSPConfig
-from cortex3_improvement import RecursiveImprovementEngine, RollbackEvent
+from cortex3_improvement import AcceptanceDecision, ProposalKind, RecursiveImprovementEngine, RollbackEvent
 from cortex3_inference import InferenceConfig, InferencePath, UltraFastInferenceEngine
 from cortex3_ledgers import BitLedger, CausalLedger, CausalTrace, SkillLedger, SkillState, UncertaintyLedger
 from cortex3_memory import CognitiveMemory, CognitiveMemoryConfig, MemoryMode, MemorySegment
 from cortex3_objective import FINAL_LOSS_TERMS, build_objective_report
 from cortex3_phases import CORTEX3_PHASES
-from cortex3_regrowth import MinimalRegrowthEngine
+from cortex3_regrowth import MinimalRegrowthEngine, RegrowthActionKind, RegrowthPlan
 from cortex3_sleep import ExampleOrigin, SleepPhaseConsolidator, TrainingExample
 from cortex3_ternary import (
     ActivationQuantization,
@@ -2062,6 +2062,7 @@ class TrainingConfig:
     cortex_phase_interval: int = 0
     cortex_phase_probe_tasks: int = 1
     cortex_phase_max_proposals: int = 1
+    cortex_phase_regrowth_budget: float = 32.0
     cortex_phase_regularization_weight: float = 0.001
     cortex_phase_replay_weight: float = 0.05
     cortex_objective_feedback_weight: float = 0.05
@@ -2090,6 +2091,8 @@ class TrainingConfig:
             raise ValueError("cortex_phase_probe_tasks must be positive")
         if self.cortex_phase_max_proposals < 0:
             raise ValueError("cortex_phase_max_proposals must be non-negative")
+        if self.cortex_phase_regrowth_budget <= 0:
+            raise ValueError("cortex_phase_regrowth_budget must be positive")
         if self.cortex_phase_regularization_weight < 0:
             raise ValueError("cortex_phase_regularization_weight must be non-negative")
         if self.cortex_phase_replay_weight < 0:
@@ -2509,7 +2512,32 @@ def _cortex_architecture_audit_from_summary(summary: Mapping[str, Any]) -> dict[
     required_objective_terms = tuple(FINAL_LOSS_TERMS)
     objective_term_set = set(observed_objective_terms)
     missing_objective_terms = tuple(term for term in required_objective_terms if term not in objective_term_set)
-
+    regrowth_model_applications = tuple(
+        dict(item)
+        for item in (summary.get("regrowth_model_applications") or ())
+        if isinstance(item, Mapping)
+    )
+    regrowth_model_non_regressing = any(
+        bool(item.get("non_regression_passed"))
+        and float(item.get("parameter_delta_l1", 0.0) or 0.0) > 0.0
+        and float(item.get("repair_loss_delta", 0.0) or 0.0) > 0.0
+        and float(item.get("protected_loss_delta", 0.0) or 0.0) <= float(item.get("protected_loss_tolerance", 0.0) or 0.0)
+        for item in regrowth_model_applications
+    )
+    recursive_model_applications = tuple(
+        dict(item)
+        for item in (summary.get("recursive_model_applications") or ())
+        if isinstance(item, Mapping)
+    )
+    recursive_model_non_regressing = any(
+        bool(item.get("non_regression_passed"))
+        and bool(item.get("signed_patch_id"))
+        and bool(item.get("rollback_token"))
+        and float(item.get("parameter_delta_l1", 0.0) or 0.0) > 0.0
+        and float(item.get("repair_loss_delta", 0.0) or 0.0) > 0.0
+        and float(item.get("protected_loss_delta", 0.0) or 0.0) <= float(item.get("protected_loss_tolerance", 0.0) or 0.0)
+        for item in recursive_model_applications
+    )
     checks: list[dict[str, Any]] = []
 
     def add(component: str, passed: bool, observed: Mapping[str, Any], requirement: str) -> None:
@@ -2670,9 +2698,22 @@ def _cortex_architecture_audit_from_summary(summary: Mapping[str, Any]) -> dict[
     )
     add(
         "minimal_regrowth",
-        phase_count("P7") > 0 and replay_count("P7") > 0,
-        {"P7": phase_count("P7"), "phase_replay_P7": replay_count("P7")},
-        "minimal regrowth must create a verified repair/regrowth replay path",
+        phase_count("P7") > 0
+        and replay_count("P7") > 0
+        and integer("regrowth_model_application_count") > 0
+        and number("regrowth_model_parameter_delta_l1") > 0.0
+        and number("regrowth_model_repair_loss_delta") > 0.0
+        and regrowth_model_non_regressing,
+        {
+            "P7": phase_count("P7"),
+            "phase_replay_P7": replay_count("P7"),
+            "regrowth_model_application_count": integer("regrowth_model_application_count"),
+            "regrowth_model_parameter_delta_l1": number("regrowth_model_parameter_delta_l1"),
+            "regrowth_model_repair_loss_delta": number("regrowth_model_repair_loss_delta"),
+            "regrowth_model_protected_loss_delta": number("regrowth_model_protected_loss_delta"),
+            "regrowth_model_non_regressing": regrowth_model_non_regressing,
+        },
+        "minimal regrowth must apply a verified bounded repair to real Transformer state and keep protected loss non-regressing",
     )
     add(
         "sleep_consolidation_buffer",
@@ -2690,9 +2731,22 @@ def _cortex_architecture_audit_from_summary(summary: Mapping[str, Any]) -> dict[
     )
     add(
         "recursive_improvement",
-        phase_count("P10") > 0 and improvement_decisions > 0,
-        {"P10": phase_count("P10"), "improvement_decisions": improvement_decisions},
-        "recursive improvement sandbox must evaluate at least one proposal",
+        phase_count("P10") > 0
+        and improvement_decisions > 0
+        and integer("recursive_model_application_count") > 0
+        and number("recursive_model_parameter_delta_l1") > 0.0
+        and number("recursive_model_repair_loss_delta") > 0.0
+        and recursive_model_non_regressing,
+        {
+            "P10": phase_count("P10"),
+            "improvement_decisions": improvement_decisions,
+            "recursive_model_application_count": integer("recursive_model_application_count"),
+            "recursive_model_parameter_delta_l1": number("recursive_model_parameter_delta_l1"),
+            "recursive_model_repair_loss_delta": number("recursive_model_repair_loss_delta"),
+            "recursive_model_protected_loss_delta": number("recursive_model_protected_loss_delta"),
+            "recursive_model_non_regressing": recursive_model_non_regressing,
+        },
+        "recursive improvement sandbox must evaluate a proposal and apply an accepted signed non-regressing patch to real Transformer state",
     )
     add(
         "training_feedback_loop",
@@ -2753,6 +2807,40 @@ def _cortex_phase_deliverable_audit_from_summary(summary: Mapping[str, Any]) -> 
 
     def trace(key: str) -> int:
         return int(trace_counts.get(key, 0))
+
+    def number(key: str) -> float:
+        value = summary.get(key, 0)
+        try:
+            return float(value or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    regrowth_model_applications = tuple(
+        dict(item)
+        for item in (summary.get("regrowth_model_applications") or ())
+        if isinstance(item, Mapping)
+    )
+    regrowth_model_non_regressing = any(
+        bool(item.get("non_regression_passed"))
+        and float(item.get("parameter_delta_l1", 0.0) or 0.0) > 0.0
+        and float(item.get("repair_loss_delta", 0.0) or 0.0) > 0.0
+        and float(item.get("protected_loss_delta", 0.0) or 0.0) <= float(item.get("protected_loss_tolerance", 0.0) or 0.0)
+        for item in regrowth_model_applications
+    )
+    recursive_model_applications = tuple(
+        dict(item)
+        for item in (summary.get("recursive_model_applications") or ())
+        if isinstance(item, Mapping)
+    )
+    recursive_model_non_regressing = any(
+        bool(item.get("non_regression_passed"))
+        and bool(item.get("signed_patch_id"))
+        and bool(item.get("rollback_token"))
+        and float(item.get("parameter_delta_l1", 0.0) or 0.0) > 0.0
+        and float(item.get("repair_loss_delta", 0.0) or 0.0) > 0.0
+        and float(item.get("protected_loss_delta", 0.0) or 0.0) <= float(item.get("protected_loss_tolerance", 0.0) or 0.0)
+        for item in recursive_model_applications
+    )
 
     checks: list[dict[str, Any]] = []
 
@@ -2827,10 +2915,24 @@ def _cortex_phase_deliverable_audit_from_summary(summary: Mapping[str, Any]) -> 
     )
     add(
         "P7",
-        "minimal_regrowth_action_space_and_repair_plan",
-        count("regrowth_plan_events") > 0 and count("regrowth_candidate_actions") > 0 and replay_by_phase.get("P7", 0) > 0,
-        {"regrowth_plan_events": count("regrowth_plan_events"), "regrowth_candidate_actions": count("regrowth_candidate_actions"), "phase_replay_P7": replay_by_phase.get("P7", 0)},
-        "minimal regrowth must evaluate candidate repair actions and feed verified replay",
+        "minimal_regrowth_action_space_repair_plan_and_model_patch",
+        count("regrowth_plan_events") > 0
+        and count("regrowth_candidate_actions") > 0
+        and replay_by_phase.get("P7", 0) > 0
+        and int(number("regrowth_model_application_count")) > 0
+        and number("regrowth_model_parameter_delta_l1") > 0.0
+        and number("regrowth_model_repair_loss_delta") > 0.0
+        and regrowth_model_non_regressing,
+        {
+            "regrowth_plan_events": count("regrowth_plan_events"),
+            "regrowth_candidate_actions": count("regrowth_candidate_actions"),
+            "phase_replay_P7": replay_by_phase.get("P7", 0),
+            "regrowth_model_application_count": int(number("regrowth_model_application_count")),
+            "regrowth_model_parameter_delta_l1": number("regrowth_model_parameter_delta_l1"),
+            "regrowth_model_repair_loss_delta": number("regrowth_model_repair_loss_delta"),
+            "regrowth_model_non_regressing": regrowth_model_non_regressing,
+        },
+        "minimal regrowth must evaluate candidate repair actions, feed verified replay, and apply a verified bounded patch to real model state",
     )
     add(
         "P8",
@@ -2876,13 +2978,17 @@ def _cortex_phase_deliverable_audit_from_summary(summary: Mapping[str, Any]) -> 
     )
     add(
         "P10",
-        "recursive_improvement_sandbox_pareto_rollback_diversity",
+        "recursive_improvement_sandbox_pareto_signed_model_patch_rollback_diversity",
         count("recursive_proposal_events") > 0
         and count("recursive_sandbox_trials") > 0
         and count("recursive_dynamic_evaluations") > 0
         and count("recursive_pareto_gate_decisions") > 0
         and count("recursive_rollback_tokens") > 0
-        and count("recursive_diversity_checks") > 0,
+        and count("recursive_diversity_checks") > 0
+        and int(number("recursive_model_application_count")) > 0
+        and number("recursive_model_parameter_delta_l1") > 0.0
+        and number("recursive_model_repair_loss_delta") > 0.0
+        and recursive_model_non_regressing,
         {
             "recursive_proposal_events": count("recursive_proposal_events"),
             "recursive_sandbox_trials": count("recursive_sandbox_trials"),
@@ -2890,8 +2996,12 @@ def _cortex_phase_deliverable_audit_from_summary(summary: Mapping[str, Any]) -> 
             "recursive_pareto_gate_decisions": count("recursive_pareto_gate_decisions"),
             "recursive_rollback_tokens": count("recursive_rollback_tokens"),
             "recursive_diversity_checks": count("recursive_diversity_checks"),
+            "recursive_model_application_count": int(number("recursive_model_application_count")),
+            "recursive_model_parameter_delta_l1": number("recursive_model_parameter_delta_l1"),
+            "recursive_model_repair_loss_delta": number("recursive_model_repair_loss_delta"),
+            "recursive_model_non_regressing": recursive_model_non_regressing,
         },
-        "recursive improvement must propose, sandbox, evaluate, gate, preserve rollback tokens and run diversity checks",
+        "recursive improvement must propose, sandbox, evaluate, gate, apply a signed model patch, preserve rollback tokens and run diversity checks",
     )
 
     failed_checks = tuple(f"{check['phase']}:{check['deliverable']}" for check in checks if not check["passed"])
@@ -2987,6 +3097,14 @@ class CortexTrainingPhaseController:
         self.input_anchor_observations = 0
         self.input_anchor_count = 0
         self.input_anchor_fidelity_failures = 0
+        self.regrowth_model_applications: list[dict[str, Any]] = []
+        self.regrowth_model_parameter_delta_l1 = 0.0
+        self.regrowth_model_repair_loss_delta = 0.0
+        self.regrowth_model_protected_loss_delta = 0.0
+        self.recursive_model_applications: list[dict[str, Any]] = []
+        self.recursive_model_parameter_delta_l1 = 0.0
+        self.recursive_model_repair_loss_delta = 0.0
+        self.recursive_model_protected_loss_delta = 0.0
 
     def _touch(self, phase_id: str) -> None:
         self.phase_counts[phase_id] = self.phase_counts.get(phase_id, 0) + 1
@@ -3388,6 +3506,342 @@ class CortexTrainingPhaseController:
             self.phase_replay_example_ids.append(f"llm-p9-{self.phase_replay_examples['P9']}-{example.example_id}")
             self._record_training_example_ledgers(example, phase_id="P9")
 
+    def _batch_from_task(self, task: Task, answer: CandidateAnswer | str) -> torch.Tensor:
+        candidate = CandidateAnswer.coerce(answer)
+        text = (
+            f"Skill: {task.skill}\n"
+            f"Task: {task.prompt}\n"
+            f"Verified answer: {candidate.text}\n"
+        )
+        ids = list(self.tokenizer.encode(text))
+        if not ids:
+            ids = [self.tokenizer.bos_id, self.tokenizer.eos_id]
+        while len(ids) < self.model.config.seq_len + 1:
+            ids.extend(ids)
+        ids = ids[: self.model.config.seq_len + 1]
+        return torch.tensor([ids], dtype=torch.long)
+
+    def _loss_for_regrowth_batch(self, batch: torch.Tensor, *, require_grad: bool) -> torch.Tensor:
+        device = next(self.model.parameters()).device
+        batch = batch.to(device)
+        x = batch[:, :-1]
+        y = batch[:, 1:]
+        future = self._future_targets_from_next_tokens(y)
+        context = nullcontext() if require_grad else torch.no_grad()
+        with context:
+            output = self.model(x)
+            loss, _ = CortexObjective().compute(
+                output,
+                y,
+                future,
+                use_cortex_terms=self.model.config.use_cortex_heads,
+            )
+        return loss
+
+    def _selected_regrowth_parameters(self, action: RegrowthActionKind) -> list[tuple[str, nn.Parameter]]:
+        if action in {
+            RegrowthActionKind.UNZERO_BLOCK,
+            RegrowthActionKind.CHANGE_SIGN,
+            RegrowthActionKind.INCREASE_SCALE_PRECISION,
+            RegrowthActionKind.INCREASE_LOCAL_ACTIVATION_BITS,
+        }:
+            prefixes = ("blocks.", "variable_in.", "lm_head.", "token_embedding.")
+        elif action == RegrowthActionKind.FORCE_EXACT_ANCHOR:
+            prefixes = ("token_embedding.", "position_embedding.", "variable_in.", "lm_head.")
+        elif action == RegrowthActionKind.REDUCE_MTP_HORIZON:
+            prefixes = ("mtp_heads.", "confidence_head.")
+        elif action == RegrowthActionKind.ROUTE_SPECIALIST_EXPERT:
+            prefixes = ("skill_experts.", "lm_head.", "token_embedding.")
+        elif action in {RegrowthActionKind.ADD_CERTIFICATE_FIELD, RegrowthActionKind.ADD_VERIFIER_CHECK}:
+            prefixes = ("certificate_head.", "confidence_head.", "lm_head.", "token_embedding.")
+        else:
+            prefixes = ("blocks.", "skill_experts.", "mtp_heads.", "certificate_head.", "lm_head.", "token_embedding.")
+        selected: list[tuple[str, nn.Parameter]] = []
+        seen: set[int] = set()
+        for name, parameter in self.model.named_parameters():
+            if not parameter.requires_grad:
+                continue
+            if id(parameter) in seen:
+                continue
+            if any(name.startswith(prefix) for prefix in prefixes):
+                selected.append((name, parameter))
+                seen.add(id(parameter))
+        if not selected:
+            raise ValueError(f"P7 model regrowth could not find trainable parameters for action {action.value}")
+        return selected
+
+    def _apply_model_regrowth(self, plan: RegrowthPlan, *, step: int) -> dict[str, Any]:
+        if plan.selected is None:
+            raise ValueError("P7 regrowth produced no recovered non-regressing selected action")
+        selected = plan.selected
+        patch = selected.patch
+        if not selected.recovered or not selected.non_regression.passed:
+            raise ValueError(f"P7 selected action is not verified recovered/non-regressing: {selected.action.kind.value}")
+        answer = patch.answer_for(plan.failure.task, self.trial_agent(plan.failure.task))
+        repair_batch = self._batch_from_task(plan.failure.task, answer)
+        protected_batches = tuple(self.replay_batches[-4:])
+        if not protected_batches:
+            protected_task = Task(
+                f"phase-p7-protected-{step}",
+                "instruction_following",
+                "Output protected regrowth status exactly: STABLE",
+                "STABLE",
+            )
+            protected_batches = (self._batch_from_task(protected_task, self._answer_from_task_expected(protected_task)),)
+
+        was_training = self.model.training
+        self.model.train()
+        parameters = self._selected_regrowth_parameters(selected.action.kind)
+        snapshots = {name: parameter.detach().clone() for name, parameter in parameters}
+        repair_before = float(self._loss_for_regrowth_batch(repair_batch, require_grad=False).detach().cpu())
+        protected_before = float(
+            torch.stack([
+                self._loss_for_regrowth_batch(batch, require_grad=False).detach()
+                for batch in protected_batches
+            ]).mean().cpu()
+        )
+        loss = self._loss_for_regrowth_batch(repair_batch, require_grad=True)
+        grads = torch.autograd.grad(loss, [parameter for _, parameter in parameters], allow_unused=True)
+        usable = [(name, parameter, grad) for (name, parameter), grad in zip(parameters, grads) if grad is not None]
+        if not usable:
+            if not was_training:
+                self.model.eval()
+            raise ValueError(f"P7 model regrowth action {selected.action.kind.value} had no gradient path into selected parameters")
+
+        accepted_report: dict[str, Any] | None = None
+        protected_tolerance = max(1e-4, protected_before * 0.02)
+        step_sizes = (0.25, 0.125, 0.0625, 0.03125, 0.015625)
+        for step_size in step_sizes:
+            with torch.no_grad():
+                for name, parameter in parameters:
+                    parameter.copy_(snapshots[name])
+                for name, parameter, grad in usable:
+                    norm = float(grad.detach().norm().clamp_min(1e-12).cpu())
+                    parameter.add_(grad, alpha=-float(step_size) / norm)
+            self.model.requantize_ternary_core(certify_zeros=False)
+            repair_after = float(self._loss_for_regrowth_batch(repair_batch, require_grad=False).detach().cpu())
+            protected_after = float(
+                torch.stack([
+                    self._loss_for_regrowth_batch(batch, require_grad=False).detach()
+                    for batch in protected_batches
+                ]).mean().cpu()
+            )
+            repair_delta = repair_before - repair_after
+            protected_delta = protected_after - protected_before
+            parameter_delta = float(
+                sum(
+                    (parameter.detach() - snapshots[name]).abs().sum().cpu()
+                    for name, parameter in parameters
+                )
+            )
+            if repair_delta > 0.0 and protected_delta <= protected_tolerance and parameter_delta > 0.0:
+                accepted_report = {
+                    "step": step,
+                    "action": selected.action.kind.value,
+                    "target": selected.action.target,
+                    "updated_parameter_count": len(parameters),
+                    "updated_parameter_names": tuple(name for name, _ in parameters),
+                    "gradient_parameter_count": len(usable),
+                    "step_size": float(step_size),
+                    "parameter_delta_l1": parameter_delta,
+                    "repair_loss_before": repair_before,
+                    "repair_loss_after": repair_after,
+                    "repair_loss_delta": repair_delta,
+                    "protected_loss_before": protected_before,
+                    "protected_loss_after": protected_after,
+                    "protected_loss_delta": protected_delta,
+                    "protected_loss_tolerance": protected_tolerance,
+                    "non_regression_passed": True,
+                    "requantized_ternary_core": bool(self.model.config.use_ternary_core),
+                }
+                break
+
+        if accepted_report is None:
+            with torch.no_grad():
+                for name, parameter in parameters:
+                    parameter.copy_(snapshots[name])
+            self.model.requantize_ternary_core(certify_zeros=False)
+            if not was_training:
+                self.model.eval()
+            raise ValueError(
+                "P7 model regrowth failed strict gate: no bounded parameter update improved repair loss without protected regression"
+            )
+        if not was_training:
+            self.model.eval()
+        self.regrowth_model_applications.append(accepted_report)
+        self.regrowth_model_parameter_delta_l1 += float(accepted_report["parameter_delta_l1"])
+        self.regrowth_model_repair_loss_delta += float(accepted_report["repair_loss_delta"])
+        self.regrowth_model_protected_loss_delta += float(accepted_report["protected_loss_delta"])
+        self._count("regrowth_model_applications")
+        self._count("regrowth_model_updated_parameters", int(accepted_report["updated_parameter_count"]))
+        self.bit_ledger.ingest_cost(
+            CostTrace(
+                weight_bits_read=float(accepted_report["updated_parameter_count"]) * 16.0,
+                activation_bits=float(accepted_report["gradient_parameter_count"]) * 8.0,
+                verifier_steps=2,
+            ),
+            note=f"P7:model-regrowth:{selected.action.kind.value}:{selected.action.target}",
+        )
+        return accepted_report
+
+    def _selected_recursive_parameters(self, proposal_kind: ProposalKind) -> list[tuple[str, nn.Parameter]]:
+        if proposal_kind in {ProposalKind.COMPRESSION, ProposalKind.REGROWTH_STRATEGY, ProposalKind.KERNEL, ProposalKind.HARDWARE_GRAMMAR}:
+            prefixes = ("blocks.", "variable_in.", "lm_head.", "token_embedding.")
+        elif proposal_kind == ProposalKind.ROUTER:
+            prefixes = ("skill_experts.", "variable_in.", "lm_head.", "token_embedding.")
+        elif proposal_kind == ProposalKind.MTP_HEAD:
+            prefixes = ("mtp_heads.", "confidence_head.")
+        elif proposal_kind in {ProposalKind.TEST, ProposalKind.SKILL_SPEC}:
+            prefixes = ("certificate_head.", "confidence_head.", "lm_head.", "token_embedding.")
+        else:
+            prefixes = ("blocks.", "skill_experts.", "mtp_heads.", "certificate_head.", "lm_head.", "token_embedding.")
+        selected: list[tuple[str, nn.Parameter]] = []
+        seen: set[int] = set()
+        for name, parameter in self.model.named_parameters():
+            if not parameter.requires_grad or id(parameter) in seen:
+                continue
+            if any(name.startswith(prefix) for prefix in prefixes):
+                selected.append((name, parameter))
+                seen.add(id(parameter))
+        if not selected:
+            raise ValueError(f"P10 recursive improvement could not find trainable parameters for kind {proposal_kind.value}")
+        return selected
+
+    def _recursive_improvement_task(self, decision: AcceptanceDecision, cycle_report: Any, *, step: int) -> Task:
+        affected = set(decision.evaluation.proposal.affected_skills)
+        for failure in cycle_report.regressions:
+            if failure.task.skill in affected:
+                return failure.task
+        skill = next(iter(affected), "instruction_following")
+        return Task(
+            f"phase-p10-model-{step}",
+            skill,
+            f"Output recursive improvement patch {decision.evaluation.proposal.proposal_id} as accepted.",
+            f"accepted:{decision.evaluation.proposal.proposal_id}",
+        )
+
+    def _apply_recursive_model_improvement(self, decision: AcceptanceDecision, cycle_report: Any, *, step: int) -> dict[str, Any]:
+        if not decision.accepted:
+            raise ValueError(f"P10 cannot apply rejected proposal {decision.evaluation.proposal.proposal_id}: {decision.reason}")
+        proposal = decision.evaluation.proposal
+        task = self._recursive_improvement_task(decision, cycle_report, step=step)
+        repair_batch = self._batch_from_task(task, self.reference_agent(task))
+        protected_batches = tuple(self.replay_batches[-4:])
+        if not protected_batches:
+            protected_task = Task(
+                f"phase-p10-protected-{step}",
+                "instruction_following",
+                "Output protected recursive improvement status exactly: STABLE",
+                "STABLE",
+            )
+            protected_batches = (self._batch_from_task(protected_task, self._answer_from_task_expected(protected_task)),)
+
+        was_training = self.model.training
+        self.model.train()
+        parameters = self._selected_recursive_parameters(proposal.kind)
+        snapshots = {name: parameter.detach().clone() for name, parameter in parameters}
+        repair_before = float(self._loss_for_regrowth_batch(repair_batch, require_grad=False).detach().cpu())
+        protected_before = float(
+            torch.stack([
+                self._loss_for_regrowth_batch(batch, require_grad=False).detach()
+                for batch in protected_batches
+            ]).mean().cpu()
+        )
+        loss = self._loss_for_regrowth_batch(repair_batch, require_grad=True)
+        grads = torch.autograd.grad(loss, [parameter for _, parameter in parameters], allow_unused=True)
+        usable = [(name, parameter, grad) for (name, parameter), grad in zip(parameters, grads) if grad is not None]
+        if not usable:
+            if not was_training:
+                self.model.eval()
+            raise ValueError(f"P10 proposal {proposal.proposal_id} had no gradient path into selected parameters")
+
+        accepted_report: dict[str, Any] | None = None
+        protected_tolerance = max(1e-4, protected_before * 0.02)
+        step_sizes = (0.20, 0.10, 0.05, 0.025, 0.0125)
+        for step_size in step_sizes:
+            with torch.no_grad():
+                for name, parameter in parameters:
+                    parameter.copy_(snapshots[name])
+                for name, parameter, grad in usable:
+                    norm = float(grad.detach().norm().clamp_min(1e-12).cpu())
+                    parameter.add_(grad, alpha=-float(step_size) / norm)
+            self.model.requantize_ternary_core(certify_zeros=False)
+            repair_after = float(self._loss_for_regrowth_batch(repair_batch, require_grad=False).detach().cpu())
+            protected_after = float(
+                torch.stack([
+                    self._loss_for_regrowth_batch(batch, require_grad=False).detach()
+                    for batch in protected_batches
+                ]).mean().cpu()
+            )
+            repair_delta = repair_before - repair_after
+            protected_delta = protected_after - protected_before
+            parameter_delta = float(
+                sum(
+                    (parameter.detach() - snapshots[name]).abs().sum().cpu()
+                    for name, parameter in parameters
+                )
+            )
+            if repair_delta > 0.0 and protected_delta <= protected_tolerance and parameter_delta > 0.0:
+                parameter_names = tuple(name for name, _ in parameters)
+                signed_payload = {
+                    "proposal_id": proposal.proposal_id,
+                    "rollback_token": decision.evaluation.sandbox.rollback_token,
+                    "parameter_names": parameter_names,
+                    "repair_loss_delta": repair_delta,
+                    "protected_loss_delta": protected_delta,
+                }
+                accepted_report = {
+                    "step": step,
+                    "proposal_id": proposal.proposal_id,
+                    "proposal_kind": proposal.kind.value,
+                    "affected_skills": tuple(proposal.affected_skills),
+                    "rollback_token": decision.evaluation.sandbox.rollback_token,
+                    "signed_patch_id": _sha256_json(signed_payload),
+                    "updated_parameter_count": len(parameters),
+                    "updated_parameter_names": parameter_names,
+                    "gradient_parameter_count": len(usable),
+                    "step_size": float(step_size),
+                    "parameter_delta_l1": parameter_delta,
+                    "repair_loss_before": repair_before,
+                    "repair_loss_after": repair_after,
+                    "repair_loss_delta": repair_delta,
+                    "protected_loss_before": protected_before,
+                    "protected_loss_after": protected_after,
+                    "protected_loss_delta": protected_delta,
+                    "protected_loss_tolerance": protected_tolerance,
+                    "non_regression_passed": True,
+                    "requantized_ternary_core": bool(self.model.config.use_ternary_core),
+                }
+                break
+
+        if accepted_report is None:
+            with torch.no_grad():
+                for name, parameter in parameters:
+                    parameter.copy_(snapshots[name])
+            self.model.requantize_ternary_core(certify_zeros=False)
+            if not was_training:
+                self.model.eval()
+            raise ValueError(
+                f"P10 proposal {proposal.proposal_id} failed strict model patch gate: no bounded update improved repair loss without protected regression"
+            )
+        if not was_training:
+            self.model.eval()
+        self.recursive_model_applications.append(accepted_report)
+        self.recursive_model_parameter_delta_l1 += float(accepted_report["parameter_delta_l1"])
+        self.recursive_model_repair_loss_delta += float(accepted_report["repair_loss_delta"])
+        self.recursive_model_protected_loss_delta += float(accepted_report["protected_loss_delta"])
+        self._count("recursive_model_applications")
+        self._count("recursive_model_updated_parameters", int(accepted_report["updated_parameter_count"]))
+        self.bit_ledger.ingest_cost(
+            CostTrace(
+                weight_bits_read=float(accepted_report["updated_parameter_count"]) * 16.0,
+                activation_bits=float(accepted_report["gradient_parameter_count"]) * 8.0,
+                verifier_steps=2,
+            ),
+            note=f"P10:model-improvement:{proposal.proposal_id}",
+        )
+        return accepted_report
+
     def state_dict(self) -> dict[str, Any]:
         return {
             "schema_version": 1,
@@ -3408,6 +3862,14 @@ class CortexTrainingPhaseController:
             "objective_feedback_term_totals": dict(self.objective_feedback_term_totals),
             "objective_feedback_history": list(self.objective_feedback_history),
             "integration_counts": dict(self.integration_counts),
+            "regrowth_model_applications": list(self.regrowth_model_applications),
+            "regrowth_model_parameter_delta_l1": float(self.regrowth_model_parameter_delta_l1),
+            "regrowth_model_repair_loss_delta": float(self.regrowth_model_repair_loss_delta),
+            "regrowth_model_protected_loss_delta": float(self.regrowth_model_protected_loss_delta),
+            "recursive_model_applications": list(self.recursive_model_applications),
+            "recursive_model_parameter_delta_l1": float(self.recursive_model_parameter_delta_l1),
+            "recursive_model_repair_loss_delta": float(self.recursive_model_repair_loss_delta),
+            "recursive_model_protected_loss_delta": float(self.recursive_model_protected_loss_delta),
             "certificate_head_forward_events": int(self.model.certificate_forward_events),
             "input_anchor_observations": int(self.input_anchor_observations),
             "input_anchor_count": int(self.input_anchor_count),
@@ -3499,6 +3961,20 @@ class CortexTrainingPhaseController:
             str(key): int(value)
             for key, value in dict(payload.get("integration_counts") or {}).items()
         })
+        self.regrowth_model_applications = [
+            dict(item)
+            for item in payload.get("regrowth_model_applications", ())
+        ]
+        self.regrowth_model_parameter_delta_l1 = float(payload.get("regrowth_model_parameter_delta_l1", 0.0))
+        self.regrowth_model_repair_loss_delta = float(payload.get("regrowth_model_repair_loss_delta", 0.0))
+        self.regrowth_model_protected_loss_delta = float(payload.get("regrowth_model_protected_loss_delta", 0.0))
+        self.recursive_model_applications = [
+            dict(item)
+            for item in payload.get("recursive_model_applications", ())
+        ]
+        self.recursive_model_parameter_delta_l1 = float(payload.get("recursive_model_parameter_delta_l1", 0.0))
+        self.recursive_model_repair_loss_delta = float(payload.get("recursive_model_repair_loss_delta", 0.0))
+        self.recursive_model_protected_loss_delta = float(payload.get("recursive_model_protected_loss_delta", 0.0))
         self.model.certificate_forward_events = int(payload.get("certificate_head_forward_events", 0))
         self.input_anchor_observations = int(payload.get("input_anchor_observations", 0))
         self.input_anchor_count = int(payload.get("input_anchor_count", 0))
@@ -3573,6 +4049,16 @@ class CortexTrainingPhaseController:
             "sleep_reservoir_examples": len(self.sleep.reservoir.examples),
             "improvement_archive_accepted": self.improvement.archive.accepted_count,
             "improvement_archive_rejected": self.improvement.archive.rejected_count,
+            "regrowth_model_application_count": len(self.regrowth_model_applications),
+            "regrowth_model_parameter_delta_l1": float(self.regrowth_model_parameter_delta_l1),
+            "regrowth_model_repair_loss_delta": float(self.regrowth_model_repair_loss_delta),
+            "regrowth_model_protected_loss_delta": float(self.regrowth_model_protected_loss_delta),
+            "regrowth_model_applications": _last_items(self.regrowth_model_applications, 5),
+            "recursive_model_application_count": len(self.recursive_model_applications),
+            "recursive_model_parameter_delta_l1": float(self.recursive_model_parameter_delta_l1),
+            "recursive_model_repair_loss_delta": float(self.recursive_model_repair_loss_delta),
+            "recursive_model_protected_loss_delta": float(self.recursive_model_protected_loss_delta),
+            "recursive_model_applications": _last_items(self.recursive_model_applications, 5),
             "error_count": len(self.errors),
         }
         summary["architecture_audit"] = _cortex_architecture_audit_from_summary(summary)
@@ -3749,18 +4235,23 @@ class CortexTrainingPhaseController:
                     attribution_report,
                     self.trial_agent,
                     (attribution_report.failure.task,),
-                    budget=10.0,
+                    budget=float(self.config.cortex_phase_regrowth_budget),
                 )
                 self._touch("P7")
                 audit["regrowth"] = regrowth_plan.to_dict()
+                audit["regrowth_budget"] = float(self.config.cortex_phase_regrowth_budget)
                 self._count("regrowth_plan_events")
                 self._count("regrowth_candidate_actions", len(regrowth_plan.candidates))
+                model_regrowth = self._apply_model_regrowth(regrowth_plan, step=step)
+                audit["regrowth_model_application"] = model_regrowth
                 self._add_verified_phase_replay(
                     "P7",
                     regrowth_plan.failure.task,
                     metadata={
                         "selected_action": regrowth_plan.selected_action,
                         "candidate_count": len(regrowth_plan.candidates),
+                        "model_regrowth_parameter_delta_l1": model_regrowth["parameter_delta_l1"],
+                        "model_regrowth_repair_loss_delta": model_regrowth["repair_loss_delta"],
                     },
                 )
         except Exception as exc:
@@ -3877,6 +4368,14 @@ class CortexTrainingPhaseController:
                 self._count("recursive_reward_hacking_checks", len(improvement_report.decisions))
                 if improvement_report.decisions:
                     accepted_decision = next((decision for decision in improvement_report.decisions if decision.accepted), None)
+                    if accepted_decision is None:
+                        raise ValueError("P10 recursive improvement produced no accepted proposal for model-state application")
+                    recursive_model_patch = self._apply_recursive_model_improvement(
+                        accepted_decision,
+                        cycle_report,
+                        step=step,
+                    )
+                    audit["recursive_model_application"] = recursive_model_patch
                     selected_decision = accepted_decision or improvement_report.decisions[0]
                     gate_label = (
                         selected_decision.evaluation.proposal.proposal_id
@@ -3896,6 +4395,9 @@ class CortexTrainingPhaseController:
                             "proposal_id": selected_decision.evaluation.proposal.proposal_id,
                             "accepted": selected_decision.accepted,
                             "reason": selected_decision.reason,
+                            "signed_patch_id": recursive_model_patch["signed_patch_id"],
+                            "model_patch_parameter_delta_l1": recursive_model_patch["parameter_delta_l1"],
+                            "model_patch_repair_loss_delta": recursive_model_patch["repair_loss_delta"],
                         },
                     )
         except Exception as exc:
@@ -3995,6 +4497,16 @@ class CortexTrainingPhaseController:
                 "sleep_replay_examples": len(self.sleep.replay.examples),
                 "sleep_synthetic_examples": len(self.sleep.synthetic.examples),
                 "sleep_reservoir_examples": len(self.sleep.reservoir.examples),
+                "regrowth_model_application_count": len(self.regrowth_model_applications),
+                "regrowth_model_parameter_delta_l1": float(self.regrowth_model_parameter_delta_l1),
+                "regrowth_model_repair_loss_delta": float(self.regrowth_model_repair_loss_delta),
+                "regrowth_model_protected_loss_delta": float(self.regrowth_model_protected_loss_delta),
+                "regrowth_model_applications": _last_items(self.regrowth_model_applications, 5),
+                "recursive_model_application_count": len(self.recursive_model_applications),
+                "recursive_model_parameter_delta_l1": float(self.recursive_model_parameter_delta_l1),
+                "recursive_model_repair_loss_delta": float(self.recursive_model_repair_loss_delta),
+                "recursive_model_protected_loss_delta": float(self.recursive_model_protected_loss_delta),
+                "recursive_model_applications": _last_items(self.recursive_model_applications, 5),
                 "improvement_archive_accepted": self.improvement.archive.accepted_count,
                 "improvement_archive_rejected": self.improvement.archive.rejected_count,
                 "objective_feedback_events": self.objective_feedback_events,
@@ -4042,6 +4554,16 @@ class CortexTrainingPhaseController:
                     "sleep_replay_examples": len(self.sleep.replay.examples),
                     "sleep_synthetic_examples": len(self.sleep.synthetic.examples),
                     "sleep_reservoir_examples": len(self.sleep.reservoir.examples),
+                    "regrowth_model_application_count": len(self.regrowth_model_applications),
+                    "regrowth_model_parameter_delta_l1": float(self.regrowth_model_parameter_delta_l1),
+                    "regrowth_model_repair_loss_delta": float(self.regrowth_model_repair_loss_delta),
+                    "regrowth_model_protected_loss_delta": float(self.regrowth_model_protected_loss_delta),
+                    "regrowth_model_applications": _last_items(self.regrowth_model_applications, 5),
+                    "recursive_model_application_count": len(self.recursive_model_applications),
+                    "recursive_model_parameter_delta_l1": float(self.recursive_model_parameter_delta_l1),
+                    "recursive_model_repair_loss_delta": float(self.recursive_model_repair_loss_delta),
+                    "recursive_model_protected_loss_delta": float(self.recursive_model_protected_loss_delta),
+                    "recursive_model_applications": _last_items(self.recursive_model_applications, 5),
                     "improvement_archive_accepted": self.improvement.archive.accepted_count,
                     "improvement_archive_rejected": self.improvement.archive.rejected_count,
                     "error_count": len(self.errors),
@@ -4078,6 +4600,16 @@ class CortexTrainingPhaseController:
                     "sleep_replay_examples": len(self.sleep.replay.examples),
                     "sleep_synthetic_examples": len(self.sleep.synthetic.examples),
                     "sleep_reservoir_examples": len(self.sleep.reservoir.examples),
+                    "regrowth_model_application_count": len(self.regrowth_model_applications),
+                    "regrowth_model_parameter_delta_l1": float(self.regrowth_model_parameter_delta_l1),
+                    "regrowth_model_repair_loss_delta": float(self.regrowth_model_repair_loss_delta),
+                    "regrowth_model_protected_loss_delta": float(self.regrowth_model_protected_loss_delta),
+                    "regrowth_model_applications": _last_items(self.regrowth_model_applications, 5),
+                    "recursive_model_application_count": len(self.recursive_model_applications),
+                    "recursive_model_parameter_delta_l1": float(self.recursive_model_parameter_delta_l1),
+                    "recursive_model_repair_loss_delta": float(self.recursive_model_repair_loss_delta),
+                    "recursive_model_protected_loss_delta": float(self.recursive_model_protected_loss_delta),
+                    "recursive_model_applications": _last_items(self.recursive_model_applications, 5),
                     "improvement_archive_accepted": self.improvement.archive.accepted_count,
                     "improvement_archive_rejected": self.improvement.archive.rejected_count,
                     "error_count": len(self.errors),
@@ -4099,6 +4631,8 @@ class CortexTrainingPhaseController:
                 "reservoir_examples": len(self.sleep.reservoir.examples),
             },
             "improvement_state_summary": _improvement_state(self.improvement),
+            "regrowth_model_applications": _last_items(self.regrowth_model_applications, 5),
+            "recursive_model_applications": _last_items(self.recursive_model_applications, 5),
             "phase_audits": _last_items(self.phase_audits, 2),
             "batch_contract_samples": _last_items(self.batch_contract_samples, 5),
             "phase_replay_example_ids": _last_items(self.phase_replay_example_ids, 10),

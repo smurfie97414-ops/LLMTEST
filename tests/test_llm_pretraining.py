@@ -852,6 +852,8 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             TrainingConfig(cortex_objective_feedback_clip=-1.0)
         with self.assertRaisesRegex(ValueError, "cortex_trace_retention_limit"):
             TrainingConfig(cortex_trace_retention_limit=-1)
+        with self.assertRaisesRegex(ValueError, "cortex_phase_regrowth_budget"):
+            TrainingConfig(cortex_phase_regrowth_budget=0.0)
 
     def test_full_cortex_phase_controller_uses_all_modules_during_training(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -949,10 +951,10 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 "P4:recent_exact_old_latent_query_memory_anchor_fidelity",
                 "P5:latent_certificate_delatentization_tool_verification",
                 "P6:causal_attribution_counterfactual_dimensions",
-                "P7:minimal_regrowth_action_space_and_repair_plan",
+                "P7:minimal_regrowth_action_space_repair_plan_and_model_patch",
                 "P8:fast_normal_careful_budget_early_exit_mod_speculative_kernels",
                 "P9:sleep_replay_synthetic_real_reservoir_anti_collapse_schedule",
-                "P10:recursive_improvement_sandbox_pareto_rollback_diversity",
+                "P10:recursive_improvement_sandbox_pareto_signed_model_patch_rollback_diversity",
             }
             self.assertEqual(set(deliverable_audit["checks_by_deliverable"]), expected_deliverables)
             influence = phase_report["training_influence"]
@@ -972,6 +974,12 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             self.assertGreater(influence["sleep_replay_batches_available"], 0)
             self.assertGreater(influence["sleep_replay_updates"], 0)
             self.assertGreater(influence["phase_replay_examples"], 0)
+            self.assertGreater(influence["regrowth_model_application_count"], 0)
+            self.assertGreater(influence["regrowth_model_parameter_delta_l1"], 0.0)
+            self.assertGreater(influence["regrowth_model_repair_loss_delta"], 0.0)
+            self.assertGreater(influence["recursive_model_application_count"], 0)
+            self.assertGreater(influence["recursive_model_parameter_delta_l1"], 0.0)
+            self.assertGreater(influence["recursive_model_repair_loss_delta"], 0.0)
             self.assertGreater(influence["objective_feedback_events"], 0)
             self.assertGreater(influence["last_objective_loss_total"], 0.0)
             self.assertGreater(influence["objective_feedback_scale"], 1.0)
@@ -992,6 +1000,26 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             for phase_id in ("P1", "P3", "P4", "P5", "P6", "P7", "P8", "P9", "P10"):
                 self.assertGreater(phase_replay[phase_id], 0, phase_replay)
             self.assertTrue(phase_report["phase_replay_example_ids"], phase_report)
+            self.assertTrue(phase_report["regrowth_model_applications"], phase_report)
+            latest_regrowth = phase_report["regrowth_model_applications"][-1]
+            self.assertTrue(latest_regrowth["non_regression_passed"], latest_regrowth)
+            self.assertGreater(latest_regrowth["parameter_delta_l1"], 0.0)
+            self.assertGreater(latest_regrowth["repair_loss_delta"], 0.0)
+            self.assertLessEqual(
+                latest_regrowth["protected_loss_delta"],
+                latest_regrowth["protected_loss_tolerance"],
+            )
+            self.assertTrue(phase_report["recursive_model_applications"], phase_report)
+            latest_recursive = phase_report["recursive_model_applications"][-1]
+            self.assertTrue(latest_recursive["non_regression_passed"], latest_recursive)
+            self.assertTrue(latest_recursive["signed_patch_id"], latest_recursive)
+            self.assertTrue(latest_recursive["rollback_token"], latest_recursive)
+            self.assertGreater(latest_recursive["parameter_delta_l1"], 0.0)
+            self.assertGreater(latest_recursive["repair_loss_delta"], 0.0)
+            self.assertLessEqual(
+                latest_recursive["protected_loss_delta"],
+                latest_recursive["protected_loss_tolerance"],
+            )
             self.assertTrue(phase_report["objective_feedback_history"], phase_report)
             latest_feedback = phase_report["objective_feedback_history"][-1]
             self.assertEqual(latest_feedback["term_count"], len(FINAL_LOSS_TERMS))
@@ -1010,6 +1038,8 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             self.assertTrue(persisted["phase_deliverable_audit"]["passed"], persisted["phase_deliverable_audit"])
             self.assertEqual(tuple(persisted["objective_feedback_term_names"]), FINAL_LOSS_TERMS)
             self.assertEqual(set(persisted["last_objective_loss_terms"]), set(FINAL_LOSS_TERMS))
+            self.assertTrue(persisted["regrowth_model_applications"], persisted)
+            self.assertTrue(persisted["recursive_model_applications"], persisted)
             self.assertEqual(persisted["training_influence"]["sleep_replay_updates"], influence["sleep_replay_updates"])
             self.assertEqual(
                 persisted["training_influence"]["objective_feedback_events"],
@@ -1108,6 +1138,12 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 self.assertGreater(checkpoint["cortex_phase_state"]["last_objective_loss_total"], 0.0)
                 self.assertEqual(tuple(checkpoint["cortex_phase_state"]["last_objective_loss_terms"]), FINAL_LOSS_TERMS)
                 self.assertEqual(tuple(checkpoint["cortex_phase_state"]["objective_feedback_term_totals"]), FINAL_LOSS_TERMS)
+                self.assertGreater(len(checkpoint["cortex_phase_state"]["regrowth_model_applications"]), 0)
+                self.assertGreater(checkpoint["cortex_phase_state"]["regrowth_model_parameter_delta_l1"], 0.0)
+                self.assertGreater(checkpoint["cortex_phase_state"]["regrowth_model_repair_loss_delta"], 0.0)
+                self.assertGreater(len(checkpoint["cortex_phase_state"]["recursive_model_applications"]), 0)
+                self.assertGreater(checkpoint["cortex_phase_state"]["recursive_model_parameter_delta_l1"], 0.0)
+                self.assertGreater(checkpoint["cortex_phase_state"]["recursive_model_repair_loss_delta"], 0.0)
                 self.assertGreater(checkpoint["cortex_phase_state"]["certificate_head_forward_events"], 0)
                 self.assertGreater(checkpoint["cortex_phase_state"]["input_anchor_observations"], 0)
                 self.assertGreater(checkpoint["cortex_phase_state"]["input_anchor_count"], 0)
@@ -1159,6 +1195,14 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                     sidecar["cortex_phase_state_summary"]["phase_deliverable_audit"],
                 )
                 self.assertGreater(sidecar["cortex_phase_state_summary"]["replay_batch_count"], 0)
+                self.assertGreater(sidecar["cortex_phase_state_summary"]["regrowth_model_application_count"], 0)
+                self.assertGreater(sidecar["cortex_phase_state_summary"]["regrowth_model_parameter_delta_l1"], 0.0)
+                self.assertGreater(sidecar["cortex_phase_state_summary"]["regrowth_model_repair_loss_delta"], 0.0)
+                self.assertTrue(sidecar["cortex_phase_state_summary"]["regrowth_model_applications"])
+                self.assertGreater(sidecar["cortex_phase_state_summary"]["recursive_model_application_count"], 0)
+                self.assertGreater(sidecar["cortex_phase_state_summary"]["recursive_model_parameter_delta_l1"], 0.0)
+                self.assertGreater(sidecar["cortex_phase_state_summary"]["recursive_model_repair_loss_delta"], 0.0)
+                self.assertTrue(sidecar["cortex_phase_state_summary"]["recursive_model_applications"])
                 self.assertGreater(sidecar["cortex_phase_state_summary"]["objective_feedback_events"], 0)
                 self.assertEqual(
                     tuple(sidecar["cortex_phase_state_summary"]["objective_feedback_term_names"]),
@@ -1238,6 +1282,22 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             resumed_influence = resumed.cortex_phase_report["training_influence"]
             self.assertEqual(resumed.start_step, 1)
             self.assertGreaterEqual(resumed_influence["phase_replay_examples"], first_influence["phase_replay_examples"])
+            self.assertGreaterEqual(
+                resumed_influence["regrowth_model_application_count"],
+                first_influence["regrowth_model_application_count"],
+            )
+            self.assertGreater(
+                resumed_influence["regrowth_model_parameter_delta_l1"],
+                0.0,
+            )
+            self.assertGreaterEqual(
+                resumed_influence["recursive_model_application_count"],
+                first_influence["recursive_model_application_count"],
+            )
+            self.assertGreater(
+                resumed_influence["recursive_model_parameter_delta_l1"],
+                0.0,
+            )
             self.assertGreater(resumed_influence["sleep_replay_updates"], first_influence["sleep_replay_updates"])
             self.assertGreaterEqual(
                 resumed_influence["objective_feedback_events"],

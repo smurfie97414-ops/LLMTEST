@@ -158,12 +158,12 @@ Current executable coverage:
 - `MinimalRegrowthEngine` selects the best recovering, non-regressing repair under budget.
 - `tools/run_cycle_report.py` now builds Phase 7 plans from real cycle regressions through causal attribution by default, with `--skip-regrowth` as the escape hatch.
 - `write_cycle_run` persists regrowth plans into `summary.json`.
-- The full LLM Cortex phase controller converts verified regrowth outputs into causal replay examples, so accepted repair evidence can influence subsequent optimizer steps.
+- The full LLM Cortex phase controller converts verified regrowth outputs into causal replay examples, then applies the accepted repair to real Transformer parameters with a bounded gradient patch over targeted Cortex submodules.
+- The P7 model patch gate records before/after repair loss, protected loss, parameter L1 delta, updated parameter names, non-regression status, ternary requantization and rollback-on-failure evidence in `cortex_phase_report.json` and checkpoint sidecars.
 
 Remaining:
 
-- Apply accepted repairs to a real multi-layer model state rather than targeted repair agents.
-- Persist accepted repair archives for rollback and audit.
+- Calibrate repeated model-state regrowth schedules across long multi-corpus runs, not only the strict per-audit bounded repair gate.
 
 ## Phase 8 - Fast/normal/careful inference
 
@@ -238,7 +238,7 @@ Current executable coverage:
 
 - `ProposalGenerator` converts cycle actions and regressions into typed proposals for tests, compression, router changes, MTP heads, regrowth strategies and new skill/test families.
 - `ImprovementProposal` carries affected skills, expected quality/cost/robustness deltas, risk, diversity tags and patch payload metadata.
-- `SandboxTrainer` applies proposals only as in-memory sandbox agents; it records no touched files and creates rollback tokens.
+- `SandboxTrainer` first applies proposals as in-memory sandbox agents; it records no touched repo files and creates rollback tokens for verifier-gated evaluation.
 - `ProposalPatchedAgent` simulates repair, protected-skill degradation, reward-hacking behavior and calibration regression for verifier-gated evaluation.
 - `DynamicEvaluator` compares baseline vs sandbox agents on main suites and anti/metamorphic robustness suites, then measures quality delta, cost delta, robustness delta, calibration delta, protected losses and cross-skill collapse flags.
 - `RewardHackingDetector` flags declared overfitting, robustness-suite collapse and overconfident failures on affected skills.
@@ -249,7 +249,7 @@ Current executable coverage:
 - `RecursiveImprovementEngine` orchestrates proposal generation, sandbox training, dynamic evaluation, acceptance and archive recording from a `CycleReport`.
 - `write_cycle_run` can persist recursive improvement reports into `summary.json`.
 - `tools/run_cycle_report.py` writes Phase 10 traces by default unless `--skip-improvement` is passed.
-- The full LLM Cortex phase controller converts verifier-approved recursive-improvement gate decisions into causal replay examples and persists the resulting phase state in checkpoints.
+- The full LLM Cortex phase controller converts verifier-approved recursive-improvement gate decisions into causal replay examples, applies accepted proposals as signed bounded patches to real Transformer parameters, and persists patch id, rollback token, parameter deltas, repair-loss improvement and protected-loss non-regression in checkpoints.
 
 Evidence:
 
@@ -261,8 +261,7 @@ Evidence:
 
 Remaining:
 
-- Convert accepted in-memory proposals into signed patch artifacts.
-- Persist evolutionary and rollback archives across runs.
+- Persist evolutionary and rollback archives across independent long runs.
 - Run multi-generation proposal evolution with diversity pressure.
 
 ## Frontier Skill Discovery
