@@ -4195,6 +4195,8 @@ class LLMTrainer:
                 curve.append(self.evaluate(self.val_data, split="val", step=0))
                 if phase_controller is not None:
                     self._prime_phase_controller(phase_controller, step=0)
+            if runtime.is_main:
+                self._prune_intermediate_checkpoints()
             for step in range(start_step + 1, self.config.steps + 1):
                 self.model.train()
                 optimizer.zero_grad(set_to_none=True)
@@ -4493,6 +4495,11 @@ class LLMTrainer:
                 "checkpoint_size_bytes": int(output.stat().st_size),
                 "step": step,
                 "model_kind": self.model_kind,
+                "training_config": asdict(self.config),
+                "checkpoint_retention": {
+                    "checkpoint_interval": int(self.config.checkpoint_interval),
+                    "max_intermediate_checkpoints": int(self.config.max_intermediate_checkpoints),
+                },
                 "curve_points": len(curve),
                 "corpus_identity_sha256": self.corpus_identity.get("identity_sha256"),
                 "code_state": code_state,
@@ -5106,6 +5113,7 @@ def build_training_plan(
     split = _manifest_split_availability(manifest)
     train_tokens_available = max(1, int(split["train_end"]) - int(split["train_start"]))
     checkpoint_interval = max(1, int(config.training.checkpoint_interval))
+    max_intermediate_checkpoints = int(config.training.max_intermediate_checkpoints)
     adam_training_bytes_per_parameter = 16
     checkpoint_bytes_per_parameter = 12
     precision_bytes = _training_precision_bytes(config.training.precision)
@@ -5153,6 +5161,12 @@ def build_training_plan(
             "eval_events": int(eval_events),
             "checkpoint_interval": checkpoint_interval,
             "intermediate_checkpoint_count": int(optimizer_steps // checkpoint_interval),
+            "max_intermediate_checkpoints": max_intermediate_checkpoints,
+            "retained_intermediate_checkpoint_count": (
+                int(optimizer_steps // checkpoint_interval)
+                if max_intermediate_checkpoints <= 0
+                else min(int(optimizer_steps // checkpoint_interval), max_intermediate_checkpoints)
+            ),
             "final_checkpoint_count": 1,
         },
         "memory_estimate": {
@@ -6433,6 +6447,7 @@ class LLMExperimentRunner:
             resume=bool(training_payload["resume"]),
             resume_if_exists=bool(training_payload["resume_if_exists"]),
             checkpoint_interval=int(training_payload["checkpoint_interval"]),
+            max_intermediate_checkpoints=int(training_payload["max_intermediate_checkpoints"]),
             resource_monitor_interval=float(training_payload["resource_monitor_interval"]),
             cortex_phase_interval=int(training_payload["cortex_phase_interval"]),
             cortex_phase_probe_tasks=int(training_payload["cortex_phase_probe_tasks"]),
@@ -7224,6 +7239,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     smoke.add_argument("--steps", type=int, default=48)
     smoke.add_argument("--gradient-accumulation-steps", type=int, default=1)
     smoke.add_argument("--checkpoint-interval", type=int, default=100)
+    smoke.add_argument("--max-intermediate-checkpoints", type=int, default=0)
     smoke.add_argument("--resume", action="store_true")
     smoke.add_argument("--resume-if-exists", action="store_true", help="resume from existing verified artifacts if present, otherwise start fresh")
     smoke.add_argument("--precision", choices=("fp32", "bf16", "fp16"), default="fp32")
@@ -7246,6 +7262,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     compare.add_argument("--batch-size", type=int, default=32)
     compare.add_argument("--gradient-accumulation-steps", type=int, default=1)
     compare.add_argument("--checkpoint-interval", type=int, default=100)
+    compare.add_argument("--max-intermediate-checkpoints", type=int, default=0)
     compare.add_argument("--resume", action="store_true")
     compare.add_argument("--resume-if-exists", action="store_true", help="resume from existing verified artifacts if present, otherwise start fresh")
     compare.add_argument("--d-model", type=int, default=256)
@@ -7272,6 +7289,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     compare_matrix.add_argument("--batch-size", type=int, default=32)
     compare_matrix.add_argument("--gradient-accumulation-steps", type=int, default=1)
     compare_matrix.add_argument("--checkpoint-interval", type=int, default=100)
+    compare_matrix.add_argument("--max-intermediate-checkpoints", type=int, default=0)
     compare_matrix.add_argument("--resume", action="store_true")
     compare_matrix.add_argument("--resume-if-exists", action="store_true", help="resume from existing verified artifacts if present, otherwise start fresh")
     compare_matrix.add_argument("--d-model", type=int, default=256)
@@ -7298,6 +7316,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     corpus_matrix.add_argument("--batch-size", type=int, default=32)
     corpus_matrix.add_argument("--gradient-accumulation-steps", type=int, default=1)
     corpus_matrix.add_argument("--checkpoint-interval", type=int, default=100)
+    corpus_matrix.add_argument("--max-intermediate-checkpoints", type=int, default=0)
     corpus_matrix.add_argument("--resume", action="store_true")
     corpus_matrix.add_argument("--resume-if-exists", action="store_true", help="resume from existing verified artifacts if present, otherwise start fresh")
     corpus_matrix.add_argument("--d-model", type=int, default=256)
@@ -7322,6 +7341,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     benchmark.add_argument("--batch-size", type=int, default=8)
     benchmark.add_argument("--gradient-accumulation-steps", type=int, default=1)
     benchmark.add_argument("--checkpoint-interval", type=int, default=100)
+    benchmark.add_argument("--max-intermediate-checkpoints", type=int, default=0)
     benchmark.add_argument("--resume", action="store_true")
     benchmark.add_argument("--resume-if-exists", action="store_true", help="resume from existing verified artifacts if present, otherwise start fresh")
     benchmark.add_argument("--vocab-size", type=int, default=256)
@@ -7349,6 +7369,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     benchmark_matrix.add_argument("--batch-size", type=int, default=8)
     benchmark_matrix.add_argument("--gradient-accumulation-steps", type=int, default=1)
     benchmark_matrix.add_argument("--checkpoint-interval", type=int, default=100)
+    benchmark_matrix.add_argument("--max-intermediate-checkpoints", type=int, default=0)
     benchmark_matrix.add_argument("--resume", action="store_true")
     benchmark_matrix.add_argument("--resume-if-exists", action="store_true", help="resume from existing verified artifacts if present, otherwise start fresh")
     benchmark_matrix.add_argument("--vocab-size", type=int, default=256)
@@ -7485,6 +7506,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             resume=args.resume,
             resume_if_exists=args.resume_if_exists,
             checkpoint_interval=args.checkpoint_interval,
+            max_intermediate_checkpoints=args.max_intermediate_checkpoints,
             num_threads=1,
         )
         config = ComparisonConfig(
@@ -7604,6 +7626,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             resume=args.resume,
             resume_if_exists=args.resume_if_exists,
             checkpoint_interval=args.checkpoint_interval,
+            max_intermediate_checkpoints=args.max_intermediate_checkpoints,
             num_threads=1,
         )
         config = ComparisonConfig(
@@ -7652,6 +7675,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             resume=args.resume,
             resume_if_exists=args.resume_if_exists,
             checkpoint_interval=args.checkpoint_interval,
+            max_intermediate_checkpoints=args.max_intermediate_checkpoints,
             num_threads=1,
         )
         config = ComparisonConfig(
@@ -7698,6 +7722,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             resume=args.resume,
             resume_if_exists=args.resume_if_exists,
             checkpoint_interval=args.checkpoint_interval,
+            max_intermediate_checkpoints=args.max_intermediate_checkpoints,
             seed=seeds[0],
         )
         config = ComparisonConfig(
@@ -7733,6 +7758,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             resume=args.resume,
             resume_if_exists=args.resume_if_exists,
             checkpoint_interval=args.checkpoint_interval,
+            max_intermediate_checkpoints=args.max_intermediate_checkpoints,
             seed=seeds[0],
         )
         config = ComparisonConfig(
@@ -7766,6 +7792,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         resume=args.resume,
         resume_if_exists=args.resume_if_exists,
         checkpoint_interval=args.checkpoint_interval,
+        max_intermediate_checkpoints=args.max_intermediate_checkpoints,
     )
     config = ComparisonConfig(
         vocab_size=args.vocab_size,

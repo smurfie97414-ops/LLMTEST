@@ -701,6 +701,64 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             self.assertTrue((run_dir / "checkpoint_step_3.pt").exists())
             self.assertTrue((run_dir / "checkpoint_step_3.pt.json").exists())
             self.assertTrue((run_dir / "checkpoint_final.pt").exists())
+            sidecar = json.loads((run_dir / "checkpoint_step_3.pt.json").read_text(encoding="utf-8"))
+            self.assertEqual(sidecar["checkpoint_retention"]["checkpoint_interval"], 1)
+            self.assertEqual(sidecar["checkpoint_retention"]["max_intermediate_checkpoints"], 2)
+            self.assertEqual(sidecar["training_config"]["max_intermediate_checkpoints"], 2)
+
+    def test_manifest_training_config_preserves_checkpoint_retention_in_plan(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            corpus = self._corpus(root, repeats=40)
+            tokenizer = LLMTokenizer.train(corpus, vocab_size=192, min_frequency=1)
+            tokenized_manifest = TokenizedCorpusBuilder(corpus, tokenizer).build(
+                root / "prepared",
+                seq_len=16,
+                max_horizon=4,
+            )
+            manifest = {
+                "name": "retention-manifest",
+                "out_dir": str(root / "experiment"),
+                "doctor": {"precision": "bf16", "device": "auto", "require_cuda": False},
+                "seeds": [17],
+                "require_win": False,
+                "model": {
+                    "vocab_size": tokenized_manifest.vocab_size,
+                    "min_frequency": 1,
+                    "seq_len": 16,
+                    "d_model": 32,
+                    "n_heads": 4,
+                    "n_layers": 1,
+                    "dropout": 0.0,
+                    "horizons": [1, 2, 4],
+                },
+                "training": {
+                    "steps": 9,
+                    "batch_size": 2,
+                    "eval_interval": 3,
+                    "eval_batches": 1,
+                    "checkpoint_interval": 3,
+                    "max_intermediate_checkpoints": 2,
+                    "resume_if_exists": True,
+                    "num_threads": 1,
+                },
+                "corpora": [
+                    {
+                        "name": "paths",
+                        "kind": "paths",
+                        "paths": list(corpus.files),
+                        "min_chars_per_chunk": 512,
+                    }
+                ],
+            }
+            runner = LLMExperimentRunner(manifest)
+            config = runner._comparison_config((17,))
+            self.assertEqual(config.training.checkpoint_interval, 3)
+            self.assertEqual(config.training.max_intermediate_checkpoints, 2)
+            plan = build_training_plan(tokenized_manifest, config)
+            self.assertEqual(plan["training"]["intermediate_checkpoint_count"], 3)
+            self.assertEqual(plan["training"]["max_intermediate_checkpoints"], 2)
+            self.assertEqual(plan["training"]["retained_intermediate_checkpoint_count"], 2)
 
     def test_training_config_rejects_strict_and_auto_resume_together(self):
         with self.assertRaisesRegex(ValueError, "mutually exclusive"):
