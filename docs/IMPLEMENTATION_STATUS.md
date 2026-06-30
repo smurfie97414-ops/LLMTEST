@@ -158,12 +158,12 @@ Current executable coverage:
 - `MinimalRegrowthEngine` selects the best recovering, non-regressing repair under budget.
 - `tools/run_cycle_report.py` now builds Phase 7 plans from real cycle regressions through causal attribution by default, with `--skip-regrowth` as the escape hatch.
 - `write_cycle_run` persists regrowth plans into `summary.json`.
+- The full LLM Cortex phase controller converts verified regrowth outputs into causal replay examples, so accepted repair evidence can influence subsequent optimizer steps.
 
 Remaining:
 
 - Apply accepted repairs to a real multi-layer model state rather than targeted repair agents.
 - Persist accepted repair archives for rollback and audit.
-- Feed accepted repairs into Phase 9 sleep/consolidation buffers.
 
 ## Phase 8 - Fast/normal/careful inference
 
@@ -217,6 +217,7 @@ Current executable coverage:
 - `write_cycle_run` can persist sleep phase reports into `summary.json`.
 - `tools/run_cycle_report.py` writes Phase 9 sleep traces by default unless `--skip-sleep` is passed.
 - The full LLM trainer tokenizes accepted sleep examples with the active BPE tokenizer and replays them as causal batches in the Cortex loss.
+- Cortex phase replay batches are now saved in checkpoints and restored on resume, so long runs do not lose sleep/consolidation training state after interruption.
 
 Evidence:
 
@@ -227,7 +228,6 @@ Evidence:
 
 Remaining:
 
-- Persist replay buffers and real/exogenous reservoirs across runs.
 - Add external provenance adapters for real data sources.
 - Measure rare-skill retention, diversity and calibration over repeated sleep/wake cycles.
 
@@ -248,11 +248,13 @@ Current executable coverage:
 - `RecursiveImprovementEngine` orchestrates proposal generation, sandbox training, dynamic evaluation, acceptance and archive recording from a `CycleReport`.
 - `write_cycle_run` can persist recursive improvement reports into `summary.json`.
 - `tools/run_cycle_report.py` writes Phase 10 traces by default unless `--skip-improvement` is passed.
+- The full LLM Cortex phase controller converts verifier-approved recursive-improvement gate decisions into causal replay examples and persists the resulting phase state in checkpoints.
 
 Evidence:
 
 - `.\.venv\Scripts\python.exe -m unittest tests.test_recursive_improvement`
 - `.\.venv\Scripts\python.exe -m unittest discover -s tests`
+- `tests/test_llm_pretraining.py::LLMPretrainingHarnessTest::test_cortex_phase_state_survives_checkpoint_resume` verifies that P1-P10 replay state persists through a checkpoint resume and keeps influencing optimizer steps.
 - Smoke: `RecursiveImprovementEngine(...).run(..., max_proposals=3)` accepted Pareto-improving sandbox proposals with no touched files.
 - Temporary artifact write with `tools\run_cycle_report.py --out-dir <temp> --run-id final-smoke` includes `recursive_improvement` with accepted sandbox proposals and rollback data.
 
@@ -261,7 +263,6 @@ Remaining:
 - Convert accepted in-memory proposals into signed patch artifacts.
 - Persist evolutionary and rollback archives across runs.
 - Run multi-generation proposal evolution with diversity pressure.
-- Connect accepted proposals to real model/checkpoint training updates after verifier approval.
 
 ## Frontier Skill Discovery
 
