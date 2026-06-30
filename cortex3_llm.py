@@ -2000,6 +2000,58 @@ class CortexTrainingPhaseController:
         for example in examples[:8]:
             self.replay_batches.append(self._batch_from_example(example))
 
+    def state_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": 1,
+            "phase_counts": dict(self.phase_counts),
+            "errors": list(self.errors),
+            "batch_contract_samples": list(self.batch_contract_samples),
+            "phase_audits": list(self.phase_audits),
+            "replay_batches": [batch.detach().cpu() for batch in self.replay_batches],
+            "replay_cursor": int(self.replay_cursor),
+            "regularization_steps": int(self.regularization_steps),
+            "replay_updates": int(self.replay_updates),
+            "phase_replay_examples": dict(self.phase_replay_examples),
+            "phase_replay_example_ids": list(self.phase_replay_example_ids),
+        }
+
+    def load_state_dict(self, payload: Mapping[str, Any] | None) -> None:
+        if not payload:
+            return
+        if int(payload.get("schema_version", 0)) != 1:
+            raise ValueError(f"unsupported Cortex phase state schema: {payload.get('schema_version')!r}")
+        self.phase_counts.update({str(key): int(value) for key, value in dict(payload.get("phase_counts", {})).items()})
+        self.errors = [dict(item) for item in payload.get("errors", ())]
+        self.batch_contract_samples = [dict(item) for item in payload.get("batch_contract_samples", ())]
+        self.phase_audits = [dict(item) for item in payload.get("phase_audits", ())]
+        self.replay_batches = [
+            batch.detach().cpu().to(dtype=torch.long)
+            if isinstance(batch, torch.Tensor)
+            else torch.as_tensor(batch, dtype=torch.long)
+            for batch in payload.get("replay_batches", ())
+        ]
+        self.replay_cursor = int(payload.get("replay_cursor", 0))
+        self.regularization_steps = int(payload.get("regularization_steps", 0))
+        self.replay_updates = int(payload.get("replay_updates", 0))
+        self.phase_replay_examples.update({
+            str(key): int(value)
+            for key, value in dict(payload.get("phase_replay_examples", {})).items()
+        })
+        self.phase_replay_example_ids = [str(item) for item in payload.get("phase_replay_example_ids", ())]
+
+    def checkpoint_state_summary(self) -> dict[str, Any]:
+        return {
+            "schema_version": 1,
+            "phase_event_counts": dict(self.phase_counts),
+            "replay_batch_count": len(self.replay_batches),
+            "replay_cursor": int(self.replay_cursor),
+            "regularization_steps": int(self.regularization_steps),
+            "replay_updates": int(self.replay_updates),
+            "phase_replay_examples": sum(self.phase_replay_examples.values()),
+            "phase_replay_examples_by_phase": dict(self.phase_replay_examples),
+            "error_count": len(self.errors),
+        }
+
     def run_phase_audit(self, *, step: int) -> Mapping[str, Any]:
         audit: dict[str, Any] = {"step": step}
         cycle_report = None
@@ -2453,7 +2505,13 @@ class LLMTrainer:
         resource_usage: Mapping[str, Any] = {"enabled": False}
         try:
             if resumed_from is not None:
-                start_step, curve = self.load_checkpoint(resumed_from, optimizer=optimizer, scaler=scaler, restore_rng=not runtime.enabled)
+                start_step, curve = self.load_checkpoint(
+                    resumed_from,
+                    optimizer=optimizer,
+                    scaler=scaler,
+                    phase_controller=phase_controller,
+                    restore_rng=not runtime.enabled,
+                )
                 if start_step > self.config.steps:
                     raise ValueError(f"checkpoint step {start_step} is greater than target steps {self.config.steps}")
                 if runtime.enabled:
@@ -2529,10 +2587,24 @@ class LLMTrainer:
                     if phase_controller is not None:
                         phase_controller.run_phase_audit(step=step)
                 if runtime.is_main and step % self.config.checkpoint_interval == 0:
-                    self.save_checkpoint(optimizer, self.run_dir / f"checkpoint_step_{step}.pt", step=step, curve=curve, scaler=scaler)
+                    self.save_checkpoint(
+                        optimizer,
+                        self.run_dir / f"checkpoint_step_{step}.pt",
+                        step=step,
+                        curve=curve,
+                        scaler=scaler,
+                        phase_controller=phase_controller,
+                    )
             checkpoint_path = self.run_dir / "checkpoint_final.pt"
             if runtime.is_main:
-                checkpoint_path = self.save_checkpoint(optimizer, checkpoint_path, step=self.config.steps, curve=curve, scaler=scaler)
+                checkpoint_path = self.save_checkpoint(
+                    optimizer,
+                    checkpoint_path,
+                    step=self.config.steps,
+                    curve=curve,
+                    scaler=scaler,
+                    phase_controller=phase_controller,
+                )
                 self._write_curve(curve)
         finally:
             if resource_monitor is not None:
@@ -2607,6 +2679,7 @@ class LLMTrainer:
         *,
         optimizer: torch.optim.Optimizer,
         scaler: torch.amp.GradScaler | None,
+        phase_controller: CortexTrainingPhaseController | None = None,
         restore_rng: bool = True,
     ) -> tuple[int, list[TrainingPoint]]:
         checkpoint_path = Path(path)
@@ -2630,6 +2703,8 @@ class LLMTrainer:
         optimizer.load_state_dict(payload["optimizer_state_dict"])
         if scaler is not None and payload.get("scaler_state_dict") is not None:
             scaler.load_state_dict(payload["scaler_state_dict"])
+        if phase_controller is not None:
+            phase_controller.load_state_dict(payload.get("cortex_phase_state"))
         if restore_rng:
             rng_state = payload.get("rng_state", {})
             if "torch" in rng_state:
@@ -2675,10 +2750,13 @@ class LLMTrainer:
         step: int,
         curve: Sequence[TrainingPoint],
         scaler: torch.amp.GradScaler | None = None,
+        phase_controller: CortexTrainingPhaseController | None = None,
     ) -> Path:
         output = Path(path)
         output.parent.mkdir(parents=True, exist_ok=True)
         code_state = code_state_report()
+        cortex_phase_state = phase_controller.state_dict() if phase_controller is not None else None
+        cortex_phase_state_summary = phase_controller.checkpoint_state_summary() if phase_controller is not None else None
         torch.save(
             {
                 "schema_version": 2,
@@ -2691,6 +2769,7 @@ class LLMTrainer:
                 "model_kind": self.model_kind,
                 "corpus_identity": self.corpus_identity,
                 "code_state": code_state,
+                "cortex_phase_state": cortex_phase_state,
                 "curve": [point.to_dict() for point in curve],
                 "rng_state": self._rng_state(),
             },
@@ -2707,6 +2786,8 @@ class LLMTrainer:
                 "curve_points": len(curve),
                 "corpus_identity_sha256": self.corpus_identity.get("identity_sha256"),
                 "code_state": code_state,
+                "cortex_phase_state_present": cortex_phase_state is not None,
+                "cortex_phase_state_summary": cortex_phase_state_summary,
                 "written_at": time.time(),
             },
         )

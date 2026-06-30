@@ -654,6 +654,90 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
 
             self.assertEqual(observed, list(range(80, 88)))
 
+    def test_cortex_phase_state_survives_checkpoint_resume(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            corpus = self._corpus(root, repeats=70)
+            tokenizer = LLMTokenizer.train(corpus, vocab_size=192, min_frequency=1)
+            manifest = TokenizedCorpusBuilder(corpus, tokenizer).build(
+                root / "prepared",
+                seq_len=24,
+                max_horizon=8,
+            )
+            model_config = TransformerConfig(
+                vocab_size=manifest.vocab_size,
+                seq_len=24,
+                d_model=32,
+                n_heads=4,
+                n_layers=1,
+                dropout=0.0,
+                horizons=(1, 2, 4, 8),
+                use_cortex_heads=True,
+                use_ternary_core=True,
+            )
+            train = MemmapCausalDataset(manifest, split="train")
+            val = MemmapCausalDataset(manifest, split="val")
+            run_dir = root / "cortex-resume"
+            try:
+                first = LLMTrainer(
+                    CortexTransformerLM(model_config),
+                    train,
+                    val,
+                    TrainingConfig(
+                        steps=1,
+                        batch_size=2,
+                        eval_interval=1,
+                        eval_batches=1,
+                        checkpoint_interval=1,
+                        seed=71,
+                        num_threads=1,
+                        cortex_phase_interval=1,
+                        cortex_phase_probe_tasks=1,
+                        cortex_phase_max_proposals=1,
+                    ),
+                    run_dir=run_dir,
+                    model_kind="cortex3_multi_horizon",
+                    corpus_identity=manifest.identity(),
+                ).train(name="cortex3")
+                first_influence = first.cortex_phase_report["training_influence"]
+                self.assertGreater(first_influence["phase_replay_examples"], 0)
+                checkpoint = torch.load(run_dir / "checkpoint_final.pt", map_location="cpu", weights_only=False)
+                self.assertIn("cortex_phase_state", checkpoint)
+                self.assertGreater(len(checkpoint["cortex_phase_state"]["replay_batches"]), 0)
+                sidecar = json.loads((run_dir / "checkpoint_final.pt.json").read_text(encoding="utf-8"))
+                self.assertTrue(sidecar["cortex_phase_state_present"])
+                self.assertGreater(sidecar["cortex_phase_state_summary"]["replay_batch_count"], 0)
+
+                resumed = LLMTrainer(
+                    CortexTransformerLM(model_config),
+                    train,
+                    val,
+                    TrainingConfig(
+                        steps=2,
+                        batch_size=2,
+                        eval_interval=1,
+                        eval_batches=1,
+                        checkpoint_interval=1,
+                        seed=71,
+                        resume=True,
+                        num_threads=1,
+                        cortex_phase_interval=1,
+                        cortex_phase_probe_tasks=1,
+                        cortex_phase_max_proposals=1,
+                    ),
+                    run_dir=run_dir,
+                    model_kind="cortex3_multi_horizon",
+                    corpus_identity=manifest.identity(),
+                ).train(name="cortex3")
+            finally:
+                train.close()
+                val.close()
+
+            resumed_influence = resumed.cortex_phase_report["training_influence"]
+            self.assertEqual(resumed.start_step, 1)
+            self.assertGreaterEqual(resumed_influence["phase_replay_examples"], first_influence["phase_replay_examples"])
+            self.assertGreater(resumed_influence["sleep_replay_updates"], first_influence["sleep_replay_updates"])
+
     def test_inspect_experiment_reports_partial_run_without_loading_checkpoints(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
