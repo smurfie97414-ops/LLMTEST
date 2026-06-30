@@ -375,8 +375,10 @@ Current executable coverage:
 - `PrecisionPolicy(require_cuda=True)` raises when CUDA is required but unavailable, preventing silent CPU fallback.
 - `LLMComparisonRunner` trains a baseline next-token Transformer and a Cortex multi-horizon Transformer on the same corpus/cache, then writes `comparison_report.json`, `report.md`, `learning_curve.png`, both final checkpoints and both learning-curve CSV files.
 - `LLMBenchmarkSuite` runs multiple deterministic domains, persists per-domain comparison artifacts and writes an aggregate `benchmark_report.json`, `benchmark_report.md` and `benchmark_ratios.png`.
+- `LLMStatisticalBenchmarkSuite` repeats the benchmark over multiple seeds, persists each seed/domain comparison and writes `statistical_benchmark_report.json`, `statistical_benchmark_report.md` and `statistical_benchmark_ratios.png` with mean, median, min ratio, win-rate, per-domain and per-seed aggregates.
 - `tools/train_llm.py` exposes `smoke`, `prepare-hf` and `compare` commands for local proof runs, Hugging Face corpus preparation and larger text-shard corpora.
 - `tools/train_llm.py benchmark` exposes the multi-domain proof gate and supports CPU `bf16` validation.
+- `tools/train_llm.py benchmark-matrix` exposes the multi-domain x multi-seed proof gate and fails `--require-win` unless every seed-domain sample wins with a nonzero baseline and bounded next-token regression.
 - `tools/launch_llm_ddp.py` launches true local multi-process DDP workers, pins the Gloo interface and writes per-rank logs.
 - `.github/workflows/ci.yml` runs the LLM smoke command.
 
@@ -387,6 +389,8 @@ Evidence:
 - Smoke proof: baseline score `0.022321`, Cortex score `0.145833`, Cortex/baseline `6.533x`, next-token-loss regression ratio `1.020`, proof passed.
 - `.\.venv\Scripts\python.exe tools\train_llm.py benchmark --out-dir runs\llm-benchmark-validation --domains sequence,anchors --repeats 96 --steps 48 --batch-size 8 --precision bf16 --require-win`
 - Benchmark proof through `codex-test` with `gradient_accumulation_steps=2`: `2/2` domains passed, mean Cortex/baseline ratio `32.097x`, minimum domain ratio `25.861x`, mean baseline score `0.005301`, max next-token-loss regression ratio `1.001049`.
+- `.\.venv\Scripts\python.exe tools\train_llm.py benchmark-matrix --out-dir runs\llm-benchmark-matrix-validation --domains sequence,anchors --seeds 11,23 --repeats 96 --steps 48 --batch-size 8 --precision bf16 --require-win`
+- Statistical benchmark proof through `codex-test`: `4/4` seed-domain samples passed, win-rate `1.0`, mean Cortex/baseline ratio `26.520x`, median ratio `18.829x`, minimum ratio `4.840x`, mean baseline score `0.012835`, max next-token-loss regression ratio `1.067812`.
 - DDP root cause and fix: the local Windows CPU PyTorch build exposes Gloo but `torchrun` elastic requests TCPStore libuv that is not compiled in; when Gloo auto-selected a bad host route it tried `kubernetes.docker.internal`. Cortex now pins `GLOO_SOCKET_IFNAME` and uses an explicit `TCPStore(..., use_libuv=False)` for local Gloo env initialization.
 - `.\.venv\Scripts\python.exe tools\launch_llm_ddp.py --nproc 2 --master-port 29752 --gloo-interface Ethernet --timeout 240 -- smoke --out-dir runs\llm-ddp-smoke-validation --steps 48 --precision bf16 --require-win`
 - DDP smoke proof through `codex-test`: `world_size=2`, `distributed=True`, proof passed, baseline score `0.002790`, Cortex score `0.149740`, Cortex/baseline `53.667x`, next-token-loss regression ratio `0.952`.
@@ -402,5 +406,5 @@ Remaining:
 
 - Run a genuine long large-corpus experiment from an external Hugging Face dataset such as C4/FineWeb, not only the deterministic local smoke corpus or local JSONL export test.
 - Validate CUDA mixed precision and NCCL multi-GPU runs on hardware that exposes real CUDA devices; this machine currently exposes only CPU Torch, so CUDA/NCCL claims remain unvalidated locally.
-- Scale model sizes and training steps, then publish variance across multiple seeds and corpus domains.
+- Scale model sizes and training steps, then publish the same statistical benchmark on broad external corpora instead of only deterministic local domains.
 - Connect accepted recursive-improvement proposals to persisted LLM checkpoint patches with rollback archives.

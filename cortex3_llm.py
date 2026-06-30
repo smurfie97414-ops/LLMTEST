@@ -7,9 +7,10 @@ import os
 import platform
 import random
 import shutil
+import statistics
 import time
 from contextlib import nullcontext
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import timedelta
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping, Sequence
@@ -1290,6 +1291,17 @@ class BenchmarkSuiteReport:
         return asdict(self)
 
 
+@dataclass(frozen=True)
+class StatisticalBenchmarkReport:
+    run_dir: str
+    seeds: tuple[Mapping[str, Any], ...]
+    proof: Mapping[str, Any]
+    hardware: Mapping[str, Any]
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
 class LLMComparisonRunner:
     def __init__(self, corpus: TextCorpusConfig, config: ComparisonConfig, *, run_dir: str | Path):
         self.corpus = corpus
@@ -1578,6 +1590,257 @@ class LLMBenchmarkSuite:
         plt.close(fig)
 
 
+class LLMStatisticalBenchmarkSuite:
+    def __init__(
+        self,
+        *,
+        run_dir: str | Path,
+        domains: Sequence[str],
+        seeds: Sequence[int],
+        repeats: int,
+        config: ComparisonConfig,
+    ):
+        if not domains:
+            raise ValueError("at least one benchmark domain is required")
+        if not seeds:
+            raise ValueError("at least one benchmark seed is required")
+        self.run_dir = Path(run_dir)
+        self.domains = tuple(domains)
+        self.seeds = tuple(int(seed) for seed in seeds)
+        self.repeats = repeats
+        self.config = config
+
+    def run(self, *, require_win: bool = False) -> StatisticalBenchmarkReport:
+        runtime = DistributedRuntime.from_env(
+            requested=self.config.training.distributed,
+            device_type="cuda" if torch.cuda.is_available() and self.config.training.device in {"auto", "cuda"} else "cpu",
+            gloo_interface=self.config.training.gloo_interface,
+        )
+        runtime.ensure_initialized()
+        if runtime.is_main:
+            if self.run_dir.exists() and not self.config.training.resume:
+                shutil.rmtree(self.run_dir)
+            self.run_dir.mkdir(parents=True, exist_ok=True)
+        _barrier_if_needed(runtime)
+
+        seed_payloads: list[Mapping[str, Any]] = []
+        for seed in self.seeds:
+            seed_training = replace(self.config.training, seed=seed)
+            seed_config = replace(self.config, training=seed_training)
+            seed_report = LLMBenchmarkSuite(
+                run_dir=self.run_dir / f"seed_{seed}",
+                domains=self.domains,
+                repeats=self.repeats,
+                config=seed_config,
+            ).run(require_win=False)
+            seed_payloads.append(
+                {
+                    "seed": seed,
+                    "run_dir": seed_report.run_dir,
+                    "proof": seed_report.proof,
+                    "domains": seed_report.domains,
+                }
+            )
+
+        proof = self._proof(seed_payloads)
+        report = StatisticalBenchmarkReport(
+            run_dir=str(self.run_dir),
+            seeds=tuple(seed_payloads),
+            proof=proof,
+            hardware=hardware_report(),
+        )
+        if runtime.is_main:
+            _write_json(self.run_dir / "statistical_benchmark_report.json", report.to_dict())
+            self._write_markdown(report)
+            self._write_ratio_plot(report)
+        failed = bool(require_win and not proof["passed"] and runtime.is_main)
+        if runtime.enabled:
+            flag_device = torch.device(f"cuda:{runtime.local_rank}") if runtime.backend == "nccl" else torch.device("cpu")
+            flag = torch.tensor([1 if failed else 0], dtype=torch.int64, device=flag_device)
+            torch.distributed.broadcast(flag, src=0)
+            failed = bool(int(flag.cpu().item()))
+        _barrier_if_needed(runtime)
+        if failed:
+            raise RuntimeError(f"Cortex statistical benchmark did not pass: {proof}")
+        return report
+
+    def _proof(self, seed_reports: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+        samples: list[dict[str, Any]] = []
+        for seed_report in seed_reports:
+            seed = int(seed_report["seed"])
+            for domain_report in seed_report["domains"]:
+                proof = domain_report["proof"]
+                samples.append(
+                    {
+                        "seed": seed,
+                        "domain": str(domain_report["domain"]),
+                        "ratio": float(proof["cortex_over_baseline_ratio"]),
+                        "baseline_score": float(proof["baseline_score"]),
+                        "cortex_score": float(proof["cortex_score"]),
+                        "next_token_loss_regression_ratio": float(proof["next_token_loss_regression_ratio"]),
+                        "passed": bool(proof["passed"]) and float(proof["baseline_score"]) > 0.0,
+                    }
+                )
+
+        ratios = [sample["ratio"] for sample in samples]
+        baseline_scores = [sample["baseline_score"] for sample in samples]
+        regressions = [sample["next_token_loss_regression_ratio"] for sample in samples]
+        passed_count = sum(1 for sample in samples if sample["passed"])
+        sample_count = len(samples)
+
+        domain_results: list[dict[str, Any]] = []
+        for domain in self.domains:
+            domain_samples = [sample for sample in samples if sample["domain"] == domain]
+            domain_ratios = [sample["ratio"] for sample in domain_samples]
+            domain_passed = sum(1 for sample in domain_samples if sample["passed"])
+            domain_results.append(
+                {
+                    "domain": domain,
+                    "sample_count": len(domain_samples),
+                    "mean_ratio": sum(domain_ratios) / max(1, len(domain_ratios)),
+                    "min_ratio": min(domain_ratios) if domain_ratios else 0.0,
+                    "max_ratio": max(domain_ratios) if domain_ratios else 0.0,
+                    "win_rate": domain_passed / max(1, len(domain_samples)),
+                    "passed": bool(domain_samples) and domain_passed == len(domain_samples),
+                }
+            )
+
+        seed_results: list[dict[str, Any]] = []
+        for seed in self.seeds:
+            seed_samples = [sample for sample in samples if sample["seed"] == seed]
+            seed_ratios = [sample["ratio"] for sample in seed_samples]
+            seed_passed = sum(1 for sample in seed_samples if sample["passed"])
+            seed_results.append(
+                {
+                    "seed": seed,
+                    "sample_count": len(seed_samples),
+                    "mean_ratio": sum(seed_ratios) / max(1, len(seed_ratios)),
+                    "min_ratio": min(seed_ratios) if seed_ratios else 0.0,
+                    "win_rate": seed_passed / max(1, len(seed_samples)),
+                    "passed": bool(seed_samples) and seed_passed == len(seed_samples),
+                }
+            )
+
+        min_ratio = min(ratios) if ratios else 0.0
+        max_regression = max(regressions) if regressions else 0.0
+        min_baseline = min(baseline_scores) if baseline_scores else 0.0
+        win_rate = passed_count / max(1, sample_count)
+        passed = (
+            sample_count == len(self.domains) * len(self.seeds)
+            and passed_count == sample_count
+            and min_ratio >= self.config.cortex_win_margin
+            and min_baseline > 0.0
+            and max_regression <= self.config.max_next_token_loss_regression
+        )
+        return {
+            "metric": "statistical_benchmark_cortex_over_baseline",
+            "domains": list(self.domains),
+            "seeds": list(self.seeds),
+            "domain_count": len(self.domains),
+            "seed_count": len(self.seeds),
+            "sample_count": sample_count,
+            "required_margin": self.config.cortex_win_margin,
+            "required_win_rate": 1.0,
+            "mean_ratio": sum(ratios) / max(1, len(ratios)),
+            "median_ratio": statistics.median(ratios) if ratios else 0.0,
+            "ratio_population_stddev": statistics.pstdev(ratios) if len(ratios) > 1 else 0.0,
+            "min_ratio": min_ratio,
+            "max_ratio": max(ratios) if ratios else 0.0,
+            "win_rate": win_rate,
+            "mean_baseline_score": sum(baseline_scores) / max(1, len(baseline_scores)),
+            "min_baseline_score": min_baseline,
+            "max_next_token_loss_regression": max_regression,
+            "all_samples_passed": passed_count == sample_count and sample_count > 0,
+            "domain_results": tuple(domain_results),
+            "seed_results": tuple(seed_results),
+            "samples": tuple(samples),
+            "passed": passed,
+        }
+
+    def _write_markdown(self, report: StatisticalBenchmarkReport) -> None:
+        proof = report.proof
+        lines = [
+            "# Cortex-3 LLM statistical benchmark report",
+            "",
+            f"- Domains: `{', '.join(proof['domains'])}`",
+            f"- Seeds: `{', '.join(str(seed) for seed in proof['seeds'])}`",
+            f"- Samples: `{proof['sample_count']}`",
+            f"- Mean Cortex/baseline ratio: `{proof['mean_ratio']:.3f}`",
+            f"- Median Cortex/baseline ratio: `{proof['median_ratio']:.3f}`",
+            f"- Min Cortex/baseline ratio: `{proof['min_ratio']:.3f}`",
+            f"- Win rate: `{proof['win_rate']:.3f}`",
+            f"- Max next-token-loss regression: `{proof['max_next_token_loss_regression']:.3f}`",
+            f"- Passed: `{proof['passed']}`",
+            "",
+            "## Domain Results",
+            "",
+            "| Domain | Samples | Mean ratio | Min ratio | Win rate | Passed |",
+            "| --- | ---: | ---: | ---: | ---: | --- |",
+        ]
+        for item in proof["domain_results"]:
+            lines.append(
+                f"| `{item['domain']}` | {item['sample_count']} | {item['mean_ratio']:.3f} | "
+                f"{item['min_ratio']:.3f} | {item['win_rate']:.3f} | `{item['passed']}` |"
+            )
+        lines.extend(
+            [
+                "",
+                "## Seed Results",
+                "",
+                "| Seed | Samples | Mean ratio | Min ratio | Win rate | Passed |",
+                "| ---: | ---: | ---: | ---: | ---: | --- |",
+            ]
+        )
+        for item in proof["seed_results"]:
+            lines.append(
+                f"| {item['seed']} | {item['sample_count']} | {item['mean_ratio']:.3f} | "
+                f"{item['min_ratio']:.3f} | {item['win_rate']:.3f} | `{item['passed']}` |"
+            )
+        lines.extend(
+            [
+                "",
+                "## Artifacts",
+                "",
+                "- `statistical_benchmark_report.json`",
+                "- `statistical_benchmark_report.md`",
+                "- `statistical_benchmark_ratios.png`",
+                "- `seed_<seed>/benchmark_report.json`",
+                "- `seed_<seed>/<domain>/comparison_report.json`",
+                "- `seed_<seed>/<domain>/baseline_ntp/checkpoint_final.pt`",
+                "- `seed_<seed>/<domain>/cortex3/checkpoint_final.pt`",
+            ]
+        )
+        (self.run_dir / "statistical_benchmark_report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    def _write_ratio_plot(self, report: StatisticalBenchmarkReport) -> None:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        domain_results = list(report.proof["domain_results"])
+        names = [str(item["domain"]) for item in domain_results]
+        means = [float(item["mean_ratio"]) for item in domain_results]
+        lows = [max(0.0, float(item["mean_ratio"]) - float(item["min_ratio"])) for item in domain_results]
+        highs = [max(0.0, float(item["max_ratio"]) - float(item["mean_ratio"])) for item in domain_results]
+        fig, ax = plt.subplots(figsize=(8, 4))
+        ax.bar(names, means, color="#435c7a")
+        ax.errorbar(names, means, yerr=[lows, highs], fmt="none", ecolor="#222222", capsize=4, linewidth=1)
+        for index, domain in enumerate(names):
+            domain_samples = [sample for sample in report.proof["samples"] if sample["domain"] == domain]
+            for offset, sample in enumerate(domain_samples):
+                jitter = (offset - (len(domain_samples) - 1) / 2.0) * 0.04
+                ax.scatter(index + jitter, float(sample["ratio"]), color="#b2473e", s=22, zorder=3)
+        ax.axhline(1.0, color="#333333", linewidth=1)
+        ax.axhline(float(report.proof["required_margin"]), color="#555555", linestyle="--", linewidth=1)
+        ax.set_title("Cortex / baseline ratio by domain and seed")
+        ax.set_ylabel("ratio")
+        ax.set_xlabel("domain")
+        fig.tight_layout()
+        fig.savefig(self.run_dir / "statistical_benchmark_ratios.png", dpi=150)
+        plt.close(fig)
+
+
 def build_seed_corpus(path: str | Path, *, repeats: int = 256) -> tuple[str, ...]:
     output = Path(path)
     output.mkdir(parents=True, exist_ok=True)
@@ -1611,6 +1874,22 @@ def build_benchmark_corpus(path: str | Path, *, domain: str, repeats: int = 256)
             handle.write(pattern + "\n")
             handle.write(f"domain {domain} sample {index:05d} control token {index % 31:02d} repeats with stable local structure.\n")
     return (str(shard),)
+
+
+def _parse_list(raw: str) -> tuple[str, ...]:
+    return tuple(part.strip() for part in raw.replace(",", " ").split() if part.strip())
+
+
+def _parse_seed_list(raw: str) -> tuple[int, ...]:
+    seeds: list[int] = []
+    for part in _parse_list(raw):
+        try:
+            seeds.append(int(part))
+        except ValueError as exc:
+            raise ValueError(f"invalid seed {part!r}; seeds must be integers") from exc
+    if not seeds:
+        raise ValueError("at least one seed is required")
+    return tuple(seeds)
 
 
 def main(argv: Sequence[str] | None = None) -> None:
@@ -1670,6 +1949,28 @@ def main(argv: Sequence[str] | None = None) -> None:
     benchmark.add_argument("--distributed", action="store_true")
     benchmark.add_argument("--gloo-interface", default=None)
     benchmark.add_argument("--require-win", action="store_true")
+
+    benchmark_matrix = sub.add_parser("benchmark-matrix", help="run a multi-domain x multi-seed statistical LLM benchmark")
+    benchmark_matrix.add_argument("--out-dir", default="runs/llm-benchmark-matrix")
+    benchmark_matrix.add_argument("--domains", default="sequence,reasoning,code,anchors")
+    benchmark_matrix.add_argument("--seeds", default="11,23,37")
+    benchmark_matrix.add_argument("--repeats", type=int, default=160)
+    benchmark_matrix.add_argument("--steps", type=int, default=48)
+    benchmark_matrix.add_argument("--batch-size", type=int, default=8)
+    benchmark_matrix.add_argument("--gradient-accumulation-steps", type=int, default=1)
+    benchmark_matrix.add_argument("--checkpoint-interval", type=int, default=100)
+    benchmark_matrix.add_argument("--resume", action="store_true")
+    benchmark_matrix.add_argument("--vocab-size", type=int, default=256)
+    benchmark_matrix.add_argument("--seq-len", type=int, default=32)
+    benchmark_matrix.add_argument("--d-model", type=int, default=64)
+    benchmark_matrix.add_argument("--n-heads", type=int, default=4)
+    benchmark_matrix.add_argument("--n-layers", type=int, default=2)
+    benchmark_matrix.add_argument("--precision", choices=("fp32", "bf16", "fp16"), default="fp32")
+    benchmark_matrix.add_argument("--device", default="auto")
+    benchmark_matrix.add_argument("--require-cuda", action="store_true")
+    benchmark_matrix.add_argument("--distributed", action="store_true")
+    benchmark_matrix.add_argument("--gloo-interface", default=None)
+    benchmark_matrix.add_argument("--require-win", action="store_true")
 
     prepare_hf = sub.add_parser("prepare-hf", help="export a Hugging Face dataset to text shards and a token memmap corpus")
     prepare_hf.add_argument("--dataset", required=True, help="Hugging Face dataset path, e.g. allenai/c4 or json")
@@ -1780,7 +2081,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         return
 
     if args.command == "benchmark":
-        domains = tuple(part.strip() for part in args.domains.replace(",", " ").split() if part.strip())
+        domains = _parse_list(args.domains)
         resolved_domains = tuple(DEFAULT_BENCHMARK_DOMAINS.keys()) if "all" in domains else domains
         training = TrainingConfig(
             steps=args.steps,
@@ -1814,6 +2115,50 @@ def main(argv: Sequence[str] | None = None) -> None:
         report = LLMBenchmarkSuite(
             run_dir=args.out_dir,
             domains=resolved_domains,
+            repeats=args.repeats,
+            config=config,
+        ).run(require_win=args.require_win)
+        if _rank_zero():
+            print(json.dumps(report.proof, indent=2, sort_keys=True))
+        return
+
+    if args.command == "benchmark-matrix":
+        domains = _parse_list(args.domains)
+        resolved_domains = tuple(DEFAULT_BENCHMARK_DOMAINS.keys()) if "all" in domains else domains
+        seeds = _parse_seed_list(args.seeds)
+        training = TrainingConfig(
+            steps=args.steps,
+            batch_size=args.batch_size,
+            gradient_accumulation_steps=args.gradient_accumulation_steps,
+            eval_interval=max(1, args.steps // 3),
+            eval_batches=3,
+            seed=seeds[0],
+            device=args.device,
+            precision=args.precision,
+            require_cuda=args.require_cuda,
+            distributed=args.distributed,
+            gloo_interface=args.gloo_interface,
+            resume=args.resume,
+            checkpoint_interval=args.checkpoint_interval,
+            num_threads=1,
+        )
+        config = ComparisonConfig(
+            vocab_size=args.vocab_size,
+            min_frequency=1,
+            seq_len=args.seq_len,
+            d_model=args.d_model,
+            n_heads=args.n_heads,
+            n_layers=args.n_layers,
+            dropout=0.0,
+            horizons=(1, 2, 4),
+            training=training,
+            cortex_win_margin=1.02,
+            max_next_token_loss_regression=1.50,
+        )
+        report = LLMStatisticalBenchmarkSuite(
+            run_dir=args.out_dir,
+            domains=resolved_domains,
+            seeds=seeds,
             repeats=args.repeats,
             config=config,
         ).run(require_win=args.require_win)

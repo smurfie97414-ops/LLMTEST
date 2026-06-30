@@ -1,11 +1,11 @@
 ﻿# Codex Repo Map
 
 - Root: `C:\Users\hight\Documents\Codex\2026-06-30\cl\work\LLMTEST`
-- Generated: 2026-06-30T07:59:21
+- Generated: 2026-06-30T08:27:52
 - Files indexed: 49
-- Symbols indexed: 549
+- Symbols indexed: 550
 - Symbol files scanned: 42 of 42 candidates
-- Git: branch `main`, head `db844f4`, changed entries `5`
+- Git: branch `main`, head `3145e4c`, changed entries `7`
 
 ## Use
 
@@ -84,7 +84,7 @@ Read this map before broad file exploration. Prefer targeted `rg` and narrow fil
 - `tests/test_frontier_discovery.py`: py:FrontierSkillDiscoveryTest, py:test_frontier_discovery_report_is_persisted, py:test_frontier_discovery_slow_solves_distills_and_compiles_fragile_skill
 - `tests/test_future_contracts.py`: py:_confident_heads, py:FutureContractsTest, py:test_contract_revision_rejects_mismatch_and_high_temporal_loss, py:test_future_contract_accepts_low_risk_fast_path, py:test_future_contract_from_logits_accepts_and_rejects_observed_blocks, py:test_mtp_fsp_calibrator_learns_standalone_future_tokens, py:test_mtp_heads_have_required_horizons_and_confidence, py:test_risky_domain_shortens_and_requires_gate_before_acceptance, py:test_temporal_consistency_loss_from_outputs_runs_on_real_heads, py:test_temporal_consistency_loss_rewards_shifted_future_agreement, py:test_verified_answers_per_effective_cost_is_not_tokens_per_second
 - `tests/test_inference.py`: py:_engine, py:_verifier, py:test_budget_predictor_prices_careful_path_above_fast_path, py:test_careful_route_runs_strong_verification_certificate_and_expert_trace, py:test_cycle_report_can_persist_inference_results, py:test_difficulty_router_selects_fast_normal_and_careful_paths, py:test_engine_can_use_trained_autoregressive_answer_source, py:test_fast_path_uses_less_depth_and_better_verified_cost_than_careful_on_easy_task, py:test_fast_path_verified_cost_rejects_confident_wrong_answer, py:test_inference_gate_rejects_tampered_proof_carrying_answer, py:test_latent_kv_reconstruction_is_used_and_anchor_fidelity_is_verified, py:test_memory_augmented_generation_recovers_latent_anchor_answer, py:test_normal_path_uses_light_certificate_and_moderate_budget, py:test_self_speculative_decoding_respects_route_horizon_caps, py:UltraFastInferenceTest
-- `tests/test_llm_pretraining.py`: py:_corpus, py:LLMPretrainingHarnessTest, py:test_bpe_tokenizer_and_memmap_corpus_are_streamable, py:test_cortex_comparison_produces_checkpoints_curves_and_cost_win, py:test_cuda_requirement_is_explicit_not_silent_fallback, py:test_distributed_runtime_can_pin_gloo_interface_without_initializing, py:test_hf_dataset_export_builds_real_text_shards_and_token_memmap, py:test_multi_domain_benchmark_aggregates_real_learning_curves, py:test_trainer_resumes_checkpoint_with_gradient_accumulation
+- `tests/test_llm_pretraining.py`: py:_corpus, py:LLMPretrainingHarnessTest, py:test_bpe_tokenizer_and_memmap_corpus_are_streamable, py:test_cortex_comparison_produces_checkpoints_curves_and_cost_win, py:test_cuda_requirement_is_explicit_not_silent_fallback, py:test_distributed_runtime_can_pin_gloo_interface_without_initializing, py:test_hf_dataset_export_builds_real_text_shards_and_token_memmap, py:test_multi_domain_benchmark_aggregates_real_learning_curves, py:test_statistical_benchmark_matrix_requires_all_seed_domain_wins, py:test_trainer_resumes_checkpoint_with_gradient_accumulation
 - `tests/test_microtrain.py`: py:MicroTrainTest, py:test_checkpoint_save_and_load_preserves_predictions, py:test_micro_model_training_improves_verified_accuracy, py:test_sleep_phase_examples_can_train_checkpoint
 - `tests/test_objective_metrics.py`: py:_cycle_bundle, py:Decision, py:Evaluation, py:Improvement, py:ObjectiveMetricsTest, py:test_absolute_metrics_contains_every_plan_metric, py:test_final_loss_contains_every_plan_term_with_weighted_total, py:test_inference_results_feed_path_anchor_and_certificate_metrics, py:test_objective_uses_custom_weights, py:test_recursive_invalidity_counts_calibration_and_collapse, py:test_reporting_persists_objective_report
 - `tests/test_plan_experiments.py`: py:PlanExperimentsTest, py:test_experiment_report_is_persisted_in_cycle_artifact, py:test_experiments_a_to_e_all_pass_with_named_metrics

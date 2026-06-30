@@ -224,6 +224,14 @@ python tools/train_llm.py benchmark --domains sequence,anchors --precision bf16 
 
 Il génère plusieurs corpus contrôlés, entraîne baseline et Cortex sur chaque domaine, agrège les ratios Cortex/baseline et écrit `benchmark_report.json`, `benchmark_report.md` et `benchmark_ratios.png`. Le runtime supporte DDP via `torch.distributed`; sur le build Windows CPU local, le chemin `torchrun` elastic échoue à cause d'un TCPStore libuv indisponible, donc le lanceur local ci-dessous utilise un TCPStore explicite `use_libuv=False` et une interface Gloo fixée.
 
+Pour une preuve plus robuste avec variance inter-seeds :
+
+```bash
+python tools/train_llm.py benchmark-matrix --domains sequence,anchors --seeds 11,23,37 --precision bf16 --require-win
+```
+
+Cette commande exécute chaque domaine pour chaque seed, persiste les artefacts par couple `seed_<seed>/<domain>`, puis écrit `statistical_benchmark_report.json`, `statistical_benchmark_report.md` et `statistical_benchmark_ratios.png`. La preuve ne passe que si chaque échantillon domaine x seed gagne contre la baseline avec score baseline non nul et régression next-token bornée.
+
 Pour valider un vrai run DDP local sans dépendre de `torchrun` elastic quand le build Windows CPU de PyTorch n'a pas le support libuv :
 
 ```bash

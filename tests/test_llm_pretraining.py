@@ -13,6 +13,7 @@ from cortex3_llm import (
     HFDatasetTextExporter,
     LLMBenchmarkSuite,
     LLMComparisonRunner,
+    LLMStatisticalBenchmarkSuite,
     LLMTrainer,
     LLMTokenizer,
     MemmapCausalDataset,
@@ -263,6 +264,53 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             self.assertGreater(report.proof["mean_baseline_score"], 0.0)
             self.assertTrue((root / "benchmark" / "benchmark_report.json").exists())
             self.assertTrue((root / "benchmark" / "benchmark_ratios.png").exists())
+
+    def test_statistical_benchmark_matrix_requires_all_seed_domain_wins(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = ComparisonConfig(
+                vocab_size=256,
+                min_frequency=1,
+                seq_len=32,
+                d_model=64,
+                n_heads=4,
+                n_layers=2,
+                dropout=0.0,
+                horizons=(1, 2, 4),
+                training=TrainingConfig(
+                    steps=48,
+                    batch_size=8,
+                    eval_interval=16,
+                    eval_batches=2,
+                    seed=11,
+                    precision="bf16",
+                    num_threads=1,
+                ),
+                cortex_win_margin=1.02,
+                max_next_token_loss_regression=1.60,
+            )
+            report = LLMStatisticalBenchmarkSuite(
+                run_dir=root / "benchmark-matrix",
+                domains=("sequence", "anchors"),
+                seeds=(11, 23),
+                repeats=96,
+                config=config,
+            ).run(require_win=True)
+            self.assertTrue(report.proof["passed"], report.proof)
+            self.assertEqual(report.proof["domain_count"], 2)
+            self.assertEqual(report.proof["seed_count"], 2)
+            self.assertEqual(report.proof["sample_count"], 4)
+            self.assertEqual(report.proof["win_rate"], 1.0)
+            self.assertGreater(report.proof["mean_baseline_score"], 0.0)
+            self.assertTrue((root / "benchmark-matrix" / "statistical_benchmark_report.json").exists())
+            self.assertTrue((root / "benchmark-matrix" / "statistical_benchmark_report.md").exists())
+            self.assertTrue((root / "benchmark-matrix" / "statistical_benchmark_ratios.png").exists())
+            for seed in (11, 23):
+                for domain in ("sequence", "anchors"):
+                    self.assertTrue(
+                        (root / "benchmark-matrix" / f"seed_{seed}" / domain / "comparison_report.json").exists(),
+                        f"missing comparison report for seed={seed} domain={domain}",
+                    )
 
     def test_cuda_requirement_is_explicit_not_silent_fallback(self):
         report = hardware_report()
