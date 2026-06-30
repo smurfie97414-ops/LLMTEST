@@ -367,8 +367,8 @@ Current executable coverage:
 - `cortex3_llm.LLMTokenizer` trains and persists a Hugging Face `tokenizers` BPE tokenizer with required special tokens.
 - `HFDatasetTextExporter` streams Hugging Face `datasets` sources or local JSONL builders into bounded text shards with export reports, document/character counts and explicit unbounded-run opt-in.
 - `TextShardReader` streams text shards without loading the whole corpus into memory.
-- `TokenizedCorpusBuilder` performs a two-pass corpus tokenization and writes a `uint32` memmap plus `manifest.json`.
-- `MemmapCausalDataset` samples causal next-token targets and multi-horizon future targets directly from the memmap.
+- `TokenizedCorpusBuilder` streams encoded chunks once into a `uint32` token file and writes a coherent `manifest.json`.
+- `MemmapCausalDataset` samples causal next-token targets and multi-horizon future targets directly from the memmap with vectorized batch window reads.
 - `CortexTransformerLM` is a complete causal Transformer with tied embeddings, causal self-attention, MLP blocks and optional Cortex multi-horizon heads.
 - `CortexObjective` optimizes next-token loss plus Cortex MTP, temporal-consistency and confidence terms when the Cortex heads are enabled.
 - `LLMTrainer` supports checkpoints, strict resume, optimizer/scaler/RNG state persistence, gradient accumulation, CSV learning curves, deterministic random sampling, explicit device selection, mixed precision policy and DDP initialization from environment, including a Windows/Gloo TCPStore path that avoids unsupported libuv builds.

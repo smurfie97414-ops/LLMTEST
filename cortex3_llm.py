@@ -509,20 +509,15 @@ class TokenizedCorpusBuilder:
         self.tokenizer.save(tokenizer_path)
 
         token_count = 0
-        for tokens in self._iter_token_chunks():
-            token_count += len(tokens)
+        with token_path.open("wb") as handle:
+            for tokens in self._iter_token_chunks():
+                array = np.asarray(tokens, dtype=np.uint32)
+                handle.write(array.tobytes(order="C"))
+                token_count += int(array.size)
         minimum = seq_len + max_horizon + 2
         if token_count < minimum:
+            token_path.unlink(missing_ok=True)
             raise ValueError(f"corpus produced {token_count} tokens, need at least {minimum}")
-
-        memmap = np.memmap(token_path, dtype=np.uint32, mode="w+", shape=(token_count,))
-        offset = 0
-        for tokens in self._iter_token_chunks():
-            size = len(tokens)
-            memmap[offset:offset + size] = np.asarray(tokens, dtype=np.uint32)
-            offset += size
-        memmap.flush()
-        del memmap
 
         manifest = TokenizedCorpusManifest(
             token_file=str(token_path),
@@ -577,6 +572,44 @@ class MemmapCausalDataset:
         future_tensor = torch.from_numpy(future.copy()).long()
         return x, future_tensor[:, 0], future_tensor
 
+    def batch_at(
+        self,
+        offsets: Sequence[int] | np.ndarray | torch.Tensor,
+        *,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if isinstance(offsets, torch.Tensor):
+            offset_array = offsets.detach().cpu().numpy().astype(np.int64, copy=False)
+        else:
+            offset_array = np.asarray(offsets, dtype=np.int64)
+        if offset_array.ndim != 1:
+            raise ValueError("offsets must be a 1D sequence")
+        if offset_array.size == 0:
+            raise ValueError("offsets must not be empty")
+        if int(offset_array.min()) < 0 or int(offset_array.max()) >= self.available:
+            raise IndexError("batch offset is outside the available split range")
+
+        starts = self.start + offset_array
+        positions = starts[:, None] + np.arange(
+            self.manifest.seq_len + self.manifest.max_horizon,
+            dtype=np.int64,
+        )[None, :]
+        windows = np.asarray(self.tokens[positions], dtype=np.int64)
+        x = torch.from_numpy(windows[:, : self.manifest.seq_len].copy()).long()
+        future = np.stack(
+            [
+                windows[:, horizon : horizon + self.manifest.seq_len]
+                for horizon in range(1, self.manifest.max_horizon + 1)
+            ],
+            axis=2,
+        )
+        future_tensor = torch.from_numpy(future.copy()).long()
+        return (
+            x.to(device, non_blocking=device.type == "cuda"),
+            future_tensor[:, :, 0].to(device, non_blocking=device.type == "cuda"),
+            future_tensor.to(device, non_blocking=device.type == "cuda"),
+        )
+
     def sample_batch(
         self,
         batch_size: int,
@@ -587,19 +620,7 @@ class MemmapCausalDataset:
         if batch_size <= 0:
             raise ValueError("batch_size must be positive")
         offsets = torch.randint(0, self.available, (batch_size,), generator=generator)
-        xs: list[torch.Tensor] = []
-        ys: list[torch.Tensor] = []
-        futures: list[torch.Tensor] = []
-        for offset in offsets.tolist():
-            x, y, future = self.item(int(offset))
-            xs.append(x)
-            ys.append(y)
-            futures.append(future)
-        return (
-            torch.stack(xs).to(device),
-            torch.stack(ys).to(device),
-            torch.stack(futures).to(device),
-        )
+        return self.batch_at(offsets, device=device)
 
     def close(self) -> None:
         mmap = getattr(self.tokens, "_mmap", None)

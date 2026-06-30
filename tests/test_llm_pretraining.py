@@ -23,6 +23,7 @@ from cortex3_llm import (
     MemmapCausalDataset,
     PrecisionPolicy,
     TextCorpusConfig,
+    TextShardReader,
     TokenizedCorpusBuilder,
     TrainingConfig,
     TransformerConfig,
@@ -56,6 +57,7 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 max_horizon=4,
             )
             self.assertGreater(manifest.token_count, 24)
+            self.assertEqual(Path(manifest.token_file).stat().st_size, manifest.token_count * 4)
             train = MemmapCausalDataset(manifest, split="train")
             try:
                 x, y, future = train.item(0)
@@ -63,8 +65,56 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 self.assertEqual(tuple(y.shape), (24,))
                 self.assertEqual(tuple(future.shape), (24, 4))
                 self.assertEqual(int(y[0]), int(future[0, 0]))
+
+                batch_offsets = [0, 1, min(2, len(train) - 1)]
+                bx, by, bfuture = train.batch_at(batch_offsets, device=torch.device("cpu"))
+                self.assertEqual(tuple(bx.shape), (3, 24))
+                self.assertEqual(tuple(by.shape), (3, 24))
+                self.assertEqual(tuple(bfuture.shape), (3, 24, 4))
+                for batch_index, offset in enumerate(batch_offsets):
+                    ix, iy, ifuture = train.item(offset)
+                    self.assertTrue(torch.equal(bx[batch_index], ix))
+                    self.assertTrue(torch.equal(by[batch_index], iy))
+                    self.assertTrue(torch.equal(bfuture[batch_index], ifuture))
+                with self.assertRaises(IndexError):
+                    train.batch_at([len(train)], device=torch.device("cpu"))
             finally:
                 train.close()
+
+    def test_tokenized_corpus_builder_streams_tokens_once(self):
+        class CountingTokenizer:
+            vocab_size = 64
+
+            def __init__(self):
+                self.encode_calls = 0
+
+            def encode(self, text: str) -> tuple[int, ...]:
+                self.encode_calls += 1
+                payload = [4 + (ord(ch) % 48) for ch in text if not ch.isspace()]
+                return tuple([1, *payload, 2])
+
+            def save(self, path: str | Path) -> Path:
+                output = Path(path)
+                output.parent.mkdir(parents=True, exist_ok=True)
+                output.write_text("{}", encoding="utf-8")
+                return output
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            text_file = root / "stream.txt"
+            text_file.write_text(("cortex streaming corpus writes uint32 tokens once per chunk.\n" * 40), encoding="utf-8")
+            corpus = TextCorpusConfig.from_paths([text_file], min_chars_per_chunk=256)
+            expected_chunks = sum(1 for _ in TextShardReader(corpus).iter_chunks())
+            tokenizer = CountingTokenizer()
+
+            manifest = TokenizedCorpusBuilder(corpus, tokenizer).build(
+                root / "prepared",
+                seq_len=16,
+                max_horizon=2,
+            )
+
+            self.assertEqual(tokenizer.encode_calls, expected_chunks)
+            self.assertEqual(Path(manifest.token_file).stat().st_size, manifest.token_count * 4)
 
     def test_trainer_resumes_checkpoint_with_gradient_accumulation(self):
         with tempfile.TemporaryDirectory() as tmp:
