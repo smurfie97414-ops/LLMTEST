@@ -39,6 +39,7 @@ from cortex3_llm import (
     build_benchmark_corpus,
     build_seed_corpus,
     hardware_report,
+    inspect_llm_experiment,
     llm_doctor_report,
     main as llm_main,
 )
@@ -605,6 +606,70 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             persisted = json.loads((run_dir / "cortex_phase_report.json").read_text(encoding="utf-8"))
             self.assertTrue(persisted["all_phases_active"], persisted)
             self.assertEqual(persisted["training_influence"]["sleep_replay_updates"], influence["sleep_replay_updates"])
+
+    def test_inspect_experiment_reports_partial_run_without_loading_checkpoints(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            run = root / "run"
+            corpus_dir = run / "corpus_matrix" / "c4-en" / "corpus"
+            seed_dir = run / "corpus_matrix" / "c4-en" / "seed_11"
+            baseline_dir = seed_dir / "baseline_ntp"
+            cortex_dir = seed_dir / "cortex3"
+            baseline_dir.mkdir(parents=True)
+            cortex_dir.mkdir(parents=True)
+            corpus_dir.mkdir(parents=True)
+
+            (run / "experiment_manifest.normalized.json").write_text(
+                json.dumps({"name": "inspect", "out_dir": str(run), "seeds": [11]}),
+                encoding="utf-8",
+            )
+            (corpus_dir / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "token_count": 64_000_000,
+                        "seq_len": 1024,
+                        "max_horizon": 8,
+                        "preparation_config": {"max_tokens": 64_000_000},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (seed_dir / "run_plan.json").write_text(json.dumps({"training": {"steps": 32_000}}), encoding="utf-8")
+            (baseline_dir / "checkpoint_step_500.pt").write_bytes(b"checkpoint-placeholder")
+            (baseline_dir / "checkpoint_step_1000.pt").write_bytes(b"checkpoint-placeholder-newer")
+            (baseline_dir / "learning_curve.csv").write_text(
+                "step,split,loss,next_token_loss,token_accuracy,mtp_loss,future_tokens_per_cost\n"
+                "0,val,1.0,1.0,0.1,0.0,0.01\n"
+                "500,val,0.8,0.8,0.2,0.0,0.02\n",
+                encoding="utf-8",
+            )
+            (cortex_dir / "cortex_phase_report.json").write_text(
+                json.dumps(
+                    {
+                        "all_phases_active": True,
+                        "phase_event_counts": {f"P{index}": 1 for index in range(1, 11)},
+                        "training_influence": {"sleep_replay_updates": 3},
+                        "errors": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            report = inspect_llm_experiment(run)
+            payload = report.to_dict()
+
+            self.assertTrue(payload["exists"], payload)
+            self.assertEqual(payload["status"], "partial", payload)
+            self.assertEqual(payload["manifest"]["name"], "inspect")
+            corpus = payload["corpora"][0]
+            self.assertEqual(corpus["token_count"], 64_000_000)
+            seed = corpus["seed_runs"][0]
+            self.assertTrue(seed["run_plan_exists"])
+            self.assertEqual(seed["baseline"]["latest_checkpoint_step"], 1000)
+            self.assertTrue(seed["baseline"]["latest_checkpoint"]["path"].endswith("checkpoint_step_1000.pt"))
+            self.assertEqual(seed["baseline"]["last_validation"]["step"], 500)
+            self.assertTrue(seed["cortex"]["cortex_phase_summary"]["all_phases_active"])
+            self.assertEqual(seed["cortex"]["cortex_phase_summary"]["training_influence"]["sleep_replay_updates"], 3)
 
     def test_trainer_rejects_resume_when_corpus_identity_changes(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -2649,6 +2649,228 @@ class LLMExperimentPreflightReport:
         return asdict(self)
 
 
+@dataclass(frozen=True)
+class LLMExperimentInspectionReport:
+    run_dir: str
+    exists: bool
+    status: str
+    running_processes: tuple[Mapping[str, Any], ...]
+    gpu_snapshot: Mapping[str, Any]
+    manifest: Mapping[str, Any]
+    corpora: tuple[Mapping[str, Any], ...]
+    warnings: tuple[str, ...]
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+def _read_json_if_exists(path: Path) -> Mapping[str, Any]:
+    if not path.exists():
+        return {}
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _checkpoint_step_from_name(path: Path) -> int | None:
+    raw = path.stem.removeprefix("checkpoint_step_")
+    return int(raw) if raw.isdigit() else None
+
+
+def _last_validation_row(path: Path) -> Mapping[str, Any]:
+    if not path.exists():
+        return {}
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        rows = [row for row in csv.DictReader(handle) if row.get("split") == "val"]
+    if not rows:
+        return {}
+    row = rows[-1]
+    out: dict[str, Any] = {}
+    for key, value in row.items():
+        if value is None:
+            continue
+        try:
+            out[key] = int(value) if key == "step" else float(value)
+        except ValueError:
+            out[key] = value
+    return out
+
+
+def _model_run_inspection(model_dir: Path) -> Mapping[str, Any]:
+    step_checkpoints = []
+    for checkpoint in model_dir.glob("checkpoint_step_*.pt"):
+        step = _checkpoint_step_from_name(checkpoint)
+        if step is None:
+            continue
+        step_checkpoints.append(
+            {
+                "step": step,
+                "path": str(checkpoint),
+                "size_bytes": int(checkpoint.stat().st_size),
+                "last_write_time": checkpoint.stat().st_mtime,
+            }
+        )
+    step_checkpoints.sort(key=lambda item: item["step"])
+    final_checkpoint = model_dir / "checkpoint_final.pt"
+    training_report = _read_json_if_exists(model_dir / "training_report.json")
+    cortex_phase_report = _read_json_if_exists(model_dir / "cortex_phase_report.json")
+    return {
+        "exists": model_dir.exists(),
+        "latest_checkpoint_step": max((item["step"] for item in step_checkpoints), default=None),
+        "checkpoint_count": len(step_checkpoints),
+        "latest_checkpoint": step_checkpoints[-1] if step_checkpoints else None,
+        "final_checkpoint_exists": final_checkpoint.exists(),
+        "final_checkpoint_size_bytes": int(final_checkpoint.stat().st_size) if final_checkpoint.exists() else 0,
+        "learning_curve_exists": (model_dir / "learning_curve.csv").exists(),
+        "last_validation": _last_validation_row(model_dir / "learning_curve.csv"),
+        "training_report_exists": bool(training_report),
+        "training_report_summary": {
+            "start_step": training_report.get("start_step"),
+            "optimizer_steps": training_report.get("optimizer_steps"),
+            "effective_batch_size": training_report.get("effective_batch_size"),
+            "resumed_from": training_report.get("resumed_from"),
+            "resource_usage": training_report.get("resource_usage", {}),
+            "cortex_phase_report": training_report.get("cortex_phase_report", {}),
+        } if training_report else {},
+        "cortex_phase_report_exists": bool(cortex_phase_report),
+        "cortex_phase_summary": {
+            "all_phases_active": cortex_phase_report.get("all_phases_active"),
+            "phase_event_counts": cortex_phase_report.get("phase_event_counts", {}),
+            "training_influence": cortex_phase_report.get("training_influence", {}),
+            "errors": cortex_phase_report.get("errors", ()),
+        } if cortex_phase_report else {},
+    }
+
+
+def _running_processes_for_run(run_dir: Path) -> tuple[Mapping[str, Any], ...]:
+    needles = {str(run_dir), str(run_dir.resolve())}
+    if len(run_dir.name) >= 12 and run_dir.name.lower() not in {"run", "runs", "experiment"}:
+        needles.add(run_dir.name)
+    matches: list[Mapping[str, Any]] = []
+    for proc in psutil.process_iter(["pid", "ppid", "name", "cmdline", "create_time"]):
+        try:
+            cmdline = " ".join(str(part) for part in (proc.info.get("cmdline") or ()))
+            if not cmdline or not any(needle in cmdline for needle in needles):
+                continue
+            if int(proc.info["pid"]) == os.getpid() or "inspect-experiment" in cmdline:
+                continue
+            cpu_times = proc.cpu_times()
+            memory_info = proc.memory_info()
+            matches.append(
+                {
+                    "pid": int(proc.info["pid"]),
+                    "ppid": int(proc.info.get("ppid") or 0),
+                    "name": proc.info.get("name"),
+                    "cmdline": cmdline,
+                    "create_time": float(proc.info.get("create_time") or 0.0),
+                    "cpu_seconds": float(cpu_times.user + cpu_times.system),
+                    "rss_bytes": int(memory_info.rss),
+                }
+            )
+        except (psutil.AccessDenied, psutil.NoSuchProcess, psutil.ZombieProcess):
+            continue
+    return tuple(matches)
+
+
+def _gpu_snapshot() -> Mapping[str, Any]:
+    command = [
+        "nvidia-smi",
+        "--query-gpu=index,utilization.gpu,utilization.memory,memory.used,memory.total,power.draw",
+        "--format=csv,noheader,nounits",
+    ]
+    try:
+        completed = subprocess.run(command, capture_output=True, text=True, timeout=2.0, check=False)
+    except FileNotFoundError:
+        return {"available": False, "error": "nvidia-smi not found"}
+    except Exception as exc:
+        return {"available": False, "error": f"{type(exc).__name__}: {exc}"}
+    if completed.returncode != 0:
+        return {"available": False, "error": completed.stderr.strip() or f"nvidia-smi exited {completed.returncode}"}
+    devices: list[dict[str, Any]] = []
+    for line in completed.stdout.splitlines():
+        parts = [part.strip() for part in line.split(",")]
+        if len(parts) < 6:
+            continue
+        try:
+            devices.append(
+                {
+                    "index": int(parts[0]),
+                    "gpu_utilization_percent": float(parts[1]),
+                    "gpu_memory_utilization_percent": float(parts[2]),
+                    "memory_used_mb": float(parts[3]),
+                    "memory_total_mb": float(parts[4]),
+                    "power_draw_watts": float(parts[5]),
+                }
+            )
+        except ValueError:
+            continue
+    return {"available": True, "devices": tuple(devices)}
+
+
+def inspect_llm_experiment(run_dir: str | Path) -> LLMExperimentInspectionReport:
+    root = Path(run_dir)
+    warnings: list[str] = []
+    if not root.exists():
+        return LLMExperimentInspectionReport(
+            run_dir=str(root),
+            exists=False,
+            status="missing",
+            running_processes=(),
+            gpu_snapshot=_gpu_snapshot(),
+            manifest={},
+            corpora=(),
+            warnings=("run_dir does not exist",),
+        )
+
+    manifest = _read_json_if_exists(root / "experiment_manifest.normalized.json")
+    running = _running_processes_for_run(root)
+    experiment_report = _read_json_if_exists(root / "experiment_report.json")
+    status = "complete" if experiment_report else "running" if running else "partial"
+    if not manifest:
+        warnings.append("experiment_manifest.normalized.json is missing")
+
+    corpora: list[Mapping[str, Any]] = []
+    matrix_root = root / "corpus_matrix"
+    if not matrix_root.exists():
+        warnings.append("corpus_matrix directory is missing")
+    else:
+        for corpus_dir in sorted(path for path in matrix_root.iterdir() if path.is_dir()):
+            corpus_manifest = _read_json_if_exists(corpus_dir / "corpus" / "manifest.json")
+            seed_payloads: list[Mapping[str, Any]] = []
+            for seed_dir in sorted(path for path in corpus_dir.glob("seed_*") if path.is_dir()):
+                comparison_report = _read_json_if_exists(seed_dir / "comparison_report.json")
+                seed_payloads.append(
+                    {
+                        "seed": seed_dir.name.removeprefix("seed_"),
+                        "run_plan_exists": (seed_dir / "run_plan.json").exists(),
+                        "baseline": _model_run_inspection(seed_dir / "baseline_ntp"),
+                        "cortex": _model_run_inspection(seed_dir / "cortex3"),
+                        "comparison_report_exists": bool(comparison_report),
+                        "proof": comparison_report.get("proof", {}) if comparison_report else {},
+                    }
+                )
+            corpora.append(
+                {
+                    "name": corpus_dir.name,
+                    "manifest_exists": bool(corpus_manifest),
+                    "token_count": corpus_manifest.get("token_count"),
+                    "seq_len": corpus_manifest.get("seq_len"),
+                    "max_horizon": corpus_manifest.get("max_horizon"),
+                    "preparation_config": corpus_manifest.get("preparation_config", {}),
+                    "seed_runs": tuple(seed_payloads),
+                }
+            )
+
+    return LLMExperimentInspectionReport(
+        run_dir=str(root),
+        exists=True,
+        status=status,
+        running_processes=running,
+        gpu_snapshot=_gpu_snapshot(),
+        manifest=manifest,
+        corpora=tuple(corpora),
+        warnings=tuple(warnings),
+    )
+
+
 def _training_precision_bytes(precision: str) -> int:
     return 2 if precision in {"bf16", "fp16"} else 4
 
@@ -4872,6 +5094,9 @@ def main(argv: Sequence[str] | None = None) -> None:
     audit_experiment.add_argument("run_dir", help="experiment run directory")
     audit_experiment.add_argument("--allow-failed-proof", action="store_true", help="report missing/corrupt artifacts without failing solely on proof=false")
 
+    inspect_experiment = sub.add_parser("inspect-experiment", help="inspect a running or partial LLM experiment without loading large checkpoints")
+    inspect_experiment.add_argument("run_dir", help="experiment run directory")
+
     smoke = sub.add_parser("smoke", help="run a deterministic small corpus comparison")
     smoke.add_argument("--out-dir", default="runs/llm-smoke")
     smoke.add_argument("--steps", type=int, default=48)
@@ -5103,6 +5328,11 @@ def main(argv: Sequence[str] | None = None) -> None:
         if not report.passed:
             failed = "; ".join(report.failed_checks[:10])
             raise RuntimeError(f"Cortex LLM experiment audit failed: {failed}")
+        return
+
+    if args.command == "inspect-experiment":
+        report = inspect_llm_experiment(args.run_dir)
+        print(json.dumps(report.to_dict(), indent=2, sort_keys=True, default=_json_default))
         return
 
     if args.command == "smoke":
