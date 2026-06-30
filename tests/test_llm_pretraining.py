@@ -950,6 +950,10 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                     0,
                 )
                 self.assertGreater(
+                    sidecar["cortex_phase_state_summary"]["phase_event_counts"]["P2"],
+                    0,
+                )
+                self.assertGreater(
                     sidecar["cortex_phase_state_summary"]["compression_trace_counts"]["expert_activations"],
                     0,
                 )

@@ -3044,9 +3044,12 @@ class CortexTrainingPhaseController:
                     "mtp_fsp_events": len(compression_trace.get("mtp_fsp_events", ())),
                     "layer_forward_events": len(compression_trace.get("layer_forward_events", ())),
                 }
+        phase_counts = dict(self.phase_counts)
+        if compression_trace_counts.get("layer_forward_events", 0) > 0:
+            phase_counts["P2"] = max(phase_counts.get("P2", 0), compression_trace_counts["layer_forward_events"])
         return {
             "schema_version": 1,
-            "phase_event_counts": dict(self.phase_counts),
+            "phase_event_counts": phase_counts,
             "replay_batch_count": len(self.replay_batches),
             "replay_cursor": int(self.replay_cursor),
             "regularization_steps": int(self.regularization_steps),
