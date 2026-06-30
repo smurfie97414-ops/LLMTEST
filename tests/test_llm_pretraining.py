@@ -4,6 +4,7 @@ import os
 import tempfile
 import unittest
 from contextlib import redirect_stdout
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -708,6 +709,47 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 self.assertTrue((root / "compare-matrix" / f"seed_{seed}" / "comparison_report.json").exists())
                 self.assertTrue((root / "compare-matrix" / f"seed_{seed}" / "baseline_ntp" / "checkpoint_final.pt").exists())
                 self.assertTrue((root / "compare-matrix" / f"seed_{seed}" / "cortex3" / "checkpoint_final.pt").exists())
+
+    def test_comparison_matrix_resume_rejects_mismatched_tokenized_manifest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            corpus = self._corpus(root, repeats=80)
+            initial = ComparisonConfig(
+                vocab_size=192,
+                min_frequency=1,
+                seq_len=24,
+                d_model=32,
+                n_heads=4,
+                n_layers=1,
+                horizons=(1, 2),
+                training=TrainingConfig(
+                    steps=1,
+                    batch_size=2,
+                    eval_interval=1,
+                    eval_batches=1,
+                    checkpoint_interval=1,
+                    num_threads=1,
+                ),
+            )
+            LLMComparisonMatrixSuite(
+                corpus,
+                initial,
+                run_dir=root / "matrix",
+                seeds=(3,),
+            ).run(require_win=False)
+
+            resumed = replace(
+                initial,
+                seq_len=32,
+                training=replace(initial.training, resume=True),
+            )
+            with self.assertRaisesRegex(ValueError, "tokenized corpus preparation config"):
+                LLMComparisonMatrixSuite(
+                    corpus,
+                    resumed,
+                    run_dir=root / "matrix",
+                    seeds=(3,),
+                ).run(require_win=False)
 
     def test_multi_domain_benchmark_aggregates_real_learning_curves(self):
         with tempfile.TemporaryDirectory() as tmp:

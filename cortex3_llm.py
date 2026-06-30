@@ -87,6 +87,70 @@ def _fingerprint_files(paths: Sequence[str | Path]) -> tuple[dict[str, Any], ...
     return tuple(_fingerprint_file(path) for path in paths)
 
 
+def _tokenized_preparation_config(
+    corpus: "TextCorpusConfig",
+    *,
+    vocab_size: int,
+    min_frequency: int | None,
+    seq_len: int,
+    max_horizon: int,
+    train_fraction: float = 0.9,
+) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "vocab_size": int(vocab_size),
+        "min_frequency": int(min_frequency) if min_frequency is not None else None,
+        "seq_len": int(seq_len),
+        "max_horizon": int(max_horizon),
+        "train_fraction": float(train_fraction),
+        "min_chars_per_chunk": int(corpus.min_chars_per_chunk),
+        "encoding": str(corpus.encoding),
+    }
+
+
+def _tokenized_preparation_mismatches(
+    existing: Mapping[str, Any],
+    expected: Mapping[str, Any],
+) -> tuple[str, ...]:
+    mismatches: list[str] = []
+    for key, expected_value in expected.items():
+        if key not in existing:
+            mismatches.append(f"{key}: missing != {expected_value!r}")
+            continue
+        existing_value = existing[key]
+        if isinstance(expected_value, float):
+            try:
+                equal = math.isclose(float(existing_value), expected_value, rel_tol=0.0, abs_tol=1e-12)
+            except (TypeError, ValueError):
+                equal = False
+        else:
+            equal = existing_value == expected_value
+        if not equal:
+            mismatches.append(f"{key}: {existing_value!r} != {expected_value!r}")
+    return tuple(mismatches)
+
+
+def _require_tokenized_preparation_config(
+    manifest: "TokenizedCorpusManifest",
+    expected: Mapping[str, Any],
+    *,
+    manifest_path: str | Path,
+) -> None:
+    existing = dict(manifest.preparation_config or {})
+    if not existing:
+        raise ValueError(
+            "tokenized corpus preparation config is missing from "
+            f"{manifest_path}; rebuild the tokenized corpus before using resume=True"
+        )
+    mismatches = _tokenized_preparation_mismatches(existing, expected)
+    if mismatches:
+        detail = "; ".join(mismatches[:8])
+        raise ValueError(
+            "tokenized corpus preparation config does not match requested arguments "
+            f"for {manifest_path}: {detail}"
+        )
+
+
 def _read_validation_learning_curve_rows(seed_runs: Sequence[Mapping[str, Any]], *, corpus: str = "") -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for seed_run in seed_runs:
@@ -568,6 +632,7 @@ class TokenizedCorpusManifest:
     token_file_sha256: str = ""
     tokenizer_file_sha256: str = ""
     source_file_fingerprints: tuple[Mapping[str, Any], ...] = ()
+    preparation_config: Mapping[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -631,6 +696,7 @@ class TokenizedCorpusManifest:
         payload.setdefault("token_file_sha256", "")
         payload.setdefault("tokenizer_file_sha256", "")
         payload["source_file_fingerprints"] = tuple(dict(item) for item in payload.get("source_file_fingerprints", ()))
+        payload["preparation_config"] = dict(payload.get("preparation_config", {}))
         return TokenizedCorpusManifest(**payload)
 
     def save(self, path: str | Path) -> Path:
@@ -657,6 +723,7 @@ class TokenizedCorpusBuilder:
         seq_len: int,
         max_horizon: int,
         train_fraction: float = 0.9,
+        preparation_config: Mapping[str, Any] | None = None,
     ) -> TokenizedCorpusManifest:
         if seq_len < 8:
             raise ValueError("seq_len must be >= 8")
@@ -695,6 +762,17 @@ class TokenizedCorpusBuilder:
             token_file_sha256=_sha256_file(token_path),
             tokenizer_file_sha256=_sha256_file(tokenizer_path),
             source_file_fingerprints=_fingerprint_files(self.corpus.files),
+            preparation_config=dict(
+                preparation_config
+                or _tokenized_preparation_config(
+                    self.corpus,
+                    vocab_size=self.tokenizer.vocab_size,
+                    min_frequency=None,
+                    seq_len=seq_len,
+                    max_horizon=max_horizon,
+                    train_fraction=train_fraction,
+                )
+            ),
         )
         manifest.save(manifest_path)
         return manifest
@@ -1954,6 +2032,16 @@ class LLMComparisonRunner:
             self.run_dir / "corpus",
             seq_len=self.config.seq_len,
             max_horizon=max(self.config.horizons),
+            preparation_config=self._expected_preparation_config(),
+        )
+
+    def _expected_preparation_config(self) -> dict[str, Any]:
+        return _tokenized_preparation_config(
+            self.corpus,
+            vocab_size=self.config.vocab_size,
+            min_frequency=self.config.min_frequency,
+            seq_len=self.config.seq_len,
+            max_horizon=max(self.config.horizons),
         )
 
     def run(self, *, require_win: bool = False) -> ComparisonReport:
@@ -1986,6 +2074,12 @@ class LLMComparisonRunner:
                     manifest = self.prepare_corpus()
             _barrier_if_needed(runtime)
             manifest = TokenizedCorpusManifest.load(self.run_dir / "corpus" / "manifest.json")
+        manifest_path = Path(manifest.token_file).parent / "manifest.json"
+        _require_tokenized_preparation_config(
+            manifest,
+            self._expected_preparation_config(),
+            manifest_path=manifest_path,
+        )
         corpus_identity = manifest.identity()
         plan = build_training_plan(
             manifest,
@@ -2251,9 +2345,25 @@ class LLMComparisonMatrixSuite:
                     self.run_dir / "corpus",
                     seq_len=self.config.seq_len,
                     max_horizon=max(self.config.horizons),
+                    preparation_config=self._expected_preparation_config(),
                 )
         _barrier_if_needed(runtime)
-        return TokenizedCorpusManifest.load(manifest_path)
+        manifest = TokenizedCorpusManifest.load(manifest_path)
+        _require_tokenized_preparation_config(
+            manifest,
+            self._expected_preparation_config(),
+            manifest_path=manifest_path,
+        )
+        return manifest
+
+    def _expected_preparation_config(self) -> dict[str, Any]:
+        return _tokenized_preparation_config(
+            self.corpus,
+            vocab_size=self.config.vocab_size,
+            min_frequency=self.config.min_frequency,
+            seq_len=self.config.seq_len,
+            max_horizon=max(self.config.horizons),
+        )
 
     def _proof(self, seed_reports: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         samples: list[dict[str, Any]] = []
@@ -3660,14 +3770,14 @@ def main(argv: Sequence[str] | None = None) -> None:
         )
         export_report = HFDatasetTextExporter(hf_config).export(out_dir, resume=args.resume)
         corpus = TextCorpusConfig.from_paths(export_report.shard_files, min_chars_per_chunk=args.min_chars_per_chunk)
-        tokenization_config = {
-            "min_chars_per_chunk": int(args.min_chars_per_chunk),
-            "vocab_size": int(args.vocab_size),
-            "min_frequency": int(args.min_frequency),
-            "seq_len": int(args.seq_len),
-            "max_horizon": int(args.max_horizon),
-            "train_fraction": float(args.train_fraction),
-        }
+        tokenization_config = _tokenized_preparation_config(
+            corpus,
+            vocab_size=args.vocab_size,
+            min_frequency=args.min_frequency,
+            seq_len=args.seq_len,
+            max_horizon=args.max_horizon,
+            train_fraction=args.train_fraction,
+        )
         tokenized_dir = out_dir / "tokenized"
         tokenized_manifest_path = tokenized_dir / "manifest.json"
         prepare_report_path = out_dir / "prepare_report.json"
@@ -3679,6 +3789,11 @@ def main(argv: Sequence[str] | None = None) -> None:
                 raise ValueError("existing prepare_report tokenization config does not match requested prepare-hf arguments")
             manifest = TokenizedCorpusManifest.load(tokenized_manifest_path)
             manifest.identity()
+            _require_tokenized_preparation_config(
+                manifest,
+                tokenization_config,
+                manifest_path=tokenized_manifest_path,
+            )
             if manifest.source_files != export_report.shard_files:
                 raise ValueError("existing tokenized corpus source_files do not match resumed HF export shards")
         else:
@@ -3690,6 +3805,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 seq_len=args.seq_len,
                 max_horizon=args.max_horizon,
                 train_fraction=args.train_fraction,
+                preparation_config=tokenization_config,
             )
         payload = {
             "hf_export": export_report.to_dict(),

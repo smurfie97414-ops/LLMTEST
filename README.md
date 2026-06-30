@@ -266,9 +266,9 @@ Pour un dataset local JSONL compatible Hugging Face :
 python tools/train_llm.py prepare-hf --dataset json --data-file path/to/corpus.jsonl --split train --text-field text --out-dir runs/json-prepared
 ```
 
-Sans limite explicite, `prepare-hf` plafonne l'export à 100 000 documents pour éviter un lancement massif accidentel. Pour un vrai job complet, passe une limite de caractères/documents adaptée ou `--allow-unbounded` de façon explicite. `prepare-hf --resume` réutilise uniquement un export HF complet avec `hf_export_report.json`, shards présents, `prepare_report.json` et manifest tokenisé vérifié ; si les shards, le rapport ou la config de tokenization ne correspondent pas, la commande échoue au lieu d'écraser ou de reconstruire silencieusement.
+Sans limite explicite, `prepare-hf` plafonne l'export à 100 000 documents pour éviter un lancement massif accidentel. Pour un vrai job complet, passe une limite de caractères/documents adaptée ou `--allow-unbounded` de façon explicite. `prepare-hf --resume` réutilise uniquement un export HF complet avec `hf_export_report.json`, shards présents, `prepare_report.json` et manifest tokenisé vérifié ; si les shards, le rapport, la recette de préparation du tokenizer/memmap ou la config de tokenization ne correspondent pas, la commande échoue au lieu d'écraser ou de reconstruire silencieusement.
 
-Pour l'entraînement, `--resume` reprend strictement depuis `checkpoint_final.pt` ou le plus récent `checkpoint_step_*.pt` du dossier baseline/Cortex. Si le corpus manifest, l'identité SHA-256 du corpus, le checkpoint attendu ou le champ `corpus_identity` manque, ou si le checkpoint ne correspond pas au corpus courant, la commande échoue au lieu de repartir de zéro silencieusement.
+Pour l'entraînement, `--resume` reprend strictement depuis `checkpoint_final.pt` ou le plus récent `checkpoint_step_*.pt` du dossier baseline/Cortex. Si le corpus manifest, la recette tokenisée (`vocab_size`, `min_frequency`, `seq_len`, horizon, chunking), l'identité SHA-256 du corpus, le checkpoint attendu ou le champ `corpus_identity` manque, ou si le checkpoint ne correspond pas au corpus courant, la commande échoue au lieu de repartir de zéro silencieusement.
 
 Pour refuser tout fallback CPU quand un run GPU est obligatoire :
 
