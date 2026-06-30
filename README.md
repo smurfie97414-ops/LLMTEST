@@ -199,12 +199,21 @@ python tools/train_llm.py compare-matrix path/to/text_shards --out-dir runs/llm-
 
 `compare-matrix` écrit un `corpus/manifest.json` partagé, puis un dossier `seed_<seed>` par graine avec rapports, courbes et checkpoints baseline/Cortex. Le rapport agrégé `comparison_matrix_report.json` mesure moyenne, médiane, variance, win-rate, minimum Cortex/baseline et régression next-token maximale.
 
+Pour un banc multi-corpus déjà préparé :
+
+```bash
+python tools/train_llm.py corpus-matrix --corpus c4=runs/c4-prepared/text_shards --corpus code=path/to/code_shards --out-dir runs/llm-corpus-matrix --seeds 11,23,37 --steps 2000 --batch-size 64 --gradient-accumulation-steps 4 --checkpoint-interval 100 --precision bf16 --require-win
+```
+
+Chaque corpus reçoit son propre `comparison_matrix_report.json`, et le dossier racine écrit `corpus_matrix_report.json`, `corpus_matrix_report.md` et `corpus_matrix_ratios.png`. La preuve globale exige que tous les couples corpus x seed gagnent contre la baseline avec score baseline non nul.
+
 Pour préparer un corpus Hugging Face massif en shards texte puis memmap tokenisé :
 
 ```bash
 python tools/train_llm.py prepare-hf --dataset allenai/c4 --config-name en --split train --text-field text --out-dir runs/c4-prepared --max-documents 1000000 --vocab-size 32768 --seq-len 1024 --max-horizon 8
 python tools/train_llm.py compare runs/c4-prepared/text_shards --out-dir runs/c4-cortex-vs-ntp --steps 2000 --batch-size 64 --gradient-accumulation-steps 4 --checkpoint-interval 100 --precision bf16
 python tools/train_llm.py compare-matrix runs/c4-prepared/text_shards --out-dir runs/c4-cortex-vs-ntp-matrix --seeds 11,23,37 --steps 2000 --batch-size 64 --gradient-accumulation-steps 4 --checkpoint-interval 100 --precision bf16 --require-win
+python tools/train_llm.py corpus-matrix --corpus c4=runs/c4-prepared/text_shards --corpus local=path/to/local_text_shards --out-dir runs/corpus-suite --seeds 11,23,37 --steps 2000 --batch-size 64 --gradient-accumulation-steps 4 --checkpoint-interval 100 --precision bf16 --require-win
 ```
 
 Pour un dataset local JSONL compatible Hugging Face :

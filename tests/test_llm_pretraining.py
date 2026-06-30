@@ -14,6 +14,7 @@ from cortex3_llm import (
     LLMBenchmarkSuite,
     LLMComparisonMatrixSuite,
     LLMComparisonRunner,
+    LLMCorpusMatrixSuite,
     LLMStatisticalBenchmarkSuite,
     LLMTrainer,
     LLMTokenizer,
@@ -24,6 +25,7 @@ from cortex3_llm import (
     TrainingConfig,
     TransformerConfig,
     CortexTransformerLM,
+    build_benchmark_corpus,
     build_seed_corpus,
     hardware_report,
 )
@@ -357,6 +359,63 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                         (root / "benchmark-matrix" / f"seed_{seed}" / domain / "comparison_report.json").exists(),
                         f"missing comparison report for seed={seed} domain={domain}",
                     )
+
+    def test_corpus_matrix_aggregates_multiple_corpora_and_seeds(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            seed_corpus = TextCorpusConfig.from_paths(
+                build_seed_corpus(root / "seed-corpus", repeats=120),
+                min_chars_per_chunk=512,
+            )
+            anchor_corpus = TextCorpusConfig.from_paths(
+                build_benchmark_corpus(root / "anchor-corpus", domain="anchors", repeats=120),
+                min_chars_per_chunk=512,
+            )
+            config = ComparisonConfig(
+                vocab_size=256,
+                min_frequency=1,
+                seq_len=32,
+                d_model=64,
+                n_heads=4,
+                n_layers=2,
+                dropout=0.0,
+                horizons=(1, 2, 4),
+                training=TrainingConfig(
+                    steps=48,
+                    batch_size=8,
+                    eval_interval=16,
+                    eval_batches=2,
+                    seed=17,
+                    precision="bf16",
+                    num_threads=1,
+                ),
+                cortex_win_margin=1.02,
+                max_next_token_loss_regression=1.60,
+            )
+            report = LLMCorpusMatrixSuite(
+                (("seed", seed_corpus), ("anchors", anchor_corpus)),
+                config,
+                run_dir=root / "corpus-matrix",
+                seeds=(17, 29),
+            ).run(require_win=True)
+            self.assertTrue(report.proof["passed"], report.proof)
+            self.assertEqual(report.proof["corpus_count"], 2)
+            self.assertEqual(report.proof["seed_count"], 2)
+            self.assertEqual(report.proof["sample_count"], 4)
+            self.assertEqual(report.proof["win_rate"], 1.0)
+            self.assertGreater(report.proof["mean_baseline_score"], 0.0)
+            self.assertTrue((root / "corpus-matrix" / "corpus_matrix_report.json").exists())
+            self.assertTrue((root / "corpus-matrix" / "corpus_matrix_report.md").exists())
+            self.assertTrue((root / "corpus-matrix" / "corpus_matrix_ratios.png").exists())
+            for corpus in ("seed", "anchors"):
+                self.assertTrue((root / "corpus-matrix" / corpus / "comparison_matrix_report.json").exists())
+                self.assertTrue((root / "corpus-matrix" / corpus / "corpus" / "manifest.json").exists())
+                for seed in (17, 29):
+                    self.assertTrue(
+                        (root / "corpus-matrix" / corpus / f"seed_{seed}" / "comparison_report.json").exists(),
+                        f"missing comparison report for corpus={corpus} seed={seed}",
+                    )
+                    self.assertTrue((root / "corpus-matrix" / corpus / f"seed_{seed}" / "cortex3" / "checkpoint_final.pt").exists())
 
     def test_cuda_requirement_is_explicit_not_silent_fallback(self):
         report = hardware_report()

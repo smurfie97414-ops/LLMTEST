@@ -1314,6 +1314,17 @@ class ComparisonMatrixReport:
         return asdict(self)
 
 
+@dataclass(frozen=True)
+class CorpusMatrixReport:
+    run_dir: str
+    corpora: tuple[Mapping[str, Any], ...]
+    proof: Mapping[str, Any]
+    hardware: Mapping[str, Any]
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
 class LLMComparisonRunner:
     def __init__(
         self,
@@ -1705,6 +1716,271 @@ class LLMComparisonMatrixSuite:
         ax.set_xlabel("seed")
         fig.tight_layout()
         fig.savefig(self.run_dir / "comparison_matrix_ratios.png", dpi=150)
+        plt.close(fig)
+
+
+class LLMCorpusMatrixSuite:
+    def __init__(
+        self,
+        corpora: Sequence[tuple[str, TextCorpusConfig]],
+        config: ComparisonConfig,
+        *,
+        run_dir: str | Path,
+        seeds: Sequence[int],
+    ):
+        if not corpora:
+            raise ValueError("at least one corpus is required")
+        if not seeds:
+            raise ValueError("at least one seed is required")
+        seen_names: set[str] = set()
+        seen_run_names: set[str] = set()
+        normalized: list[tuple[str, str, TextCorpusConfig]] = []
+        for name, corpus in corpora:
+            clean_name = str(name).strip()
+            if not clean_name:
+                raise ValueError("corpus names must be non-empty")
+            if clean_name in seen_names:
+                raise ValueError(f"duplicate corpus name {clean_name!r}")
+            run_name = _safe_run_name(clean_name)
+            if run_name in seen_run_names:
+                raise ValueError(f"corpus names collide after sanitizing: {clean_name!r}")
+            seen_names.add(clean_name)
+            seen_run_names.add(run_name)
+            normalized.append((clean_name, run_name, corpus))
+        self.corpora = tuple(normalized)
+        self.config = config
+        self.run_dir = Path(run_dir)
+        self.seeds = tuple(int(seed) for seed in seeds)
+
+    def run(self, *, require_win: bool = False) -> CorpusMatrixReport:
+        runtime = DistributedRuntime.from_env(
+            requested=self.config.training.distributed,
+            device_type="cuda" if torch.cuda.is_available() and self.config.training.device in {"auto", "cuda"} else "cpu",
+            gloo_interface=self.config.training.gloo_interface,
+        )
+        runtime.ensure_initialized()
+        if runtime.is_main:
+            if self.run_dir.exists() and not self.config.training.resume:
+                shutil.rmtree(self.run_dir)
+            self.run_dir.mkdir(parents=True, exist_ok=True)
+        _barrier_if_needed(runtime)
+
+        corpus_payloads: list[Mapping[str, Any]] = []
+        for name, run_name, corpus in self.corpora:
+            report = LLMComparisonMatrixSuite(
+                corpus,
+                self.config,
+                run_dir=self.run_dir / run_name,
+                seeds=self.seeds,
+            ).run(require_win=False)
+            corpus_payloads.append(
+                {
+                    "name": name,
+                    "run_name": run_name,
+                    "run_dir": report.run_dir,
+                    "manifest": report.manifest,
+                    "proof": report.proof,
+                    "seeds": report.seeds,
+                }
+            )
+
+        proof = self._proof(corpus_payloads)
+        report = CorpusMatrixReport(
+            run_dir=str(self.run_dir),
+            corpora=tuple(corpus_payloads),
+            proof=proof,
+            hardware=hardware_report(),
+        )
+        if runtime.is_main:
+            _write_json(self.run_dir / "corpus_matrix_report.json", report.to_dict())
+            self._write_markdown(report)
+            self._write_ratio_plot(report)
+        failed = bool(require_win and not proof["passed"] and runtime.is_main)
+        if runtime.enabled:
+            flag_device = torch.device(f"cuda:{runtime.local_rank}") if runtime.backend == "nccl" else torch.device("cpu")
+            flag = torch.tensor([1 if failed else 0], dtype=torch.int64, device=flag_device)
+            torch.distributed.broadcast(flag, src=0)
+            failed = bool(int(flag.cpu().item()))
+        _barrier_if_needed(runtime)
+        if failed:
+            raise RuntimeError(f"Cortex corpus matrix did not pass: {proof}")
+        return report
+
+    def _proof(self, corpus_reports: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+        samples: list[dict[str, Any]] = []
+        for corpus_report in corpus_reports:
+            corpus_name = str(corpus_report["name"])
+            for sample in corpus_report["proof"]["samples"]:
+                samples.append(
+                    {
+                        "corpus": corpus_name,
+                        "seed": int(sample["seed"]),
+                        "ratio": float(sample["ratio"]),
+                        "baseline_score": float(sample["baseline_score"]),
+                        "cortex_score": float(sample["cortex_score"]),
+                        "next_token_loss_regression_ratio": float(sample["next_token_loss_regression_ratio"]),
+                        "passed": bool(sample["passed"]) and float(sample["baseline_score"]) > 0.0,
+                    }
+                )
+
+        ratios = [sample["ratio"] for sample in samples]
+        baseline_scores = [sample["baseline_score"] for sample in samples]
+        regressions = [sample["next_token_loss_regression_ratio"] for sample in samples]
+        passed_count = sum(1 for sample in samples if sample["passed"])
+        sample_count = len(samples)
+
+        corpus_results: list[dict[str, Any]] = []
+        for name, _, _ in self.corpora:
+            corpus_samples = [sample for sample in samples if sample["corpus"] == name]
+            corpus_ratios = [sample["ratio"] for sample in corpus_samples]
+            corpus_passed = sum(1 for sample in corpus_samples if sample["passed"])
+            corpus_results.append(
+                {
+                    "corpus": name,
+                    "sample_count": len(corpus_samples),
+                    "mean_ratio": sum(corpus_ratios) / max(1, len(corpus_ratios)),
+                    "median_ratio": statistics.median(corpus_ratios) if corpus_ratios else 0.0,
+                    "min_ratio": min(corpus_ratios) if corpus_ratios else 0.0,
+                    "max_ratio": max(corpus_ratios) if corpus_ratios else 0.0,
+                    "win_rate": corpus_passed / max(1, len(corpus_samples)),
+                    "passed": bool(corpus_samples) and corpus_passed == len(corpus_samples),
+                }
+            )
+
+        seed_results: list[dict[str, Any]] = []
+        for seed in self.seeds:
+            seed_samples = [sample for sample in samples if sample["seed"] == seed]
+            seed_ratios = [sample["ratio"] for sample in seed_samples]
+            seed_passed = sum(1 for sample in seed_samples if sample["passed"])
+            seed_results.append(
+                {
+                    "seed": seed,
+                    "sample_count": len(seed_samples),
+                    "mean_ratio": sum(seed_ratios) / max(1, len(seed_ratios)),
+                    "median_ratio": statistics.median(seed_ratios) if seed_ratios else 0.0,
+                    "min_ratio": min(seed_ratios) if seed_ratios else 0.0,
+                    "win_rate": seed_passed / max(1, len(seed_samples)),
+                    "passed": bool(seed_samples) and seed_passed == len(seed_samples),
+                }
+            )
+
+        min_ratio = min(ratios) if ratios else 0.0
+        max_regression = max(regressions) if regressions else 0.0
+        min_baseline = min(baseline_scores) if baseline_scores else 0.0
+        expected_samples = len(self.corpora) * len(self.seeds)
+        passed = (
+            sample_count == expected_samples
+            and passed_count == sample_count
+            and min_ratio >= self.config.cortex_win_margin
+            and min_baseline > 0.0
+            and max_regression <= self.config.max_next_token_loss_regression
+        )
+        return {
+            "metric": "corpus_matrix_cortex_over_baseline",
+            "corpora": [name for name, _, _ in self.corpora],
+            "seeds": list(self.seeds),
+            "corpus_count": len(self.corpora),
+            "seed_count": len(self.seeds),
+            "sample_count": sample_count,
+            "required_margin": self.config.cortex_win_margin,
+            "required_win_rate": 1.0,
+            "mean_ratio": sum(ratios) / max(1, len(ratios)),
+            "median_ratio": statistics.median(ratios) if ratios else 0.0,
+            "ratio_population_stddev": statistics.pstdev(ratios) if len(ratios) > 1 else 0.0,
+            "min_ratio": min_ratio,
+            "max_ratio": max(ratios) if ratios else 0.0,
+            "win_rate": passed_count / max(1, sample_count),
+            "mean_baseline_score": sum(baseline_scores) / max(1, len(baseline_scores)),
+            "min_baseline_score": min_baseline,
+            "max_next_token_loss_regression": max_regression,
+            "all_samples_passed": passed_count == sample_count and sample_count > 0,
+            "corpus_results": tuple(corpus_results),
+            "seed_results": tuple(seed_results),
+            "samples": tuple(samples),
+            "passed": passed,
+        }
+
+    def _write_markdown(self, report: CorpusMatrixReport) -> None:
+        proof = report.proof
+        lines = [
+            "# Cortex-3 LLM corpus matrix report",
+            "",
+            f"- Corpora: `{', '.join(proof['corpora'])}`",
+            f"- Seeds: `{', '.join(str(seed) for seed in proof['seeds'])}`",
+            f"- Samples: `{proof['sample_count']}`",
+            f"- Mean Cortex/baseline ratio: `{proof['mean_ratio']:.3f}`",
+            f"- Median Cortex/baseline ratio: `{proof['median_ratio']:.3f}`",
+            f"- Min Cortex/baseline ratio: `{proof['min_ratio']:.3f}`",
+            f"- Win rate: `{proof['win_rate']:.3f}`",
+            f"- Max next-token-loss regression: `{proof['max_next_token_loss_regression']:.3f}`",
+            f"- Passed: `{proof['passed']}`",
+            "",
+            "## Corpus Results",
+            "",
+            "| Corpus | Samples | Mean ratio | Median ratio | Min ratio | Win rate | Passed |",
+            "| --- | ---: | ---: | ---: | ---: | ---: | --- |",
+        ]
+        for item in proof["corpus_results"]:
+            lines.append(
+                f"| `{item['corpus']}` | {item['sample_count']} | {item['mean_ratio']:.3f} | "
+                f"{item['median_ratio']:.3f} | {item['min_ratio']:.3f} | {item['win_rate']:.3f} | `{item['passed']}` |"
+            )
+        lines.extend(
+            [
+                "",
+                "## Seed Results",
+                "",
+                "| Seed | Samples | Mean ratio | Median ratio | Min ratio | Win rate | Passed |",
+                "| ---: | ---: | ---: | ---: | ---: | ---: | --- |",
+            ]
+        )
+        for item in proof["seed_results"]:
+            lines.append(
+                f"| {item['seed']} | {item['sample_count']} | {item['mean_ratio']:.3f} | "
+                f"{item['median_ratio']:.3f} | {item['min_ratio']:.3f} | {item['win_rate']:.3f} | `{item['passed']}` |"
+            )
+        lines.extend(
+            [
+                "",
+                "## Artifacts",
+                "",
+                "- `corpus_matrix_report.json`",
+                "- `corpus_matrix_report.md`",
+                "- `corpus_matrix_ratios.png`",
+                "- `<corpus>/comparison_matrix_report.json`",
+                "- `<corpus>/seed_<seed>/comparison_report.json`",
+                "- `<corpus>/seed_<seed>/baseline_ntp/checkpoint_final.pt`",
+                "- `<corpus>/seed_<seed>/cortex3/checkpoint_final.pt`",
+            ]
+        )
+        (self.run_dir / "corpus_matrix_report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    def _write_ratio_plot(self, report: CorpusMatrixReport) -> None:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        corpus_results = list(report.proof["corpus_results"])
+        names = [str(item["corpus"]) for item in corpus_results]
+        means = [float(item["mean_ratio"]) for item in corpus_results]
+        lows = [max(0.0, float(item["mean_ratio"]) - float(item["min_ratio"])) for item in corpus_results]
+        highs = [max(0.0, float(item["max_ratio"]) - float(item["mean_ratio"])) for item in corpus_results]
+        fig, ax = plt.subplots(figsize=(8, 4))
+        ax.bar(names, means, color="#6a5f3a")
+        ax.errorbar(names, means, yerr=[lows, highs], fmt="none", ecolor="#222222", capsize=4, linewidth=1)
+        for index, corpus_name in enumerate(names):
+            corpus_samples = [sample for sample in report.proof["samples"] if sample["corpus"] == corpus_name]
+            for offset, sample in enumerate(corpus_samples):
+                jitter = (offset - (len(corpus_samples) - 1) / 2.0) * 0.04
+                ax.scatter(index + jitter, float(sample["ratio"]), color="#b2473e", s=22, zorder=3)
+        ax.axhline(1.0, color="#333333", linewidth=1)
+        ax.axhline(float(report.proof["required_margin"]), color="#555555", linestyle="--", linewidth=1)
+        ax.set_title("Cortex / baseline ratio by corpus and seed")
+        ax.set_ylabel("ratio")
+        ax.set_xlabel("corpus")
+        fig.tight_layout()
+        fig.savefig(self.run_dir / "corpus_matrix_ratios.png", dpi=150)
         plt.close(fig)
 
 
@@ -2120,6 +2396,13 @@ def _parse_list(raw: str) -> tuple[str, ...]:
     return tuple(part.strip() for part in raw.replace(",", " ").split() if part.strip())
 
 
+def _safe_run_name(name: str) -> str:
+    slug = "".join(ch if ch.isascii() and (ch.isalnum() or ch in "._-") else "_" for ch in name).strip("._-")
+    if not slug:
+        raise ValueError(f"name {name!r} does not contain any safe run-directory characters")
+    return slug
+
+
 def _parse_seed_list(raw: str) -> tuple[int, ...]:
     seeds: list[int] = []
     for part in _parse_list(raw):
@@ -2130,6 +2413,28 @@ def _parse_seed_list(raw: str) -> tuple[int, ...]:
     if not seeds:
         raise ValueError("at least one seed is required")
     return tuple(seeds)
+
+
+def _parse_named_corpus_specs(raw_specs: Sequence[str]) -> tuple[tuple[str, TextCorpusConfig], ...]:
+    if not raw_specs:
+        raise ValueError("at least one --corpus NAME=PATH spec is required")
+    parsed: list[tuple[str, TextCorpusConfig]] = []
+    seen: set[str] = set()
+    for raw in raw_specs:
+        if "=" not in raw:
+            raise ValueError(f"invalid corpus spec {raw!r}; expected NAME=PATH or NAME=PATH1;PATH2")
+        name, path_blob = raw.split("=", 1)
+        name = name.strip()
+        if not name:
+            raise ValueError(f"invalid corpus spec {raw!r}; corpus name is empty")
+        if name in seen:
+            raise ValueError(f"duplicate corpus name {name!r}")
+        paths = tuple(part.strip() for part in path_blob.split(";") if part.strip())
+        if not paths:
+            raise ValueError(f"invalid corpus spec {raw!r}; at least one path is required")
+        seen.add(name)
+        parsed.append((name, TextCorpusConfig.from_paths(paths)))
+    return tuple(parsed)
 
 
 def main(argv: Sequence[str] | None = None) -> None:
@@ -2189,6 +2494,27 @@ def main(argv: Sequence[str] | None = None) -> None:
     compare_matrix.add_argument("--distributed", action="store_true")
     compare_matrix.add_argument("--gloo-interface", default=None)
     compare_matrix.add_argument("--require-win", action="store_true")
+
+    corpus_matrix = sub.add_parser("corpus-matrix", help="run compare-matrix across multiple named corpora")
+    corpus_matrix.add_argument("--corpus", action="append", default=[], help="named corpus spec: NAME=PATH or NAME=PATH1;PATH2")
+    corpus_matrix.add_argument("--out-dir", default="runs/llm-corpus-matrix")
+    corpus_matrix.add_argument("--seeds", default="11,23,37")
+    corpus_matrix.add_argument("--vocab-size", type=int, default=4096)
+    corpus_matrix.add_argument("--seq-len", type=int, default=128)
+    corpus_matrix.add_argument("--steps", type=int, default=200)
+    corpus_matrix.add_argument("--batch-size", type=int, default=32)
+    corpus_matrix.add_argument("--gradient-accumulation-steps", type=int, default=1)
+    corpus_matrix.add_argument("--checkpoint-interval", type=int, default=100)
+    corpus_matrix.add_argument("--resume", action="store_true")
+    corpus_matrix.add_argument("--d-model", type=int, default=256)
+    corpus_matrix.add_argument("--n-heads", type=int, default=8)
+    corpus_matrix.add_argument("--n-layers", type=int, default=6)
+    corpus_matrix.add_argument("--precision", choices=("fp32", "bf16", "fp16"), default="fp32")
+    corpus_matrix.add_argument("--device", default="auto")
+    corpus_matrix.add_argument("--require-cuda", action="store_true")
+    corpus_matrix.add_argument("--distributed", action="store_true")
+    corpus_matrix.add_argument("--gloo-interface", default=None)
+    corpus_matrix.add_argument("--require-win", action="store_true")
 
     benchmark = sub.add_parser("benchmark", help="run a deterministic multi-domain LLM benchmark suite")
     benchmark.add_argument("--out-dir", default="runs/llm-benchmark")
@@ -2453,6 +2779,36 @@ def main(argv: Sequence[str] | None = None) -> None:
             training=training,
         )
         report = LLMComparisonMatrixSuite(corpus, config, run_dir=args.out_dir, seeds=seeds).run(require_win=args.require_win)
+        if _rank_zero():
+            print(json.dumps(report.proof, indent=2, sort_keys=True))
+        return
+
+    if args.command == "corpus-matrix":
+        seeds = _parse_seed_list(args.seeds)
+        corpora = _parse_named_corpus_specs(args.corpus)
+        training = TrainingConfig(
+            steps=args.steps,
+            batch_size=args.batch_size,
+            gradient_accumulation_steps=args.gradient_accumulation_steps,
+            eval_interval=max(1, args.steps // 10),
+            device=args.device,
+            precision=args.precision,
+            require_cuda=args.require_cuda,
+            distributed=args.distributed,
+            gloo_interface=args.gloo_interface,
+            resume=args.resume,
+            checkpoint_interval=args.checkpoint_interval,
+            seed=seeds[0],
+        )
+        config = ComparisonConfig(
+            vocab_size=args.vocab_size,
+            seq_len=args.seq_len,
+            d_model=args.d_model,
+            n_heads=args.n_heads,
+            n_layers=args.n_layers,
+            training=training,
+        )
+        report = LLMCorpusMatrixSuite(corpora, config, run_dir=args.out_dir, seeds=seeds).run(require_win=args.require_win)
         if _rank_zero():
             print(json.dumps(report.proof, indent=2, sort_keys=True))
         return
