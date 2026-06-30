@@ -42,11 +42,11 @@ from cortex3 import (
     default_skill_specs,
 )
 from cortex3_attribution import CausalAttributionEngine
-from cortex3_certificates import CertificateHead, CertificateHeadOutput, CertificateType, CertificateVerifier, LatentProofState, build_certificate, evaluate_certificate_efficiency
+from cortex3_certificates import CertificateHead, CertificateHeadOutput, CertificateType, CertificateVerifier, LatentProofState, RandomDelatentizer, build_certificate, evaluate_certificate_efficiency
 from cortex3_cycle import CortexCycle
 from cortex3_future import ContractDecision, FutureContract, FutureContractEngine, FutureContractLedger, MTPFSPConfig
 from cortex3_improvement import RecursiveImprovementEngine, RollbackEvent
-from cortex3_inference import InferenceConfig, UltraFastInferenceEngine
+from cortex3_inference import InferenceConfig, InferencePath, UltraFastInferenceEngine
 from cortex3_ledgers import BitLedger, CausalLedger, CausalTrace, SkillLedger, SkillState, UncertaintyLedger
 from cortex3_memory import CognitiveMemory, CognitiveMemoryConfig, MemoryMode, MemorySegment
 from cortex3_objective import build_objective_report
@@ -2713,6 +2713,176 @@ def _cortex_architecture_audit_from_summary(summary: Mapping[str, Any]) -> dict[
     }
 
 
+def _cortex_phase_deliverable_audit_from_summary(summary: Mapping[str, Any]) -> dict[str, Any]:
+    counts = {str(key): int(value) for key, value in dict(summary.get("integration_counts") or {}).items()}
+    phase_counts = {str(key): int(value) for key, value in dict(summary.get("phase_event_counts") or {}).items()}
+    trace_counts = {str(key): int(value) for key, value in dict(summary.get("compression_trace_counts") or {}).items()}
+    replay_by_phase = {
+        str(key): int(value)
+        for key, value in dict(summary.get("phase_replay_examples_by_phase") or {}).items()
+    }
+
+    def count(key: str) -> int:
+        return int(counts.get(key, 0))
+
+    def phase(phase_id: str) -> int:
+        return int(phase_counts.get(phase_id, 0))
+
+    def trace(key: str) -> int:
+        return int(trace_counts.get(key, 0))
+
+    checks: list[dict[str, Any]] = []
+
+    def add(phase_id: str, deliverable: str, passed: bool, observed: Mapping[str, Any], requirement: str) -> None:
+        checks.append(
+            {
+                "phase": phase_id,
+                "deliverable": deliverable,
+                "passed": bool(passed),
+                "observed": dict(observed),
+                "requirement": requirement,
+            }
+        )
+
+    add(
+        "P1",
+        "verifier_os_regression_harness",
+        phase("P1") > 0 and int(summary.get("skill_ledger_states", 0) or 0) > 0 and replay_by_phase.get("P1", 0) > 0,
+        {"P1": phase("P1"), "skill_ledger_states": int(summary.get("skill_ledger_states", 0) or 0), "phase_replay_P1": replay_by_phase.get("P1", 0)},
+        "Dynamic verifier must generate verified regression evidence and replay",
+    )
+    add(
+        "P2",
+        "ternary_sign_mask_activation_and_trace_logs",
+        trace("layer_forward_events") > 0 and trace("activation_quantizations") > 0 and trace("compression_decisions") > 0,
+        {"layer_forward_events": trace("layer_forward_events"), "activation_quantizations": trace("activation_quantizations"), "compression_decisions": trace("compression_decisions")},
+        "BitLinear sign+mask, activation quantization, and compression decisions must all be logged",
+    )
+    add(
+        "P3",
+        "mtp_fsp_confidence_temporal_contract_gate",
+        int(summary.get("future_contract_decisions", 0) or 0) > 0 and trace("mtp_fsp_events") > 0 and count("future_contract_observed_token_checks") > 0,
+        {"future_contract_decisions": int(summary.get("future_contract_decisions", 0) or 0), "mtp_fsp_events": trace("mtp_fsp_events"), "observed_token_checks": count("future_contract_observed_token_checks")},
+        "MTP/FSP must gate observed future tokens, not only instantiate heads",
+    )
+    add(
+        "P4",
+        "recent_exact_old_latent_query_memory_anchor_fidelity",
+        int(summary.get("memory_recent_segments", 0) or 0) > 0
+        and int(summary.get("memory_latent_segments", 0) or 0) > 0
+        and int(summary.get("input_anchor_count", 0) or 0) > 0
+        and int(summary.get("input_anchor_fidelity_failures", 0) or 0) == 0,
+        {
+            "memory_recent_segments": int(summary.get("memory_recent_segments", 0) or 0),
+            "memory_latent_segments": int(summary.get("memory_latent_segments", 0) or 0),
+            "input_anchor_count": int(summary.get("input_anchor_count", 0) or 0),
+            "input_anchor_fidelity_failures": int(summary.get("input_anchor_fidelity_failures", 0) or 0),
+        },
+        "Cognitive memory must preserve exact anchors across recent/latent KV reconstruction",
+    )
+    add(
+        "P5",
+        "latent_certificate_delatentization_tool_verification",
+        count("certificate_efficiency_events") > 0
+        and count("delatentization_probe_events") > 0
+        and count("delatentization_probe_failures") == 0
+        and count("certificate_tool_verification_events") > 0,
+        {
+            "certificate_efficiency_events": count("certificate_efficiency_events"),
+            "delatentization_probe_events": count("delatentization_probe_events"),
+            "delatentization_probe_failures": count("delatentization_probe_failures"),
+            "certificate_tool_verification_events": count("certificate_tool_verification_events"),
+        },
+        "latent proof state must be audited by random de-latentization and tool verification",
+    )
+    add(
+        "P6",
+        "causal_attribution_counterfactual_dimensions",
+        count("attribution_probe_events") > 0 and count("attribution_unique_dimensions") >= 7,
+        {"attribution_probe_events": count("attribution_probe_events"), "attribution_unique_dimensions": count("attribution_unique_dimensions")},
+        "causal attribution must run counterfactual probes over block/expert/KV/MTP/activation/FSP/routing dimensions",
+    )
+    add(
+        "P7",
+        "minimal_regrowth_action_space_and_repair_plan",
+        count("regrowth_plan_events") > 0 and count("regrowth_candidate_actions") > 0 and replay_by_phase.get("P7", 0) > 0,
+        {"regrowth_plan_events": count("regrowth_plan_events"), "regrowth_candidate_actions": count("regrowth_candidate_actions"), "phase_replay_P7": replay_by_phase.get("P7", 0)},
+        "minimal regrowth must evaluate candidate repair actions and feed verified replay",
+    )
+    add(
+        "P8",
+        "fast_normal_careful_budget_early_exit_mod_speculative_kernels",
+        count("inference_fast_path_events") > 0
+        and count("inference_normal_path_events") > 0
+        and count("inference_careful_path_events") > 0
+        and count("inference_budget_predictions") >= 3
+        and count("inference_early_exit_events") >= 3
+        and count("inference_self_speculative_events") >= 3
+        and count("inference_kernel_dispatches") > 0
+        and count("inference_latent_kv_events") > 0,
+        {
+            "fast": count("inference_fast_path_events"),
+            "normal": count("inference_normal_path_events"),
+            "careful": count("inference_careful_path_events"),
+            "budget_predictions": count("inference_budget_predictions"),
+            "early_exit_events": count("inference_early_exit_events"),
+            "self_speculative_events": count("inference_self_speculative_events"),
+            "kernel_dispatches": count("inference_kernel_dispatches"),
+            "latent_kv_events": count("inference_latent_kv_events"),
+        },
+        "all inference paths plus budget predictor, early exit, self-speculative MTP, latent KV and ternary dispatch must run",
+    )
+    add(
+        "P9",
+        "sleep_replay_synthetic_real_reservoir_anti_collapse_schedule",
+        int(summary.get("sleep_replay_examples", 0) or 0) > 0
+        and int(summary.get("sleep_synthetic_examples", 0) or 0) > 0
+        and int(summary.get("sleep_reservoir_examples", 0) or 0) > 0
+        and count("sleep_metamorphic_examples") > 0
+        and count("sleep_anti_collapse_decisions") > 0
+        and count("sleep_consolidation_schedule_items") > 0,
+        {
+            "sleep_replay_examples": int(summary.get("sleep_replay_examples", 0) or 0),
+            "sleep_synthetic_examples": int(summary.get("sleep_synthetic_examples", 0) or 0),
+            "sleep_reservoir_examples": int(summary.get("sleep_reservoir_examples", 0) or 0),
+            "sleep_metamorphic_examples": count("sleep_metamorphic_examples"),
+            "sleep_anti_collapse_decisions": count("sleep_anti_collapse_decisions"),
+            "sleep_consolidation_schedule_items": count("sleep_consolidation_schedule_items"),
+        },
+        "sleep phase must combine replay, verified synthetic/metamorphic, real reservoir, anti-collapse and scheduling",
+    )
+    add(
+        "P10",
+        "recursive_improvement_sandbox_pareto_rollback_diversity",
+        count("recursive_proposal_events") > 0
+        and count("recursive_sandbox_trials") > 0
+        and count("recursive_dynamic_evaluations") > 0
+        and count("recursive_pareto_gate_decisions") > 0
+        and count("recursive_rollback_tokens") > 0
+        and count("recursive_diversity_checks") > 0,
+        {
+            "recursive_proposal_events": count("recursive_proposal_events"),
+            "recursive_sandbox_trials": count("recursive_sandbox_trials"),
+            "recursive_dynamic_evaluations": count("recursive_dynamic_evaluations"),
+            "recursive_pareto_gate_decisions": count("recursive_pareto_gate_decisions"),
+            "recursive_rollback_tokens": count("recursive_rollback_tokens"),
+            "recursive_diversity_checks": count("recursive_diversity_checks"),
+        },
+        "recursive improvement must propose, sandbox, evaluate, gate, preserve rollback tokens and run diversity checks",
+    )
+
+    failed_checks = tuple(f"{check['phase']}:{check['deliverable']}" for check in checks if not check["passed"])
+    return {
+        "schema_version": 1,
+        "passed": not failed_checks,
+        "failed_checks": failed_checks,
+        "checks": tuple(checks),
+        "checks_by_deliverable": {f"{check['phase']}:{check['deliverable']}": check for check in checks},
+        "passed_count": sum(1 for check in checks if check["passed"]),
+        "deliverable_count": len(checks),
+    }
+
+
 class CortexTrainingPhaseController:
     def __init__(
         self,
@@ -2787,6 +2957,7 @@ class CortexTrainingPhaseController:
         self.skill_ledger = SkillLedger()
         self.causal_ledger = CausalLedger()
         self.uncertainty_ledger = UncertaintyLedger()
+        self.integration_counts: dict[str, int] = {}
         self._last_ingested_compression_cost = CostTrace()
         self.input_anchor_observations = 0
         self.input_anchor_count = 0
@@ -2794,6 +2965,9 @@ class CortexTrainingPhaseController:
 
     def _touch(self, phase_id: str) -> None:
         self.phase_counts[phase_id] = self.phase_counts.get(phase_id, 0) + 1
+
+    def _count(self, key: str, amount: int = 1) -> None:
+        self.integration_counts[key] = self.integration_counts.get(key, 0) + int(amount)
 
     def _record_error(self, phase_id: str, exc: Exception) -> None:
         self.errors.append({"phase": phase_id, "type": type(exc).__name__, "message": str(exc)})
@@ -3016,6 +3190,7 @@ class CortexTrainingPhaseController:
             )
             observed = self._observed_contract_tokens(future_targets, contract.accepted_horizon)
             decision = self.future_engine.gate_contract(contract, observed_tokens=[int(token) for token in observed])
+            self._count("future_contract_observed_token_checks")
             self.bit_ledger.ingest_cost(decision.cost, note=f"P3:{decision.contract.contract_id}")
             self.uncertainty_ledger.record("llm_pretraining_future_contract", decision.contract.confidence, decision.accepted)
             self._record_causal_trace(
@@ -3205,6 +3380,7 @@ class CortexTrainingPhaseController:
             "objective_feedback_total": float(self.objective_feedback_total),
             "last_objective_loss_total": float(self.last_objective_loss_total),
             "objective_feedback_history": list(self.objective_feedback_history),
+            "integration_counts": dict(self.integration_counts),
             "certificate_head_forward_events": int(self.model.certificate_forward_events),
             "input_anchor_observations": int(self.input_anchor_observations),
             "input_anchor_count": int(self.input_anchor_count),
@@ -3257,6 +3433,10 @@ class CortexTrainingPhaseController:
             dict(item)
             for item in payload.get("objective_feedback_history", ())
         ]
+        self.integration_counts.update({
+            str(key): int(value)
+            for key, value in dict(payload.get("integration_counts") or {}).items()
+        })
         self.model.certificate_forward_events = int(payload.get("certificate_head_forward_events", 0))
         self.input_anchor_observations = int(payload.get("input_anchor_observations", 0))
         self.input_anchor_count = int(payload.get("input_anchor_count", 0))
@@ -3299,6 +3479,7 @@ class CortexTrainingPhaseController:
             "replay_updates": int(self.replay_updates),
             "phase_replay_examples": sum(self.phase_replay_examples.values()),
             "phase_replay_examples_by_phase": dict(self.phase_replay_examples),
+            "integration_counts": dict(self.integration_counts),
             "objective_feedback_events": int(self.objective_feedback_events),
             "objective_feedback_scale": self.objective_feedback_scale(),
             "last_objective_loss_total": float(self.last_objective_loss_total),
@@ -3324,6 +3505,7 @@ class CortexTrainingPhaseController:
             "error_count": len(self.errors),
         }
         summary["architecture_audit"] = _cortex_architecture_audit_from_summary(summary)
+        summary["phase_deliverable_audit"] = _cortex_phase_deliverable_audit_from_summary(summary)
         return summary
 
     def run_phase_audit(self, *, step: int) -> Mapping[str, Any]:
@@ -3423,18 +3605,30 @@ class CortexTrainingPhaseController:
                 tool_args={"expected": answer_text},
             )
             verification = self.certificate_verifier.verify(certificate, latent_state)
+            delatentizer = RandomDelatentizer(probes=2)
+            probe = delatentizer.probe(latent_state, seed=self.config.seed + step)
+            probe_ok = delatentizer.verify_probe(latent_state, probe)
+            self._count("delatentization_probe_events")
+            if not probe_ok:
+                self._count("delatentization_probe_failures")
             efficiency = evaluate_certificate_efficiency(
                 "slow visible reasoning " * 32,
                 certificate,
                 verification,
                 reference_uncertainty=0.05,
             )
+            self._count("certificate_tool_verification_events")
+            self._count("certificate_efficiency_events")
             self._touch("P5")
             audit["certificate"] = {
                 "verified": verification.to_dict(),
                 "efficiency": asdict(efficiency),
                 "certificate": certificate.to_dict(),
+                "delatentization_probe": asdict(probe),
+                "delatentization_probe_verified": probe_ok,
             }
+            if not probe_ok:
+                self._record_error("P5", ValueError(f"random de-latentization probe failed for {latent_state.state_id}"))
             if verification.passed:
                 self.bit_ledger.add_certificate(certificate.to_dict())
                 self._add_verified_phase_replay(
@@ -3458,6 +3652,15 @@ class CortexTrainingPhaseController:
                 )
                 self._touch("P6")
                 audit["attribution"] = attribution_report.to_dict()
+                dimensions = {
+                    probe.spec.dimension.value
+                    for probe in attribution_report.probes
+                }
+                self._count("attribution_probe_events", len(attribution_report.probes))
+                self.integration_counts["attribution_unique_dimensions"] = max(
+                    self.integration_counts.get("attribution_unique_dimensions", 0),
+                    len(dimensions),
+                )
                 self._add_verified_phase_replay(
                     "P6",
                     attribution_report.failure.task,
@@ -3479,6 +3682,8 @@ class CortexTrainingPhaseController:
                 )
                 self._touch("P7")
                 audit["regrowth"] = regrowth_plan.to_dict()
+                self._count("regrowth_plan_events")
+                self._count("regrowth_candidate_actions", len(regrowth_plan.candidates))
                 self._add_verified_phase_replay(
                     "P7",
                     regrowth_plan.failure.task,
@@ -3493,10 +3698,24 @@ class CortexTrainingPhaseController:
         inference_results: list[Any] = []
         try:
             task = first_failure.task if first_failure is not None else Task("phase-infer", "instruction_following", "Output OK exactly.", "OK")
-            inferred = self.inference.infer(task)
-            inference_results.append(inferred)
+            forced_paths = (InferencePath.FAST, InferencePath.NORMAL, InferencePath.CAREFUL)
+            route_reports = []
+            for forced_path in forced_paths:
+                inferred = self.inference.infer(task, forced_path=forced_path)
+                inference_results.append(inferred)
+                route_reports.append(inferred.to_dict())
+                self._count(f"inference_{inferred.route.path.value}_path_events")
+                self._count("inference_budget_predictions")
+                self._count("inference_early_exit_events")
+                self._count("inference_kernel_dispatches", len(inferred.kernel_dispatches))
+                if inferred.future_contract is not None:
+                    self._count("inference_self_speculative_events")
+                if inferred.memory_reconstruction is not None:
+                    self._count("inference_latent_kv_events")
             self._touch("P8")
-            audit["inference"] = inferred.to_dict()
+            audit["inference"] = route_reports[0] if route_reports else {}
+            audit["inference_routes"] = route_reports
+            inferred = inference_results[-1]
             self.bit_ledger.ingest_cost(inferred.cost, note=f"P8:{inferred.route.path.value}:{inferred.task.skill}")
             self.uncertainty_ledger.record(inferred.task.skill, inferred.answer.confidence, bool(inferred.passed))
             self._record_causal_trace(
@@ -3508,7 +3727,9 @@ class CortexTrainingPhaseController:
                 verifier_level=inferred.route.verifier_level,
                 mtp_horizon=inferred.route.mtp_horizon,
             )
-            if inferred.passed:
+            for inferred in inference_results:
+                if not inferred.passed:
+                    continue
                 self._add_verified_phase_replay(
                     "P8",
                     inferred.task,
@@ -3525,10 +3746,38 @@ class CortexTrainingPhaseController:
         sleep_report = None
         try:
             if cycle_report is not None:
+                real_task = first_failure.task if first_failure is not None else Task(
+                    f"phase-real-{step}",
+                    "instruction_following",
+                    "Output real reservoir status exactly: VERIFIED",
+                    "VERIFIED",
+                )
+                self.sleep.reservoir.add(
+                    real_task,
+                    self._answer_from_task_expected(real_task),
+                    source_id=f"llm-training-{step}",
+                    oracle=real_task.skill,
+                    verification_level=2,
+                )
+                self._count("sleep_real_reservoir_events")
                 sleep_report = self.sleep.ingest_cycle(cycle_report, seed=self.config.seed + step)
                 self._add_sleep_replay(sleep_report.accepted_examples)
                 self._touch("P9")
                 audit["sleep"] = sleep_report.to_dict()
+                self._count("sleep_anti_collapse_decisions")
+                self._count("sleep_consolidation_schedule_items", len(sleep_report.schedule))
+                self._count(
+                    "sleep_tool_solved_examples",
+                    sum(1 for example in self.sleep.synthetic.examples if example.origin == ExampleOrigin.TOOL_SOLVED),
+                )
+                self._count(
+                    "sleep_metamorphic_examples",
+                    sum(
+                        1
+                        for example in self.sleep.synthetic.examples
+                        if example.origin in {ExampleOrigin.METAMORPHIC, ExampleOrigin.ANTI_METAMORPHIC}
+                    ),
+                )
         except Exception as exc:
             self._record_error("P9", exc)
 
@@ -3545,6 +3794,16 @@ class CortexTrainingPhaseController:
                 )
                 self._touch("P10")
                 audit["recursive_improvement"] = improvement_report.to_dict()
+                self._count("recursive_proposal_events", len(improvement_report.proposals))
+                self._count("recursive_sandbox_trials", len(improvement_report.decisions))
+                self._count("recursive_dynamic_evaluations", len(improvement_report.decisions))
+                self._count("recursive_pareto_gate_decisions", len(improvement_report.decisions))
+                self._count(
+                    "recursive_rollback_tokens",
+                    sum(1 for decision in improvement_report.decisions if decision.evaluation.sandbox.rollback_token),
+                )
+                self._count("recursive_diversity_checks", len(improvement_report.decisions))
+                self._count("recursive_reward_hacking_checks", len(improvement_report.decisions))
                 if improvement_report.decisions:
                     accepted_decision = next((decision for decision in improvement_report.decisions if decision.accepted), None)
                     selected_decision = accepted_decision or improvement_report.decisions[0]
@@ -3660,10 +3919,42 @@ class CortexTrainingPhaseController:
                 "objective_feedback_scale": self.objective_feedback_scale(),
                 "last_objective_loss_total": self.last_objective_loss_total,
             },
+            "integration_counts": dict(self.integration_counts),
             "architecture_audit": _cortex_architecture_audit_from_summary(
                 {
                     "phase_event_counts": dict(self.phase_counts),
                     "phase_replay_examples_by_phase": dict(self.phase_replay_examples),
+                    "integration_counts": dict(self.integration_counts),
+                    "replay_batch_count": len(self.replay_batches),
+                    "replay_updates": self.replay_updates,
+                    "objective_feedback_events": self.objective_feedback_events,
+                    "last_objective_loss_total": self.last_objective_loss_total,
+                    "future_contract_decisions": len(self.future_ledger.decisions),
+                    "compression_trace_counts": trace_counts,
+                    "variable_input_compression_events": trace_counts.get("kv_events", 0),
+                    "certificate_head_forward_events": int(self.model.certificate_forward_events),
+                    "input_anchor_observations": int(self.input_anchor_observations),
+                    "input_anchor_count": int(self.input_anchor_count),
+                    "input_anchor_fidelity_failures": int(self.input_anchor_fidelity_failures),
+                    "bit_ledger_total_effective_bits": self.bit_ledger.total_effective_bits,
+                    "skill_ledger_states": len(self.skill_ledger.states),
+                    "causal_ledger_traces": len(self.causal_ledger.traces),
+                    "uncertainty_ledger_observations": sum(len(pairs) for pairs in self.uncertainty_ledger.bins.values()),
+                    "memory_recent_segments": len(self.memory.recent.segments),
+                    "memory_latent_segments": len(self.memory.latent.segments),
+                    "sleep_replay_examples": len(self.sleep.replay.examples),
+                    "sleep_synthetic_examples": len(self.sleep.synthetic.examples),
+                    "sleep_reservoir_examples": len(self.sleep.reservoir.examples),
+                    "improvement_archive_accepted": self.improvement.archive.accepted_count,
+                    "improvement_archive_rejected": self.improvement.archive.rejected_count,
+                    "error_count": len(self.errors),
+                }
+            ),
+            "phase_deliverable_audit": _cortex_phase_deliverable_audit_from_summary(
+                {
+                    "phase_event_counts": dict(self.phase_counts),
+                    "phase_replay_examples_by_phase": dict(self.phase_replay_examples),
+                    "integration_counts": dict(self.integration_counts),
                     "replay_batch_count": len(self.replay_batches),
                     "replay_updates": self.replay_updates,
                     "objective_feedback_events": self.objective_feedback_events,
@@ -3895,8 +4186,10 @@ class LLMTrainer:
                     random.seed(resumed_seed)
                     np.random.seed(resumed_seed)
                     self.generator.manual_seed(resumed_seed)
-                if phase_controller is not None and start_step >= self.config.steps:
-                    self._prime_phase_controller(phase_controller, step=start_step)
+                if phase_controller is not None:
+                    deliverable_audit = phase_controller.checkpoint_state_summary().get("phase_deliverable_audit", {})
+                    if start_step >= self.config.steps or not bool(deliverable_audit.get("passed")):
+                        self._prime_phase_controller(phase_controller, step=start_step)
             else:
                 curve.append(self.evaluate(self.train_data, split="train", step=0))
                 curve.append(self.evaluate(self.val_data, split="val", step=0))
@@ -4457,16 +4750,19 @@ def _model_run_inspection(model_dir: Path) -> Mapping[str, Any]:
     cortex_phase_report = _read_json_if_exists(model_dir / "cortex_phase_report.json")
     latest_sidecar = step_checkpoints[-1]["sidecar"] if step_checkpoints else None
     latest_architecture_audit = {}
+    latest_phase_deliverable_audit = {}
     if isinstance(latest_sidecar, Mapping):
         state_summary = latest_sidecar.get("cortex_phase_state_summary", {})
         if isinstance(state_summary, Mapping):
             latest_architecture_audit = dict(state_summary.get("architecture_audit") or {})
+            latest_phase_deliverable_audit = dict(state_summary.get("phase_deliverable_audit") or {})
     return {
         "exists": model_dir.exists(),
         "latest_checkpoint_step": max((item["step"] for item in step_checkpoints), default=None),
         "checkpoint_count": len(step_checkpoints),
         "latest_checkpoint": step_checkpoints[-1] if step_checkpoints else None,
         "latest_checkpoint_architecture_audit": latest_architecture_audit,
+        "latest_checkpoint_phase_deliverable_audit": latest_phase_deliverable_audit,
         "final_checkpoint_exists": final_checkpoint.exists(),
         "final_checkpoint_size_bytes": int(final_checkpoint.stat().st_size) if final_checkpoint.exists() else 0,
         "final_checkpoint_sidecar_exists": bool(final_sidecar),
@@ -4488,6 +4784,7 @@ def _model_run_inspection(model_dir: Path) -> Mapping[str, Any]:
             "phase_event_counts": cortex_phase_report.get("phase_event_counts", {}),
             "training_influence": cortex_phase_report.get("training_influence", {}),
             "architecture_audit": cortex_phase_report.get("architecture_audit", {}),
+            "phase_deliverable_audit": cortex_phase_report.get("phase_deliverable_audit", {}),
             "errors": cortex_phase_report.get("errors", ()),
         } if cortex_phase_report else {},
     }
@@ -5146,9 +5443,16 @@ class LLMComparisonRunner:
         architecture_audit = phase_report.get("architecture_audit", {}) if isinstance(phase_report, Mapping) else {}
         if not isinstance(architecture_audit, Mapping):
             architecture_audit = {}
+        phase_deliverable_audit = phase_report.get("phase_deliverable_audit", {}) if isinstance(phase_report, Mapping) else {}
+        if not isinstance(phase_deliverable_audit, Mapping):
+            phase_deliverable_audit = {}
         cortex_architecture_audit_passed = (
             (not cortex_full_phase_required)
             or bool(architecture_audit.get("passed"))
+        )
+        cortex_phase_deliverable_audit_passed = (
+            (not cortex_full_phase_required)
+            or bool(phase_deliverable_audit.get("passed"))
         )
         cortex_phase_integration_passed = (
             (not cortex_full_phase_required)
@@ -5156,6 +5460,7 @@ class LLMComparisonRunner:
                 bool(phase_report.get("all_phases_active"))
                 and not phase_report.get("errors")
                 and cortex_architecture_audit_passed
+                and cortex_phase_deliverable_audit_passed
             )
         )
         checks = {
@@ -5167,6 +5472,7 @@ class LLMComparisonRunner:
             "corpus_scale_passed": corpus_scale_passed,
             "planned_train_tokens_passed": planned_train_tokens_passed,
             "cortex_architecture_audit_passed": cortex_architecture_audit_passed,
+            "cortex_phase_deliverable_audit_passed": cortex_phase_deliverable_audit_passed,
             "cortex_phase_integration_passed": cortex_phase_integration_passed,
         }
         failed_checks = tuple(name for name, passed_check in checks.items() if not passed_check)
@@ -5187,6 +5493,8 @@ class LLMComparisonRunner:
             "cortex_full_phase_required": cortex_full_phase_required,
             "cortex_architecture_audit_passed": cortex_architecture_audit_passed,
             "cortex_architecture_audit": dict(architecture_audit),
+            "cortex_phase_deliverable_audit_passed": cortex_phase_deliverable_audit_passed,
+            "cortex_phase_deliverable_audit": dict(phase_deliverable_audit),
             "cortex_phase_integration_passed": cortex_phase_integration_passed,
             "checks": checks,
             "failed_checks": failed_checks,

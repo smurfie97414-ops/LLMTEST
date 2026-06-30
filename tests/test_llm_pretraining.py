@@ -468,8 +468,10 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
         self.assertFalse(proof["passed"], proof)
         self.assertTrue(proof["cortex_full_phase_required"], proof)
         self.assertFalse(proof["cortex_architecture_audit_passed"], proof)
+        self.assertFalse(proof["cortex_phase_deliverable_audit_passed"], proof)
         self.assertFalse(proof["cortex_phase_integration_passed"], proof)
         self.assertIn("cortex_architecture_audit_passed", proof["failed_checks"])
+        self.assertIn("cortex_phase_deliverable_audit_passed", proof["failed_checks"])
         self.assertIn("cortex_phase_integration_passed", proof["failed_checks"])
 
     def test_trainer_resumes_checkpoint_with_gradient_accumulation(self):
@@ -795,6 +797,22 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 "training_feedback_loop",
             }
             self.assertEqual(set(architecture_audit["checks_by_component"]), expected_components)
+            deliverable_audit = phase_report["phase_deliverable_audit"]
+            self.assertTrue(deliverable_audit["passed"], deliverable_audit)
+            self.assertEqual(deliverable_audit["deliverable_count"], 10)
+            expected_deliverables = {
+                "P1:verifier_os_regression_harness",
+                "P2:ternary_sign_mask_activation_and_trace_logs",
+                "P3:mtp_fsp_confidence_temporal_contract_gate",
+                "P4:recent_exact_old_latent_query_memory_anchor_fidelity",
+                "P5:latent_certificate_delatentization_tool_verification",
+                "P6:causal_attribution_counterfactual_dimensions",
+                "P7:minimal_regrowth_action_space_and_repair_plan",
+                "P8:fast_normal_careful_budget_early_exit_mod_speculative_kernels",
+                "P9:sleep_replay_synthetic_real_reservoir_anti_collapse_schedule",
+                "P10:recursive_improvement_sandbox_pareto_rollback_diversity",
+            }
+            self.assertEqual(set(deliverable_audit["checks_by_deliverable"]), expected_deliverables)
             influence = phase_report["training_influence"]
             self.assertGreater(influence["ternary_core_forward_events"], 0)
             self.assertGreater(influence["variable_input_compression_events"], 0)
@@ -838,6 +856,7 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             persisted = json.loads((run_dir / "cortex_phase_report.json").read_text(encoding="utf-8"))
             self.assertTrue(persisted["all_phases_active"], persisted)
             self.assertTrue(persisted["architecture_audit"]["passed"], persisted["architecture_audit"])
+            self.assertTrue(persisted["phase_deliverable_audit"]["passed"], persisted["phase_deliverable_audit"])
             self.assertEqual(persisted["training_influence"]["sleep_replay_updates"], influence["sleep_replay_updates"])
             self.assertEqual(
                 persisted["training_influence"]["objective_feedback_events"],
@@ -979,6 +998,10 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 self.assertTrue(
                     sidecar["cortex_phase_state_summary"]["architecture_audit"]["passed"],
                     sidecar["cortex_phase_state_summary"]["architecture_audit"],
+                )
+                self.assertTrue(
+                    sidecar["cortex_phase_state_summary"]["phase_deliverable_audit"]["passed"],
+                    sidecar["cortex_phase_state_summary"]["phase_deliverable_audit"],
                 )
                 self.assertGreater(sidecar["cortex_phase_state_summary"]["replay_batch_count"], 0)
                 self.assertGreater(sidecar["cortex_phase_state_summary"]["objective_feedback_events"], 0)
@@ -1147,6 +1170,7 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                         "phase_event_counts": {f"P{index}": 1 for index in range(1, 11)},
                         "training_influence": {"sleep_replay_updates": 3},
                         "architecture_audit": {"passed": True, "failed_checks": []},
+                        "phase_deliverable_audit": {"passed": True, "failed_checks": []},
                         "errors": [],
                     }
                 ),
@@ -1168,6 +1192,7 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             self.assertEqual(seed["baseline"]["last_validation"]["step"], 500)
             self.assertTrue(seed["cortex"]["cortex_phase_summary"]["all_phases_active"])
             self.assertTrue(seed["cortex"]["cortex_phase_summary"]["architecture_audit"]["passed"])
+            self.assertTrue(seed["cortex"]["cortex_phase_summary"]["phase_deliverable_audit"]["passed"])
             self.assertEqual(seed["cortex"]["cortex_phase_summary"]["training_influence"]["sleep_replay_updates"], 3)
 
     def test_trainer_rejects_resume_when_corpus_identity_changes(self):
