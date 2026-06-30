@@ -7,6 +7,8 @@ from cortex3 import CorruptedCompressedAgent, DynamicSkillVerifier, ReferenceRul
 from cortex3_cycle import CortexCycle
 from cortex3_improvement import (
     DynamicEvaluator,
+    DiversityPreserver,
+    EvolutionaryArchive,
     ImprovementProposal,
     PatchAcceptanceGate,
     ProposalGenerator,
@@ -36,6 +38,29 @@ class RecursiveImprovementTest(unittest.TestCase):
         self.assertTrue(all(proposal.kind in ProposalKind for proposal in proposals))
         self.assertTrue(all(proposal.affected_skills for proposal in proposals))
         self.assertTrue(all(proposal.diversity_tags for proposal in proposals))
+
+    def test_restored_archive_kind_counts_still_guard_diversity(self):
+        archive = EvolutionaryArchive()
+        archive.restore_summary(
+            accepted_count=3,
+            rejected_count=1,
+            kind_counts={ProposalKind.ROUTER.value: 3},
+        )
+        proposal = ImprovementProposal(
+            "router-repeat",
+            "repeat router patch",
+            ProposalKind.ROUTER,
+            ("instruction_following",),
+            expected_quality_delta=0.1,
+            expected_cost_delta=0.0,
+            expected_robustness_delta=0.0,
+            risk=0.1,
+            diversity_tags=("router",),
+        )
+
+        flags = DiversityPreserver().check(proposal, archive)
+
+        self.assertIn("proposal kind would dominate evolutionary archive", flags)
 
     def test_sandbox_trainer_uses_in_memory_patch_without_touching_files(self):
         verifier, report = _cycle()

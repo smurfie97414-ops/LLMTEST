@@ -301,10 +301,10 @@ class DiversityPreserver:
         flags: list[str] = []
         if not proposal.diversity_tags:
             flags.append("proposal has no diversity tags")
-        accepted = archive.accepted
-        if len(accepted) >= 3:
-            counts = Counter(record.proposal.kind for record in accepted)
-            projected_total = len(accepted) + 1
+        accepted_count = archive.accepted_count
+        if accepted_count >= 3:
+            counts = archive.accepted_kind_counts()
+            projected_total = accepted_count + 1
             projected_fraction = (counts[proposal.kind] + 1) / projected_total
             if projected_fraction > self.max_kind_fraction:
                 flags.append("proposal kind would dominate evolutionary archive")
@@ -421,6 +421,9 @@ class ArchiveRecord:
 class EvolutionaryArchive:
     def __init__(self) -> None:
         self.records: list[ArchiveRecord] = []
+        self.restored_accepted_kind_counts: Counter[ProposalKind] = Counter()
+        self.restored_accepted_count = 0
+        self.restored_rejected_count = 0
 
     def record(self, decision: AcceptanceDecision) -> ArchiveRecord:
         record = ArchiveRecord(decision.evaluation.proposal, decision, decision.evaluation.sandbox.rollback_token)
@@ -435,11 +438,40 @@ class EvolutionaryArchive:
     def rejected(self) -> tuple[ArchiveRecord, ...]:
         return tuple(record for record in self.records if not record.decision.accepted)
 
+    @property
+    def accepted_count(self) -> int:
+        return self.restored_accepted_count + len(self.accepted)
+
+    @property
+    def rejected_count(self) -> int:
+        return self.restored_rejected_count + len(self.rejected)
+
+    def accepted_kind_counts(self) -> Counter[ProposalKind]:
+        counts = Counter(self.restored_accepted_kind_counts)
+        counts.update(record.proposal.kind for record in self.accepted)
+        return counts
+
+    def restore_summary(self, *, accepted_count: int, rejected_count: int, kind_counts: Mapping[str, int]) -> None:
+        self.restored_accepted_count = int(accepted_count)
+        self.restored_rejected_count = int(rejected_count)
+        self.restored_accepted_kind_counts = Counter({
+            ProposalKind(kind): int(count)
+            for kind, count in dict(kind_counts).items()
+        })
+
     def to_dict(self) -> dict[str, Any]:
+        kind_counts = {
+            kind.value: count
+            for kind, count in self.accepted_kind_counts().items()
+        }
         return {
             "accepted": [record.to_dict() for record in self.accepted],
             "rejected": [record.to_dict() for record in self.rejected],
-            "kind_counts": dict(Counter(record.proposal.kind.value for record in self.accepted)),
+            "restored_accepted_count": self.restored_accepted_count,
+            "restored_rejected_count": self.restored_rejected_count,
+            "accepted_count": self.accepted_count,
+            "rejected_count": self.rejected_count,
+            "kind_counts": kind_counts,
         }
 
 

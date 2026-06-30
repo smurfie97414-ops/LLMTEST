@@ -32,6 +32,7 @@ from tokenizers.processors import TemplateProcessing
 from tokenizers.trainers import BpeTrainer
 
 from cortex3 import (
+    Anchor,
     CandidateAnswer,
     CostTrace,
     CorruptedCompressedAgent,
@@ -44,9 +45,9 @@ from cortex3_attribution import CausalAttributionEngine
 from cortex3_certificates import CertificateType, CertificateVerifier, LatentProofState, build_certificate, evaluate_certificate_efficiency
 from cortex3_cycle import CortexCycle
 from cortex3_future import ContractDecision, FutureContract, FutureContractEngine, FutureContractLedger, MTPFSPConfig
-from cortex3_improvement import RecursiveImprovementEngine
+from cortex3_improvement import RecursiveImprovementEngine, RollbackEvent
 from cortex3_inference import InferenceConfig, UltraFastInferenceEngine
-from cortex3_memory import CognitiveMemory, CognitiveMemoryConfig
+from cortex3_memory import CognitiveMemory, CognitiveMemoryConfig, MemoryMode, MemorySegment
 from cortex3_objective import build_objective_report
 from cortex3_phases import CORTEX3_PHASES
 from cortex3_regrowth import MinimalRegrowthEngine
@@ -263,6 +264,206 @@ def _restore_compression_trace_ledger(ledger: CompressionTraceLedger | None, pay
     ledger.total_kv_bytes = float(
         cost_trace.get("kv_bytes", sum(item.bytes_used for item in ledger.kv_events))
     )
+
+
+def _anchor_payload(anchor: Anchor) -> dict[str, Any]:
+    return {
+        "kind": anchor.kind,
+        "value": anchor.value,
+        "source_id": anchor.source_id,
+        "importance": anchor.importance,
+    }
+
+
+def _anchor_from_payload(payload: Mapping[str, Any]) -> Anchor:
+    return Anchor(
+        kind=str(payload.get("kind", "")),
+        value=str(payload.get("value", "")),
+        source_id=str(payload.get("source_id", "")),
+        importance=float(payload.get("importance", 1.0)),
+    )
+
+
+def _task_payload(task: Task) -> dict[str, Any]:
+    return {
+        "task_id": task.task_id,
+        "skill": task.skill,
+        "prompt": task.prompt,
+        "expected": task.expected,
+        "metadata": dict(task.metadata),
+        "anchors": [_anchor_payload(anchor) for anchor in task.anchors],
+        "group_id": task.group_id,
+    }
+
+
+def _task_from_payload(payload: Mapping[str, Any]) -> Task:
+    return Task(
+        task_id=str(payload.get("task_id", "")),
+        skill=str(payload.get("skill", "")),
+        prompt=str(payload.get("prompt", "")),
+        expected=payload.get("expected"),
+        metadata=dict(payload.get("metadata") or {}),
+        anchors=tuple(_anchor_from_payload(anchor) for anchor in payload.get("anchors", ())),
+        group_id=payload.get("group_id"),
+    )
+
+
+def _candidate_payload(answer: CandidateAnswer) -> dict[str, Any]:
+    return {
+        "text": answer.text,
+        "confidence": float(answer.confidence),
+        "certificate": dict(answer.certificate),
+        "cost": asdict(answer.cost),
+        "raw": dict(answer.raw),
+    }
+
+
+def _candidate_from_payload(payload: Mapping[str, Any]) -> CandidateAnswer:
+    return CandidateAnswer(
+        text=str(payload.get("text", "")),
+        confidence=float(payload.get("confidence", 0.0)),
+        certificate=dict(payload.get("certificate") or {}),
+        cost=_cost_trace_from_payload(payload.get("cost")),
+        raw=dict(payload.get("raw") or {}),
+    )
+
+
+def _training_example_payload(example: TrainingExample) -> dict[str, Any]:
+    return {
+        "example_id": example.example_id,
+        "task": _task_payload(example.task),
+        "answer": _candidate_payload(example.answer),
+        "origin": example.origin.value,
+        "oracle": example.oracle,
+        "targeted_skill": example.targeted_skill,
+        "verification_level": int(example.verification_level),
+        "contamination_risk": float(example.contamination_risk),
+        "difficulty": float(example.difficulty),
+        "confidence_label": example.confidence_label,
+        "synthetic": bool(example.synthetic),
+        "metadata": dict(example.metadata),
+    }
+
+
+def _training_example_from_payload(payload: Mapping[str, Any]) -> TrainingExample:
+    return TrainingExample(
+        example_id=str(payload.get("example_id", "")),
+        task=_task_from_payload(dict(payload.get("task") or {})),
+        answer=_candidate_from_payload(dict(payload.get("answer") or {})),
+        origin=ExampleOrigin(str(payload.get("origin", ExampleOrigin.TOOL_SOLVED.value))),
+        oracle=str(payload.get("oracle", "")),
+        targeted_skill=str(payload.get("targeted_skill", "")),
+        verification_level=int(payload.get("verification_level", 0)),
+        contamination_risk=float(payload.get("contamination_risk", 0.0)),
+        difficulty=float(payload.get("difficulty", 0.0)),
+        confidence_label=(
+            None
+            if payload.get("confidence_label") is None
+            else float(payload.get("confidence_label"))
+        ),
+        synthetic=bool(payload.get("synthetic", False)),
+        metadata=dict(payload.get("metadata") or {}),
+    )
+
+
+def _memory_segment_payload(segment: MemorySegment) -> dict[str, Any]:
+    return {
+        "segment_id": segment.segment_id,
+        "mode": segment.mode.value,
+        "exact_text": segment.exact_text,
+        "latent_summary": segment.latent_summary,
+        "anchors": [_anchor_payload(anchor) for anchor in segment.anchors],
+        "token_counts": dict(segment.token_counts),
+        "embedding": segment.embedding.detach().cpu(),
+        "original_token_count": int(segment.original_token_count),
+        "stored_token_count": int(segment.stored_token_count),
+        "metadata": dict(segment.metadata),
+    }
+
+
+def _memory_segment_from_payload(payload: Mapping[str, Any]) -> MemorySegment:
+    embedding_payload = payload.get("embedding")
+    embedding = (
+        embedding_payload.detach().cpu().to(dtype=torch.float32)
+        if isinstance(embedding_payload, torch.Tensor)
+        else torch.as_tensor(embedding_payload or (), dtype=torch.float32)
+    )
+    return MemorySegment(
+        segment_id=str(payload.get("segment_id", "")),
+        mode=MemoryMode(str(payload.get("mode", MemoryMode.EXACT.value))),
+        exact_text=str(payload.get("exact_text", "")),
+        latent_summary=str(payload.get("latent_summary", "")),
+        anchors=tuple(_anchor_from_payload(anchor) for anchor in payload.get("anchors", ())),
+        token_counts={str(key): int(value) for key, value in dict(payload.get("token_counts") or {}).items()},
+        embedding=embedding,
+        original_token_count=int(payload.get("original_token_count", 0)),
+        stored_token_count=int(payload.get("stored_token_count", 0)),
+        metadata=dict(payload.get("metadata") or {}),
+    )
+
+
+def _memory_state(memory: CognitiveMemory) -> dict[str, Any]:
+    return {
+        "recent": [_memory_segment_payload(segment) for segment in memory.recent.segments],
+        "latent": [_memory_segment_payload(segment) for segment in memory.latent.segments],
+        "anchors": [_anchor_payload(anchor) for anchor in memory.anchor_ledger.anchors],
+        "compression_report": memory.compression_report(),
+    }
+
+
+def _restore_memory_state(memory: CognitiveMemory, payload: Mapping[str, Any] | None) -> None:
+    if not payload:
+        return
+    memory.recent.segments = [_memory_segment_from_payload(item) for item in payload.get("recent", ())]
+    memory.latent.segments = [_memory_segment_from_payload(item) for item in payload.get("latent", ())]
+    memory.anchor_ledger.anchors = [_anchor_from_payload(item) for item in payload.get("anchors", ())]
+
+
+def _sleep_state(sleep: SleepPhaseConsolidator) -> dict[str, Any]:
+    return {
+        "replay_examples": [_training_example_payload(example) for example in sleep.replay.examples],
+        "synthetic_examples": [_training_example_payload(example) for example in sleep.synthetic.examples],
+        "reservoir_examples": [_training_example_payload(example) for example in sleep.reservoir.examples],
+    }
+
+
+def _restore_sleep_state(sleep: SleepPhaseConsolidator, payload: Mapping[str, Any] | None) -> None:
+    if not payload:
+        return
+    sleep.replay.examples = [_training_example_from_payload(item) for item in payload.get("replay_examples", ())]
+    sleep.synthetic.examples = [_training_example_from_payload(item) for item in payload.get("synthetic_examples", ())]
+    sleep.reservoir.examples = [_training_example_from_payload(item) for item in payload.get("reservoir_examples", ())]
+
+
+def _improvement_state(improvement: RecursiveImprovementEngine) -> dict[str, Any]:
+    archive = improvement.archive.to_dict()
+    return {
+        "archive": {
+            "accepted_count": int(archive.get("accepted_count", 0)),
+            "rejected_count": int(archive.get("rejected_count", 0)),
+            "kind_counts": dict(archive.get("kind_counts", {})),
+        },
+        "rollback": improvement.rollback.to_dict(),
+    }
+
+
+def _restore_improvement_state(improvement: RecursiveImprovementEngine, payload: Mapping[str, Any] | None) -> None:
+    if not payload:
+        return
+    archive_payload = dict(payload.get("archive") or {})
+    improvement.archive.restore_summary(
+        accepted_count=int(archive_payload.get("accepted_count", 0)),
+        rejected_count=int(archive_payload.get("rejected_count", 0)),
+        kind_counts=dict(archive_payload.get("kind_counts") or {}),
+    )
+    improvement.rollback.events = [
+        RollbackEvent(
+            proposal_id=str(item.get("proposal_id", "")),
+            rollback_token=str(item.get("rollback_token", "")),
+            reason=str(item.get("reason", "")),
+        )
+        for item in dict(payload.get("rollback") or {}).get("events", ())
+    ]
 
 
 def _sha256_file(path: str | Path, *, chunk_size: int = 1024 * 1024) -> str:
@@ -1136,6 +1337,9 @@ class TransformerConfig:
     use_cortex_heads: bool = False
     use_ternary_core: bool = False
     ternary_activation_bits: int = 4
+    use_skill_aware_experts: bool = False
+    skill_expert_count: int = 4
+    skill_expert_top_k: int = 2
 
     def __post_init__(self) -> None:
         if self.vocab_size <= len(SPECIAL_TOKENS):
@@ -1152,6 +1356,10 @@ class TransformerConfig:
             raise ValueError("horizons must be positive")
         if self.use_ternary_core and self.ternary_activation_bits < 2:
             raise ValueError("ternary_activation_bits must be >= 2")
+        if self.skill_expert_count < 1:
+            raise ValueError("skill_expert_count must be positive")
+        if not 1 <= self.skill_expert_top_k <= self.skill_expert_count:
+            raise ValueError("skill_expert_top_k must be between 1 and skill_expert_count")
 
 
 def _make_transformer_linear(
@@ -1248,6 +1456,59 @@ class TransformerBlock(nn.Module):
         return x
 
 
+class SkillAwareExpertMoE(nn.Module):
+    def __init__(self, config: TransformerConfig, *, ledger: CompressionTraceLedger | None = None):
+        super().__init__()
+        self.config = config
+        self.ledger = ledger
+        self.router = nn.Linear(config.d_model, config.skill_expert_count)
+        self.experts = nn.ModuleList([
+            nn.Sequential(
+                _make_transformer_linear(
+                    config,
+                    config.d_model,
+                    config.d_model * 2,
+                    ledger=ledger,
+                    log_prefix=f"skill_expert_{index}.up",
+                ),
+                nn.GELU(),
+                _make_transformer_linear(
+                    config,
+                    config.d_model * 2,
+                    config.d_model,
+                    ledger=ledger,
+                    log_prefix=f"skill_expert_{index}.down",
+                ),
+            )
+            for index in range(config.skill_expert_count)
+        ])
+
+    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+        route_logits = self.router(hidden)
+        top_values, top_indices = torch.topk(
+            route_logits,
+            k=self.config.skill_expert_top_k,
+            dim=-1,
+        )
+        top_weights = F.softmax(top_values, dim=-1)
+        combined = hidden.new_zeros(hidden.shape)
+        selected = set(int(index) for index in top_indices.detach().cpu().reshape(-1).tolist())
+        for expert_index, expert in enumerate(self.experts):
+            expert_mask = top_indices.eq(expert_index)
+            if not bool(expert_mask.any()):
+                continue
+            token_weight = (top_weights * expert_mask.to(top_weights.dtype)).sum(dim=-1, keepdim=True)
+            combined = combined + expert(hidden) * token_weight
+        if self.ledger is not None:
+            for expert_index in sorted(selected):
+                self.ledger.record_expert(
+                    f"llm-skill-expert-{expert_index}",
+                    "skill-aware MoE route in Cortex Transformer forward",
+                    cost=float(top_indices.eq(expert_index).sum().item()) / max(1.0, float(top_indices.numel())),
+                )
+        return hidden + combined
+
+
 @dataclass(frozen=True)
 class LLMForwardOutput:
     logits: torch.Tensor
@@ -1269,6 +1530,11 @@ class CortexTransformerLM(nn.Module):
             for index in range(config.n_layers)
         ])
         self.ln_f = nn.LayerNorm(config.d_model)
+        self.skill_experts = (
+            SkillAwareExpertMoE(config, ledger=self.compression_ledger)
+            if config.use_skill_aware_experts
+            else None
+        )
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
         self.mtp_heads = nn.ModuleDict({
             str(horizon): _make_transformer_linear(
@@ -1301,6 +1567,8 @@ class CortexTransformerLM(nn.Module):
         for block in self.blocks:
             hidden = block(hidden)
         hidden = self.ln_f(hidden)
+        if self.skill_experts is not None:
+            hidden = self.skill_experts(hidden)
         logits = self.lm_head(hidden)
         mtp_logits = {
             int(horizon): head(hidden)
@@ -1949,6 +2217,8 @@ class CortexTrainingPhaseController:
     ):
         if not model.config.use_cortex_heads:
             raise ValueError("CortexTrainingPhaseController requires a Cortex model with use_cortex_heads=True")
+        if not model.config.use_skill_aware_experts:
+            raise ValueError("CortexTrainingPhaseController requires skill-aware experts for full Cortex training")
         self.model = model
         self.tokenizer = tokenizer
         self.config = config
@@ -2244,6 +2514,9 @@ class CortexTrainingPhaseController:
                 if self.model.compression_ledger is not None
                 else None
             ),
+            "memory_state": _memory_state(self.memory),
+            "sleep_state": _sleep_state(self.sleep),
+            "improvement_state": _improvement_state(self.improvement),
         }
 
     def load_state_dict(self, payload: Mapping[str, Any] | None) -> None:
@@ -2278,6 +2551,9 @@ class CortexTrainingPhaseController:
         ]
         _restore_future_contract_ledger(self.future_ledger, payload.get("future_ledger"))
         _restore_compression_trace_ledger(self.model.compression_ledger, payload.get("compression_trace_ledger"))
+        _restore_memory_state(self.memory, payload.get("memory_state"))
+        _restore_sleep_state(self.sleep, payload.get("sleep_state"))
+        _restore_improvement_state(self.improvement, payload.get("improvement_state"))
 
     def checkpoint_state_summary(self) -> dict[str, Any]:
         compression_trace = self.model.compression_trace()
@@ -2307,6 +2583,13 @@ class CortexTrainingPhaseController:
             "last_objective_loss_total": float(self.last_objective_loss_total),
             "future_contract_decisions": len(self.future_ledger.decisions),
             "compression_trace_counts": compression_trace_counts,
+            "memory_recent_segments": len(self.memory.recent.segments),
+            "memory_latent_segments": len(self.memory.latent.segments),
+            "sleep_replay_examples": len(self.sleep.replay.examples),
+            "sleep_synthetic_examples": len(self.sleep.synthetic.examples),
+            "sleep_reservoir_examples": len(self.sleep.reservoir.examples),
+            "improvement_archive_accepted": self.improvement.archive.accepted_count,
+            "improvement_archive_rejected": self.improvement.archive.rejected_count,
             "error_count": len(self.errors),
         }
 
@@ -2600,12 +2883,20 @@ class CortexTrainingPhaseController:
             "phase_event_counts": dict(self.phase_counts),
             "training_influence": {
                 "ternary_core_forward_events": trace_counts.get("layer_forward_events", 0),
+                "skill_expert_activations": trace_counts.get("expert_activations", 0),
                 "future_contract_decisions": len(self.future_ledger.decisions),
                 "confidence_regularization_steps": self.regularization_steps,
                 "sleep_replay_batches_available": len(self.replay_batches),
                 "sleep_replay_updates": self.replay_updates,
                 "phase_replay_examples": sum(self.phase_replay_examples.values()),
                 "phase_replay_examples_by_phase": dict(self.phase_replay_examples),
+                "memory_recent_segments": len(self.memory.recent.segments),
+                "memory_latent_segments": len(self.memory.latent.segments),
+                "sleep_replay_examples": len(self.sleep.replay.examples),
+                "sleep_synthetic_examples": len(self.sleep.synthetic.examples),
+                "sleep_reservoir_examples": len(self.sleep.reservoir.examples),
+                "improvement_archive_accepted": self.improvement.archive.accepted_count,
+                "improvement_archive_rejected": self.improvement.archive.rejected_count,
                 "objective_feedback_events": self.objective_feedback_events,
                 "objective_feedback_average_loss": (
                     self.objective_feedback_total / max(1, self.objective_feedback_events)
@@ -2616,6 +2907,13 @@ class CortexTrainingPhaseController:
             "trace_counts": trace_counts,
             "retained_trace_counts": compression_trace.get("retained_event_counts", {}),
             "future_ledger": self.future_ledger.to_dict(),
+            "memory_state_summary": self.memory.compression_report(),
+            "sleep_state_summary": {
+                "replay_examples": len(self.sleep.replay.examples),
+                "synthetic_examples": len(self.sleep.synthetic.examples),
+                "reservoir_examples": len(self.sleep.reservoir.examples),
+            },
+            "improvement_state_summary": _improvement_state(self.improvement),
             "phase_audits": _last_items(self.phase_audits, 2),
             "batch_contract_samples": _last_items(self.batch_contract_samples, 5),
             "phase_replay_example_ids": _last_items(self.phase_replay_example_ids, 10),
@@ -2766,6 +3064,7 @@ class LLMTrainer:
             if (
                 self.model.config.use_cortex_heads
                 and self.model.config.use_ternary_core
+                and self.model.config.use_skill_aware_experts
                 and self.model.config.horizons == (1, 2, 4, 8)
             )
             else None
@@ -3520,6 +3819,10 @@ def _transformer_parameter_count(config: TransformerConfig) -> int:
     if config.use_cortex_heads:
         total += len(config.horizons) * (d_model * vocab_size + vocab_size)
         total += d_model + 1
+    if config.use_skill_aware_experts:
+        router = d_model * int(config.skill_expert_count) + int(config.skill_expert_count)
+        expert = (d_model * d_model * 2 + d_model * 2) + (d_model * 2 * d_model + d_model)
+        total += router + int(config.skill_expert_count) * expert
     return int(total)
 
 
@@ -3557,6 +3860,9 @@ def _estimate_transformer_training_memory(config: TransformerConfig, training: T
         "n_heads": n_heads,
         "vocab_size": vocab_size,
         "output_heads": int(output_heads),
+        "skill_aware_experts": bool(config.use_skill_aware_experts),
+        "skill_expert_count": int(config.skill_expert_count) if config.use_skill_aware_experts else 0,
+        "skill_expert_top_k": int(config.skill_expert_top_k) if config.use_skill_aware_experts else 0,
         "training_state_bytes": int(training_state_bytes),
         "parameter_forward_bytes": int(parameter_forward_bytes),
         "hidden_activation_bytes": int(hidden_activation_bytes),
@@ -3578,7 +3884,12 @@ def _experiment_model_memory_estimates(config: ComparisonConfig) -> dict[str, An
         horizons=config.horizons,
         use_cortex_heads=False,
     )
-    cortex_config = TransformerConfig(**{**asdict(baseline_config), "use_cortex_heads": True, "use_ternary_core": True})
+    cortex_config = TransformerConfig(**{
+        **asdict(baseline_config),
+        "use_cortex_heads": True,
+        "use_ternary_core": True,
+        "use_skill_aware_experts": True,
+    })
     baseline = _estimate_transformer_training_memory(baseline_config, config.training)
     cortex = _estimate_transformer_training_memory(cortex_config, config.training)
     return {
@@ -3625,7 +3936,12 @@ def build_training_plan(
         horizons=config.horizons,
         use_cortex_heads=False,
     )
-    cortex_config = TransformerConfig(**{**asdict(baseline_config), "use_cortex_heads": True, "use_ternary_core": True})
+    cortex_config = TransformerConfig(**{
+        **asdict(baseline_config),
+        "use_cortex_heads": True,
+        "use_ternary_core": True,
+        "use_skill_aware_experts": True,
+    })
     baseline_parameters = _transformer_parameter_count(baseline_config)
     cortex_parameters = _transformer_parameter_count(cortex_config)
     effective_world_size = max(1, int(world_size))
@@ -3678,6 +3994,9 @@ def build_training_plan(
             "baseline_parameters": baseline_parameters,
             "cortex_parameters": cortex_parameters,
             "cortex_extra_parameters": cortex_parameters - baseline_parameters,
+            "cortex_skill_aware_experts": bool(cortex_config.use_skill_aware_experts),
+            "cortex_skill_expert_count": int(cortex_config.skill_expert_count),
+            "cortex_skill_expert_top_k": int(cortex_config.skill_expert_top_k),
         },
         "training": {
             "steps": optimizer_steps,
@@ -3896,7 +4215,12 @@ class LLMComparisonRunner:
                 model_kind="baseline_next_token",
                 corpus_identity=corpus_identity,
             ).train(name="baseline_ntp")
-            cortex_config = TransformerConfig(**{**asdict(model_config), "use_cortex_heads": True, "use_ternary_core": True})
+            cortex_config = TransformerConfig(**{
+                **asdict(model_config),
+                "use_cortex_heads": True,
+                "use_ternary_core": True,
+                "use_skill_aware_experts": True,
+            })
             cortex = LLMTrainer(
                 CortexTransformerLM(cortex_config),
                 train_data,
