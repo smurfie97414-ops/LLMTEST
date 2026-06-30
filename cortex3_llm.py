@@ -50,7 +50,7 @@ from cortex3_memory import CognitiveMemory, CognitiveMemoryConfig
 from cortex3_objective import build_objective_report
 from cortex3_phases import CORTEX3_PHASES
 from cortex3_regrowth import MinimalRegrowthEngine
-from cortex3_sleep import SleepPhaseConsolidator, TrainingExample
+from cortex3_sleep import ExampleOrigin, SleepPhaseConsolidator, TrainingExample
 from cortex3_ternary import BitLinear, BitLinearConfig, CompressionTraceLedger
 
 
@@ -1756,6 +1756,8 @@ class CortexTrainingPhaseController:
         self.replay_cursor = 0
         self.regularization_steps = 0
         self.replay_updates = 0
+        self.phase_replay_examples: dict[str, int] = {phase.id: 0 for phase in CORTEX3_PHASES}
+        self.phase_replay_example_ids: list[str] = []
 
     def _touch(self, phase_id: str) -> None:
         self.phase_counts[phase_id] = self.phase_counts.get(phase_id, 0) + 1
@@ -1802,15 +1804,33 @@ class CortexTrainingPhaseController:
                 contract_id=f"llm-step-{step}-{len(self.batch_contract_samples)}",
                 temporal_loss=float(breakdown.temporal_consistency),
             )
-            observed = future_targets[0, -1, : contract.accepted_horizon].detach().cpu().tolist()
+            observed = self._observed_contract_tokens(future_targets, contract.accepted_horizon)
             decision = self.future_engine.gate_contract(contract, observed_tokens=[int(token) for token in observed])
             self._touch("P3")
+            decision_label = "ACCEPT" if decision.accepted else "REJECT"
+            decision_task = Task(
+                f"phase-p3-{step}-{len(self.batch_contract_samples)}",
+                "instruction_following",
+                f"Output the future contract gate result exactly: {decision_label}",
+                decision_label,
+            )
+            self._add_verified_phase_replay(
+                "P3",
+                decision_task,
+                metadata={
+                    "contract_id": decision.contract.contract_id,
+                    "accepted_horizon": decision.contract.accepted_horizon,
+                    "observed_token_count": len(observed),
+                    "reason": decision.reason,
+                },
+            )
             self.batch_contract_samples.append(
                 {
                     "step": step,
                     "accepted": decision.accepted,
                     "horizon": decision.contract.accepted_horizon,
                     "confidence": decision.contract.confidence,
+                    "observed_token_count": len(observed),
                     "reason": decision.reason,
                 }
             )
@@ -1849,6 +1869,21 @@ class CortexTrainingPhaseController:
             future.append(shifted)
         return torch.stack(future, dim=-1)
 
+    def _observed_contract_tokens(self, future_targets: torch.Tensor, accepted_horizon: int) -> list[int]:
+        horizons = tuple(int(horizon) for horizon in self.model.config.horizons)
+        if accepted_horizon not in horizons:
+            lower_or_equal = tuple(horizon for horizon in horizons if horizon <= accepted_horizon)
+            accepted_horizon = max(lower_or_equal) if lower_or_equal else min(horizons)
+        horizon_column = horizons.index(accepted_horizon)
+        if future_targets.shape[1] < accepted_horizon:
+            raise ValueError(
+                f"cannot verify future contract horizon {accepted_horizon} with sequence length {future_targets.shape[1]}"
+            )
+        return [
+            int(token)
+            for token in future_targets[0, -accepted_horizon:, horizon_column].detach().cpu().tolist()
+        ]
+
     def _batch_from_example(self, example: TrainingExample) -> torch.Tensor:
         text = (
             f"Skill: {example.targeted_skill}\n"
@@ -1862,6 +1897,66 @@ class CortexTrainingPhaseController:
             ids.extend(ids)
         ids = ids[: self.model.config.seq_len + 1]
         return torch.tensor([ids], dtype=torch.long)
+
+    def _answer_from_task_expected(self, task: Task) -> CandidateAnswer:
+        expected = task.expected
+        text = str(expected["answer"]) if isinstance(expected, Mapping) and "answer" in expected else str(expected)
+        return CandidateAnswer(
+            text,
+            confidence=1.0,
+            certificate={"oracle_label": task.skill, "source": "cortex_phase_replay"},
+        )
+
+    def _difficulty_for_phase_task(self, task: Task) -> float:
+        token_count = max(1, len(task.prompt.split()))
+        score = 0.20 + min(0.35, token_count / 200.0)
+        if task.anchors:
+            score += 0.20
+        if task.skill in {"arithmetic", "algebra", "code_unit_tests", "calibration"}:
+            score += 0.15
+        return max(0.0, min(1.0, score))
+
+    def _add_verified_phase_replay(
+        self,
+        phase_id: str,
+        task: Task,
+        *,
+        answer: CandidateAnswer | str | None = None,
+        metadata: Mapping[str, Any] | None = None,
+        origin: ExampleOrigin = ExampleOrigin.TOOL_SOLVED,
+    ) -> TrainingExample | None:
+        candidate = CandidateAnswer.coerce(answer) if answer is not None else self._answer_from_task_expected(task)
+        verification = self.verifier.oracle_registry.verify(task.skill, task, candidate)
+        if not verification.passed:
+            self._record_error(
+                phase_id,
+                ValueError(f"phase replay oracle rejected {task.task_id}: {verification.reason}"),
+            )
+            return None
+        example = TrainingExample(
+            example_id=f"llm-{phase_id.lower()}-{self.phase_replay_examples.get(phase_id, 0)}-{task.task_id}",
+            task=task,
+            answer=CandidateAnswer(
+                candidate.text,
+                confidence=max(float(candidate.confidence), float(verification.score)),
+                certificate={**dict(candidate.certificate), "phase_replay": phase_id},
+                cost=candidate.cost,
+                raw={**dict(candidate.raw), "verification_reason": verification.reason},
+            ),
+            origin=origin,
+            oracle=task.skill,
+            targeted_skill=task.skill,
+            verification_level=3,
+            contamination_risk=0.04,
+            difficulty=self._difficulty_for_phase_task(task),
+            confidence_label=float(verification.score),
+            synthetic=True,
+            metadata={"source_phase": phase_id, **dict(metadata or {})},
+        )
+        self.replay_batches.append(self._batch_from_example(example))
+        self.phase_replay_examples[phase_id] = self.phase_replay_examples.get(phase_id, 0) + 1
+        self.phase_replay_example_ids.append(example.example_id)
+        return example
 
     def _add_sleep_replay(self, examples: Sequence[TrainingExample]) -> None:
         for example in examples[:8]:
@@ -1886,11 +1981,26 @@ class CortexTrainingPhaseController:
                 "aggregate_score": cycle_report.trial.aggregate_score,
             }
             first_failure = cycle_report.regressions[0] if cycle_report.regressions else None
+            verifier_task = first_failure.task if first_failure is not None else Task(
+                f"phase-p1-{step}",
+                "instruction_following",
+                "Output verifier status exactly: OK",
+                "OK",
+            )
+            self._add_verified_phase_replay(
+                "P1",
+                verifier_task,
+                metadata={
+                    "regressions": len(cycle_report.regressions),
+                    "aggregate_score": cycle_report.trial.aggregate_score,
+                },
+            )
         except Exception as exc:
             self._record_error("P1", exc)
 
         try:
             if first_failure is not None:
+                memory_task = first_failure.task
                 self.memory.ingest(
                     f"step-{step}-{first_failure.task.task_id}",
                     f"{first_failure.task.prompt}\nExpected: {first_failure.expected}",
@@ -1898,6 +2008,12 @@ class CortexTrainingPhaseController:
                 )
                 reconstruction = self.memory.reconstruct(first_failure.task.prompt, required_anchors=first_failure.task.anchors)
             else:
+                memory_task = Task(
+                    f"phase-p4-{step}",
+                    "instruction_following",
+                    "Recall the Cortex-3 LLM training memory anchor exactly.",
+                    "C3-LLM-ANCHOR",
+                )
                 self.memory.ingest(f"step-{step}-general", "Cortex-3 LLM training memory anchor C3-LLM-ANCHOR.")
                 reconstruction = self.memory.reconstruct("C3-LLM-ANCHOR")
             self._touch("P4")
@@ -1906,6 +2022,14 @@ class CortexTrainingPhaseController:
                 "fidelity": asdict(reconstruction.fidelity),
                 "compression": self.memory.compression_report(),
             }
+            self._add_verified_phase_replay(
+                "P4",
+                memory_task,
+                metadata={
+                    "selected_segment_ids": list(reconstruction.selected_segment_ids),
+                    "fidelity_passed": reconstruction.fidelity.passed,
+                },
+            )
         except Exception as exc:
             self._record_error("P4", exc)
 
@@ -1946,6 +2070,15 @@ class CortexTrainingPhaseController:
                 "efficiency": asdict(efficiency),
                 "certificate": certificate.to_dict(),
             }
+            if verification.passed:
+                self._add_verified_phase_replay(
+                    "P5",
+                    task,
+                    metadata={
+                        "certificate_id": certificate.certificate_id,
+                        "reduction_ratio": efficiency.reduction_ratio,
+                    },
+                )
         except Exception as exc:
             self._record_error("P5", exc)
 
@@ -1959,6 +2092,14 @@ class CortexTrainingPhaseController:
                 )
                 self._touch("P6")
                 audit["attribution"] = attribution_report.to_dict()
+                self._add_verified_phase_replay(
+                    "P6",
+                    attribution_report.failure.task,
+                    metadata={
+                        "top_cause": attribution_report.top_cause,
+                        "targeted_repair_is_cheaper": attribution_report.targeted_repair_is_cheaper,
+                    },
+                )
         except Exception as exc:
             self._record_error("P6", exc)
 
@@ -1972,6 +2113,14 @@ class CortexTrainingPhaseController:
                 )
                 self._touch("P7")
                 audit["regrowth"] = regrowth_plan.to_dict()
+                self._add_verified_phase_replay(
+                    "P7",
+                    regrowth_plan.failure.task,
+                    metadata={
+                        "selected_action": regrowth_plan.selected_action,
+                        "candidate_count": len(regrowth_plan.candidates),
+                    },
+                )
         except Exception as exc:
             self._record_error("P7", exc)
 
@@ -1982,6 +2131,17 @@ class CortexTrainingPhaseController:
             inference_results.append(inferred)
             self._touch("P8")
             audit["inference"] = inferred.to_dict()
+            if inferred.passed:
+                self._add_verified_phase_replay(
+                    "P8",
+                    inferred.task,
+                    answer=inferred.answer,
+                    metadata={
+                        "route": inferred.route.path.value,
+                        "layers_ran": inferred.layers_ran,
+                        "verified_capability_per_cost": inferred.verified_capability_per_cost,
+                    },
+                )
         except Exception as exc:
             self._record_error("P8", exc)
 
@@ -2008,6 +2168,29 @@ class CortexTrainingPhaseController:
                 )
                 self._touch("P10")
                 audit["recursive_improvement"] = improvement_report.to_dict()
+                if improvement_report.decisions:
+                    accepted_decision = next((decision for decision in improvement_report.decisions if decision.accepted), None)
+                    selected_decision = accepted_decision or improvement_report.decisions[0]
+                    gate_label = (
+                        selected_decision.evaluation.proposal.proposal_id
+                        if selected_decision.accepted
+                        else f"REJECTED:{selected_decision.reason}"
+                    )
+                    gate_task = Task(
+                        f"phase-p10-{step}",
+                        "instruction_following",
+                        f"Output recursive improvement gate result exactly: {gate_label}",
+                        gate_label,
+                    )
+                    self._add_verified_phase_replay(
+                        "P10",
+                        gate_task,
+                        metadata={
+                            "proposal_id": selected_decision.evaluation.proposal.proposal_id,
+                            "accepted": selected_decision.accepted,
+                            "reason": selected_decision.reason,
+                        },
+                    )
         except Exception as exc:
             self._record_error("P10", exc)
 
@@ -2060,11 +2243,14 @@ class CortexTrainingPhaseController:
                 "confidence_regularization_steps": self.regularization_steps,
                 "sleep_replay_batches_available": len(self.replay_batches),
                 "sleep_replay_updates": self.replay_updates,
+                "phase_replay_examples": sum(self.phase_replay_examples.values()),
+                "phase_replay_examples_by_phase": dict(self.phase_replay_examples),
             },
             "trace_counts": trace_counts,
             "future_ledger": self.future_ledger.to_dict(),
             "phase_audits": _last_items(self.phase_audits, 2),
             "batch_contract_samples": _last_items(self.batch_contract_samples, 5),
+            "phase_replay_example_ids": _last_items(self.phase_replay_example_ids, 10),
             "errors": list(self.errors),
         }
 

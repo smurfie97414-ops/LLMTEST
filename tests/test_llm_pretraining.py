@@ -31,6 +31,7 @@ from cortex3_llm import (
     TrainingConfig,
     TransformerConfig,
     CortexTransformerLM,
+    CortexTrainingPhaseController,
     TrainingPoint,
     TrainingRunReport,
     audit_llm_experiment_artifacts,
@@ -602,10 +603,46 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             self.assertGreater(influence["confidence_regularization_steps"], 0)
             self.assertGreater(influence["sleep_replay_batches_available"], 0)
             self.assertGreater(influence["sleep_replay_updates"], 0)
+            self.assertGreater(influence["phase_replay_examples"], 0)
+            phase_replay = influence["phase_replay_examples_by_phase"]
+            for phase_id in ("P1", "P3", "P4", "P5", "P6", "P7", "P8", "P10"):
+                self.assertGreater(phase_replay[phase_id], 0, phase_replay)
+            self.assertTrue(phase_report["phase_replay_example_ids"], phase_report)
+            for sample in phase_report["batch_contract_samples"]:
+                self.assertGreaterEqual(sample["observed_token_count"], sample["horizon"])
             self.assertTrue((run_dir / "cortex_phase_report.json").exists())
             persisted = json.loads((run_dir / "cortex_phase_report.json").read_text(encoding="utf-8"))
             self.assertTrue(persisted["all_phases_active"], persisted)
             self.assertEqual(persisted["training_influence"]["sleep_replay_updates"], influence["sleep_replay_updates"])
+
+    def test_future_contract_observed_tokens_use_real_horizon_not_horizon_columns(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            corpus = self._corpus(root, repeats=20)
+            tokenizer = LLMTokenizer.train(corpus, vocab_size=128, min_frequency=1)
+            config = TransformerConfig(
+                vocab_size=128,
+                seq_len=16,
+                d_model=32,
+                n_heads=4,
+                n_layers=1,
+                dropout=0.0,
+                horizons=(1, 2, 4, 8),
+                use_cortex_heads=True,
+                use_ternary_core=True,
+            )
+            controller = CortexTrainingPhaseController(
+                CortexTransformerLM(config),
+                tokenizer,
+                TrainingConfig(steps=1, batch_size=1, eval_interval=1, checkpoint_interval=1),
+                run_dir=root / "run",
+            )
+            future_targets = torch.zeros((1, 16, 4), dtype=torch.long)
+            future_targets[0, -8:, 3] = torch.arange(80, 88)
+
+            observed = controller._observed_contract_tokens(future_targets, 8)
+
+            self.assertEqual(observed, list(range(80, 88)))
 
     def test_inspect_experiment_reports_partial_run_without_loading_checkpoints(self):
         with tempfile.TemporaryDirectory() as tmp:
