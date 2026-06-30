@@ -450,7 +450,12 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             curve=(),
             config={"model": {"use_cortex_heads": True, "use_ternary_core": True, "horizons": [1, 2, 4, 8]}},
             hardware={},
-            cortex_phase_report={"enabled": True, "all_phases_active": False, "errors": []},
+            cortex_phase_report={
+                "enabled": True,
+                "all_phases_active": True,
+                "phase_event_counts": {f"P{index}": 1 for index in range(1, 11)},
+                "errors": [],
+            },
         )
 
         proof = runner._proof_payload(
@@ -462,7 +467,9 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
 
         self.assertFalse(proof["passed"], proof)
         self.assertTrue(proof["cortex_full_phase_required"], proof)
+        self.assertFalse(proof["cortex_architecture_audit_passed"], proof)
         self.assertFalse(proof["cortex_phase_integration_passed"], proof)
+        self.assertIn("cortex_architecture_audit_passed", proof["failed_checks"])
         self.assertIn("cortex_phase_integration_passed", proof["failed_checks"])
 
     def test_trainer_resumes_checkpoint_with_gradient_accumulation(self):
@@ -762,6 +769,32 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             self.assertEqual(set(phase_report["phase_event_counts"]), {f"P{index}" for index in range(1, 11)})
             for phase_id, count in phase_report["phase_event_counts"].items():
                 self.assertGreater(count, 0, phase_id)
+            architecture_audit = phase_report["architecture_audit"]
+            self.assertTrue(architecture_audit["passed"], architecture_audit)
+            expected_components = {
+                "p1_to_p10_phase_activity",
+                "variable_in_compressor",
+                "exact_anchor_ledger",
+                "latent_memory_kv",
+                "ternary_core",
+                "skill_aware_experts",
+                "bit_ledger",
+                "skill_ledger",
+                "causal_ledger",
+                "uncertainty_ledger",
+                "future_contract_fsp",
+                "adaptive_multi_token_decoding",
+                "latent_reasoning_workspace",
+                "certificate_generator",
+                "hierarchical_dynamic_verifier",
+                "accept_reject_gate",
+                "attribute_regression",
+                "minimal_regrowth",
+                "sleep_consolidation_buffer",
+                "recursive_improvement",
+                "training_feedback_loop",
+            }
+            self.assertEqual(set(architecture_audit["checks_by_component"]), expected_components)
             influence = phase_report["training_influence"]
             self.assertGreater(influence["ternary_core_forward_events"], 0)
             self.assertGreater(influence["variable_input_compression_events"], 0)
@@ -804,6 +837,7 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             self.assertTrue((run_dir / "cortex_phase_report.json").exists())
             persisted = json.loads((run_dir / "cortex_phase_report.json").read_text(encoding="utf-8"))
             self.assertTrue(persisted["all_phases_active"], persisted)
+            self.assertTrue(persisted["architecture_audit"]["passed"], persisted["architecture_audit"])
             self.assertEqual(persisted["training_influence"]["sleep_replay_updates"], influence["sleep_replay_updates"])
             self.assertEqual(
                 persisted["training_influence"]["objective_feedback_events"],
@@ -942,6 +976,10 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 )
                 sidecar = json.loads((run_dir / "checkpoint_final.pt.json").read_text(encoding="utf-8"))
                 self.assertTrue(sidecar["cortex_phase_state_present"])
+                self.assertTrue(
+                    sidecar["cortex_phase_state_summary"]["architecture_audit"]["passed"],
+                    sidecar["cortex_phase_state_summary"]["architecture_audit"],
+                )
                 self.assertGreater(sidecar["cortex_phase_state_summary"]["replay_batch_count"], 0)
                 self.assertGreater(sidecar["cortex_phase_state_summary"]["objective_feedback_events"], 0)
                 self.assertGreater(sidecar["cortex_phase_state_summary"]["future_contract_decisions"], 0)
@@ -1108,6 +1146,7 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                         "all_phases_active": True,
                         "phase_event_counts": {f"P{index}": 1 for index in range(1, 11)},
                         "training_influence": {"sleep_replay_updates": 3},
+                        "architecture_audit": {"passed": True, "failed_checks": []},
                         "errors": [],
                     }
                 ),
@@ -1128,6 +1167,7 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             self.assertTrue(seed["baseline"]["latest_checkpoint"]["path"].endswith("checkpoint_step_1000.pt"))
             self.assertEqual(seed["baseline"]["last_validation"]["step"], 500)
             self.assertTrue(seed["cortex"]["cortex_phase_summary"]["all_phases_active"])
+            self.assertTrue(seed["cortex"]["cortex_phase_summary"]["architecture_audit"]["passed"])
             self.assertEqual(seed["cortex"]["cortex_phase_summary"]["training_influence"]["sleep_replay_updates"], 3)
 
     def test_trainer_rejects_resume_when_corpus_identity_changes(self):

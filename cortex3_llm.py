@@ -2470,6 +2470,249 @@ def _last_items(items: Sequence[Any], limit: int = 3) -> list[Any]:
     return list(items[-limit:])
 
 
+def _cortex_architecture_audit_from_summary(summary: Mapping[str, Any]) -> dict[str, Any]:
+    phase_counts = {str(key): int(value) for key, value in dict(summary.get("phase_event_counts") or {}).items()}
+    trace_counts = {str(key): int(value) for key, value in dict(summary.get("compression_trace_counts") or {}).items()}
+    replay_by_phase = {
+        str(key): int(value)
+        for key, value in dict(summary.get("phase_replay_examples_by_phase") or {}).items()
+    }
+
+    def number(key: str) -> float:
+        value = summary.get(key, 0)
+        try:
+            return float(value or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def integer(key: str) -> int:
+        return int(number(key))
+
+    def phase_count(phase_id: str) -> int:
+        return int(phase_counts.get(phase_id, 0))
+
+    def trace_count(name: str) -> int:
+        return int(trace_counts.get(name, 0))
+
+    def replay_count(phase_id: str) -> int:
+        return int(replay_by_phase.get(phase_id, 0))
+
+    raw_errors = summary.get("errors", ())
+    inferred_error_count = len(raw_errors) if isinstance(raw_errors, Sequence) and not isinstance(raw_errors, (str, bytes)) else 0
+    error_count = int(number("error_count")) if "error_count" in summary else inferred_error_count
+    improvement_decisions = integer("improvement_archive_accepted") + integer("improvement_archive_rejected")
+    required_phase_ids = tuple(phase.id for phase in CORTEX3_PHASES)
+    phase_observed = {phase_id: phase_count(phase_id) for phase_id in required_phase_ids}
+
+    checks: list[dict[str, Any]] = []
+
+    def add(component: str, passed: bool, observed: Mapping[str, Any], requirement: str) -> None:
+        checks.append(
+            {
+                "component": component,
+                "passed": bool(passed),
+                "observed": dict(observed),
+                "requirement": requirement,
+            }
+        )
+
+    add(
+        "p1_to_p10_phase_activity",
+        all(count > 0 for count in phase_observed.values()),
+        phase_observed,
+        "every Cortex-3 phase P1..P10 must have at least one training event",
+    )
+    add(
+        "variable_in_compressor",
+        integer("variable_input_compression_events") > 0 and trace_count("kv_events") > 0,
+        {
+            "variable_input_compression_events": integer("variable_input_compression_events"),
+            "kv_events": trace_count("kv_events"),
+        },
+        "Variable-In/KV compression must record real LLM batch events",
+    )
+    add(
+        "exact_anchor_ledger",
+        integer("input_anchor_observations") > 0
+        and integer("input_anchor_count") > 0
+        and integer("input_anchor_fidelity_failures") == 0,
+        {
+            "input_anchor_observations": integer("input_anchor_observations"),
+            "input_anchor_count": integer("input_anchor_count"),
+            "input_anchor_fidelity_failures": integer("input_anchor_fidelity_failures"),
+        },
+        "decoded input batches must create exact anchors with zero fidelity failures",
+    )
+    add(
+        "latent_memory_kv",
+        integer("memory_recent_segments") > 0 and integer("memory_latent_segments") > 0,
+        {
+            "memory_recent_segments": integer("memory_recent_segments"),
+            "memory_latent_segments": integer("memory_latent_segments"),
+        },
+        "Cognitive memory must contain both recent exact KV and latent compressed KV",
+    )
+    add(
+        "ternary_core",
+        trace_count("layer_forward_events") > 0
+        and trace_count("activation_quantizations") > 0
+        and trace_count("compression_decisions") > 0,
+        {
+            "layer_forward_events": trace_count("layer_forward_events"),
+            "activation_quantizations": trace_count("activation_quantizations"),
+            "compression_decisions": trace_count("compression_decisions"),
+        },
+        "ternary W in {-1,0,+1} core must run layer forwards and activation quantization",
+    )
+    add(
+        "skill_aware_experts",
+        trace_count("expert_activations") > 0,
+        {"expert_activations": trace_count("expert_activations")},
+        "skill-aware expert routing must activate experts during training",
+    )
+    add(
+        "bit_ledger",
+        number("bit_ledger_total_effective_bits") > 0.0,
+        {"bit_ledger_total_effective_bits": number("bit_ledger_total_effective_bits")},
+        "Bit ledger must accumulate non-zero effective bit cost",
+    )
+    add(
+        "skill_ledger",
+        integer("skill_ledger_states") > 0,
+        {"skill_ledger_states": integer("skill_ledger_states")},
+        "Skill ledger must record at least one skill state",
+    )
+    add(
+        "causal_ledger",
+        integer("causal_ledger_traces") > 0,
+        {"causal_ledger_traces": integer("causal_ledger_traces")},
+        "Causal ledger must record attribution/routing traces",
+    )
+    add(
+        "uncertainty_ledger",
+        integer("uncertainty_ledger_observations") > 0,
+        {"uncertainty_ledger_observations": integer("uncertainty_ledger_observations")},
+        "Uncertainty ledger must record confidence outcomes",
+    )
+    add(
+        "future_contract_fsp",
+        phase_count("P3") > 0 and integer("future_contract_decisions") > 0 and trace_count("mtp_fsp_events") > 0,
+        {
+            "P3": phase_count("P3"),
+            "future_contract_decisions": integer("future_contract_decisions"),
+            "mtp_fsp_events": trace_count("mtp_fsp_events"),
+        },
+        "Future Contract/FSP must gate real multi-horizon token predictions",
+    )
+    add(
+        "adaptive_multi_token_decoding",
+        phase_count("P8") > 0 and integer("future_contract_decisions") > 0 and trace_count("mtp_fsp_events") > 0,
+        {
+            "P8": phase_count("P8"),
+            "future_contract_decisions": integer("future_contract_decisions"),
+            "mtp_fsp_events": trace_count("mtp_fsp_events"),
+        },
+        "adaptive multi-token path must be active with MTP/FSP evidence",
+    )
+    add(
+        "latent_reasoning_workspace",
+        phase_count("P5") > 0 and integer("certificate_head_forward_events") > 0 and replay_count("P5") > 0,
+        {
+            "P5": phase_count("P5"),
+            "certificate_head_forward_events": integer("certificate_head_forward_events"),
+            "phase_replay_P5": replay_count("P5"),
+        },
+        "latent proof workspace must feed certificates and verified replay",
+    )
+    add(
+        "certificate_generator",
+        phase_count("P5") > 0 and integer("certificate_head_forward_events") > 0,
+        {
+            "P5": phase_count("P5"),
+            "certificate_head_forward_events": integer("certificate_head_forward_events"),
+        },
+        "certificate generator/head must run in training",
+    )
+    add(
+        "hierarchical_dynamic_verifier",
+        phase_count("P1") > 0 and integer("skill_ledger_states") > 0 and error_count == 0,
+        {
+            "P1": phase_count("P1"),
+            "skill_ledger_states": integer("skill_ledger_states"),
+            "error_count": error_count,
+        },
+        "hierarchical verifier must run with skill ledger state and no phase errors",
+    )
+    add(
+        "accept_reject_gate",
+        integer("future_contract_decisions") + improvement_decisions > 0,
+        {
+            "future_contract_decisions": integer("future_contract_decisions"),
+            "improvement_decisions": improvement_decisions,
+        },
+        "at least one verifier-controlled accept/reject gate decision must be recorded",
+    )
+    add(
+        "attribute_regression",
+        phase_count("P6") > 0 and integer("causal_ledger_traces") > 0 and replay_count("P6") > 0,
+        {
+            "P6": phase_count("P6"),
+            "causal_ledger_traces": integer("causal_ledger_traces"),
+            "phase_replay_P6": replay_count("P6"),
+        },
+        "attribute regression phase must produce causal evidence and replay",
+    )
+    add(
+        "minimal_regrowth",
+        phase_count("P7") > 0 and replay_count("P7") > 0,
+        {"P7": phase_count("P7"), "phase_replay_P7": replay_count("P7")},
+        "minimal regrowth must create a verified repair/regrowth replay path",
+    )
+    add(
+        "sleep_consolidation_buffer",
+        phase_count("P9") > 0
+        and integer("sleep_replay_examples") > 0
+        and integer("sleep_synthetic_examples") > 0
+        and integer("replay_batch_count") > 0,
+        {
+            "P9": phase_count("P9"),
+            "sleep_replay_examples": integer("sleep_replay_examples"),
+            "sleep_synthetic_examples": integer("sleep_synthetic_examples"),
+            "replay_batch_count": integer("replay_batch_count"),
+        },
+        "sleep/consolidation must emit verified replay plus synthetic examples",
+    )
+    add(
+        "recursive_improvement",
+        phase_count("P10") > 0 and improvement_decisions > 0,
+        {"P10": phase_count("P10"), "improvement_decisions": improvement_decisions},
+        "recursive improvement sandbox must evaluate at least one proposal",
+    )
+    add(
+        "training_feedback_loop",
+        integer("replay_updates") > 0
+        and integer("objective_feedback_events") > 0
+        and number("last_objective_loss_total") > 0.0,
+        {
+            "replay_updates": integer("replay_updates"),
+            "objective_feedback_events": integer("objective_feedback_events"),
+            "last_objective_loss_total": number("last_objective_loss_total"),
+        },
+        "verified Cortex replay and objective feedback must affect LLM optimization",
+    )
+
+    failed_checks = tuple(check["component"] for check in checks if not check["passed"])
+    return {
+        "schema_version": 1,
+        "passed": not failed_checks,
+        "failed_checks": failed_checks,
+        "checks": tuple(checks),
+        "checks_by_component": {check["component"]: check for check in checks},
+        "passed_count": sum(1 for check in checks if check["passed"]),
+        "component_count": len(checks),
+    }
+
+
 class CortexTrainingPhaseController:
     def __init__(
         self,
@@ -3047,7 +3290,7 @@ class CortexTrainingPhaseController:
         phase_counts = dict(self.phase_counts)
         if compression_trace_counts.get("layer_forward_events", 0) > 0:
             phase_counts["P2"] = max(phase_counts.get("P2", 0), compression_trace_counts["layer_forward_events"])
-        return {
+        summary = {
             "schema_version": 1,
             "phase_event_counts": phase_counts,
             "replay_batch_count": len(self.replay_batches),
@@ -3080,6 +3323,8 @@ class CortexTrainingPhaseController:
             "improvement_archive_rejected": self.improvement.archive.rejected_count,
             "error_count": len(self.errors),
         }
+        summary["architecture_audit"] = _cortex_architecture_audit_from_summary(summary)
+        return summary
 
     def run_phase_audit(self, *, step: int) -> Mapping[str, Any]:
         audit: dict[str, Any] = {"step": step}
@@ -3415,6 +3660,35 @@ class CortexTrainingPhaseController:
                 "objective_feedback_scale": self.objective_feedback_scale(),
                 "last_objective_loss_total": self.last_objective_loss_total,
             },
+            "architecture_audit": _cortex_architecture_audit_from_summary(
+                {
+                    "phase_event_counts": dict(self.phase_counts),
+                    "phase_replay_examples_by_phase": dict(self.phase_replay_examples),
+                    "replay_batch_count": len(self.replay_batches),
+                    "replay_updates": self.replay_updates,
+                    "objective_feedback_events": self.objective_feedback_events,
+                    "last_objective_loss_total": self.last_objective_loss_total,
+                    "future_contract_decisions": len(self.future_ledger.decisions),
+                    "compression_trace_counts": trace_counts,
+                    "variable_input_compression_events": trace_counts.get("kv_events", 0),
+                    "certificate_head_forward_events": int(self.model.certificate_forward_events),
+                    "input_anchor_observations": int(self.input_anchor_observations),
+                    "input_anchor_count": int(self.input_anchor_count),
+                    "input_anchor_fidelity_failures": int(self.input_anchor_fidelity_failures),
+                    "bit_ledger_total_effective_bits": self.bit_ledger.total_effective_bits,
+                    "skill_ledger_states": len(self.skill_ledger.states),
+                    "causal_ledger_traces": len(self.causal_ledger.traces),
+                    "uncertainty_ledger_observations": sum(len(pairs) for pairs in self.uncertainty_ledger.bins.values()),
+                    "memory_recent_segments": len(self.memory.recent.segments),
+                    "memory_latent_segments": len(self.memory.latent.segments),
+                    "sleep_replay_examples": len(self.sleep.replay.examples),
+                    "sleep_synthetic_examples": len(self.sleep.synthetic.examples),
+                    "sleep_reservoir_examples": len(self.sleep.reservoir.examples),
+                    "improvement_archive_accepted": self.improvement.archive.accepted_count,
+                    "improvement_archive_rejected": self.improvement.archive.rejected_count,
+                    "error_count": len(self.errors),
+                }
+            ),
             "trace_counts": trace_counts,
             "retained_trace_counts": compression_trace.get("retained_event_counts", {}),
             "future_ledger": self.future_ledger.to_dict(),
@@ -4181,11 +4455,18 @@ def _model_run_inspection(model_dir: Path) -> Mapping[str, Any]:
     final_sidecar = _read_json_if_exists(final_checkpoint.with_name(final_checkpoint.name + ".json"))
     training_report = _read_json_if_exists(model_dir / "training_report.json")
     cortex_phase_report = _read_json_if_exists(model_dir / "cortex_phase_report.json")
+    latest_sidecar = step_checkpoints[-1]["sidecar"] if step_checkpoints else None
+    latest_architecture_audit = {}
+    if isinstance(latest_sidecar, Mapping):
+        state_summary = latest_sidecar.get("cortex_phase_state_summary", {})
+        if isinstance(state_summary, Mapping):
+            latest_architecture_audit = dict(state_summary.get("architecture_audit") or {})
     return {
         "exists": model_dir.exists(),
         "latest_checkpoint_step": max((item["step"] for item in step_checkpoints), default=None),
         "checkpoint_count": len(step_checkpoints),
         "latest_checkpoint": step_checkpoints[-1] if step_checkpoints else None,
+        "latest_checkpoint_architecture_audit": latest_architecture_audit,
         "final_checkpoint_exists": final_checkpoint.exists(),
         "final_checkpoint_size_bytes": int(final_checkpoint.stat().st_size) if final_checkpoint.exists() else 0,
         "final_checkpoint_sidecar_exists": bool(final_sidecar),
@@ -4206,6 +4487,7 @@ def _model_run_inspection(model_dir: Path) -> Mapping[str, Any]:
             "all_phases_active": cortex_phase_report.get("all_phases_active"),
             "phase_event_counts": cortex_phase_report.get("phase_event_counts", {}),
             "training_influence": cortex_phase_report.get("training_influence", {}),
+            "architecture_audit": cortex_phase_report.get("architecture_audit", {}),
             "errors": cortex_phase_report.get("errors", ()),
         } if cortex_phase_report else {},
     }
@@ -4861,9 +5143,20 @@ class LLMComparisonRunner:
             and tuple(int(value) for value in raw_horizons) == (1, 2, 4, 8)
         )
         phase_report = cortex.cortex_phase_report if isinstance(cortex.cortex_phase_report, Mapping) else {}
+        architecture_audit = phase_report.get("architecture_audit", {}) if isinstance(phase_report, Mapping) else {}
+        if not isinstance(architecture_audit, Mapping):
+            architecture_audit = {}
+        cortex_architecture_audit_passed = (
+            (not cortex_full_phase_required)
+            or bool(architecture_audit.get("passed"))
+        )
         cortex_phase_integration_passed = (
             (not cortex_full_phase_required)
-            or (bool(phase_report.get("all_phases_active")) and not phase_report.get("errors"))
+            or (
+                bool(phase_report.get("all_phases_active"))
+                and not phase_report.get("errors")
+                and cortex_architecture_audit_passed
+            )
         )
         checks = {
             "finite_metrics": finite_metrics,
@@ -4873,6 +5166,7 @@ class LLMComparisonRunner:
             "learning_curve_audit_passed": learning_curve_audit_passed,
             "corpus_scale_passed": corpus_scale_passed,
             "planned_train_tokens_passed": planned_train_tokens_passed,
+            "cortex_architecture_audit_passed": cortex_architecture_audit_passed,
             "cortex_phase_integration_passed": cortex_phase_integration_passed,
         }
         failed_checks = tuple(name for name, passed_check in checks.items() if not passed_check)
@@ -4891,6 +5185,8 @@ class LLMComparisonRunner:
             "planned_train_tokens": planned_train_tokens,
             "min_planned_train_tokens": int(self.config.min_planned_train_tokens),
             "cortex_full_phase_required": cortex_full_phase_required,
+            "cortex_architecture_audit_passed": cortex_architecture_audit_passed,
+            "cortex_architecture_audit": dict(architecture_audit),
             "cortex_phase_integration_passed": cortex_phase_integration_passed,
             "checks": checks,
             "failed_checks": failed_checks,
