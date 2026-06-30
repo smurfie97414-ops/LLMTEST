@@ -12,12 +12,15 @@ Ce document explique comment l'architecture Cortex-3 complete agit pendant un en
 
 Dernier sidecar inspecte :
 
-- checkpoint : `checkpoint_step_165.pt.json`
+- checkpoint : `checkpoint_step_175.pt.json`
 - commit : `1e6366135e62097116e51e80ab7ab83a3c192da9`
 - architecture audit : `True 22/22`
 - phase deliverables : `True 10/10`
 - erreurs phase : `0`
 - termes de l'objectif final Cortex : `17/17`
+
+Observation ressource separee du meme run long :
+
 - GPU moyen observe : `95.7%`
 - CPU moyen observe : `36.4%`
 - VRAM moyenne observee : `11808.3 MB`
@@ -28,7 +31,7 @@ Evenements phase observes dans le checkpoint :
 | Phase | Evenements | Replay |
 | --- | ---: | ---: |
 | P1 | 3 | 3 |
-| P2 | 225212 | 0 |
+| P2 | 238652 | 0 |
 | P3 | 3 | 3 |
 | P4 | 3 | 3 |
 | P5 | 3 | 3 |
@@ -40,12 +43,27 @@ Evenements phase observes dans le checkpoint :
 
 P7 et P10 ont maintenant une preuve de modification reelle du modele :
 
-| Gate | Applications | Delta poids L1 | Repair loss delta |
-| --- | ---: | ---: | ---: |
-| P7 minimal regrowth | 1 | 880.410583 | 1.239653 |
-| P10 recursive improvement | 1 | 523.004089 | 0.056110 |
+| Gate | Applications | Delta poids L1 | Repair before | Repair after | Repair delta | Protected before | Protected after | Protected delta | Tolerance | Gate |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| P7 minimal regrowth | 1 | 880.410583 | 29.159054 | 27.919401 | 1.239653 | 29.138744 | 27.827297 | -1.311447 | 0.582775 | accepted |
+| P10 recursive improvement | 1 | 523.004089 | 27.872873 | 27.816763 | 0.056110 | 43.066746 | 43.136181 | 0.069435 | 0.861335 | accepted |
 
 Ces valeurs prouvent que les deux gates ne se limitent plus a produire du texte, des rapports ou du replay. Ils ont applique des patchs bornes sur les vrais parametres du Transformer, puis ont mesure une amelioration de loss sur la cible de reparation.
+
+## Convention Des Deltas De Reparation
+
+La convention est explicite dans `CortexTrainingPhaseController` :
+
+- `repair_loss_delta = repair_loss_before - repair_loss_after`
+- `protected_loss_delta = protected_loss_after - protected_loss_before`
+
+Donc :
+
+- un `repair_loss_delta` positif signifie une amelioration de la loss sur la cible de reparation ;
+- un `protected_loss_delta` positif signifie une hausse de loss sur les batchs proteges ;
+- le gate accepte seulement si `repair_loss_delta > 0`, `protected_loss_delta <= protected_loss_tolerance` et `parameter_delta_l1 > 0`.
+
+Dans le dernier sidecar inspecte, P7 ameliore aussi les batchs proteges (`protected_delta=-1.311447`). P10 augmente legerement la loss protegee (`+0.069435`), mais reste sous la tolerance (`0.861335`) et passe donc le gate de non-regression.
 
 ## Boucle LLM Complete
 
@@ -177,7 +195,7 @@ Correspondance runtime :
 | Latent Memory / KV | `CognitiveMemory` recent exact + latent old KV | audit `latent_memory_kv` |
 | Causal Ledger | `CausalLedger` + traces P1/P3/P4/P8/replay | audit `causal_ledger` |
 | Skill Ledger | `SkillLedger.update_from_report` | audit `skill_ledger` |
-| Ternary Core | `BitLinear`, quantization, requantization | P2 `225212` events |
+| Ternary Core | `BitLinear`, quantization, requantization | P2 `238652` events |
 | Skill-aware Experts | `SkillAwareExpertMoE` | audit `skill_aware_experts` |
 | Future Contract / FSP | `FutureContractEngine` + observed tokens | P3 replay + contract decisions |
 | Adaptive Multi-Token Decoding | MTP horizons + inference route | audit `adaptive_multi_token_decoding` |
@@ -266,7 +284,7 @@ Le gradient passe par les poids flottants avec une approximation runtime quantif
 
 ### Preuve Runtime
 
-Le checkpoint inspecte montre `P2=225212` evenements. C'est beaucoup plus qu'un smoke test ponctuel : le coeur ternaire tourne dans le run long.
+Le checkpoint inspecte montre `P2=238652` evenements. C'est beaucoup plus qu'un smoke test ponctuel : le coeur ternaire tourne dans le run long.
 
 ## Phase 3 - Future Contract / FSP / MTP
 
@@ -440,11 +458,18 @@ La modification directe est importante : elle fait de P7 un vrai mecanisme de re
 
 ### Preuve Runtime
 
-Checkpoint `step 165` :
+Checkpoint `step 175` :
 
 - applications P7 : `1`
 - delta poids L1 : `880.410583`
+- repair loss before : `29.159054`
+- repair loss after : `27.919401`
 - repair loss delta : `1.239653`
+- protected loss before : `29.138744`
+- protected loss after : `27.827297`
+- protected loss delta : `-1.311447`
+- protected loss tolerance : `0.582775`
+- gate : `accepted`
 
 ## Phase 8 - Adaptive Inference
 
@@ -568,11 +593,20 @@ P10 agit par :
 
 ### Preuve Runtime
 
-Checkpoint `step 165` :
+Checkpoint `step 175` :
 
 - applications P10 : `1`
 - delta poids L1 : `523.004089`
+- repair loss before : `27.872873`
+- repair loss after : `27.816763`
 - repair loss delta : `0.056110`
+- protected loss before : `43.066746`
+- protected loss after : `43.136181`
+- protected loss delta : `0.069435`
+- protected loss tolerance : `0.861335`
+- signed patch id : `c5c1e64a504bc61f407d380b0664978382fe1225c0c40a967a8f48957bfb0139`
+- rollback token : `rollback-proposal-0-mtp_head-arithmetic`
+- gate : `accepted`
 
 ## Objectif Final 17 Termes
 
@@ -635,6 +669,78 @@ La distinction importante est donc :
 
 - **Implementation integree reelle** : oui, prouvee par le checkpoint actuel.
 - **Preuve scientifique finale que Cortex-3 bat la baseline sur benchmark large** : pas encore, car le run long doit finir et `audit-experiment` doit passer.
+
+## Frontieres Restantes Vers La Vision Maximale
+
+L'avis externe qui dit "ce n'est pas encore la preuve maximale" est correct. Il ne contredit pas les preuves d'integration ; il se place au niveau plus exigeant de la demonstration finale du paradigme.
+
+### Memoire Cognitive Apprise
+
+Etat actuel :
+
+- `VariableInCompressor` est dans le forward PyTorch et peut apprendre une compression differentiable des representations ;
+- P4 observe de vrais batchs, extrait des ancres, reconstruit via memoire exacte/latente, verifie la fidelite et genere du replay.
+
+Limite actuelle :
+
+- `CognitiveMemory` agit encore surtout comme memoire exacte/latente verifiee et source de replay ;
+- la politique long terme "quoi garder, quoi oublier, quoi compresser, quoi preserver exactement" n'est pas encore prouvee comme politique memoire apprise et utile a grande echelle.
+
+Critere de fermeture :
+
+- ajouter une politique memoire trainable ou un gate appris sur retention/compression/oubli ;
+- mesurer son gain sur long contexte, anchors held-out, cout memoire, loss et qualite de generation.
+
+### Ternary Hardware-Native
+
+Etat actuel :
+
+- `BitLinear` tourne dans le forward ;
+- le coeur est requantifie apres optimizer step et apres patchs P7/P10 ;
+- les traces P2 prouvent une execution ternaire-compatible pendant le run.
+
+Limite actuelle :
+
+- l'execution reste PyTorch-compatible ;
+- il n'y a pas encore de kernel CUDA/custom hardware-native prouvant le gain final attendu d'un coeur ternaire optimise.
+
+Critere de fermeture :
+
+- fournir kernels ternaires optimises ou backend compile ;
+- benchmarker latence, VRAM, energie estimee, throughput et qualite face a une baseline dense.
+
+### Verifier Dynamique A Grande Echelle
+
+Etat actuel :
+
+- P1 couvre arithmetic, algebra, long context anchors, entity tracking, instruction following, code unit tests et calibration ;
+- ces familles alimentent attribution, regrowth, sleep et recursive improvement.
+
+Limite actuelle :
+
+- ce n'est pas encore un banc large avec domaines nombreux, oracles varies, held-out strict et adversarial sets massifs.
+
+Critere de fermeture :
+
+- elargir les generateurs et oracles ;
+- separer train/validation/held-out verifier tasks ;
+- publier les taux accept/reject, faux positifs, faux negatifs et regressions attribuees.
+
+### SlowSolve -> Compile -> FastSolve
+
+Etat actuel :
+
+- P1/P6/P7/P9/P10 creent detection lente, attribution, reparation, replay, consolidation et patchs ;
+- P8 mesure fast/normal/careful paths avec couts et verification.
+
+Limite actuelle :
+
+- la preuve finale manque encore : une competence resolue lentement et verifiee doit devenir rapide, moins chere, stable et generalisable a des taches nouvelles.
+
+Critere de fermeture :
+
+- suivre une famille de competences depuis slow solve jusqu'a fast solve ;
+- mesurer cout avant/apres, pass rate held-out, generalisation, non-regression et retention apres consolidation.
 
 ## Tests Courts Qui Demontrent L'Integration
 
