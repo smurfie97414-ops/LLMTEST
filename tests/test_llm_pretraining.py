@@ -1,7 +1,9 @@
+import io
 import json
 import os
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
@@ -36,6 +38,7 @@ from cortex3_llm import (
     build_seed_corpus,
     hardware_report,
     llm_doctor_report,
+    main as llm_main,
 )
 from tools.launch_llm_ddp import _manifest_requests_cuda, _train_args_request_cuda
 
@@ -493,6 +496,9 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             for shard in export_report.shard_files:
                 self.assertTrue(Path(shard).exists(), shard)
             self.assertTrue((root / "hf" / "hf_export_report.json").exists())
+            with patch("datasets.load_dataset", side_effect=AssertionError("resume should not reload dataset")):
+                resumed_export = HFDatasetTextExporter(export_config).export(root / "hf", resume=True)
+            self.assertEqual(resumed_export.to_dict(), export_report.to_dict())
 
             corpus = TextCorpusConfig.from_paths(export_report.shard_files, min_chars_per_chunk=128)
             tokenizer = LLMTokenizer.train(corpus, vocab_size=192, min_frequency=1)
@@ -508,6 +514,89 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 self.assertEqual(tuple(x.shape), (24,))
                 self.assertEqual(tuple(y.shape), (24,))
                 self.assertEqual(tuple(future.shape), (24, 4))
+
+    def test_hf_dataset_export_resume_rejects_incomplete_shards(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            jsonl = root / "dataset.jsonl"
+            with jsonl.open("w", encoding="utf-8") as handle:
+                for index in range(12):
+                    handle.write(json.dumps({"text": f"document {index:03d} resume integrity shard check."}) + "\n")
+            export_config = HFDatasetExportConfig(
+                dataset="json",
+                split="train",
+                text_field="text",
+                data_files=(str(jsonl),),
+                streaming=True,
+                max_documents=12,
+                shard_max_chars=512,
+            )
+            export_report = HFDatasetTextExporter(export_config).export(root / "hf")
+            Path(export_report.shard_files[0]).unlink()
+
+            with self.assertRaises(FileNotFoundError):
+                HFDatasetTextExporter(export_config).export(root / "hf", resume=True)
+
+    def test_prepare_hf_resume_reuses_tokenized_manifest_without_reloading_dataset(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            jsonl = root / "dataset.jsonl"
+            with jsonl.open("w", encoding="utf-8") as handle:
+                for index in range(24):
+                    handle.write(
+                        json.dumps(
+                            {
+                                "text": (
+                                    f"resume document {index:03d} keeps the prepared token memmap stable. "
+                                    f"checkpoint identity must survive repeated prepare-hf commands."
+                                )
+                            }
+                        )
+                        + "\n"
+                    )
+            out_dir = root / "prepared"
+            args = [
+                "prepare-hf",
+                "--dataset",
+                "json",
+                "--data-file",
+                str(jsonl),
+                "--out-dir",
+                str(out_dir),
+                "--max-documents",
+                "24",
+                "--shard-chars",
+                "768",
+                "--vocab-size",
+                "192",
+                "--min-frequency",
+                "1",
+                "--seq-len",
+                "24",
+                "--max-horizon",
+                "4",
+            ]
+            with redirect_stdout(io.StringIO()):
+                llm_main(args)
+            token_path = out_dir / "tokenized" / "tokens.uint32"
+            token_mtime = token_path.stat().st_mtime_ns
+            first_report = json.loads((out_dir / "prepare_report.json").read_text(encoding="utf-8"))
+
+            with patch("datasets.load_dataset", side_effect=AssertionError("resume should reuse HF export report")):
+                with redirect_stdout(io.StringIO()):
+                    llm_main([*args, "--resume"])
+
+            self.assertEqual(token_path.stat().st_mtime_ns, token_mtime)
+            resumed_report = json.loads((out_dir / "prepare_report.json").read_text(encoding="utf-8"))
+            self.assertEqual(resumed_report["manifest"], first_report["manifest"])
+            self.assertEqual(resumed_report["tokenization"], first_report["tokenization"])
+
+            changed_tokenizer_args = list(args)
+            changed_tokenizer_args[changed_tokenizer_args.index("--min-frequency") + 1] = "2"
+            with patch("datasets.load_dataset", side_effect=AssertionError("resume should validate before reload")):
+                with self.assertRaisesRegex(ValueError, "tokenization config"):
+                    with redirect_stdout(io.StringIO()):
+                        llm_main([*changed_tokenizer_args, "--resume"])
 
     def test_hf_dataset_export_namespaced_id_error_is_actionable(self):
         config = HFDatasetExportConfig(

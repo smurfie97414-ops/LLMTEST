@@ -272,21 +272,90 @@ class HFDatasetExportReport:
     streaming: bool
     config_name: str | None = None
     data_files: tuple[str, ...] = ()
+    trust_remote_code: bool = False
+    cache_dir: str | None = None
+    max_documents: int | None = None
+    max_characters: int | None = None
+    allow_unbounded: bool = False
+    min_text_chars: int = 1
+    shard_max_chars: int = 64 * 1024 * 1024
     truncated_reason: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+    @staticmethod
+    def load(path: str | Path) -> "HFDatasetExportReport":
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+        payload["shard_files"] = tuple(payload["shard_files"])
+        payload["data_files"] = tuple(payload.get("data_files", ()))
+        payload.setdefault("trust_remote_code", False)
+        payload.setdefault("cache_dir", None)
+        payload.setdefault("max_documents", None)
+        payload.setdefault("max_characters", None)
+        payload.setdefault("allow_unbounded", False)
+        payload.setdefault("min_text_chars", 1)
+        payload.setdefault("shard_max_chars", 64 * 1024 * 1024)
+        payload.setdefault("truncated_reason", None)
+        return HFDatasetExportReport(**payload)
+
+    def matches_config(self, config: HFDatasetExportConfig) -> bool:
+        return self.config_mismatches(config) == ()
+
+    def config_mismatches(self, config: HFDatasetExportConfig) -> tuple[str, ...]:
+        expected = {
+            "dataset": config.dataset,
+            "split": config.split,
+            "text_field": config.text_field,
+            "config_name": config.config_name,
+            "data_files": tuple(config.data_files),
+            "streaming": config.streaming,
+            "trust_remote_code": config.trust_remote_code,
+            "cache_dir": config.cache_dir,
+            "max_documents": config.max_documents,
+            "max_characters": config.max_characters,
+            "allow_unbounded": config.allow_unbounded,
+            "min_text_chars": config.min_text_chars,
+            "shard_max_chars": config.shard_max_chars,
+        }
+        actual = {key: getattr(self, key) for key in expected}
+        return tuple(key for key, expected_value in expected.items() if actual[key] != expected_value)
+
+    def validate_artifacts(self) -> None:
+        if self.shard_count != len(self.shard_files):
+            raise ValueError("HF export report shard_count does not match shard_files")
+        if self.document_count < 1:
+            raise ValueError("HF export report has no usable documents")
+        if self.character_count < 1:
+            raise ValueError("HF export report has no exported characters")
+        missing = [path for path in self.shard_files if not Path(path).exists()]
+        if missing:
+            raise FileNotFoundError(f"HF export resume is missing shard files: {missing[:5]}")
+        empty = [path for path in self.shard_files if Path(path).stat().st_size == 0]
+        if empty:
+            raise ValueError(f"HF export resume found empty shard files: {empty[:5]}")
 
 
 class HFDatasetTextExporter:
     def __init__(self, config: HFDatasetExportConfig):
         self.config = config
 
-    def export(self, output_dir: str | Path) -> HFDatasetExportReport:
+    def export(self, output_dir: str | Path, *, resume: bool = False) -> HFDatasetExportReport:
         output = Path(output_dir)
         shard_dir = output / "text_shards"
+        report_path = output / "hf_export_report.json"
         output.mkdir(parents=True, exist_ok=True)
         shard_dir.mkdir(parents=True, exist_ok=True)
+        if resume and report_path.exists():
+            report = HFDatasetExportReport.load(report_path)
+            report.validate_artifacts()
+            mismatches = report.config_mismatches(self.config)
+            if mismatches:
+                joined = ", ".join(mismatches)
+                raise ValueError(f"existing HF export report does not match requested config fields: {joined}")
+            return report
+        if resume and any(shard_dir.glob("shard_*.txt")):
+            raise FileExistsError(f"resume=True found text shards without a complete export report: {shard_dir}")
         for stale in shard_dir.glob("shard_*.txt"):
             stale.unlink()
 
@@ -358,9 +427,16 @@ class HFDatasetTextExporter:
             streaming=self.config.streaming,
             config_name=self.config.config_name,
             data_files=self.config.data_files,
+            trust_remote_code=self.config.trust_remote_code,
+            cache_dir=self.config.cache_dir,
+            max_documents=self.config.max_documents,
+            max_characters=self.config.max_characters,
+            allow_unbounded=self.config.allow_unbounded,
+            min_text_chars=self.config.min_text_chars,
+            shard_max_chars=self.config.shard_max_chars,
             truncated_reason=truncated_reason,
         )
-        _write_json(output / "hf_export_report.json", report.to_dict())
+        _write_json(report_path, report.to_dict())
         return report
 
     def _load_dataset(self) -> Iterable[Mapping[str, Any]]:
@@ -2782,7 +2858,10 @@ class LLMExperimentRunner:
                 min_text_chars=int(corpus_payload["min_text_chars"]),
                 shard_max_chars=int(corpus_payload["shard_max_chars"]),
             )
-            export_report = HFDatasetTextExporter(export_config).export(corpus_dir)
+            export_report = HFDatasetTextExporter(export_config).export(
+                corpus_dir,
+                resume=bool(self.manifest["training"]["resume"]),
+            )
             corpus = TextCorpusConfig.from_paths(
                 export_report.shard_files,
                 min_chars_per_chunk=int(corpus_payload["min_chars_per_chunk"]),
@@ -3482,6 +3561,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     prepare_hf.add_argument("--seq-len", type=int, default=128)
     prepare_hf.add_argument("--max-horizon", type=int, default=8)
     prepare_hf.add_argument("--train-fraction", type=float, default=0.9)
+    prepare_hf.add_argument("--resume", action="store_true", help="reuse a verified existing HF export and tokenized corpus")
 
     args = parser.parse_args(argv)
     if args.command == "doctor":
@@ -3578,21 +3658,46 @@ def main(argv: Sequence[str] | None = None) -> None:
             min_text_chars=args.min_text_chars,
             shard_max_chars=args.shard_chars,
         )
-        export_report = HFDatasetTextExporter(hf_config).export(out_dir)
+        export_report = HFDatasetTextExporter(hf_config).export(out_dir, resume=args.resume)
         corpus = TextCorpusConfig.from_paths(export_report.shard_files, min_chars_per_chunk=args.min_chars_per_chunk)
-        tokenizer = LLMTokenizer.train(corpus, vocab_size=args.vocab_size, min_frequency=args.min_frequency)
-        manifest = TokenizedCorpusBuilder(corpus, tokenizer).build(
-            out_dir / "tokenized",
-            seq_len=args.seq_len,
-            max_horizon=args.max_horizon,
-            train_fraction=args.train_fraction,
-        )
+        tokenization_config = {
+            "min_chars_per_chunk": int(args.min_chars_per_chunk),
+            "vocab_size": int(args.vocab_size),
+            "min_frequency": int(args.min_frequency),
+            "seq_len": int(args.seq_len),
+            "max_horizon": int(args.max_horizon),
+            "train_fraction": float(args.train_fraction),
+        }
+        tokenized_dir = out_dir / "tokenized"
+        tokenized_manifest_path = tokenized_dir / "manifest.json"
+        prepare_report_path = out_dir / "prepare_report.json"
+        if args.resume and tokenized_manifest_path.exists():
+            if not prepare_report_path.exists():
+                raise FileNotFoundError(f"resume=True found tokenized manifest without prepare_report.json: {prepare_report_path}")
+            previous_prepare = json.loads(prepare_report_path.read_text(encoding="utf-8"))
+            if previous_prepare.get("tokenization") != tokenization_config:
+                raise ValueError("existing prepare_report tokenization config does not match requested prepare-hf arguments")
+            manifest = TokenizedCorpusManifest.load(tokenized_manifest_path)
+            manifest.identity()
+            if manifest.source_files != export_report.shard_files:
+                raise ValueError("existing tokenized corpus source_files do not match resumed HF export shards")
+        else:
+            if args.resume and tokenized_dir.exists() and any(tokenized_dir.iterdir()):
+                raise FileExistsError(f"resume=True found incomplete tokenized artifacts without manifest: {tokenized_dir}")
+            tokenizer = LLMTokenizer.train(corpus, vocab_size=args.vocab_size, min_frequency=args.min_frequency)
+            manifest = TokenizedCorpusBuilder(corpus, tokenizer).build(
+                tokenized_dir,
+                seq_len=args.seq_len,
+                max_horizon=args.max_horizon,
+                train_fraction=args.train_fraction,
+            )
         payload = {
             "hf_export": export_report.to_dict(),
             "manifest": manifest.to_dict(),
+            "tokenization": tokenization_config,
             "command": "prepare-hf",
         }
-        _write_json(out_dir / "prepare_report.json", payload)
+        _write_json(prepare_report_path, payload)
         print(json.dumps(payload, indent=2, sort_keys=True, default=_json_default))
         return
 

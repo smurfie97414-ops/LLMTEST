@@ -251,6 +251,7 @@ Pour préparer un corpus Hugging Face massif en shards texte puis memmap tokenis
 
 ```bash
 python tools/train_llm.py prepare-hf --dataset allenai/c4 --config-name en --split train --text-field text --out-dir runs/c4-prepared --max-documents 1000000 --vocab-size 32768 --seq-len 1024 --max-horizon 8
+python tools/train_llm.py prepare-hf --dataset allenai/c4 --config-name en --split train --text-field text --out-dir runs/c4-prepared --max-documents 1000000 --vocab-size 32768 --seq-len 1024 --max-horizon 8 --resume
 python tools/train_llm.py prepare-hf --dataset Salesforce/wikitext --config-name wikitext-2-raw-v1 --split train --text-field text --out-dir runs/wikitext2-prepared --max-documents 200 --vocab-size 512 --seq-len 64 --max-horizon 4
 python tools/train_llm.py compare runs/c4-prepared/text_shards --out-dir runs/c4-cortex-vs-ntp --steps 2000 --batch-size 64 --gradient-accumulation-steps 4 --checkpoint-interval 100 --precision bf16
 python tools/train_llm.py compare-matrix runs/c4-prepared/text_shards --out-dir runs/c4-cortex-vs-ntp-matrix --seeds 11,23,37 --steps 2000 --batch-size 64 --gradient-accumulation-steps 4 --checkpoint-interval 100 --precision bf16 --require-win
@@ -265,9 +266,9 @@ Pour un dataset local JSONL compatible Hugging Face :
 python tools/train_llm.py prepare-hf --dataset json --data-file path/to/corpus.jsonl --split train --text-field text --out-dir runs/json-prepared
 ```
 
-Sans limite explicite, `prepare-hf` plafonne l'export à 100 000 documents pour éviter un lancement massif accidentel. Pour un vrai job complet, passe une limite de caractères/documents adaptée ou `--allow-unbounded` de façon explicite.
+Sans limite explicite, `prepare-hf` plafonne l'export à 100 000 documents pour éviter un lancement massif accidentel. Pour un vrai job complet, passe une limite de caractères/documents adaptée ou `--allow-unbounded` de façon explicite. `prepare-hf --resume` réutilise uniquement un export HF complet avec `hf_export_report.json`, shards présents, `prepare_report.json` et manifest tokenisé vérifié ; si les shards, le rapport ou la config de tokenization ne correspondent pas, la commande échoue au lieu d'écraser ou de reconstruire silencieusement.
 
-`--resume` reprend strictement depuis `checkpoint_final.pt` ou le plus récent `checkpoint_step_*.pt` du dossier baseline/Cortex. Si le corpus manifest, l'identité SHA-256 du corpus, le checkpoint attendu ou le champ `corpus_identity` manque, ou si le checkpoint ne correspond pas au corpus courant, la commande échoue au lieu de repartir de zéro silencieusement.
+Pour l'entraînement, `--resume` reprend strictement depuis `checkpoint_final.pt` ou le plus récent `checkpoint_step_*.pt` du dossier baseline/Cortex. Si le corpus manifest, l'identité SHA-256 du corpus, le checkpoint attendu ou le champ `corpus_identity` manque, ou si le checkpoint ne correspond pas au corpus courant, la commande échoue au lieu de repartir de zéro silencieusement.
 
 Pour refuser tout fallback CPU quand un run GPU est obligatoire :
 

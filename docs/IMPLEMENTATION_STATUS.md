@@ -390,6 +390,7 @@ Current executable coverage:
 - `tools/train_llm.py benchmark-matrix` exposes the multi-domain x multi-seed proof gate and fails `--require-win` unless every seed-domain sample wins with a nonzero baseline and bounded next-token regression.
 - `tools/launch_llm_ddp.py` launches true local multi-process DDP workers, pins the Gloo interface and writes per-rank logs.
 - `.github/workflows/ci.yml` runs the LLM smoke command.
+- `prepare-hf --resume` reuses only complete HF export reports and tokenized manifests whose tokenization config still matches; missing shards, incomplete tokenized directories and changed tokenizer args fail loudly instead of deleting or rebuilding long-running corpus preparation work.
 - Tokenized corpus manifests now carry SHA-256 hashes for the token memmap, tokenizer and source shards; `run_plan.json`, training reports and checkpoints include a corpus identity digest, and `LLMTrainer` refuses resume from missing or mismatched `corpus_identity` checkpoints.
 - Single comparison reports now require `baseline_score >= min_baseline_future_tokens_per_cost`; a Cortex ratio computed against a zero baseline is recorded with `failed_checks=["baseline_score_passed"]` and cannot pass `--require-win`.
 
@@ -416,7 +417,7 @@ Evidence:
 - DDP root cause and fix: the local Windows/Gloo path needs explicit TCPStore `use_libuv=False`; when Gloo auto-selected a bad host route it tried `kubernetes.docker.internal`. Cortex now pins `GLOO_SOCKET_IFNAME` and uses an explicit `TCPStore(..., use_libuv=False)` for local Gloo env initialization.
 - `.\.venv\Scripts\python.exe tools\launch_llm_ddp.py --nproc 2 --master-port 29752 --gloo-interface Ethernet --timeout 240 -- smoke --out-dir runs\llm-ddp-smoke-validation --steps 48 --precision bf16 --require-win`
 - DDP smoke proof through `codex-test`: `world_size=2`, `distributed=True`, proof passed, baseline score `0.002790`, Cortex score `0.149740`, Cortex/baseline `53.667x`, next-token-loss regression ratio `0.952`.
-- `prepare-hf` is covered with a local Hugging Face JSONL dataset path that exports 30 documents into multiple shards, writes `hf_export_report.json`, trains a BPE tokenizer and builds a causal memmap manifest.
+- `prepare-hf` is covered with a local Hugging Face JSONL dataset path that exports 30 documents into multiple shards, writes `hf_export_report.json`, trains a BPE tokenizer and builds a causal memmap manifest. Resume coverage verifies that a completed export does not reload the dataset, missing shards are rejected, an existing token memmap is reused unchanged, and changed tokenizer arguments are rejected.
 - CLI HF/text validation: `tools\train_llm.py prepare-hf --dataset text --data-file README.md ...` exported 148 documents into 15 shards and built a 9,331-token `uint32` memmap.
 - External HF validation: `tools\train_llm.py prepare-hf --dataset Salesforce/wikitext --config-name wikitext-2-raw-v1 --split train --text-field text --out-dir runs\hf-wikitext2-validation --max-documents 200 --min-text-chars 20 --shard-chars 4096 --vocab-size 512 --seq-len 64 --max-horizon 4` exported 200 Wikitext documents into 19 shards and built a 29,008-token `uint32` memmap. The older short id `wikitext` was rejected by the current HF stack with a `namespace/name` error; the exporter now converts that failure into an actionable namespaced-id message.
 - HF-prepared compare smoke: `tools\train_llm.py compare runs\hf-text-cli-default-cap\text_shards ... --precision bf16` passed with baseline score `0.002778`, Cortex score `0.011719`, Cortex/baseline `4.219x`, next-token-loss regression ratio `0.976`.
@@ -434,7 +435,7 @@ Evidence:
 - CLI resume validation: `tools\train_llm.py smoke --out-dir runs\llm-resume-cli-validation --steps 2 ...` then `--steps 4 --resume ...` resumed both `baseline_ntp` and `cortex3` from `checkpoint_final.pt` with `start_step=2`, `optimizer_steps=2`, `effective_batch_size=16` and `final_step=4`.
 - DDP accumulation validation: `tools\launch_llm_ddp.py --nproc 2 ... --gradient-accumulation-steps 2` completed with `distributed=True`, `world_size=2`, proof passed and `effective_batch_size=32` for both baseline and Cortex.
 - DDP CUDA preflight validation: `tools\launch_llm_ddp.py --nproc 2 ... --device cuda --require-cuda` now fails before spawning workers because one visible CUDA device cannot serve two local CUDA ranks; CPU/Gloo DDP still passed after the CUDA wheel install.
-- `.\.venv\Scripts\python.exe -m unittest discover -s tests`: `129` tests passed.
+- `.\.venv\Scripts\python.exe -m unittest discover -s tests`: `131` tests passed.
 
 Remaining:
 
