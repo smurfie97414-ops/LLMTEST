@@ -13,12 +13,15 @@ from cortex3_llm import (
     HFDatasetTextExporter,
     LLMBenchmarkSuite,
     LLMComparisonRunner,
+    LLMTrainer,
     LLMTokenizer,
     MemmapCausalDataset,
     PrecisionPolicy,
     TextCorpusConfig,
     TokenizedCorpusBuilder,
     TrainingConfig,
+    TransformerConfig,
+    CortexTransformerLM,
     build_seed_corpus,
     hardware_report,
 )
@@ -54,6 +57,86 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 self.assertEqual(int(y[0]), int(future[0, 0]))
             finally:
                 train.close()
+
+    def test_trainer_resumes_checkpoint_with_gradient_accumulation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            corpus = self._corpus(root, repeats=80)
+            tokenizer = LLMTokenizer.train(corpus, vocab_size=192, min_frequency=1)
+            manifest = TokenizedCorpusBuilder(corpus, tokenizer).build(
+                root / "prepared",
+                seq_len=16,
+                max_horizon=2,
+            )
+            model_config = TransformerConfig(
+                vocab_size=manifest.vocab_size,
+                seq_len=16,
+                d_model=32,
+                n_heads=4,
+                n_layers=1,
+                dropout=0.0,
+                horizons=(1, 2),
+                use_cortex_heads=True,
+            )
+            train = MemmapCausalDataset(manifest, split="train")
+            val = MemmapCausalDataset(manifest, split="val")
+            try:
+                first_config = TrainingConfig(
+                    steps=2,
+                    batch_size=2,
+                    gradient_accumulation_steps=2,
+                    eval_interval=1,
+                    eval_batches=1,
+                    checkpoint_interval=1,
+                    seed=31,
+                    num_threads=1,
+                )
+                run_dir = root / "resume-run"
+                first = LLMTrainer(
+                    CortexTransformerLM(model_config),
+                    train,
+                    val,
+                    first_config,
+                    run_dir=run_dir,
+                    model_kind="cortex3_multi_horizon",
+                ).train(name="cortex3")
+                self.assertEqual(first.start_step, 0)
+                self.assertEqual(first.optimizer_steps, 2)
+                self.assertEqual(first.effective_batch_size, 4)
+                self.assertTrue((run_dir / "checkpoint_step_1.pt").exists())
+                self.assertTrue((run_dir / "checkpoint_final.pt").exists())
+
+                resumed_config = TrainingConfig(
+                    steps=4,
+                    batch_size=2,
+                    gradient_accumulation_steps=2,
+                    eval_interval=1,
+                    eval_batches=1,
+                    checkpoint_interval=1,
+                    seed=31,
+                    resume=True,
+                    num_threads=1,
+                )
+                resumed = LLMTrainer(
+                    CortexTransformerLM(model_config),
+                    train,
+                    val,
+                    resumed_config,
+                    run_dir=run_dir,
+                    model_kind="cortex3_multi_horizon",
+                ).train(name="cortex3")
+                self.assertEqual(resumed.start_step, 2)
+                self.assertEqual(resumed.optimizer_steps, 2)
+                self.assertEqual(resumed.effective_batch_size, 4)
+                self.assertEqual(resumed.final_val.step, 4)
+                self.assertEqual(Path(resumed.resumed_from).name, "checkpoint_final.pt")
+                checkpoint = torch.load(run_dir / "checkpoint_final.pt", map_location="cpu", weights_only=False)
+                self.assertEqual(checkpoint["step"], 4)
+                self.assertIn("rng_state", checkpoint)
+                self.assertGreaterEqual(len(checkpoint["curve"]), len(first.curve))
+            finally:
+                train.close()
+                val.close()
 
     def test_hf_dataset_export_builds_real_text_shards_and_token_memmap(self):
         with tempfile.TemporaryDirectory() as tmp:

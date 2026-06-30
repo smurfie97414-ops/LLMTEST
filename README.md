@@ -187,14 +187,15 @@ Ce smoke construit un corpus texte déterministe, entraîne un tokenizer BPE, é
 Pour un corpus plus large :
 
 ```bash
-python tools/train_llm.py compare path/to/text_shards --out-dir runs/llm-large --steps 2000 --batch-size 64 --precision bf16
+python tools/train_llm.py compare path/to/text_shards --out-dir runs/llm-large --steps 2000 --batch-size 64 --gradient-accumulation-steps 4 --checkpoint-interval 100 --precision bf16
+python tools/train_llm.py compare path/to/text_shards --out-dir runs/llm-large --steps 4000 --resume --batch-size 64 --gradient-accumulation-steps 4 --precision bf16
 ```
 
 Pour préparer un corpus Hugging Face massif en shards texte puis memmap tokenisé :
 
 ```bash
 python tools/train_llm.py prepare-hf --dataset allenai/c4 --config-name en --split train --text-field text --out-dir runs/c4-prepared --max-documents 1000000 --vocab-size 32768 --seq-len 1024 --max-horizon 8
-python tools/train_llm.py compare runs/c4-prepared/text_shards --out-dir runs/c4-cortex-vs-ntp --steps 2000 --batch-size 64 --precision bf16
+python tools/train_llm.py compare runs/c4-prepared/text_shards --out-dir runs/c4-cortex-vs-ntp --steps 2000 --batch-size 64 --gradient-accumulation-steps 4 --checkpoint-interval 100 --precision bf16
 ```
 
 Pour un dataset local JSONL compatible Hugging Face :
@@ -204,6 +205,8 @@ python tools/train_llm.py prepare-hf --dataset json --data-file path/to/corpus.j
 ```
 
 Sans limite explicite, `prepare-hf` plafonne l'export à 100 000 documents pour éviter un lancement massif accidentel. Pour un vrai job complet, passe une limite de caractères/documents adaptée ou `--allow-unbounded` de façon explicite.
+
+`--resume` reprend strictement depuis `checkpoint_final.pt` ou le plus récent `checkpoint_step_*.pt` du dossier baseline/Cortex. Si le corpus manifest ou le checkpoint attendu manque, la commande échoue au lieu de repartir de zéro silencieusement.
 
 Pour refuser tout fallback CPU quand un run GPU est obligatoire :
 

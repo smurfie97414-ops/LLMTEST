@@ -371,7 +371,7 @@ Current executable coverage:
 - `MemmapCausalDataset` samples causal next-token targets and multi-horizon future targets directly from the memmap.
 - `CortexTransformerLM` is a complete causal Transformer with tied embeddings, causal self-attention, MLP blocks and optional Cortex multi-horizon heads.
 - `CortexObjective` optimizes next-token loss plus Cortex MTP, temporal-consistency and confidence terms when the Cortex heads are enabled.
-- `LLMTrainer` supports checkpoints, CSV learning curves, deterministic random sampling, explicit device selection, mixed precision policy and DDP initialization from environment, including a Windows/Gloo TCPStore path that avoids unsupported libuv builds.
+- `LLMTrainer` supports checkpoints, strict resume, optimizer/scaler/RNG state persistence, gradient accumulation, CSV learning curves, deterministic random sampling, explicit device selection, mixed precision policy and DDP initialization from environment, including a Windows/Gloo TCPStore path that avoids unsupported libuv builds.
 - `PrecisionPolicy(require_cuda=True)` raises when CUDA is required but unavailable, preventing silent CPU fallback.
 - `LLMComparisonRunner` trains a baseline next-token Transformer and a Cortex multi-horizon Transformer on the same corpus/cache, then writes `comparison_report.json`, `report.md`, `learning_curve.png`, both final checkpoints and both learning-curve CSV files.
 - `LLMBenchmarkSuite` runs multiple deterministic domains, persists per-domain comparison artifacts and writes an aggregate `benchmark_report.json`, `benchmark_report.md` and `benchmark_ratios.png`.
@@ -386,14 +386,17 @@ Evidence:
 - `.\.venv\Scripts\python.exe tools\train_llm.py smoke --out-dir runs\llm-smoke-dev-48 --steps 48 --require-win`
 - Smoke proof: baseline score `0.022321`, Cortex score `0.145833`, Cortex/baseline `6.533x`, next-token-loss regression ratio `1.020`, proof passed.
 - `.\.venv\Scripts\python.exe tools\train_llm.py benchmark --out-dir runs\llm-benchmark-validation --domains sequence,anchors --repeats 96 --steps 48 --batch-size 8 --precision bf16 --require-win`
-- Benchmark proof through `codex-test`: `2/2` domains passed, mean Cortex/baseline ratio `35.751x`, minimum domain ratio `7.919x`, mean baseline score `0.010324`, max next-token-loss regression ratio `1.000093`.
+- Benchmark proof through `codex-test` with `gradient_accumulation_steps=2`: `2/2` domains passed, mean Cortex/baseline ratio `32.097x`, minimum domain ratio `25.861x`, mean baseline score `0.005301`, max next-token-loss regression ratio `1.001049`.
 - DDP root cause and fix: the local Windows CPU PyTorch build exposes Gloo but `torchrun` elastic requests TCPStore libuv that is not compiled in; when Gloo auto-selected a bad host route it tried `kubernetes.docker.internal`. Cortex now pins `GLOO_SOCKET_IFNAME` and uses an explicit `TCPStore(..., use_libuv=False)` for local Gloo env initialization.
 - `.\.venv\Scripts\python.exe tools\launch_llm_ddp.py --nproc 2 --master-port 29752 --gloo-interface Ethernet --timeout 240 -- smoke --out-dir runs\llm-ddp-smoke-validation --steps 48 --precision bf16 --require-win`
 - DDP smoke proof through `codex-test`: `world_size=2`, `distributed=True`, proof passed, baseline score `0.002790`, Cortex score `0.149740`, Cortex/baseline `53.667x`, next-token-loss regression ratio `0.952`.
 - `prepare-hf` is covered with a local Hugging Face JSONL dataset path that exports 30 documents into multiple shards, writes `hf_export_report.json`, trains a BPE tokenizer and builds a causal memmap manifest.
 - CLI HF/text validation: `tools\train_llm.py prepare-hf --dataset text --data-file README.md ...` exported 148 documents into 15 shards and built a 9,331-token `uint32` memmap.
 - HF-prepared compare smoke: `tools\train_llm.py compare runs\hf-text-cli-default-cap\text_shards ... --precision bf16` passed with baseline score `0.002778`, Cortex score `0.011719`, Cortex/baseline `4.219x`, next-token-loss regression ratio `0.976`.
-- `.\.venv\Scripts\python.exe -m unittest discover -s tests`: `116` tests passed.
+- Checkpoint resume unit coverage: a Cortex trainer runs two optimizer steps with `gradient_accumulation_steps=2`, writes step/final checkpoints, resumes from `checkpoint_final.pt` to step 4 and preserves curve plus RNG state in the checkpoint payload.
+- CLI resume validation: `tools\train_llm.py smoke --out-dir runs\llm-resume-cli-validation --steps 2 ...` then `--steps 4 --resume ...` resumed both `baseline_ntp` and `cortex3` from `checkpoint_final.pt` with `start_step=2`, `optimizer_steps=2`, `effective_batch_size=16` and `final_step=4`.
+- DDP accumulation validation: `tools\launch_llm_ddp.py --nproc 2 ... --gradient-accumulation-steps 2` completed with `distributed=True`, `world_size=2`, proof passed and `effective_batch_size=32` for both baseline and Cortex.
+- `.\.venv\Scripts\python.exe -m unittest discover -s tests`: `117` tests passed.
 
 Remaining:
 

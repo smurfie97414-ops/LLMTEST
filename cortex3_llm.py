@@ -824,6 +824,7 @@ class PrecisionPolicy:
 class TrainingConfig:
     steps: int = 200
     batch_size: int = 32
+    gradient_accumulation_steps: int = 1
     learning_rate: float = 3e-4
     weight_decay: float = 0.01
     grad_clip: float = 1.0
@@ -835,6 +836,8 @@ class TrainingConfig:
     require_cuda: bool = False
     distributed: bool = False
     gloo_interface: str | None = None
+    resume: bool = False
+    resume_from_checkpoint: str | None = None
     checkpoint_interval: int = 100
     num_threads: int | None = None
 
@@ -843,8 +846,12 @@ class TrainingConfig:
             raise ValueError("steps must be positive")
         if self.batch_size < 1:
             raise ValueError("batch_size must be positive")
+        if self.gradient_accumulation_steps < 1:
+            raise ValueError("gradient_accumulation_steps must be positive")
         if self.eval_interval < 1:
             raise ValueError("eval_interval must be positive")
+        if self.checkpoint_interval < 1:
+            raise ValueError("checkpoint_interval must be positive")
 
 
 @dataclass(frozen=True)
@@ -867,6 +874,10 @@ class TrainingRunReport:
     model_kind: str
     run_dir: str
     checkpoint_path: str
+    start_step: int
+    optimizer_steps: int
+    effective_batch_size: int
+    resumed_from: str | None
     final_train: TrainingPoint
     final_val: TrainingPoint
     curve: tuple[TrainingPoint, ...]
@@ -1006,38 +1017,61 @@ class LLMTrainer:
         optimizer = torch.optim.AdamW(trainable.parameters(), lr=self.config.learning_rate, weight_decay=self.config.weight_decay)
         scaler = self.precision.scaler(self.device.type)
         curve: list[TrainingPoint] = []
-        curve.append(self.evaluate(self.train_data, split="train", step=0))
-        curve.append(self.evaluate(self.val_data, split="val", step=0))
-        for step in range(1, self.config.steps + 1):
+        resumed_from = self._resolve_resume_checkpoint()
+        start_step = 0
+        if resumed_from is not None:
+            start_step, curve = self.load_checkpoint(resumed_from, optimizer=optimizer, scaler=scaler, restore_rng=not runtime.enabled)
+            if start_step > self.config.steps:
+                raise ValueError(f"checkpoint step {start_step} is greater than target steps {self.config.steps}")
+            if runtime.enabled:
+                resumed_seed = self.config.seed + runtime.rank * 100_003 + start_step * 997
+                torch.manual_seed(resumed_seed)
+                random.seed(resumed_seed)
+                np.random.seed(resumed_seed)
+                self.generator.manual_seed(resumed_seed)
+        else:
+            curve.append(self.evaluate(self.train_data, split="train", step=0))
+            curve.append(self.evaluate(self.val_data, split="val", step=0))
+        for step in range(start_step + 1, self.config.steps + 1):
             self.model.train()
-            x, y, future = self._batch(self.train_data)
             optimizer.zero_grad(set_to_none=True)
-            with self.precision.autocast(self.device.type):
-                output = trainable(x) if runtime.enabled else self.model(x)
-                loss, _ = self.objective.compute(
-                    output,
-                    y,
-                    future,
-                    use_cortex_terms=self.model.config.use_cortex_heads,
+            for micro_step in range(self.config.gradient_accumulation_steps):
+                x, y, future = self._batch(self.train_data)
+                sync_context = (
+                    trainable.no_sync()
+                    if runtime.enabled and micro_step < self.config.gradient_accumulation_steps - 1
+                    else nullcontext()
                 )
+                with sync_context:
+                    with self.precision.autocast(self.device.type):
+                        output = trainable(x) if runtime.enabled else self.model(x)
+                        loss, _ = self.objective.compute(
+                            output,
+                            y,
+                            future,
+                            use_cortex_terms=self.model.config.use_cortex_heads,
+                        )
+                        loss = loss / self.config.gradient_accumulation_steps
+                    if scaler is not None:
+                        scaler.scale(loss).backward()
+                    else:
+                        loss.backward()
             if scaler is not None:
-                scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(trainable.parameters(), self.config.grad_clip)
                 scaler.step(optimizer)
                 scaler.update()
             else:
-                loss.backward()
                 torch.nn.utils.clip_grad_norm_(trainable.parameters(), self.config.grad_clip)
                 optimizer.step()
             if step % self.config.eval_interval == 0 or step == self.config.steps:
                 curve.append(self.evaluate(self.train_data, split="train", step=step))
                 curve.append(self.evaluate(self.val_data, split="val", step=step))
             if runtime.is_main and step % self.config.checkpoint_interval == 0:
-                self.save_checkpoint(optimizer, self.run_dir / f"checkpoint_step_{step}.pt")
+                self.save_checkpoint(optimizer, self.run_dir / f"checkpoint_step_{step}.pt", step=step, curve=curve, scaler=scaler)
         checkpoint_path = self.run_dir / "checkpoint_final.pt"
         if runtime.is_main:
-            checkpoint_path = self.save_checkpoint(optimizer, checkpoint_path)
+            checkpoint_path = self.save_checkpoint(optimizer, checkpoint_path, step=self.config.steps, curve=curve, scaler=scaler)
             self._write_curve(curve)
         final_train = [point for point in curve if point.split == "train"][-1]
         final_val = [point for point in curve if point.split == "val"][-1]
@@ -1046,6 +1080,10 @@ class LLMTrainer:
             model_kind=self.model_kind,
             run_dir=str(self.run_dir),
             checkpoint_path=str(checkpoint_path),
+            start_step=start_step,
+            optimizer_steps=max(0, self.config.steps - start_step),
+            effective_batch_size=self.config.batch_size * self.config.gradient_accumulation_steps * runtime.world_size,
+            resumed_from=str(resumed_from) if resumed_from is not None else None,
             final_train=final_train,
             final_val=final_val,
             curve=tuple(curve),
@@ -1068,16 +1106,99 @@ class LLMTrainer:
             for point in curve:
                 writer.writerow(point.to_dict())
 
-    def save_checkpoint(self, optimizer: torch.optim.Optimizer, path: str | Path) -> Path:
+    def _resolve_resume_checkpoint(self) -> Path | None:
+        if self.config.resume_from_checkpoint is not None:
+            checkpoint = Path(self.config.resume_from_checkpoint)
+            if not checkpoint.exists():
+                raise FileNotFoundError(f"resume checkpoint does not exist: {checkpoint}")
+            return checkpoint
+        if not self.config.resume:
+            return None
+        final_checkpoint = self.run_dir / "checkpoint_final.pt"
+        if final_checkpoint.exists():
+            return final_checkpoint
+        candidates: list[tuple[int, Path]] = []
+        for path in self.run_dir.glob("checkpoint_step_*.pt"):
+            raw_step = path.stem.removeprefix("checkpoint_step_")
+            if raw_step.isdigit():
+                candidates.append((int(raw_step), path))
+        if candidates:
+            return sorted(candidates)[-1][1]
+        raise FileNotFoundError(f"resume=True but no checkpoint was found in {self.run_dir}")
+
+    def load_checkpoint(
+        self,
+        path: str | Path,
+        *,
+        optimizer: torch.optim.Optimizer,
+        scaler: torch.amp.GradScaler | None,
+        restore_rng: bool = True,
+    ) -> tuple[int, list[TrainingPoint]]:
+        checkpoint_path = Path(path)
+        payload = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
+        if payload.get("model_kind") != self.model_kind:
+            raise ValueError(f"checkpoint model_kind={payload.get('model_kind')!r} does not match {self.model_kind!r}")
+        checkpoint_model_config = payload.get("model_config")
+        if checkpoint_model_config != asdict(self.model.config):
+            raise ValueError("checkpoint model_config does not match the current model")
+        self.model.load_state_dict(payload["model_state_dict"])
+        optimizer.load_state_dict(payload["optimizer_state_dict"])
+        if scaler is not None and payload.get("scaler_state_dict") is not None:
+            scaler.load_state_dict(payload["scaler_state_dict"])
+        if restore_rng:
+            rng_state = payload.get("rng_state", {})
+            if "torch" in rng_state:
+                torch.set_rng_state(rng_state["torch"].cpu())
+            if self.device.type == "cuda" and rng_state.get("torch_cuda_all"):
+                torch.cuda.set_rng_state_all(rng_state["torch_cuda_all"])
+            if "python" in rng_state:
+                random.setstate(rng_state["python"])
+            if "numpy" in rng_state:
+                np.random.set_state(rng_state["numpy"])
+            if "trainer_generator" in rng_state:
+                self.generator.set_state(rng_state["trainer_generator"].cpu())
+        curve_payload = payload.get("curve", [])
+        curve = [TrainingPoint(**point) for point in curve_payload]
+        step = int(payload.get("step", 0))
+        if not curve:
+            curve.append(self.evaluate(self.train_data, split="train", step=step))
+            curve.append(self.evaluate(self.val_data, split="val", step=step))
+        return step, curve
+
+    def _rng_state(self) -> dict[str, Any]:
+        state: dict[str, Any] = {
+            "torch": torch.get_rng_state(),
+            "python": random.getstate(),
+            "numpy": np.random.get_state(),
+            "trainer_generator": self.generator.get_state(),
+        }
+        if torch.cuda.is_available():
+            state["torch_cuda_all"] = torch.cuda.get_rng_state_all()
+        return state
+
+    def save_checkpoint(
+        self,
+        optimizer: torch.optim.Optimizer,
+        path: str | Path,
+        *,
+        step: int,
+        curve: Sequence[TrainingPoint],
+        scaler: torch.amp.GradScaler | None = None,
+    ) -> Path:
         output = Path(path)
         output.parent.mkdir(parents=True, exist_ok=True)
         torch.save(
             {
+                "schema_version": 2,
+                "step": step,
                 "model_state_dict": self.model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
+                "scaler_state_dict": scaler.state_dict() if scaler is not None else None,
                 "model_config": asdict(self.model.config),
                 "training_config": asdict(self.config),
                 "model_kind": self.model_kind,
+                "curve": [point.to_dict() for point in curve],
+                "rng_state": self._rng_state(),
             },
             output,
         )
@@ -1193,10 +1314,16 @@ class LLMComparisonRunner:
         )
         runtime.ensure_initialized()
         if runtime.is_main:
-            if self.run_dir.exists():
+            if self.run_dir.exists() and not self.config.training.resume:
                 shutil.rmtree(self.run_dir)
             self.run_dir.mkdir(parents=True, exist_ok=True)
-            manifest = self.prepare_corpus()
+            manifest_path = self.run_dir / "corpus" / "manifest.json"
+            if manifest_path.exists():
+                manifest = TokenizedCorpusManifest.load(manifest_path)
+            elif self.config.training.resume:
+                raise FileNotFoundError(f"resume=True but corpus manifest is missing: {manifest_path}")
+            else:
+                manifest = self.prepare_corpus()
         _barrier_if_needed(runtime)
         manifest = TokenizedCorpusManifest.load(self.run_dir / "corpus" / "manifest.json")
         train_data = MemmapCausalDataset(manifest, split="train")
@@ -1351,7 +1478,7 @@ class LLMBenchmarkSuite:
         )
         runtime.ensure_initialized()
         if runtime.is_main:
-            if self.run_dir.exists():
+            if self.run_dir.exists() and not self.config.training.resume:
                 shutil.rmtree(self.run_dir)
             self.run_dir.mkdir(parents=True, exist_ok=True)
         _barrier_if_needed(runtime)
@@ -1493,6 +1620,9 @@ def main(argv: Sequence[str] | None = None) -> None:
     smoke = sub.add_parser("smoke", help="run a deterministic small corpus comparison")
     smoke.add_argument("--out-dir", default="runs/llm-smoke")
     smoke.add_argument("--steps", type=int, default=48)
+    smoke.add_argument("--gradient-accumulation-steps", type=int, default=1)
+    smoke.add_argument("--checkpoint-interval", type=int, default=100)
+    smoke.add_argument("--resume", action="store_true")
     smoke.add_argument("--precision", choices=("fp32", "bf16", "fp16"), default="fp32")
     smoke.add_argument("--device", default="auto")
     smoke.add_argument("--require-cuda", action="store_true")
@@ -1507,6 +1637,9 @@ def main(argv: Sequence[str] | None = None) -> None:
     compare.add_argument("--seq-len", type=int, default=128)
     compare.add_argument("--steps", type=int, default=200)
     compare.add_argument("--batch-size", type=int, default=32)
+    compare.add_argument("--gradient-accumulation-steps", type=int, default=1)
+    compare.add_argument("--checkpoint-interval", type=int, default=100)
+    compare.add_argument("--resume", action="store_true")
     compare.add_argument("--d-model", type=int, default=256)
     compare.add_argument("--n-heads", type=int, default=8)
     compare.add_argument("--n-layers", type=int, default=6)
@@ -1523,6 +1656,9 @@ def main(argv: Sequence[str] | None = None) -> None:
     benchmark.add_argument("--repeats", type=int, default=160)
     benchmark.add_argument("--steps", type=int, default=48)
     benchmark.add_argument("--batch-size", type=int, default=8)
+    benchmark.add_argument("--gradient-accumulation-steps", type=int, default=1)
+    benchmark.add_argument("--checkpoint-interval", type=int, default=100)
+    benchmark.add_argument("--resume", action="store_true")
     benchmark.add_argument("--vocab-size", type=int, default=256)
     benchmark.add_argument("--seq-len", type=int, default=32)
     benchmark.add_argument("--d-model", type=int, default=64)
@@ -1574,6 +1710,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         training = TrainingConfig(
             steps=args.steps,
             batch_size=8,
+            gradient_accumulation_steps=args.gradient_accumulation_steps,
             eval_interval=max(1, args.steps // 3),
             eval_batches=3,
             seed=11,
@@ -1582,6 +1719,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             require_cuda=args.require_cuda,
             distributed=args.distributed,
             gloo_interface=args.gloo_interface,
+            resume=args.resume,
+            checkpoint_interval=args.checkpoint_interval,
             num_threads=1,
         )
         config = ComparisonConfig(
@@ -1646,6 +1785,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         training = TrainingConfig(
             steps=args.steps,
             batch_size=args.batch_size,
+            gradient_accumulation_steps=args.gradient_accumulation_steps,
             eval_interval=max(1, args.steps // 3),
             eval_batches=3,
             seed=23,
@@ -1654,6 +1794,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             require_cuda=args.require_cuda,
             distributed=args.distributed,
             gloo_interface=args.gloo_interface,
+            resume=args.resume,
+            checkpoint_interval=args.checkpoint_interval,
             num_threads=1,
         )
         config = ComparisonConfig(
@@ -1683,12 +1825,15 @@ def main(argv: Sequence[str] | None = None) -> None:
     training = TrainingConfig(
         steps=args.steps,
         batch_size=args.batch_size,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
         eval_interval=max(1, args.steps // 10),
         device=args.device,
         precision=args.precision,
         require_cuda=args.require_cuda,
         distributed=args.distributed,
         gloo_interface=args.gloo_interface,
+        resume=args.resume,
+        checkpoint_interval=args.checkpoint_interval,
     )
     config = ComparisonConfig(
         vocab_size=args.vocab_size,
