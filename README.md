@@ -191,11 +191,20 @@ python tools/train_llm.py compare path/to/text_shards --out-dir runs/llm-large -
 python tools/train_llm.py compare path/to/text_shards --out-dir runs/llm-large --steps 4000 --resume --batch-size 64 --gradient-accumulation-steps 4 --precision bf16
 ```
 
+Pour comparer plusieurs graines sur le même corpus tokenisé une seule fois :
+
+```bash
+python tools/train_llm.py compare-matrix path/to/text_shards --out-dir runs/llm-large-matrix --seeds 11,23,37 --steps 2000 --batch-size 64 --gradient-accumulation-steps 4 --checkpoint-interval 100 --precision bf16 --require-win
+```
+
+`compare-matrix` écrit un `corpus/manifest.json` partagé, puis un dossier `seed_<seed>` par graine avec rapports, courbes et checkpoints baseline/Cortex. Le rapport agrégé `comparison_matrix_report.json` mesure moyenne, médiane, variance, win-rate, minimum Cortex/baseline et régression next-token maximale.
+
 Pour préparer un corpus Hugging Face massif en shards texte puis memmap tokenisé :
 
 ```bash
 python tools/train_llm.py prepare-hf --dataset allenai/c4 --config-name en --split train --text-field text --out-dir runs/c4-prepared --max-documents 1000000 --vocab-size 32768 --seq-len 1024 --max-horizon 8
 python tools/train_llm.py compare runs/c4-prepared/text_shards --out-dir runs/c4-cortex-vs-ntp --steps 2000 --batch-size 64 --gradient-accumulation-steps 4 --checkpoint-interval 100 --precision bf16
+python tools/train_llm.py compare-matrix runs/c4-prepared/text_shards --out-dir runs/c4-cortex-vs-ntp-matrix --seeds 11,23,37 --steps 2000 --batch-size 64 --gradient-accumulation-steps 4 --checkpoint-interval 100 --precision bf16 --require-win
 ```
 
 Pour un dataset local JSONL compatible Hugging Face :

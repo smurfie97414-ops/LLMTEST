@@ -12,6 +12,7 @@ from cortex3_llm import (
     HFDatasetExportConfig,
     HFDatasetTextExporter,
     LLMBenchmarkSuite,
+    LLMComparisonMatrixSuite,
     LLMComparisonRunner,
     LLMStatisticalBenchmarkSuite,
     LLMTrainer,
@@ -228,6 +229,51 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 "cortex3/learning_curve.csv",
             ]:
                 self.assertTrue((root / "run" / rel).exists(), rel)
+
+    def test_comparison_matrix_reuses_shared_corpus_across_seeds(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            corpus = self._corpus(root, repeats=120)
+            config = ComparisonConfig(
+                vocab_size=256,
+                min_frequency=1,
+                seq_len=32,
+                d_model=64,
+                n_heads=4,
+                n_layers=2,
+                dropout=0.0,
+                horizons=(1, 2, 4),
+                training=TrainingConfig(
+                    steps=48,
+                    batch_size=8,
+                    eval_interval=16,
+                    eval_batches=3,
+                    seed=17,
+                    precision="bf16",
+                    num_threads=1,
+                ),
+                cortex_win_margin=1.02,
+                max_next_token_loss_regression=1.60,
+            )
+            report = LLMComparisonMatrixSuite(
+                corpus,
+                config,
+                run_dir=root / "compare-matrix",
+                seeds=(17, 29),
+            ).run(require_win=True)
+            self.assertTrue(report.proof["passed"], report.proof)
+            self.assertEqual(report.proof["seed_count"], 2)
+            self.assertEqual(report.proof["sample_count"], 2)
+            self.assertEqual(report.proof["win_rate"], 1.0)
+            self.assertTrue((root / "compare-matrix" / "corpus" / "manifest.json").exists())
+            self.assertTrue((root / "compare-matrix" / "comparison_matrix_report.json").exists())
+            self.assertTrue((root / "compare-matrix" / "comparison_matrix_report.md").exists())
+            self.assertTrue((root / "compare-matrix" / "comparison_matrix_ratios.png").exists())
+            for seed in (17, 29):
+                self.assertFalse((root / "compare-matrix" / f"seed_{seed}" / "corpus" / "manifest.json").exists())
+                self.assertTrue((root / "compare-matrix" / f"seed_{seed}" / "comparison_report.json").exists())
+                self.assertTrue((root / "compare-matrix" / f"seed_{seed}" / "baseline_ntp" / "checkpoint_final.pt").exists())
+                self.assertTrue((root / "compare-matrix" / f"seed_{seed}" / "cortex3" / "checkpoint_final.pt").exists())
 
     def test_multi_domain_benchmark_aggregates_real_learning_curves(self):
         with tempfile.TemporaryDirectory() as tmp:

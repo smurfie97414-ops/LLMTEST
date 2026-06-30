@@ -1302,11 +1302,31 @@ class StatisticalBenchmarkReport:
         return asdict(self)
 
 
+@dataclass(frozen=True)
+class ComparisonMatrixReport:
+    run_dir: str
+    manifest: Mapping[str, Any]
+    seeds: tuple[Mapping[str, Any], ...]
+    proof: Mapping[str, Any]
+    hardware: Mapping[str, Any]
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
 class LLMComparisonRunner:
-    def __init__(self, corpus: TextCorpusConfig, config: ComparisonConfig, *, run_dir: str | Path):
+    def __init__(
+        self,
+        corpus: TextCorpusConfig,
+        config: ComparisonConfig,
+        *,
+        run_dir: str | Path,
+        prepared_manifest: TokenizedCorpusManifest | None = None,
+    ):
         self.corpus = corpus
         self.config = config
         self.run_dir = Path(run_dir)
+        self.prepared_manifest = prepared_manifest
 
     def prepare_corpus(self) -> TokenizedCorpusManifest:
         tokenizer = LLMTokenizer.train(self.corpus, vocab_size=self.config.vocab_size, min_frequency=self.config.min_frequency)
@@ -1325,19 +1345,27 @@ class LLMComparisonRunner:
             gloo_interface=self.config.training.gloo_interface,
         )
         runtime.ensure_initialized()
-        if runtime.is_main:
-            if self.run_dir.exists() and not self.config.training.resume:
-                shutil.rmtree(self.run_dir)
-            self.run_dir.mkdir(parents=True, exist_ok=True)
-            manifest_path = self.run_dir / "corpus" / "manifest.json"
-            if manifest_path.exists():
-                manifest = TokenizedCorpusManifest.load(manifest_path)
-            elif self.config.training.resume:
-                raise FileNotFoundError(f"resume=True but corpus manifest is missing: {manifest_path}")
-            else:
-                manifest = self.prepare_corpus()
-        _barrier_if_needed(runtime)
-        manifest = TokenizedCorpusManifest.load(self.run_dir / "corpus" / "manifest.json")
+        if self.prepared_manifest is not None:
+            if runtime.is_main:
+                if self.run_dir.exists() and not self.config.training.resume:
+                    shutil.rmtree(self.run_dir)
+                self.run_dir.mkdir(parents=True, exist_ok=True)
+            _barrier_if_needed(runtime)
+            manifest = self.prepared_manifest
+        else:
+            if runtime.is_main:
+                if self.run_dir.exists() and not self.config.training.resume:
+                    shutil.rmtree(self.run_dir)
+                self.run_dir.mkdir(parents=True, exist_ok=True)
+                manifest_path = self.run_dir / "corpus" / "manifest.json"
+                if manifest_path.exists():
+                    manifest = TokenizedCorpusManifest.load(manifest_path)
+                elif self.config.training.resume:
+                    raise FileNotFoundError(f"resume=True but corpus manifest is missing: {manifest_path}")
+                else:
+                    manifest = self.prepare_corpus()
+            _barrier_if_needed(runtime)
+            manifest = TokenizedCorpusManifest.load(self.run_dir / "corpus" / "manifest.json")
         train_data = MemmapCausalDataset(manifest, split="train")
         val_data = MemmapCausalDataset(manifest, split="val")
         try:
@@ -1465,6 +1493,218 @@ class LLMComparisonRunner:
             axis.legend()
         fig.tight_layout()
         fig.savefig(self.run_dir / "learning_curve.png", dpi=150)
+        plt.close(fig)
+
+
+class LLMComparisonMatrixSuite:
+    def __init__(
+        self,
+        corpus: TextCorpusConfig,
+        config: ComparisonConfig,
+        *,
+        run_dir: str | Path,
+        seeds: Sequence[int],
+    ):
+        if not seeds:
+            raise ValueError("at least one comparison seed is required")
+        self.corpus = corpus
+        self.config = config
+        self.run_dir = Path(run_dir)
+        self.seeds = tuple(int(seed) for seed in seeds)
+
+    def run(self, *, require_win: bool = False) -> ComparisonMatrixReport:
+        started = time.time()
+        device_type = "cuda" if (self.config.training.device == "auto" and torch.cuda.is_available()) or str(self.config.training.device).startswith("cuda") else "cpu"
+        runtime = DistributedRuntime.from_env(
+            requested=self.config.training.distributed,
+            device_type=device_type,
+            gloo_interface=self.config.training.gloo_interface,
+        )
+        runtime.ensure_initialized()
+        if runtime.is_main:
+            if self.run_dir.exists() and not self.config.training.resume:
+                shutil.rmtree(self.run_dir)
+            self.run_dir.mkdir(parents=True, exist_ok=True)
+        _barrier_if_needed(runtime)
+
+        manifest = self._prepare_or_load_manifest(runtime)
+        seed_payloads: list[Mapping[str, Any]] = []
+        for seed in self.seeds:
+            seed_training = replace(self.config.training, seed=seed)
+            seed_config = replace(self.config, training=seed_training)
+            report = LLMComparisonRunner(
+                self.corpus,
+                seed_config,
+                run_dir=self.run_dir / f"seed_{seed}",
+                prepared_manifest=manifest,
+            ).run(require_win=False)
+            seed_payloads.append(
+                {
+                    "seed": seed,
+                    "run_dir": report.run_dir,
+                    "proof": report.proof,
+                    "baseline_final_val": report.baseline["final_val"],
+                    "cortex_final_val": report.cortex["final_val"],
+                }
+            )
+
+        proof = self._proof(seed_payloads)
+        proof["elapsed_seconds"] = time.time() - started
+        proof["distributed"] = runtime.enabled
+        proof["world_size"] = runtime.world_size
+        matrix_report = ComparisonMatrixReport(
+            run_dir=str(self.run_dir),
+            manifest=manifest.to_dict(),
+            seeds=tuple(seed_payloads),
+            proof=proof,
+            hardware=hardware_report(),
+        )
+        if runtime.is_main:
+            _write_json(self.run_dir / "comparison_matrix_report.json", matrix_report.to_dict())
+            self._write_markdown(matrix_report)
+            self._write_ratio_plot(matrix_report)
+        failed = bool(require_win and not proof["passed"] and runtime.is_main)
+        if runtime.enabled:
+            flag_device = torch.device(f"cuda:{runtime.local_rank}") if runtime.backend == "nccl" else torch.device("cpu")
+            flag = torch.tensor([1 if failed else 0], dtype=torch.int64, device=flag_device)
+            torch.distributed.broadcast(flag, src=0)
+            failed = bool(int(flag.cpu().item()))
+        _barrier_if_needed(runtime)
+        if failed:
+            raise RuntimeError(f"Cortex comparison matrix did not pass: {proof}")
+        return matrix_report
+
+    def _prepare_or_load_manifest(self, runtime: DistributedRuntime) -> TokenizedCorpusManifest:
+        manifest_path = self.run_dir / "corpus" / "manifest.json"
+        if runtime.is_main:
+            if manifest_path.exists():
+                manifest = TokenizedCorpusManifest.load(manifest_path)
+            elif self.config.training.resume:
+                raise FileNotFoundError(f"resume=True but shared corpus manifest is missing: {manifest_path}")
+            else:
+                tokenizer = LLMTokenizer.train(
+                    self.corpus,
+                    vocab_size=self.config.vocab_size,
+                    min_frequency=self.config.min_frequency,
+                )
+                manifest = TokenizedCorpusBuilder(self.corpus, tokenizer).build(
+                    self.run_dir / "corpus",
+                    seq_len=self.config.seq_len,
+                    max_horizon=max(self.config.horizons),
+                )
+        _barrier_if_needed(runtime)
+        return TokenizedCorpusManifest.load(manifest_path)
+
+    def _proof(self, seed_reports: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+        samples: list[dict[str, Any]] = []
+        for seed_report in seed_reports:
+            seed = int(seed_report["seed"])
+            proof = seed_report["proof"]
+            samples.append(
+                {
+                    "seed": seed,
+                    "ratio": float(proof["cortex_over_baseline_ratio"]),
+                    "baseline_score": float(proof["baseline_score"]),
+                    "cortex_score": float(proof["cortex_score"]),
+                    "next_token_loss_regression_ratio": float(proof["next_token_loss_regression_ratio"]),
+                    "passed": bool(proof["passed"]) and float(proof["baseline_score"]) > 0.0,
+                }
+            )
+        ratios = [sample["ratio"] for sample in samples]
+        baseline_scores = [sample["baseline_score"] for sample in samples]
+        regressions = [sample["next_token_loss_regression_ratio"] for sample in samples]
+        passed_count = sum(1 for sample in samples if sample["passed"])
+        sample_count = len(samples)
+        min_ratio = min(ratios) if ratios else 0.0
+        max_regression = max(regressions) if regressions else 0.0
+        min_baseline = min(baseline_scores) if baseline_scores else 0.0
+        passed = (
+            sample_count == len(self.seeds)
+            and passed_count == sample_count
+            and min_ratio >= self.config.cortex_win_margin
+            and min_baseline > 0.0
+            and max_regression <= self.config.max_next_token_loss_regression
+        )
+        return {
+            "metric": "comparison_matrix_cortex_over_baseline",
+            "seeds": list(self.seeds),
+            "seed_count": len(self.seeds),
+            "sample_count": sample_count,
+            "required_margin": self.config.cortex_win_margin,
+            "required_win_rate": 1.0,
+            "mean_ratio": sum(ratios) / max(1, len(ratios)),
+            "median_ratio": statistics.median(ratios) if ratios else 0.0,
+            "ratio_population_stddev": statistics.pstdev(ratios) if len(ratios) > 1 else 0.0,
+            "min_ratio": min_ratio,
+            "max_ratio": max(ratios) if ratios else 0.0,
+            "win_rate": passed_count / max(1, sample_count),
+            "mean_baseline_score": sum(baseline_scores) / max(1, len(baseline_scores)),
+            "min_baseline_score": min_baseline,
+            "max_next_token_loss_regression": max_regression,
+            "all_samples_passed": passed_count == sample_count and sample_count > 0,
+            "samples": tuple(samples),
+            "passed": passed,
+        }
+
+    def _write_markdown(self, report: ComparisonMatrixReport) -> None:
+        proof = report.proof
+        lines = [
+            "# Cortex-3 LLM comparison matrix report",
+            "",
+            f"- Seeds: `{', '.join(str(seed) for seed in proof['seeds'])}`",
+            f"- Shared corpus tokens: `{report.manifest['token_count']}`",
+            f"- Samples: `{proof['sample_count']}`",
+            f"- Mean Cortex/baseline ratio: `{proof['mean_ratio']:.3f}`",
+            f"- Median Cortex/baseline ratio: `{proof['median_ratio']:.3f}`",
+            f"- Min Cortex/baseline ratio: `{proof['min_ratio']:.3f}`",
+            f"- Win rate: `{proof['win_rate']:.3f}`",
+            f"- Max next-token-loss regression: `{proof['max_next_token_loss_regression']:.3f}`",
+            f"- Passed: `{proof['passed']}`",
+            "",
+            "## Seed Results",
+            "",
+            "| Seed | Baseline score | Cortex score | Ratio | NT loss regression | Passed |",
+            "| ---: | ---: | ---: | ---: | ---: | --- |",
+        ]
+        for item in proof["samples"]:
+            lines.append(
+                f"| {item['seed']} | {item['baseline_score']:.6f} | {item['cortex_score']:.6f} | "
+                f"{item['ratio']:.3f} | {item['next_token_loss_regression_ratio']:.3f} | `{item['passed']}` |"
+            )
+        lines.extend(
+            [
+                "",
+                "## Artifacts",
+                "",
+                "- `comparison_matrix_report.json`",
+                "- `comparison_matrix_report.md`",
+                "- `comparison_matrix_ratios.png`",
+                "- `corpus/manifest.json`",
+                "- `seed_<seed>/comparison_report.json`",
+                "- `seed_<seed>/baseline_ntp/checkpoint_final.pt`",
+                "- `seed_<seed>/cortex3/checkpoint_final.pt`",
+            ]
+        )
+        (self.run_dir / "comparison_matrix_report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    def _write_ratio_plot(self, report: ComparisonMatrixReport) -> None:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        samples = list(report.proof["samples"])
+        names = [str(sample["seed"]) for sample in samples]
+        ratios = [float(sample["ratio"]) for sample in samples]
+        fig, ax = plt.subplots(figsize=(8, 4))
+        ax.bar(names, ratios, color="#476f4f")
+        ax.axhline(1.0, color="#333333", linewidth=1)
+        ax.axhline(float(report.proof["required_margin"]), color="#555555", linestyle="--", linewidth=1)
+        ax.set_title("Cortex / baseline ratio by seed")
+        ax.set_ylabel("ratio")
+        ax.set_xlabel("seed")
+        fig.tight_layout()
+        fig.savefig(self.run_dir / "comparison_matrix_ratios.png", dpi=150)
         plt.close(fig)
 
 
@@ -1929,6 +2169,27 @@ def main(argv: Sequence[str] | None = None) -> None:
     compare.add_argument("--gloo-interface", default=None)
     compare.add_argument("--require-win", action="store_true")
 
+    compare_matrix = sub.add_parser("compare-matrix", help="run baseline vs Cortex comparison across multiple seeds on one shared corpus")
+    compare_matrix.add_argument("paths", nargs="+")
+    compare_matrix.add_argument("--out-dir", default="runs/llm-compare-matrix")
+    compare_matrix.add_argument("--seeds", default="11,23,37")
+    compare_matrix.add_argument("--vocab-size", type=int, default=4096)
+    compare_matrix.add_argument("--seq-len", type=int, default=128)
+    compare_matrix.add_argument("--steps", type=int, default=200)
+    compare_matrix.add_argument("--batch-size", type=int, default=32)
+    compare_matrix.add_argument("--gradient-accumulation-steps", type=int, default=1)
+    compare_matrix.add_argument("--checkpoint-interval", type=int, default=100)
+    compare_matrix.add_argument("--resume", action="store_true")
+    compare_matrix.add_argument("--d-model", type=int, default=256)
+    compare_matrix.add_argument("--n-heads", type=int, default=8)
+    compare_matrix.add_argument("--n-layers", type=int, default=6)
+    compare_matrix.add_argument("--precision", choices=("fp32", "bf16", "fp16"), default="fp32")
+    compare_matrix.add_argument("--device", default="auto")
+    compare_matrix.add_argument("--require-cuda", action="store_true")
+    compare_matrix.add_argument("--distributed", action="store_true")
+    compare_matrix.add_argument("--gloo-interface", default=None)
+    compare_matrix.add_argument("--require-win", action="store_true")
+
     benchmark = sub.add_parser("benchmark", help="run a deterministic multi-domain LLM benchmark suite")
     benchmark.add_argument("--out-dir", default="runs/llm-benchmark")
     benchmark.add_argument("--domains", default="sequence,reasoning,code,anchors")
@@ -2162,6 +2423,36 @@ def main(argv: Sequence[str] | None = None) -> None:
             repeats=args.repeats,
             config=config,
         ).run(require_win=args.require_win)
+        if _rank_zero():
+            print(json.dumps(report.proof, indent=2, sort_keys=True))
+        return
+
+    if args.command == "compare-matrix":
+        seeds = _parse_seed_list(args.seeds)
+        corpus = TextCorpusConfig.from_paths(args.paths)
+        training = TrainingConfig(
+            steps=args.steps,
+            batch_size=args.batch_size,
+            gradient_accumulation_steps=args.gradient_accumulation_steps,
+            eval_interval=max(1, args.steps // 10),
+            device=args.device,
+            precision=args.precision,
+            require_cuda=args.require_cuda,
+            distributed=args.distributed,
+            gloo_interface=args.gloo_interface,
+            resume=args.resume,
+            checkpoint_interval=args.checkpoint_interval,
+            seed=seeds[0],
+        )
+        config = ComparisonConfig(
+            vocab_size=args.vocab_size,
+            seq_len=args.seq_len,
+            d_model=args.d_model,
+            n_heads=args.n_heads,
+            n_layers=args.n_layers,
+            training=training,
+        )
+        report = LLMComparisonMatrixSuite(corpus, config, run_dir=args.out_dir, seeds=seeds).run(require_win=args.require_win)
         if _rank_zero():
             print(json.dumps(report.proof, indent=2, sort_keys=True))
         return
