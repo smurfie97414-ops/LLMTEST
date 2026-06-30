@@ -706,6 +706,88 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             self.assertEqual(sidecar["checkpoint_retention"]["max_intermediate_checkpoints"], 2)
             self.assertEqual(sidecar["training_config"]["max_intermediate_checkpoints"], 2)
 
+    def test_resume_skips_incomplete_intermediate_checkpoint_and_rewrites_atomically(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            corpus = self._corpus(root, repeats=40)
+            tokenizer = LLMTokenizer.train(corpus, vocab_size=192, min_frequency=1)
+            manifest = TokenizedCorpusBuilder(corpus, tokenizer).build(
+                root / "prepared",
+                seq_len=16,
+                max_horizon=2,
+            )
+            train = MemmapCausalDataset(manifest, split="train")
+            val = MemmapCausalDataset(manifest, split="val")
+            run_dir = root / "resume-incomplete"
+            try:
+                model_config = TransformerConfig(
+                    vocab_size=manifest.vocab_size,
+                    seq_len=16,
+                    d_model=32,
+                    n_heads=4,
+                    n_layers=1,
+                    dropout=0.0,
+                    horizons=(1, 2),
+                    use_cortex_heads=False,
+                    use_ternary_core=False,
+                )
+                corpus_identity = manifest.identity()
+                LLMTrainer(
+                    CortexTransformerLM(model_config),
+                    train,
+                    val,
+                    TrainingConfig(
+                        steps=1,
+                        batch_size=2,
+                        eval_interval=1,
+                        eval_batches=1,
+                        checkpoint_interval=1,
+                        max_intermediate_checkpoints=2,
+                        seed=19,
+                        num_threads=1,
+                    ),
+                    run_dir=run_dir,
+                    model_kind="baseline_next_token",
+                    corpus_identity=corpus_identity,
+                ).train(name="baseline")
+                (run_dir / "checkpoint_final.pt").unlink()
+                (run_dir / "checkpoint_final.pt.json").unlink()
+                corrupt = run_dir / "checkpoint_step_2.pt"
+                corrupt.write_bytes(b"incomplete checkpoint bytes")
+
+                resumed = LLMTrainer(
+                    CortexTransformerLM(model_config),
+                    train,
+                    val,
+                    TrainingConfig(
+                        steps=2,
+                        batch_size=2,
+                        eval_interval=1,
+                        eval_batches=1,
+                        checkpoint_interval=1,
+                        max_intermediate_checkpoints=2,
+                        seed=19,
+                        resume=True,
+                        num_threads=1,
+                    ),
+                    run_dir=run_dir,
+                    model_kind="baseline_next_token",
+                    corpus_identity=corpus_identity,
+                ).train(name="baseline")
+            finally:
+                train.close()
+                val.close()
+
+            self.assertEqual(resumed.start_step, 1)
+            self.assertEqual(Path(resumed.resumed_from).name, "checkpoint_step_1.pt")
+            self.assertFalse((run_dir / "checkpoint_step_2.pt.tmp").exists())
+            rewritten = run_dir / "checkpoint_step_2.pt"
+            self.assertTrue(rewritten.exists())
+            self.assertGreater(rewritten.stat().st_size, len(b"incomplete checkpoint bytes"))
+            sidecar = json.loads((run_dir / "checkpoint_step_2.pt.json").read_text(encoding="utf-8"))
+            self.assertEqual(sidecar["step"], 2)
+            self.assertEqual(sidecar["checkpoint_size_bytes"], rewritten.stat().st_size)
+
     def test_manifest_training_config_preserves_checkpoint_retention_in_plan(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

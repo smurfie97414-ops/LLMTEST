@@ -94,7 +94,9 @@ def _json_default(value: Any) -> Any:
 
 def _write_json(path: Path, payload: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True, default=_json_default), encoding="utf-8")
+    tmp_path = path.with_name(path.name + ".tmp")
+    tmp_path.write_text(json.dumps(payload, indent=2, sort_keys=True, default=_json_default), encoding="utf-8")
+    tmp_path.replace(path)
 
 
 def _cost_trace_from_payload(payload: Mapping[str, Any] | None) -> CostTrace:
@@ -4355,25 +4357,57 @@ class LLMTrainer:
         if final_checkpoint.exists():
             return final_checkpoint
         candidates: list[tuple[int, Path]] = []
+        skipped: list[str] = []
         for path in self.run_dir.glob("checkpoint_step_*.pt"):
             raw_step = path.stem.removeprefix("checkpoint_step_")
             if raw_step.isdigit():
-                candidates.append((int(raw_step), path))
+                step = int(raw_step)
+                if self._checkpoint_sidecar_is_complete(path, expected_step=step):
+                    candidates.append((step, path))
+                else:
+                    skipped.append(path.name)
         if candidates:
             return sorted(candidates)[-1][1]
         if self.config.resume_if_exists:
             return None
+        if skipped:
+            raise FileNotFoundError(
+                f"resume=True found only incomplete checkpoint candidates in {self.run_dir}: {', '.join(sorted(skipped))}"
+            )
         raise FileNotFoundError(f"resume=True but no checkpoint was found in {self.run_dir}")
+
+    def _checkpoint_sidecar_is_complete(self, checkpoint: Path, *, expected_step: int | None = None) -> bool:
+        sidecar = checkpoint.with_name(checkpoint.name + ".json")
+        if not checkpoint.exists() or not sidecar.exists():
+            return False
+        try:
+            payload = json.loads(sidecar.read_text(encoding="utf-8"))
+        except Exception:
+            return False
+        recorded_size = payload.get("checkpoint_size_bytes")
+        if recorded_size is None or int(recorded_size) != int(checkpoint.stat().st_size):
+            return False
+        if expected_step is not None and int(payload.get("step", -1)) != int(expected_step):
+            return False
+        return True
 
     def _prune_intermediate_checkpoints(self) -> None:
         limit = int(self.config.max_intermediate_checkpoints)
         if limit <= 0:
             return
         candidates: list[tuple[int, Path]] = []
+        incomplete_candidates: list[Path] = []
         for path in self.run_dir.glob("checkpoint_step_*.pt"):
             raw_step = path.stem.removeprefix("checkpoint_step_")
             if raw_step.isdigit():
-                candidates.append((int(raw_step), path))
+                step = int(raw_step)
+                if self._checkpoint_sidecar_is_complete(path, expected_step=step):
+                    candidates.append((step, path))
+                else:
+                    incomplete_candidates.append(path)
+        for checkpoint in incomplete_candidates:
+            checkpoint.unlink(missing_ok=True)
+            checkpoint.with_name(checkpoint.name + ".json").unlink(missing_ok=True)
         for _, checkpoint in sorted(candidates)[:-limit]:
             checkpoint.unlink(missing_ok=True)
             checkpoint.with_name(checkpoint.name + ".json").unlink(missing_ok=True)
@@ -4466,6 +4500,8 @@ class LLMTrainer:
     ) -> Path:
         output = Path(path)
         output.parent.mkdir(parents=True, exist_ok=True)
+        tmp_output = output.with_name(output.name + ".tmp")
+        tmp_output.unlink(missing_ok=True)
         code_state = self.code_state
         cortex_phase_state = phase_controller.state_dict() if phase_controller is not None else None
         cortex_phase_state_summary = phase_controller.checkpoint_state_summary() if phase_controller is not None else None
@@ -4485,8 +4521,9 @@ class LLMTrainer:
                 "curve": [point.to_dict() for point in curve],
                 "rng_state": self._rng_state(),
             },
-            output,
+            tmp_output,
         )
+        tmp_output.replace(output)
         _write_json(
             output.with_name(output.name + ".json"),
             {
