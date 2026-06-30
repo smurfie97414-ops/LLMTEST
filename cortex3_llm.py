@@ -2218,6 +2218,8 @@ class CortexTrainingPhaseController:
     def _add_sleep_replay(self, examples: Sequence[TrainingExample]) -> None:
         for example in examples[:8]:
             self.replay_batches.append(self._batch_from_example(example))
+            self.phase_replay_examples["P9"] = self.phase_replay_examples.get("P9", 0) + 1
+            self.phase_replay_example_ids.append(f"llm-p9-{self.phase_replay_examples['P9']}-{example.example_id}")
 
     def state_dict(self) -> dict[str, Any]:
         return {

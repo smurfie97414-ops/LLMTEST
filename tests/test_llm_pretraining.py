@@ -690,7 +690,7 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             self.assertGreater(influence["last_objective_loss_total"], 0.0)
             self.assertGreater(influence["objective_feedback_scale"], 1.0)
             phase_replay = influence["phase_replay_examples_by_phase"]
-            for phase_id in ("P1", "P3", "P4", "P5", "P6", "P7", "P8", "P10"):
+            for phase_id in ("P1", "P3", "P4", "P5", "P6", "P7", "P8", "P9", "P10"):
                 self.assertGreater(phase_replay[phase_id], 0, phase_replay)
             self.assertTrue(phase_report["phase_replay_example_ids"], phase_report)
             self.assertTrue(phase_report["objective_feedback_history"], phase_report)
