@@ -28,6 +28,7 @@ from cortex3_llm import (
     TrainingConfig,
     TransformerConfig,
     CortexTransformerLM,
+    build_training_plan,
     build_benchmark_corpus,
     build_seed_corpus,
     hardware_report,
@@ -115,6 +116,54 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
 
             self.assertEqual(tokenizer.encode_calls, expected_chunks)
             self.assertEqual(Path(manifest.token_file).stat().st_size, manifest.token_count * 4)
+
+    def test_training_plan_matches_transformer_parameter_counts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            corpus = self._corpus(root, repeats=80)
+            tokenizer = LLMTokenizer.train(corpus, vocab_size=192, min_frequency=1)
+            manifest = TokenizedCorpusBuilder(corpus, tokenizer).build(
+                root / "prepared",
+                seq_len=24,
+                max_horizon=4,
+            )
+            training = TrainingConfig(
+                steps=10,
+                batch_size=3,
+                gradient_accumulation_steps=2,
+                eval_interval=5,
+                eval_batches=2,
+                precision="bf16",
+                num_threads=1,
+            )
+            config = ComparisonConfig(
+                vocab_size=192,
+                min_frequency=1,
+                seq_len=24,
+                d_model=32,
+                n_heads=4,
+                n_layers=2,
+                horizons=(1, 2, 4),
+                training=training,
+            )
+            plan = build_training_plan(manifest, config, world_size=2, distributed=True)
+            baseline_config = TransformerConfig(
+                vocab_size=manifest.vocab_size,
+                seq_len=24,
+                d_model=32,
+                n_heads=4,
+                n_layers=2,
+                horizons=(1, 2, 4),
+                use_cortex_heads=False,
+            )
+            cortex_config = TransformerConfig(**{**baseline_config.__dict__, "use_cortex_heads": True})
+            baseline_parameters = sum(parameter.numel() for parameter in CortexTransformerLM(baseline_config).parameters())
+            cortex_parameters = sum(parameter.numel() for parameter in CortexTransformerLM(cortex_config).parameters())
+            self.assertEqual(plan["model"]["baseline_parameters"], baseline_parameters)
+            self.assertEqual(plan["model"]["cortex_parameters"], cortex_parameters)
+            self.assertEqual(plan["training"]["tokens_per_optimizer_step"], 3 * 2 * 2 * 24)
+            self.assertEqual(plan["training"]["planned_train_tokens"], 3 * 2 * 2 * 24 * 10)
+            self.assertGreater(plan["training"]["effective_epochs_over_train_split"], 0.0)
 
     def test_trainer_resumes_checkpoint_with_gradient_accumulation(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -287,6 +336,7 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             self.assertGreater(proof["baseline_score"], 0.0)
             self.assertGreater(proof["cortex_over_baseline_ratio"], 1.02)
             for rel in [
+                "run_plan.json",
                 "comparison_report.json",
                 "report.md",
                 "learning_curve.png",
@@ -296,6 +346,10 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 "cortex3/learning_curve.csv",
             ]:
                 self.assertTrue((root / "run" / rel).exists(), rel)
+            plan = json.loads((root / "run" / "run_plan.json").read_text(encoding="utf-8"))
+            self.assertEqual(plan["training"]["tokens_per_optimizer_step"], 8 * 32)
+            self.assertEqual(plan["training"]["planned_train_tokens"], 8 * 32 * 48)
+            self.assertEqual(report.plan["corpus"]["token_count"], plan["corpus"]["token_count"])
 
     def test_comparison_matrix_reuses_shared_corpus_across_seeds(self):
         with tempfile.TemporaryDirectory() as tmp:

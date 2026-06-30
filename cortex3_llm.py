@@ -1419,6 +1419,7 @@ class ComparisonReport:
     cortex: Mapping[str, Any]
     proof: Mapping[str, Any]
     hardware: Mapping[str, Any]
+    plan: Mapping[str, Any]
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -1529,6 +1530,140 @@ class LLMExperimentReport:
         return asdict(self)
 
 
+def _training_precision_bytes(precision: str) -> int:
+    return 2 if precision in {"bf16", "fp16"} else 4
+
+
+def _transformer_parameter_count(config: TransformerConfig) -> int:
+    d_model = int(config.d_model)
+    vocab_size = int(config.vocab_size)
+    seq_len = int(config.seq_len)
+    n_layers = int(config.n_layers)
+    embedding = vocab_size * d_model
+    position = seq_len * d_model
+    attention = (d_model * 3 * d_model) + (d_model * d_model + d_model)
+    layer_norms = 4 * d_model
+    mlp = (d_model * 4 * d_model + 4 * d_model) + (4 * d_model * d_model + d_model)
+    final_norm = 2 * d_model
+    total = embedding + position + n_layers * (attention + layer_norms + mlp) + final_norm
+    if config.use_cortex_heads:
+        total += len(config.horizons) * (d_model * vocab_size + vocab_size)
+        total += d_model + 1
+    return int(total)
+
+
+def _manifest_split_availability(manifest: TokenizedCorpusManifest) -> dict[str, int]:
+    train_end = max(
+        manifest.seq_len + manifest.max_horizon + 2,
+        int(manifest.token_count * manifest.train_fraction),
+    )
+    val_start = max(0, train_end - manifest.seq_len - manifest.max_horizon - 1)
+    return {
+        "train_start": 0,
+        "train_end": int(train_end),
+        "val_start": int(val_start),
+        "val_end": int(manifest.token_count),
+        "train_available_windows": int(max(0, train_end - manifest.seq_len - manifest.max_horizon)),
+        "val_available_windows": int(max(0, manifest.token_count - val_start - manifest.seq_len - manifest.max_horizon)),
+    }
+
+
+def build_training_plan(
+    manifest: TokenizedCorpusManifest,
+    config: ComparisonConfig,
+    *,
+    world_size: int = 1,
+    distributed: bool = False,
+) -> dict[str, Any]:
+    baseline_config = TransformerConfig(
+        vocab_size=manifest.vocab_size,
+        seq_len=config.seq_len,
+        d_model=config.d_model,
+        n_heads=config.n_heads,
+        n_layers=config.n_layers,
+        dropout=config.dropout,
+        horizons=config.horizons,
+        use_cortex_heads=False,
+    )
+    cortex_config = TransformerConfig(**{**asdict(baseline_config), "use_cortex_heads": True})
+    baseline_parameters = _transformer_parameter_count(baseline_config)
+    cortex_parameters = _transformer_parameter_count(cortex_config)
+    effective_world_size = max(1, int(world_size))
+    tokens_per_optimizer_step = (
+        int(config.training.batch_size)
+        * int(config.training.gradient_accumulation_steps)
+        * effective_world_size
+        * int(config.seq_len)
+    )
+    optimizer_steps = max(0, int(config.training.steps))
+    train_tokens = tokens_per_optimizer_step * optimizer_steps
+    eval_events = 1 + sum(
+        1
+        for step in range(1, optimizer_steps + 1)
+        if step % int(config.training.eval_interval) == 0 or step == optimizer_steps
+    )
+    eval_tokens = (
+        eval_events
+        * 2
+        * int(config.training.eval_batches)
+        * int(config.training.batch_size)
+        * int(config.seq_len)
+    )
+    split = _manifest_split_availability(manifest)
+    train_tokens_available = max(1, int(split["train_end"]) - int(split["train_start"]))
+    checkpoint_interval = max(1, int(config.training.checkpoint_interval))
+    adam_training_bytes_per_parameter = 16
+    checkpoint_bytes_per_parameter = 12
+    precision_bytes = _training_precision_bytes(config.training.precision)
+    return {
+        "schema_version": 1,
+        "corpus": {
+            "token_count": int(manifest.token_count),
+            "train_fraction": float(manifest.train_fraction),
+            "seq_len": int(manifest.seq_len),
+            "max_horizon": int(manifest.max_horizon),
+            "vocab_size": int(manifest.vocab_size),
+            "source_file_count": len(manifest.source_files),
+            **split,
+        },
+        "model": {
+            "d_model": int(config.d_model),
+            "n_heads": int(config.n_heads),
+            "n_layers": int(config.n_layers),
+            "horizons": tuple(int(horizon) for horizon in config.horizons),
+            "baseline_parameters": baseline_parameters,
+            "cortex_parameters": cortex_parameters,
+            "cortex_extra_parameters": cortex_parameters - baseline_parameters,
+        },
+        "training": {
+            "steps": optimizer_steps,
+            "batch_size": int(config.training.batch_size),
+            "gradient_accumulation_steps": int(config.training.gradient_accumulation_steps),
+            "world_size": effective_world_size,
+            "distributed": bool(distributed),
+            "precision": str(config.training.precision),
+            "tokens_per_optimizer_step": int(tokens_per_optimizer_step),
+            "planned_train_tokens": int(train_tokens),
+            "planned_eval_tokens": int(eval_tokens),
+            "planned_total_tokens": int(train_tokens + eval_tokens),
+            "effective_epochs_over_train_split": float(train_tokens / train_tokens_available),
+            "eval_events": int(eval_events),
+            "checkpoint_interval": checkpoint_interval,
+            "intermediate_checkpoint_count": int(optimizer_steps // checkpoint_interval),
+            "final_checkpoint_count": 1,
+        },
+        "memory_estimate": {
+            "parameter_precision_bytes": precision_bytes,
+            "baseline_parameter_bytes": int(baseline_parameters * precision_bytes),
+            "cortex_parameter_bytes": int(cortex_parameters * precision_bytes),
+            "baseline_adam_training_bytes": int(baseline_parameters * adam_training_bytes_per_parameter),
+            "cortex_adam_training_bytes": int(cortex_parameters * adam_training_bytes_per_parameter),
+            "baseline_checkpoint_bytes": int(baseline_parameters * checkpoint_bytes_per_parameter),
+            "cortex_checkpoint_bytes": int(cortex_parameters * checkpoint_bytes_per_parameter),
+        },
+    }
+
+
 class LLMComparisonRunner:
     def __init__(
         self,
@@ -1581,6 +1716,9 @@ class LLMComparisonRunner:
                     manifest = self.prepare_corpus()
             _barrier_if_needed(runtime)
             manifest = TokenizedCorpusManifest.load(self.run_dir / "corpus" / "manifest.json")
+        plan = build_training_plan(manifest, self.config, world_size=runtime.world_size, distributed=runtime.enabled)
+        if runtime.is_main:
+            _write_json(self.run_dir / "run_plan.json", plan)
         train_data = MemmapCausalDataset(manifest, split="train")
         val_data = MemmapCausalDataset(manifest, split="val")
         try:
@@ -1625,6 +1763,7 @@ class LLMComparisonRunner:
             cortex=cortex.to_dict(),
             proof=proof,
             hardware=hardware_report(),
+            plan=plan,
         )
         if runtime.is_main:
             _write_json(self.run_dir / "comparison_report.json", report.to_dict())
@@ -1671,6 +1810,7 @@ class LLMComparisonRunner:
             "",
             "## Artifacts",
             "",
+            "- `run_plan.json`",
             "- `comparison_report.json`",
             "- `baseline_ntp/learning_curve.csv`",
             "- `cortex3/learning_curve.csv`",

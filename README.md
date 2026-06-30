@@ -184,6 +184,7 @@ python tools/train_llm.py smoke --require-win
 Ce smoke construit un corpus texte déterministe, entraîne un tokenizer BPE, écrit les tokens en streaming dans un fichier `uint32` memmap, échantillonne les batches causaux de façon vectorisée, entraîne deux Transformers causaux sur les mêmes données, sauvegarde les checkpoints et produit :
 
 - `comparison_report.json`
+- `run_plan.json`
 - `report.md`
 - `learning_curve.png`
 - `baseline_ntp/learning_curve.csv`
