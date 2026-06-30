@@ -2537,6 +2537,9 @@ class CortexTrainingPhaseController:
         self.causal_ledger = CausalLedger()
         self.uncertainty_ledger = UncertaintyLedger()
         self._last_ingested_compression_cost = CostTrace()
+        self.input_anchor_observations = 0
+        self.input_anchor_count = 0
+        self.input_anchor_fidelity_failures = 0
 
     def _touch(self, phase_id: str) -> None:
         self.phase_counts[phase_id] = self.phase_counts.get(phase_id, 0) + 1
@@ -2648,6 +2651,65 @@ class CortexTrainingPhaseController:
             "uncertainty_observations": sum(len(pairs) for pairs in self.uncertainty_ledger.bins.values()),
             "expected_calibration_error": self.uncertainty_ledger.expected_calibration_error(),
         }
+
+    def observe_input_batch(self, *, step: int, input_ids: torch.Tensor, source: str) -> None:
+        if input_ids.ndim != 2 or input_ids.shape[0] == 0:
+            return
+        sample_count = min(2, int(input_ids.shape[0]))
+        for row_index, row in enumerate(input_ids[:sample_count]):
+            token_ids = [int(token) for token in row.detach().cpu().tolist()]
+            text = self.tokenizer.decode(token_ids).strip()
+            if not text:
+                continue
+            segment_id = f"llm-input-{source}-{step}-{self.input_anchor_observations}-{row_index}"
+            segment = self.memory.ingest(
+                segment_id,
+                text,
+                metadata={
+                    "source": source,
+                    "step": step,
+                    "row_index": row_index,
+                    "token_count": len(token_ids),
+                    "from_llm_input_batch": True,
+                },
+            )
+            anchor_count = len(segment.anchors)
+            self.input_anchor_observations += 1
+            self.input_anchor_count += anchor_count
+            text_bytes = float(len(text.encode("utf-8")))
+            self.bit_ledger.ingest_cost(
+                CostTrace(kv_bytes=text_bytes, verifier_steps=1 if anchor_count else 0),
+                note=f"input-anchor:{source}:{step}:{anchor_count}",
+            )
+            if self.model.compression_ledger is not None:
+                self.model.compression_ledger.record_kv(
+                    segment_id,
+                    "exact_anchor_input",
+                    bytes_used=text_bytes,
+                    exact_anchors=anchor_count,
+                    note="Exact Anchor Ledger observed decoded LLM input batch",
+                )
+            if anchor_count:
+                reconstruction = self.memory.reconstruct(text[:512], required_anchors=segment.anchors)
+                if not reconstruction.fidelity.passed:
+                    self.input_anchor_fidelity_failures += 1
+                    self._record_error(
+                        "P4",
+                        ValueError(
+                            f"input anchor fidelity failed for {segment_id}: "
+                            f"missing {[anchor.value for anchor in reconstruction.fidelity.missing]}"
+                        ),
+                    )
+                else:
+                    self.uncertainty_ledger.record("llm_input_anchor_preservation", 0.99, True)
+                    self._record_causal_trace(
+                        trace_id=f"input-anchor-{source}-{step}-{self.input_anchor_observations}",
+                        skill="llm_input_anchor_preservation",
+                        confidence=0.99,
+                        anchors=anchor_count,
+                        certificate_fields=("exact_anchor_ledger", "input_batch_decode"),
+                        verifier_level=2,
+                    )
 
     def interval(self) -> int:
         return int(self.config.cortex_phase_interval or self.config.eval_interval)
@@ -2893,6 +2955,9 @@ class CortexTrainingPhaseController:
             "last_objective_loss_total": float(self.last_objective_loss_total),
             "objective_feedback_history": list(self.objective_feedback_history),
             "certificate_head_forward_events": int(self.model.certificate_forward_events),
+            "input_anchor_observations": int(self.input_anchor_observations),
+            "input_anchor_count": int(self.input_anchor_count),
+            "input_anchor_fidelity_failures": int(self.input_anchor_fidelity_failures),
             "last_ingested_compression_cost": _cost_trace_payload(self._last_ingested_compression_cost),
             "future_ledger": self.future_ledger.to_dict(),
             "compression_trace_ledger": (
@@ -2942,6 +3007,9 @@ class CortexTrainingPhaseController:
             for item in payload.get("objective_feedback_history", ())
         ]
         self.model.certificate_forward_events = int(payload.get("certificate_head_forward_events", 0))
+        self.input_anchor_observations = int(payload.get("input_anchor_observations", 0))
+        self.input_anchor_count = int(payload.get("input_anchor_count", 0))
+        self.input_anchor_fidelity_failures = int(payload.get("input_anchor_fidelity_failures", 0))
         self._last_ingested_compression_cost = _cost_trace_from_payload(payload.get("last_ingested_compression_cost"))
         _restore_future_contract_ledger(self.future_ledger, payload.get("future_ledger"))
         _restore_compression_trace_ledger(self.model.compression_ledger, payload.get("compression_trace_ledger"))
@@ -2984,6 +3052,9 @@ class CortexTrainingPhaseController:
             "compression_trace_counts": compression_trace_counts,
             "variable_input_compression_events": compression_trace_counts.get("kv_events", 0),
             "certificate_head_forward_events": int(self.model.certificate_forward_events),
+            "input_anchor_observations": int(self.input_anchor_observations),
+            "input_anchor_count": int(self.input_anchor_count),
+            "input_anchor_fidelity_failures": int(self.input_anchor_fidelity_failures),
             "bit_ledger_total_effective_bits": self.bit_ledger.total_effective_bits,
             "skill_ledger_states": len(self.skill_ledger.states),
             "causal_ledger_traces": len(self.causal_ledger.traces),
@@ -3305,6 +3376,9 @@ class CortexTrainingPhaseController:
                 "variable_input_compression_events": trace_counts.get("kv_events", 0),
                 "skill_expert_activations": trace_counts.get("expert_activations", 0),
                 "certificate_head_forward_events": int(self.model.certificate_forward_events),
+                "input_anchor_observations": int(self.input_anchor_observations),
+                "input_anchor_count": int(self.input_anchor_count),
+                "input_anchor_fidelity_failures": int(self.input_anchor_fidelity_failures),
                 "future_contract_decisions": len(self.future_ledger.decisions),
                 "bit_ledger_total_effective_bits": self.bit_ledger.total_effective_bits,
                 "skill_ledger_states": len(self.skill_ledger.states),
@@ -3454,6 +3528,7 @@ class LLMTrainer:
         self.model.eval()
         with torch.no_grad():
             x, y, future = self._batch(self.val_data)
+            phase_controller.observe_input_batch(step=step, input_ids=x, source="prime-val")
             with self.precision.autocast(self.device.type):
                 output = self.model(x)
                 _, breakdown = self.objective.compute(
@@ -3583,6 +3658,7 @@ class LLMTrainer:
                                 future_targets=future,
                                 breakdown=breakdown,
                             )
+                            phase_controller.observe_input_batch(step=step, input_ids=x, source="train")
                         if scaler is not None:
                             scaler.scale(loss).backward()
                         else:
