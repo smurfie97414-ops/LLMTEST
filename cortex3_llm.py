@@ -2373,6 +2373,7 @@ class LLMTrainer:
         if config.num_threads is not None:
             torch.set_num_threads(config.num_threads)
         self.generator = torch.Generator(device="cpu").manual_seed(config.seed)
+        self.code_state = code_state_report()
 
     def _resolve_device(self) -> torch.device:
         if self.config.device == "auto":
@@ -2632,7 +2633,7 @@ class LLMTrainer:
                 "corpus_identity": self.corpus_identity,
             },
             hardware=hardware_report(),
-            code_state=code_state_report(),
+            code_state=self.code_state,
             resource_usage=resource_usage,
             cortex_phase_report=cortex_phase_report,
         )
@@ -2754,7 +2755,7 @@ class LLMTrainer:
     ) -> Path:
         output = Path(path)
         output.parent.mkdir(parents=True, exist_ok=True)
-        code_state = code_state_report()
+        code_state = self.code_state
         cortex_phase_state = phase_controller.state_dict() if phase_controller is not None else None
         cortex_phase_state_summary = phase_controller.checkpoint_state_summary() if phase_controller is not None else None
         torch.save(

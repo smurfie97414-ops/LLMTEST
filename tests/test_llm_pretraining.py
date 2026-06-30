@@ -547,6 +547,63 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 train.close()
                 val.close()
 
+    def test_checkpoint_code_state_is_frozen_at_trainer_creation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            corpus = self._corpus(root, repeats=40)
+            tokenizer = LLMTokenizer.train(corpus, vocab_size=160, min_frequency=1)
+            manifest = TokenizedCorpusBuilder(corpus, tokenizer).build(
+                root / "prepared",
+                seq_len=16,
+                max_horizon=2,
+            )
+            model_config = TransformerConfig(
+                vocab_size=manifest.vocab_size,
+                seq_len=16,
+                d_model=32,
+                n_heads=4,
+                n_layers=1,
+                dropout=0.0,
+                horizons=(1, 2),
+            )
+            train = MemmapCausalDataset(manifest, split="train")
+            val = MemmapCausalDataset(manifest, split="val")
+            frozen_code_state = {
+                "schema_version": 1,
+                "git_commit": "start-commit",
+                "git_branch": "main",
+                "tracked_dirty": False,
+            }
+            try:
+                with patch("cortex3_llm.code_state_report", return_value=frozen_code_state) as mocked_code_state:
+                    report = LLMTrainer(
+                        CortexTransformerLM(model_config),
+                        train,
+                        val,
+                        TrainingConfig(
+                            steps=1,
+                            batch_size=2,
+                            eval_interval=1,
+                            eval_batches=1,
+                            checkpoint_interval=1,
+                            seed=37,
+                            num_threads=1,
+                        ),
+                        run_dir=root / "code-state",
+                        model_kind="baseline_next_token",
+                        corpus_identity=manifest.identity(),
+                    ).train(name="baseline")
+            finally:
+                train.close()
+                val.close()
+
+            self.assertEqual(mocked_code_state.call_count, 1)
+            checkpoint = torch.load(root / "code-state" / "checkpoint_final.pt", map_location="cpu", weights_only=False)
+            sidecar = json.loads((root / "code-state" / "checkpoint_final.pt.json").read_text(encoding="utf-8"))
+            self.assertEqual(report.code_state["git_commit"], "start-commit")
+            self.assertEqual(checkpoint["code_state"]["git_commit"], "start-commit")
+            self.assertEqual(sidecar["code_state"]["git_commit"], "start-commit")
+
     def test_training_config_rejects_strict_and_auto_resume_together(self):
         with self.assertRaisesRegex(ValueError, "mutually exclusive"):
             TrainingConfig(resume=True, resume_if_exists=True)
