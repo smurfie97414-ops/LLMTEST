@@ -607,6 +607,10 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
     def test_training_config_rejects_strict_and_auto_resume_together(self):
         with self.assertRaisesRegex(ValueError, "mutually exclusive"):
             TrainingConfig(resume=True, resume_if_exists=True)
+        with self.assertRaisesRegex(ValueError, "cortex_objective_feedback_weight"):
+            TrainingConfig(cortex_objective_feedback_weight=-0.1)
+        with self.assertRaisesRegex(ValueError, "cortex_objective_feedback_clip"):
+            TrainingConfig(cortex_objective_feedback_clip=-1.0)
 
     def test_full_cortex_phase_controller_uses_all_modules_during_training(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -671,16 +675,24 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             self.assertGreater(influence["sleep_replay_batches_available"], 0)
             self.assertGreater(influence["sleep_replay_updates"], 0)
             self.assertGreater(influence["phase_replay_examples"], 0)
+            self.assertGreater(influence["objective_feedback_events"], 0)
+            self.assertGreater(influence["last_objective_loss_total"], 0.0)
+            self.assertGreater(influence["objective_feedback_scale"], 1.0)
             phase_replay = influence["phase_replay_examples_by_phase"]
             for phase_id in ("P1", "P3", "P4", "P5", "P6", "P7", "P8", "P10"):
                 self.assertGreater(phase_replay[phase_id], 0, phase_replay)
             self.assertTrue(phase_report["phase_replay_example_ids"], phase_report)
+            self.assertTrue(phase_report["objective_feedback_history"], phase_report)
             for sample in phase_report["batch_contract_samples"]:
                 self.assertGreaterEqual(sample["observed_token_count"], sample["horizon"])
             self.assertTrue((run_dir / "cortex_phase_report.json").exists())
             persisted = json.loads((run_dir / "cortex_phase_report.json").read_text(encoding="utf-8"))
             self.assertTrue(persisted["all_phases_active"], persisted)
             self.assertEqual(persisted["training_influence"]["sleep_replay_updates"], influence["sleep_replay_updates"])
+            self.assertEqual(
+                persisted["training_influence"]["objective_feedback_events"],
+                influence["objective_feedback_events"],
+            )
 
     def test_future_contract_observed_tokens_use_real_horizon_not_horizon_columns(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -758,12 +770,16 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 ).train(name="cortex3")
                 first_influence = first.cortex_phase_report["training_influence"]
                 self.assertGreater(first_influence["phase_replay_examples"], 0)
+                self.assertGreater(first_influence["objective_feedback_events"], 0)
                 checkpoint = torch.load(run_dir / "checkpoint_final.pt", map_location="cpu", weights_only=False)
                 self.assertIn("cortex_phase_state", checkpoint)
                 self.assertGreater(len(checkpoint["cortex_phase_state"]["replay_batches"]), 0)
+                self.assertGreater(checkpoint["cortex_phase_state"]["objective_feedback_events"], 0)
+                self.assertGreater(checkpoint["cortex_phase_state"]["last_objective_loss_total"], 0.0)
                 sidecar = json.loads((run_dir / "checkpoint_final.pt.json").read_text(encoding="utf-8"))
                 self.assertTrue(sidecar["cortex_phase_state_present"])
                 self.assertGreater(sidecar["cortex_phase_state_summary"]["replay_batch_count"], 0)
+                self.assertGreater(sidecar["cortex_phase_state_summary"]["objective_feedback_events"], 0)
 
                 resumed = LLMTrainer(
                     CortexTransformerLM(model_config),
@@ -794,6 +810,11 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             self.assertEqual(resumed.start_step, 1)
             self.assertGreaterEqual(resumed_influence["phase_replay_examples"], first_influence["phase_replay_examples"])
             self.assertGreater(resumed_influence["sleep_replay_updates"], first_influence["sleep_replay_updates"])
+            self.assertGreaterEqual(
+                resumed_influence["objective_feedback_events"],
+                first_influence["objective_feedback_events"],
+            )
+            self.assertGreater(resumed_influence["objective_feedback_scale"], 1.0)
 
     def test_inspect_experiment_reports_partial_run_without_loading_checkpoints(self):
         with tempfile.TemporaryDirectory() as tmp:

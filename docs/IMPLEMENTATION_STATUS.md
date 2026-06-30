@@ -298,16 +298,20 @@ Current executable coverage:
 - `ABSOLUTE_METRICS` enumerates all 15 metrics from the plan: cost per verified answer, joules per correct skill, active bits per preserved skill, rare regression rate, verifier detection rate, verifier false negatives, average verification cost, MTP rejection rate, token inflation, anchor accuracy, calibration, regrowth gain per added bit, path speed, percent without heavy verification and compiled skills from slow to fast.
 - `write_cycle_run` can persist objective reports into `summary.json`.
 - `tools/run_cycle_report.py` writes the objective report by default.
+- `CortexTrainingPhaseController` now converts the latest cross-phase `L_total` into a bounded objective-feedback scale that multiplies the trainable Cortex LLM confidence regularization and verified phase-replay losses.
+- LLM checkpoints persist objective feedback counters, latest objective loss, feedback scale summary and history inside `cortex_phase_state`, so resumed runs keep the same cross-phase training signal.
 
 Evidence:
 
 - `.\.venv\Scripts\python.exe -m unittest tests.test_objective_metrics`
 - Smoke: objective report contains `17/17` loss terms and `15/15` absolute metrics.
+- `tests/test_llm_pretraining.py::LLMPretrainingHarnessTest::test_full_cortex_phase_controller_uses_all_modules_during_training` verifies objective-feedback events, latest `L_total`, feedback scale and persisted report history during full P1-P10 LLM training.
+- `tests/test_llm_pretraining.py::LLMPretrainingHarnessTest::test_cortex_phase_state_survives_checkpoint_resume` verifies objective-feedback state persists through checkpoint resume.
 
 Remaining:
 
-- Calibrate objective weights against real training runs.
-- Feed the objective directly into trainable checkpoint optimization instead of only reporting it.
+- Calibrate objective-feedback and term weights against real training runs.
+- Compare objective-guided checkpoint selection policies across broad benchmarks.
 
 ## Plan experiments A-E
 
@@ -374,7 +378,7 @@ Current executable coverage:
 - `CortexTransformerLM` is a complete causal Transformer with tied embeddings, causal self-attention, MLP blocks, optional Cortex multi-horizon heads and an optional `BitLinear` ternary core for the Cortex model.
 - `CortexObjective` optimizes next-token loss plus Cortex MTP, temporal-consistency and confidence terms when the Cortex heads are enabled.
 - `CortexTrainingPhaseController` integrates P1-P10 into full LLM training when horizons are `[1, 2, 4, 8]`: verifier cycle, ternary forward traces, MTP/FSP contract ledger, cognitive memory reconstruction, certificate verification, causal attribution, minimal regrowth planning, fast/normal/careful inference, sleep replay batches and recursive-improvement gates.
-- The full Cortex trainer adds confidence/contract regularization to the loss, tokenizes accepted sleep examples into causal replay batches and writes `cortex_phase_report.json` with per-phase event counts.
+- The full Cortex trainer adds confidence/contract regularization to the loss, tokenizes accepted sleep/phase examples into causal replay batches, scales Cortex trainable losses with bounded cross-phase objective feedback and writes `cortex_phase_report.json` with per-phase event counts.
 - `build_training_plan` writes `run_plan.json` before training starts, with real token-count, split-window, parameter-count, planned-token, checkpoint and optimizer-memory estimates for the baseline and Cortex models.
 - `LLMTrainer` supports checkpoints, strict resume, first-run-safe auto-resume, optimizer/scaler/RNG state persistence, gradient accumulation, CSV learning curves, resource usage monitoring, deterministic random sampling, explicit device selection, mixed precision policy and DDP initialization from environment, including a Windows/Gloo TCPStore path that avoids unsupported libuv builds.
 - `audit_learning_curves` writes `learning_curve_audit.json` and makes the proof gate require real finite baseline/Cortex validation curves with initial and final validation steps.
@@ -415,9 +419,9 @@ Evidence:
 - CUDA external Wikitext comparison matrix: `tools\train_llm.py compare-matrix runs\hf-wikitext2-validation\text_shards --out-dir runs\llm-wikitext2-cuda-compare-matrix-validation --seeds 17,29 --vocab-size 512 --seq-len 64 --d-model 64 --n-heads 4 --n-layers 2 --steps 48 --batch-size 8 --precision bf16 --device cuda --require-cuda --require-win` passed with `2/2` seeds, mean Cortex/baseline ratio `24.864x`, min ratio `24.500x`, aggregate CSV/PNG learning curves and CUDA recorded in per-seed reports.
 - Versioned experiment manifests: `experiments/wikitext_cuda_validation.json` for fast local CUDA validation with small scale thresholds and `experiments/c4_cuda_large_manifest.json` for a preflighted, auto-resumable large C4 CUDA run with massive corpus/training-token proof thresholds.
 - Versioned Wikitext CUDA manifest validation: `tools\train_llm.py run-experiment experiments\wikitext_cuda_validation.json` passed with `2/2` seeds, win-rate `1.0`, mean Cortex/baseline ratio `11.861x`, min ratio `10.889x`, CUDA doctor passed and aggregate CSV/PNG learning curves written.
-- Full Cortex phase integration unit validation: `.\.venv\Scripts\python.exe -m pytest tests\test_llm_pretraining.py::LLMPretrainingHarnessTest::test_full_cortex_phase_controller_uses_all_modules_during_training -q` passed and verified P1-P10 event counts, ternary forward events, future contract decisions, confidence regularization, sleep replay batches and replay updates.
+- Full Cortex phase integration unit validation: `.\.venv\Scripts\python.exe -m pytest tests\test_llm_pretraining.py::LLMPretrainingHarnessTest::test_full_cortex_phase_controller_uses_all_modules_during_training -q` passed and verified P1-P10 event counts, ternary forward events, future contract decisions, confidence regularization, sleep replay batches, replay updates and objective-feedback scaling.
 - Full Cortex proof-gate negative validation: `tests/test_llm_pretraining.py::LLMPretrainingHarnessTest::test_comparison_proof_requires_full_cortex_phase_report_for_full_architecture` verifies that a full-Cortex config fails proof when `all_phases_active=false`.
-- LLM pretraining test suite after full phase integration: `.\.venv\Scripts\python.exe -m pytest tests\test_llm_pretraining.py -q` passed with `28` tests.
+- LLM pretraining test suite after full phase integration: `.\.venv\Scripts\python.exe -m pytest tests\test_llm_pretraining.py -q` passed with `32` tests.
 - Wikitext CUDA scale-gate validation: `tools\train_llm.py run-experiment experiments\wikitext_cuda_validation.json --out-dir runs\cortex3-wikitext-cuda-scale-gate-validation` passed with `2/2` seeds, min observed corpus tokens `29,104`, min observed planned train tokens `24,576`, min required corpus/train tokens `20,000/20,000`, mean Cortex/baseline ratio `10.257x`, min ratio `9.625x`, preflight artifact written and aggregate CSV/PNG learning curves written.
 - Post-run audit validation: `tools\train_llm.py audit-experiment runs\cortex3-wikitext-cuda-scale-gate-validation` passed with no failed checks and revalidated preflight, proof, HF shards, tokenized corpus manifests, learning curves and checkpoints.
 - C4 large manifest preflight after full phase integration: `tools\train_llm.py preflight-experiment experiments\c4_cuda_large_manifest.json --out-dir runs\cortex3-c4-cuda-large-preflight-current` passed on RTX 5070 with estimated Cortex peak `6,880,310,498` bytes under `10,897,408,000` usable CUDA bytes, while preserving `2,097,152,000` planned train tokens and `50,000,000` minimum corpus tokens.

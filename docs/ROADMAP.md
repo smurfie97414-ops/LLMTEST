@@ -33,8 +33,8 @@ This document tracks implementation progress for the project.
   - Implemented baseline: proposal generator, in-memory sandbox trainer, evolutionary archive, dynamic evaluator, Pareto/protected/calibration/diversity patch acceptance gate, reward-hacking detector, cross-skill collapse detector, rollback tokens and verifier-approved proposal replay examples that feed the full LLM Cortex loss.
   - Next: convert accepted in-memory proposals into signed patch artifacts, add persistent rollback archives and run multi-generation evolution.
 - Cross-phase objective and metrics
-  - Implemented baseline: executable 17-term `L_total` from the plan, objective weights, effective joule model, recursive-improvement invalidity gates, all 15 absolute metrics and persisted objective reports in `summary.json`.
-  - Next: calibrate term weights empirically and connect the loss directly to real model/checkpoint optimization.
+  - Implemented baseline: executable 17-term `L_total` from the plan, objective weights, effective joule model, recursive-improvement invalidity gates, all 15 absolute metrics, persisted objective reports in `summary.json`, and bounded objective-feedback scaling for the trainable Cortex LLM confidence regularization and phase replay losses.
+  - Next: calibrate term weights empirically against long real training runs and compare checkpoint selection policies.
 - Plan experiments A-E
   - Implemented baseline: named experiments for verifier fault detection, compression adversary, minimal regrowth, SlowSolve to FastSolve and auto-improvement sandbox, all with persisted metrics and pass/fail criteria including calibration/collapse checks for Experiment E.
   - Next: run the experiments over larger randomized suites and compare against trained checkpoint variants.

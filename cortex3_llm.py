@@ -1352,6 +1352,8 @@ class TrainingConfig:
     cortex_phase_max_proposals: int = 1
     cortex_phase_regularization_weight: float = 0.001
     cortex_phase_replay_weight: float = 0.05
+    cortex_objective_feedback_weight: float = 0.05
+    cortex_objective_feedback_clip: float = 4.0
     num_threads: int | None = None
 
     def __post_init__(self) -> None:
@@ -1377,6 +1379,10 @@ class TrainingConfig:
             raise ValueError("cortex_phase_regularization_weight must be non-negative")
         if self.cortex_phase_replay_weight < 0:
             raise ValueError("cortex_phase_replay_weight must be non-negative")
+        if self.cortex_objective_feedback_weight < 0:
+            raise ValueError("cortex_objective_feedback_weight must be non-negative")
+        if self.cortex_objective_feedback_clip < 0:
+            raise ValueError("cortex_objective_feedback_clip must be non-negative")
         if self.resume and self.resume_if_exists:
             raise ValueError("resume and resume_if_exists are mutually exclusive")
 
@@ -1796,6 +1802,10 @@ class CortexTrainingPhaseController:
         self.replay_updates = 0
         self.phase_replay_examples: dict[str, int] = {phase.id: 0 for phase in CORTEX3_PHASES}
         self.phase_replay_example_ids: list[str] = []
+        self.objective_feedback_events = 0
+        self.objective_feedback_total = 0.0
+        self.last_objective_loss_total = 0.0
+        self.objective_feedback_history: list[dict[str, Any]] = []
 
     def _touch(self, phase_id: str) -> None:
         self.phase_counts[phase_id] = self.phase_counts.get(phase_id, 0) + 1
@@ -1809,12 +1819,25 @@ class CortexTrainingPhaseController:
     def should_sample_step(self, step: int) -> bool:
         return step == 0 or step % self.interval() == 0 or step == self.config.steps
 
+    def objective_feedback_scale(self) -> float:
+        if self.config.cortex_objective_feedback_weight <= 0:
+            return 1.0
+        bounded_loss = min(
+            float(self.config.cortex_objective_feedback_clip),
+            math.log1p(max(0.0, float(self.last_objective_loss_total))),
+        )
+        return 1.0 + float(self.config.cortex_objective_feedback_weight) * bounded_loss
+
     def auxiliary_loss(self, output: LLMForwardOutput) -> torch.Tensor:
         if output.confidence is None or self.config.cortex_phase_regularization_weight <= 0:
             return output.logits.new_tensor(0.0)
         self.regularization_steps += 1
         confidence_pressure = (1.0 - output.confidence.mean()).clamp_min(0.0)
-        return confidence_pressure * float(self.config.cortex_phase_regularization_weight)
+        return (
+            confidence_pressure
+            * float(self.config.cortex_phase_regularization_weight)
+            * self.objective_feedback_scale()
+        )
 
     def observe_batch_contract(
         self,
@@ -1893,7 +1916,7 @@ class CortexTrainingPhaseController:
             output = model_forward(x)
             loss, _ = objective.compute(output, y, future, use_cortex_terms=self.model.config.use_cortex_heads)
         self.replay_updates += 1
-        return loss * float(self.config.cortex_phase_replay_weight)
+        return loss * float(self.config.cortex_phase_replay_weight) * self.objective_feedback_scale()
 
     def _future_targets_from_next_tokens(self, y: torch.Tensor) -> torch.Tensor:
         horizons = tuple(int(horizon) for horizon in self.model.config.horizons)
@@ -2013,6 +2036,10 @@ class CortexTrainingPhaseController:
             "replay_updates": int(self.replay_updates),
             "phase_replay_examples": dict(self.phase_replay_examples),
             "phase_replay_example_ids": list(self.phase_replay_example_ids),
+            "objective_feedback_events": int(self.objective_feedback_events),
+            "objective_feedback_total": float(self.objective_feedback_total),
+            "last_objective_loss_total": float(self.last_objective_loss_total),
+            "objective_feedback_history": list(self.objective_feedback_history),
         }
 
     def load_state_dict(self, payload: Mapping[str, Any] | None) -> None:
@@ -2038,6 +2065,13 @@ class CortexTrainingPhaseController:
             for key, value in dict(payload.get("phase_replay_examples", {})).items()
         })
         self.phase_replay_example_ids = [str(item) for item in payload.get("phase_replay_example_ids", ())]
+        self.objective_feedback_events = int(payload.get("objective_feedback_events", 0))
+        self.objective_feedback_total = float(payload.get("objective_feedback_total", 0.0))
+        self.last_objective_loss_total = float(payload.get("last_objective_loss_total", 0.0))
+        self.objective_feedback_history = [
+            dict(item)
+            for item in payload.get("objective_feedback_history", ())
+        ]
 
     def checkpoint_state_summary(self) -> dict[str, Any]:
         return {
@@ -2049,6 +2083,9 @@ class CortexTrainingPhaseController:
             "replay_updates": int(self.replay_updates),
             "phase_replay_examples": sum(self.phase_replay_examples.values()),
             "phase_replay_examples_by_phase": dict(self.phase_replay_examples),
+            "objective_feedback_events": int(self.objective_feedback_events),
+            "objective_feedback_scale": self.objective_feedback_scale(),
+            "last_objective_loss_total": float(self.last_objective_loss_total),
             "error_count": len(self.errors),
         }
 
@@ -2293,6 +2330,16 @@ class CortexTrainingPhaseController:
                     improvement_report=improvement_report,
                 )
                 audit["objective"] = objective_report.to_dict()
+                self.last_objective_loss_total = float(objective_report.loss.total)
+                self.objective_feedback_events += 1
+                self.objective_feedback_total += self.last_objective_loss_total
+                self.objective_feedback_history.append(
+                    {
+                        "step": step,
+                        "loss_total": self.last_objective_loss_total,
+                        "feedback_scale": self.objective_feedback_scale(),
+                    }
+                )
         except Exception as exc:
             self._record_error("objective", exc)
 
@@ -2335,12 +2382,19 @@ class CortexTrainingPhaseController:
                 "sleep_replay_updates": self.replay_updates,
                 "phase_replay_examples": sum(self.phase_replay_examples.values()),
                 "phase_replay_examples_by_phase": dict(self.phase_replay_examples),
+                "objective_feedback_events": self.objective_feedback_events,
+                "objective_feedback_average_loss": (
+                    self.objective_feedback_total / max(1, self.objective_feedback_events)
+                ),
+                "objective_feedback_scale": self.objective_feedback_scale(),
+                "last_objective_loss_total": self.last_objective_loss_total,
             },
             "trace_counts": trace_counts,
             "future_ledger": self.future_ledger.to_dict(),
             "phase_audits": _last_items(self.phase_audits, 2),
             "batch_contract_samples": _last_items(self.batch_contract_samples, 5),
             "phase_replay_example_ids": _last_items(self.phase_replay_example_ids, 10),
+            "objective_feedback_history": _last_items(self.objective_feedback_history, 5),
             "errors": list(self.errors),
         }
 
