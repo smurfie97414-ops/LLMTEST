@@ -391,6 +391,7 @@ Current executable coverage:
 - `tools/launch_llm_ddp.py` launches true local multi-process DDP workers, pins the Gloo interface and writes per-rank logs.
 - `.github/workflows/ci.yml` runs the LLM smoke command.
 - Tokenized corpus manifests now carry SHA-256 hashes for the token memmap, tokenizer and source shards; `run_plan.json`, training reports and checkpoints include a corpus identity digest, and `LLMTrainer` refuses resume from missing or mismatched `corpus_identity` checkpoints.
+- Single comparison reports now require `baseline_score >= min_baseline_future_tokens_per_cost`; a Cortex ratio computed against a zero baseline is recorded with `failed_checks=["baseline_score_passed"]` and cannot pass `--require-win`.
 
 Evidence:
 
@@ -433,7 +434,7 @@ Evidence:
 - CLI resume validation: `tools\train_llm.py smoke --out-dir runs\llm-resume-cli-validation --steps 2 ...` then `--steps 4 --resume ...` resumed both `baseline_ntp` and `cortex3` from `checkpoint_final.pt` with `start_step=2`, `optimizer_steps=2`, `effective_batch_size=16` and `final_step=4`.
 - DDP accumulation validation: `tools\launch_llm_ddp.py --nproc 2 ... --gradient-accumulation-steps 2` completed with `distributed=True`, `world_size=2`, proof passed and `effective_batch_size=32` for both baseline and Cortex.
 - DDP CUDA preflight validation: `tools\launch_llm_ddp.py --nproc 2 ... --device cuda --require-cuda` now fails before spawning workers because one visible CUDA device cannot serve two local CUDA ranks; CPU/Gloo DDP still passed after the CUDA wheel install.
-- `.\.venv\Scripts\python.exe -m unittest discover -s tests`: `128` tests passed.
+- `.\.venv\Scripts\python.exe -m unittest discover -s tests`: `129` tests passed.
 
 Remaining:
 

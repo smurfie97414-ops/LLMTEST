@@ -1515,6 +1515,7 @@ class ComparisonConfig:
     training: TrainingConfig = field(default_factory=TrainingConfig)
     cortex_win_margin: float = 1.05
     max_next_token_loss_regression: float = 1.20
+    min_baseline_future_tokens_per_cost: float = 1e-6
 
 
 @dataclass(frozen=True)
@@ -1989,20 +1990,33 @@ class LLMComparisonRunner:
         cortex_score = cortex.final_val.future_tokens_per_cost
         ratio = cortex_score / max(1e-9, baseline_score)
         next_token_regression = cortex.final_val.next_token_loss / max(1e-9, baseline.final_val.next_token_loss)
-        passed = (
-            ratio >= self.config.cortex_win_margin
-            and next_token_regression <= self.config.max_next_token_loss_regression
-            and bool(curve_audit["passed"])
-        )
+        finite_metrics = all(math.isfinite(value) for value in (baseline_score, cortex_score, ratio, next_token_regression))
+        baseline_score_passed = finite_metrics and baseline_score >= self.config.min_baseline_future_tokens_per_cost
+        ratio_passed = finite_metrics and ratio >= self.config.cortex_win_margin
+        next_token_regression_passed = finite_metrics and next_token_regression <= self.config.max_next_token_loss_regression
+        learning_curve_audit_passed = bool(curve_audit["passed"])
+        checks = {
+            "finite_metrics": finite_metrics,
+            "baseline_score_passed": baseline_score_passed,
+            "ratio_passed": ratio_passed,
+            "next_token_regression_passed": next_token_regression_passed,
+            "learning_curve_audit_passed": learning_curve_audit_passed,
+        }
+        failed_checks = tuple(name for name, passed_check in checks.items() if not passed_check)
+        passed = not failed_checks
         return {
             "metric": "verified_future_tokens_per_forward_cost",
             "baseline_score": baseline_score,
             "cortex_score": cortex_score,
             "cortex_over_baseline_ratio": ratio,
             "required_margin": self.config.cortex_win_margin,
+            "min_baseline_future_tokens_per_cost": self.config.min_baseline_future_tokens_per_cost,
             "next_token_loss_regression_ratio": next_token_regression,
             "max_next_token_loss_regression": self.config.max_next_token_loss_regression,
-            "learning_curve_audit_passed": bool(curve_audit["passed"]),
+            "checks": checks,
+            "failed_checks": failed_checks,
+            "baseline_score_passed": baseline_score_passed,
+            "learning_curve_audit_passed": learning_curve_audit_passed,
             "passed": passed,
         }
 
@@ -2013,10 +2027,12 @@ class LLMComparisonRunner:
             "",
             f"- Proof metric: `{proof['metric']}`",
             f"- Baseline score: `{proof['baseline_score']:.6f}`",
+            f"- Minimum baseline score: `{proof['min_baseline_future_tokens_per_cost']:.6f}`",
             f"- Cortex score: `{proof['cortex_score']:.6f}`",
             f"- Cortex/baseline ratio: `{proof['cortex_over_baseline_ratio']:.3f}`",
             f"- Next-token loss regression ratio: `{proof['next_token_loss_regression_ratio']:.3f}`",
             f"- Learning curve audit passed: `{proof['learning_curve_audit_passed']}`",
+            f"- Failed checks: `{', '.join(proof['failed_checks']) if proof['failed_checks'] else 'none'}`",
             f"- Passed: `{proof['passed']}`",
             "",
             "## Artifacts",
@@ -2168,14 +2184,19 @@ class LLMComparisonMatrixSuite:
         for seed_report in seed_reports:
             seed = int(seed_report["seed"])
             proof = seed_report["proof"]
+            baseline_score = float(proof["baseline_score"])
+            baseline_score_passed = bool(
+                proof.get("baseline_score_passed", baseline_score >= self.config.min_baseline_future_tokens_per_cost)
+            )
             samples.append(
                 {
                     "seed": seed,
                     "ratio": float(proof["cortex_over_baseline_ratio"]),
-                    "baseline_score": float(proof["baseline_score"]),
+                    "baseline_score": baseline_score,
+                    "baseline_score_passed": baseline_score_passed,
                     "cortex_score": float(proof["cortex_score"]),
                     "next_token_loss_regression_ratio": float(proof["next_token_loss_regression_ratio"]),
-                    "passed": bool(proof["passed"]) and float(proof["baseline_score"]) > 0.0,
+                    "passed": bool(proof["passed"]) and baseline_score_passed,
                 }
             )
         ratios = [sample["ratio"] for sample in samples]
@@ -2190,7 +2211,7 @@ class LLMComparisonMatrixSuite:
             sample_count == len(self.seeds)
             and passed_count == sample_count
             and min_ratio >= self.config.cortex_win_margin
-            and min_baseline > 0.0
+            and min_baseline >= self.config.min_baseline_future_tokens_per_cost
             and max_regression <= self.config.max_next_token_loss_regression
         )
         return {
@@ -2208,6 +2229,7 @@ class LLMComparisonMatrixSuite:
             "win_rate": passed_count / max(1, sample_count),
             "mean_baseline_score": sum(baseline_scores) / max(1, len(baseline_scores)),
             "min_baseline_score": min_baseline,
+            "min_baseline_future_tokens_per_cost": self.config.min_baseline_future_tokens_per_cost,
             "max_next_token_loss_regression": max_regression,
             "all_samples_passed": passed_count == sample_count and sample_count > 0,
             "samples": tuple(samples),
@@ -2381,15 +2403,20 @@ class LLMCorpusMatrixSuite:
         for corpus_report in corpus_reports:
             corpus_name = str(corpus_report["name"])
             for sample in corpus_report["proof"]["samples"]:
+                baseline_score = float(sample["baseline_score"])
+                baseline_score_passed = bool(
+                    sample.get("baseline_score_passed", baseline_score >= self.config.min_baseline_future_tokens_per_cost)
+                )
                 samples.append(
                     {
                         "corpus": corpus_name,
                         "seed": int(sample["seed"]),
                         "ratio": float(sample["ratio"]),
-                        "baseline_score": float(sample["baseline_score"]),
+                        "baseline_score": baseline_score,
+                        "baseline_score_passed": baseline_score_passed,
                         "cortex_score": float(sample["cortex_score"]),
                         "next_token_loss_regression_ratio": float(sample["next_token_loss_regression_ratio"]),
-                        "passed": bool(sample["passed"]) and float(sample["baseline_score"]) > 0.0,
+                        "passed": bool(sample["passed"]) and baseline_score_passed,
                     }
                 )
 
@@ -2442,7 +2469,7 @@ class LLMCorpusMatrixSuite:
             sample_count == expected_samples
             and passed_count == sample_count
             and min_ratio >= self.config.cortex_win_margin
-            and min_baseline > 0.0
+            and min_baseline >= self.config.min_baseline_future_tokens_per_cost
             and max_regression <= self.config.max_next_token_loss_regression
         )
         return {
@@ -2462,6 +2489,7 @@ class LLMCorpusMatrixSuite:
             "win_rate": passed_count / max(1, sample_count),
             "mean_baseline_score": sum(baseline_scores) / max(1, len(baseline_scores)),
             "min_baseline_score": min_baseline,
+            "min_baseline_future_tokens_per_cost": self.config.min_baseline_future_tokens_per_cost,
             "max_next_token_loss_regression": max_regression,
             "all_samples_passed": passed_count == sample_count and sample_count > 0,
             "corpus_results": tuple(corpus_results),
@@ -2899,7 +2927,17 @@ class LLMBenchmarkSuite:
         ratios = [float(item["proof"]["cortex_over_baseline_ratio"]) for item in domains]
         baseline_scores = [float(item["proof"]["baseline_score"]) for item in domains]
         regressions = [float(item["proof"]["next_token_loss_regression_ratio"]) for item in domains]
-        all_domain_proofs = [bool(item["proof"]["passed"]) and float(item["proof"]["baseline_score"]) > 0.0 for item in domains]
+        all_domain_proofs = [
+            bool(item["proof"]["passed"])
+            and bool(
+                item["proof"].get(
+                    "baseline_score_passed",
+                    float(item["proof"]["baseline_score"]) >= self.config.min_baseline_future_tokens_per_cost,
+                )
+            )
+            for item in domains
+        ]
+        min_baseline = min(baseline_scores) if baseline_scores else 0.0
         return {
             "metric": "benchmark_mean_cortex_over_baseline",
             "domains": [str(item["domain"]) for item in domains],
@@ -2907,6 +2945,8 @@ class LLMBenchmarkSuite:
             "mean_ratio": sum(ratios) / max(1, len(ratios)),
             "min_ratio": min(ratios) if ratios else 0.0,
             "mean_baseline_score": sum(baseline_scores) / max(1, len(baseline_scores)),
+            "min_baseline_score": min_baseline,
+            "min_baseline_future_tokens_per_cost": self.config.min_baseline_future_tokens_per_cost,
             "max_next_token_loss_regression": max(regressions) if regressions else 0.0,
             "all_domains_passed": all(all_domain_proofs),
             "passed": bool(domains) and all(all_domain_proofs),
@@ -3030,15 +3070,20 @@ class LLMStatisticalBenchmarkSuite:
             seed = int(seed_report["seed"])
             for domain_report in seed_report["domains"]:
                 proof = domain_report["proof"]
+                baseline_score = float(proof["baseline_score"])
+                baseline_score_passed = bool(
+                    proof.get("baseline_score_passed", baseline_score >= self.config.min_baseline_future_tokens_per_cost)
+                )
                 samples.append(
                     {
                         "seed": seed,
                         "domain": str(domain_report["domain"]),
                         "ratio": float(proof["cortex_over_baseline_ratio"]),
-                        "baseline_score": float(proof["baseline_score"]),
+                        "baseline_score": baseline_score,
+                        "baseline_score_passed": baseline_score_passed,
                         "cortex_score": float(proof["cortex_score"]),
                         "next_token_loss_regression_ratio": float(proof["next_token_loss_regression_ratio"]),
-                        "passed": bool(proof["passed"]) and float(proof["baseline_score"]) > 0.0,
+                        "passed": bool(proof["passed"]) and baseline_score_passed,
                     }
                 )
 
@@ -3089,7 +3134,7 @@ class LLMStatisticalBenchmarkSuite:
             sample_count == len(self.domains) * len(self.seeds)
             and passed_count == sample_count
             and min_ratio >= self.config.cortex_win_margin
-            and min_baseline > 0.0
+            and min_baseline >= self.config.min_baseline_future_tokens_per_cost
             and max_regression <= self.config.max_next_token_loss_regression
         )
         return {
@@ -3109,6 +3154,7 @@ class LLMStatisticalBenchmarkSuite:
             "win_rate": win_rate,
             "mean_baseline_score": sum(baseline_scores) / max(1, len(baseline_scores)),
             "min_baseline_score": min_baseline,
+            "min_baseline_future_tokens_per_cost": self.config.min_baseline_future_tokens_per_cost,
             "max_next_token_loss_regression": max_regression,
             "all_samples_passed": passed_count == sample_count and sample_count > 0,
             "domain_results": tuple(domain_results),

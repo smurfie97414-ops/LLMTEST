@@ -224,6 +224,67 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
         self.assertIn("baseline_ntp", audit["failed_models"])
         self.assertIn("missing_final_validation_step", audit["baseline"]["failed_checks"])
 
+    def test_comparison_proof_rejects_zero_baseline_score(self):
+        config = ComparisonConfig(
+            cortex_win_margin=1.02,
+            max_next_token_loss_regression=1.50,
+            min_baseline_future_tokens_per_cost=0.001,
+        )
+        runner = object.__new__(LLMComparisonRunner)
+        runner.config = config
+        baseline = TrainingRunReport(
+            name="baseline_ntp",
+            model_kind="baseline_next_token",
+            run_dir="baseline",
+            checkpoint_path="baseline/checkpoint_final.pt",
+            start_step=0,
+            optimizer_steps=4,
+            effective_batch_size=2,
+            resumed_from=None,
+            final_train=TrainingPoint(step=4, split="train", loss=1.0, next_token_loss=1.0, token_accuracy=0.1),
+            final_val=TrainingPoint(
+                step=4,
+                split="val",
+                loss=1.0,
+                next_token_loss=1.0,
+                token_accuracy=0.1,
+                future_tokens_per_cost=0.0,
+            ),
+            curve=(),
+            config={},
+            hardware={},
+        )
+        cortex = TrainingRunReport(
+            name="cortex3",
+            model_kind="cortex3_multi_horizon",
+            run_dir="cortex",
+            checkpoint_path="cortex/checkpoint_final.pt",
+            start_step=0,
+            optimizer_steps=4,
+            effective_batch_size=2,
+            resumed_from=None,
+            final_train=TrainingPoint(step=4, split="train", loss=1.0, next_token_loss=1.0, token_accuracy=0.1),
+            final_val=TrainingPoint(
+                step=4,
+                split="val",
+                loss=0.9,
+                next_token_loss=0.9,
+                token_accuracy=0.2,
+                future_tokens_per_cost=0.25,
+            ),
+            curve=(),
+            config={},
+            hardware={},
+        )
+
+        proof = runner._proof_payload(baseline, cortex, {"passed": True})
+
+        self.assertFalse(proof["passed"], proof)
+        self.assertFalse(proof["baseline_score_passed"], proof)
+        self.assertIn("baseline_score_passed", proof["failed_checks"])
+        self.assertTrue(proof["checks"]["ratio_passed"], proof)
+        self.assertGreater(proof["cortex_over_baseline_ratio"], 1.02)
+
     def test_trainer_resumes_checkpoint_with_gradient_accumulation(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

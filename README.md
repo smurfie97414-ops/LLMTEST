@@ -278,7 +278,7 @@ python tools/train_llm.py compare path/to/text_shards --require-cuda --precision
 
 `doctor` écrit `doctor_report.json` et audite les dépendances Python, CUDA, les backends `torch.distributed`, Gloo/NCCL et la compatibilité du mode de précision demandé.
 
-Le rapport compare une baseline next-token classique à Cortex-3 sur `verified_future_tokens_per_forward_cost`, tout en contrôlant la régression de loss next-token. Le smoke local validé montre une baseline non nulle et un avantage Cortex coût/qualité, mais il ne remplace pas encore un run corpus massif GPU multi-nœuds.
+Le rapport compare une baseline next-token classique à Cortex-3 sur `verified_future_tokens_per_forward_cost`, tout en contrôlant la régression de loss next-token. Le proof gate refuse aussi les victoires artificielles où la baseline a un score nul ou inférieur à `min_baseline_future_tokens_per_cost`, afin qu'un ratio énorme causé par une division par quasi-zéro ne puisse pas passer. Le smoke local validé montre une baseline non nulle et un avantage Cortex coût/qualité, mais il ne remplace pas encore un run corpus massif GPU multi-nœuds.
 
 Un benchmark multi-domaines déterministe est aussi disponible :
 
