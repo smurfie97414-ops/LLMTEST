@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 import torch
 
+from cortex3_objective import FINAL_LOSS_TERMS
 from cortex3_llm import (
     ComparisonConfig,
     DistributedRuntime,
@@ -935,6 +936,7 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 "sleep_consolidation_buffer",
                 "recursive_improvement",
                 "training_feedback_loop",
+                "final_objective_loss",
             }
             self.assertEqual(set(architecture_audit["checks_by_component"]), expected_components)
             deliverable_audit = phase_report["phase_deliverable_audit"]
@@ -973,6 +975,12 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             self.assertGreater(influence["objective_feedback_events"], 0)
             self.assertGreater(influence["last_objective_loss_total"], 0.0)
             self.assertGreater(influence["objective_feedback_scale"], 1.0)
+            self.assertEqual(influence["objective_feedback_term_count"], len(FINAL_LOSS_TERMS))
+            self.assertEqual(tuple(influence["objective_feedback_term_names"]), FINAL_LOSS_TERMS)
+            self.assertAlmostEqual(
+                influence["last_objective_loss_weighted_total"],
+                influence["last_objective_loss_total"],
+            )
             self.assertGreater(influence["memory_recent_segments"], 0)
             self.assertGreater(influence["sleep_replay_examples"], 0)
             self.assertGreater(influence["sleep_synthetic_examples"], 0)
@@ -985,6 +993,9 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 self.assertGreater(phase_replay[phase_id], 0, phase_replay)
             self.assertTrue(phase_report["phase_replay_example_ids"], phase_report)
             self.assertTrue(phase_report["objective_feedback_history"], phase_report)
+            latest_feedback = phase_report["objective_feedback_history"][-1]
+            self.assertEqual(latest_feedback["term_count"], len(FINAL_LOSS_TERMS))
+            self.assertEqual(tuple(latest_feedback["term_names"]), FINAL_LOSS_TERMS)
             self.assertGreater(phase_report["ledgers"]["bit_ledger"]["total_effective_bits"], 0.0)
             self.assertTrue(phase_report["ledgers"]["skill_ledger"]["states"])
             self.assertGreater(phase_report["ledgers"]["causal_ledger"]["trace_count"], 0)
@@ -997,6 +1008,8 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             self.assertTrue(persisted["all_phases_active"], persisted)
             self.assertTrue(persisted["architecture_audit"]["passed"], persisted["architecture_audit"])
             self.assertTrue(persisted["phase_deliverable_audit"]["passed"], persisted["phase_deliverable_audit"])
+            self.assertEqual(tuple(persisted["objective_feedback_term_names"]), FINAL_LOSS_TERMS)
+            self.assertEqual(set(persisted["last_objective_loss_terms"]), set(FINAL_LOSS_TERMS))
             self.assertEqual(persisted["training_influence"]["sleep_replay_updates"], influence["sleep_replay_updates"])
             self.assertEqual(
                 persisted["training_influence"]["objective_feedback_events"],
@@ -1093,6 +1106,8 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 self.assertGreater(len(checkpoint["cortex_phase_state"]["replay_batches"]), 0)
                 self.assertGreater(checkpoint["cortex_phase_state"]["objective_feedback_events"], 0)
                 self.assertGreater(checkpoint["cortex_phase_state"]["last_objective_loss_total"], 0.0)
+                self.assertEqual(tuple(checkpoint["cortex_phase_state"]["last_objective_loss_terms"]), FINAL_LOSS_TERMS)
+                self.assertEqual(tuple(checkpoint["cortex_phase_state"]["objective_feedback_term_totals"]), FINAL_LOSS_TERMS)
                 self.assertGreater(checkpoint["cortex_phase_state"]["certificate_head_forward_events"], 0)
                 self.assertGreater(checkpoint["cortex_phase_state"]["input_anchor_observations"], 0)
                 self.assertGreater(checkpoint["cortex_phase_state"]["input_anchor_count"], 0)
@@ -1145,6 +1160,18 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 )
                 self.assertGreater(sidecar["cortex_phase_state_summary"]["replay_batch_count"], 0)
                 self.assertGreater(sidecar["cortex_phase_state_summary"]["objective_feedback_events"], 0)
+                self.assertEqual(
+                    tuple(sidecar["cortex_phase_state_summary"]["objective_feedback_term_names"]),
+                    FINAL_LOSS_TERMS,
+                )
+                self.assertEqual(
+                    sidecar["cortex_phase_state_summary"]["objective_feedback_term_count"],
+                    len(FINAL_LOSS_TERMS),
+                )
+                self.assertAlmostEqual(
+                    sidecar["cortex_phase_state_summary"]["last_objective_loss_weighted_total"],
+                    sidecar["cortex_phase_state_summary"]["last_objective_loss_total"],
+                )
                 self.assertGreater(sidecar["cortex_phase_state_summary"]["future_contract_decisions"], 0)
                 self.assertGreater(
                     sidecar["cortex_phase_state_summary"]["compression_trace_counts"]["layer_forward_events"],

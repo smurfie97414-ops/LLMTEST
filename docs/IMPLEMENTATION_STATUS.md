@@ -300,14 +300,15 @@ Current executable coverage:
 - `write_cycle_run` can persist objective reports into `summary.json`.
 - `tools/run_cycle_report.py` writes the objective report by default.
 - `CortexTrainingPhaseController` now converts the latest cross-phase `L_total` into a bounded objective-feedback scale that multiplies the trainable Cortex LLM confidence regularization and verified phase-replay losses.
-- LLM checkpoints persist objective feedback counters, latest objective loss, feedback scale summary and history inside `cortex_phase_state`, so resumed runs keep the same cross-phase training signal.
+- LLM checkpoints persist objective feedback counters, latest objective loss, all ordered `17/17` loss-term names, per-term raw/coefficient/weighted values, per-term cumulative weighted totals, feedback scale summary and history inside `cortex_phase_state`, so resumed runs keep the same cross-phase training signal.
+- The full Cortex LLM architecture audit now has a required `final_objective_loss` component: proof gates fail unless the LLM feedback path has consumed every term in `FINAL_LOSS_TERMS`, not just a scalar objective total.
 
 Evidence:
 
 - `.\.venv\Scripts\python.exe -m unittest tests.test_objective_metrics`
 - Smoke: objective report contains `17/17` loss terms and `15/15` absolute metrics.
-- `tests/test_llm_pretraining.py::LLMPretrainingHarnessTest::test_full_cortex_phase_controller_uses_all_modules_during_training` verifies objective-feedback events, latest `L_total`, feedback scale and persisted report history during full P1-P10 LLM training.
-- `tests/test_llm_pretraining.py::LLMPretrainingHarnessTest::test_cortex_phase_state_survives_checkpoint_resume` verifies objective-feedback state persists through checkpoint resume.
+- `tests/test_llm_pretraining.py::LLMPretrainingHarnessTest::test_full_cortex_phase_controller_uses_all_modules_during_training` verifies objective-feedback events, latest `L_total`, feedback scale, ordered `17/17` term coverage and persisted report history during full P1-P10 LLM training.
+- `tests/test_llm_pretraining.py::LLMPretrainingHarnessTest::test_cortex_phase_state_survives_checkpoint_resume` verifies objective-feedback state and all final-loss terms persist through checkpoint resume and sidecar summaries.
 
 Remaining:
 

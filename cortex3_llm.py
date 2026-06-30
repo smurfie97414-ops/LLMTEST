@@ -49,7 +49,7 @@ from cortex3_improvement import RecursiveImprovementEngine, RollbackEvent
 from cortex3_inference import InferenceConfig, InferencePath, UltraFastInferenceEngine
 from cortex3_ledgers import BitLedger, CausalLedger, CausalTrace, SkillLedger, SkillState, UncertaintyLedger
 from cortex3_memory import CognitiveMemory, CognitiveMemoryConfig, MemoryMode, MemorySegment
-from cortex3_objective import build_objective_report
+from cortex3_objective import FINAL_LOSS_TERMS, build_objective_report
 from cortex3_phases import CORTEX3_PHASES
 from cortex3_regrowth import MinimalRegrowthEngine
 from cortex3_sleep import ExampleOrigin, SleepPhaseConsolidator, TrainingExample
@@ -2505,6 +2505,10 @@ def _cortex_architecture_audit_from_summary(summary: Mapping[str, Any]) -> dict[
     improvement_decisions = integer("improvement_archive_accepted") + integer("improvement_archive_rejected")
     required_phase_ids = tuple(phase.id for phase in CORTEX3_PHASES)
     phase_observed = {phase_id: phase_count(phase_id) for phase_id in required_phase_ids}
+    observed_objective_terms = tuple(str(term) for term in summary.get("objective_feedback_term_names", ()) or ())
+    required_objective_terms = tuple(FINAL_LOSS_TERMS)
+    objective_term_set = set(observed_objective_terms)
+    missing_objective_terms = tuple(term for term in required_objective_terms if term not in objective_term_set)
 
     checks: list[dict[str, Any]] = []
 
@@ -2701,6 +2705,23 @@ def _cortex_architecture_audit_from_summary(summary: Mapping[str, Any]) -> dict[
             "last_objective_loss_total": number("last_objective_loss_total"),
         },
         "verified Cortex replay and objective feedback must affect LLM optimization",
+    )
+    add(
+        "final_objective_loss",
+        integer("objective_feedback_events") > 0
+        and integer("objective_feedback_term_count") == len(required_objective_terms)
+        and not missing_objective_terms
+        and number("last_objective_loss_total") > 0.0
+        and number("last_objective_loss_weighted_total") > 0.0,
+        {
+            "objective_feedback_events": integer("objective_feedback_events"),
+            "objective_feedback_term_count": integer("objective_feedback_term_count"),
+            "required_objective_term_count": len(required_objective_terms),
+            "missing_objective_terms": missing_objective_terms,
+            "last_objective_loss_total": number("last_objective_loss_total"),
+            "last_objective_loss_weighted_total": number("last_objective_loss_weighted_total"),
+        },
+        "the full 17-term Cortex-3 final objective must feed the LLM training feedback signal",
     )
 
     failed_checks = tuple(check["component"] for check in checks if not check["passed"])
@@ -2954,6 +2975,8 @@ class CortexTrainingPhaseController:
         self.objective_feedback_events = 0
         self.objective_feedback_total = 0.0
         self.last_objective_loss_total = 0.0
+        self.last_objective_loss_terms: dict[str, dict[str, Any]] = {}
+        self.objective_feedback_term_totals: dict[str, float] = {}
         self.objective_feedback_history: list[dict[str, Any]] = []
         self.bit_ledger = BitLedger()
         self.skill_ledger = SkillLedger()
@@ -3381,6 +3404,8 @@ class CortexTrainingPhaseController:
             "objective_feedback_events": int(self.objective_feedback_events),
             "objective_feedback_total": float(self.objective_feedback_total),
             "last_objective_loss_total": float(self.last_objective_loss_total),
+            "last_objective_loss_terms": dict(self.last_objective_loss_terms),
+            "objective_feedback_term_totals": dict(self.objective_feedback_term_totals),
             "objective_feedback_history": list(self.objective_feedback_history),
             "integration_counts": dict(self.integration_counts),
             "certificate_head_forward_events": int(self.model.certificate_forward_events),
@@ -3431,6 +3456,14 @@ class CortexTrainingPhaseController:
         self.objective_feedback_events = int(payload.get("objective_feedback_events", 0))
         self.objective_feedback_total = float(payload.get("objective_feedback_total", 0.0))
         self.last_objective_loss_total = float(payload.get("last_objective_loss_total", 0.0))
+        self.last_objective_loss_terms = {
+            str(name): dict(term)
+            for name, term in dict(payload.get("last_objective_loss_terms") or {}).items()
+        }
+        self.objective_feedback_term_totals = {
+            str(name): float(value)
+            for name, value in dict(payload.get("objective_feedback_term_totals") or {}).items()
+        }
         self.objective_feedback_history = [
             dict(item)
             for item in payload.get("objective_feedback_history", ())
@@ -3485,6 +3518,15 @@ class CortexTrainingPhaseController:
             "objective_feedback_events": int(self.objective_feedback_events),
             "objective_feedback_scale": self.objective_feedback_scale(),
             "last_objective_loss_total": float(self.last_objective_loss_total),
+            "last_objective_loss_terms": dict(self.last_objective_loss_terms),
+            "objective_feedback_term_names": tuple(self.last_objective_loss_terms),
+            "objective_feedback_term_count": len(self.last_objective_loss_terms),
+            "last_objective_loss_weighted_total": sum(
+                float(term.get("weighted", 0.0))
+                for term in self.last_objective_loss_terms.values()
+            ),
+            "objective_feedback_term_totals": dict(self.objective_feedback_term_totals),
+            "objective_feedback_history": _last_items(self.objective_feedback_history, 5),
             "future_contract_decisions": len(self.future_ledger.decisions),
             "compression_trace_counts": compression_trace_counts,
             "variable_input_compression_events": compression_trace_counts.get("kv_events", 0),
@@ -3842,12 +3884,26 @@ class CortexTrainingPhaseController:
                 )
                 audit["objective"] = objective_report.to_dict()
                 self.last_objective_loss_total = float(objective_report.loss.total)
+                self.last_objective_loss_terms = {
+                    name: term.to_dict()
+                    for name, term in objective_report.loss.terms.items()
+                }
+                for name, term in objective_report.loss.terms.items():
+                    self.objective_feedback_term_totals[name] = (
+                        self.objective_feedback_term_totals.get(name, 0.0) + float(term.weighted)
+                    )
                 self.objective_feedback_events += 1
                 self.objective_feedback_total += self.last_objective_loss_total
                 self.objective_feedback_history.append(
                     {
                         "step": step,
                         "loss_total": self.last_objective_loss_total,
+                        "term_count": len(self.last_objective_loss_terms),
+                        "term_names": tuple(self.last_objective_loss_terms),
+                        "weighted_terms": {
+                            name: float(term["weighted"])
+                            for name, term in self.last_objective_loss_terms.items()
+                        },
                         "feedback_scale": self.objective_feedback_scale(),
                     }
                 )
@@ -3920,6 +3976,12 @@ class CortexTrainingPhaseController:
                 ),
                 "objective_feedback_scale": self.objective_feedback_scale(),
                 "last_objective_loss_total": self.last_objective_loss_total,
+                "objective_feedback_term_count": len(self.last_objective_loss_terms),
+                "objective_feedback_term_names": tuple(self.last_objective_loss_terms),
+                "last_objective_loss_weighted_total": sum(
+                    float(term.get("weighted", 0.0))
+                    for term in self.last_objective_loss_terms.values()
+                ),
             },
             "integration_counts": dict(self.integration_counts),
             "architecture_audit": _cortex_architecture_audit_from_summary(
@@ -3931,6 +3993,12 @@ class CortexTrainingPhaseController:
                     "replay_updates": self.replay_updates,
                     "objective_feedback_events": self.objective_feedback_events,
                     "last_objective_loss_total": self.last_objective_loss_total,
+                    "last_objective_loss_weighted_total": sum(
+                        float(term.get("weighted", 0.0))
+                        for term in self.last_objective_loss_terms.values()
+                    ),
+                    "objective_feedback_term_names": tuple(self.last_objective_loss_terms),
+                    "objective_feedback_term_count": len(self.last_objective_loss_terms),
                     "future_contract_decisions": len(self.future_ledger.decisions),
                     "compression_trace_counts": trace_counts,
                     "variable_input_compression_events": trace_counts.get("kv_events", 0),
@@ -3961,6 +4029,12 @@ class CortexTrainingPhaseController:
                     "replay_updates": self.replay_updates,
                     "objective_feedback_events": self.objective_feedback_events,
                     "last_objective_loss_total": self.last_objective_loss_total,
+                    "last_objective_loss_weighted_total": sum(
+                        float(term.get("weighted", 0.0))
+                        for term in self.last_objective_loss_terms.values()
+                    ),
+                    "objective_feedback_term_names": tuple(self.last_objective_loss_terms),
+                    "objective_feedback_term_count": len(self.last_objective_loss_terms),
                     "future_contract_decisions": len(self.future_ledger.decisions),
                     "compression_trace_counts": trace_counts,
                     "variable_input_compression_events": trace_counts.get("kv_events", 0),
@@ -4001,6 +4075,10 @@ class CortexTrainingPhaseController:
             "phase_audits": _last_items(self.phase_audits, 2),
             "batch_contract_samples": _last_items(self.batch_contract_samples, 5),
             "phase_replay_example_ids": _last_items(self.phase_replay_example_ids, 10),
+            "objective_feedback_term_names": tuple(self.last_objective_loss_terms),
+            "objective_feedback_term_count": len(self.last_objective_loss_terms),
+            "last_objective_loss_terms": dict(self.last_objective_loss_terms),
+            "objective_feedback_term_totals": dict(self.objective_feedback_term_totals),
             "objective_feedback_history": _last_items(self.objective_feedback_history, 5),
             "errors": list(self.errors),
         }
