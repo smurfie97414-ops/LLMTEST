@@ -81,6 +81,17 @@ class ReportingAndTernaryTest(unittest.TestCase):
         self.assertIn("kv_mode_may_have_lost_exact_anchors", hints)
         self.assertIn("accepted_mtp_horizon_may_have_overshot", hints)
 
+    def test_compression_trace_ledger_retains_tail_with_total_counters(self):
+        ledger = CompressionTraceLedger(retention_limit=2)
+        for index in range(5):
+            ledger.record_activation(quantize_activation_values([float(index), float(index + 1)], bits=4))
+
+        payload = ledger.to_dict()
+        self.assertEqual(len(ledger.activation_quantizations), 2)
+        self.assertEqual(payload["retained_event_counts"]["activation_quantizations"], 2)
+        self.assertEqual(payload["total_event_counts"]["activation_quantizations"], 5)
+        self.assertEqual(ledger.cost_trace.activation_bits, 40.0)
+
     def test_bitlinear_dependency_boundary(self):
         import torch
 

@@ -620,6 +620,8 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             TrainingConfig(cortex_objective_feedback_weight=-0.1)
         with self.assertRaisesRegex(ValueError, "cortex_objective_feedback_clip"):
             TrainingConfig(cortex_objective_feedback_clip=-1.0)
+        with self.assertRaisesRegex(ValueError, "cortex_trace_retention_limit"):
+            TrainingConfig(cortex_trace_retention_limit=-1)
 
     def test_full_cortex_phase_controller_uses_all_modules_during_training(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -790,6 +792,14 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 self.assertGreater(len(checkpoint["cortex_phase_state"]["future_ledger"]["decisions"]), 0)
                 self.assertGreater(
                     len(checkpoint["cortex_phase_state"]["compression_trace_ledger"]["layer_forward_events"]),
+                    0,
+                )
+                self.assertEqual(
+                    checkpoint["cortex_phase_state"]["compression_trace_ledger"]["retention_limit"],
+                    4096,
+                )
+                self.assertGreater(
+                    checkpoint["cortex_phase_state"]["compression_trace_ledger"]["total_event_counts"]["layer_forward_events"],
                     0,
                 )
                 sidecar = json.loads((run_dir / "checkpoint_final.pt.json").read_text(encoding="utf-8"))

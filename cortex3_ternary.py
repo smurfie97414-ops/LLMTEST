@@ -91,32 +91,64 @@ class CompressionTraceLedger:
     kv_events: list[KVModeEvent] = field(default_factory=list)
     mtp_fsp_events: list[MTPFSPEvent] = field(default_factory=list)
     layer_forward_events: list[LayerForwardEvent] = field(default_factory=list)
+    retention_limit: int | None = None
+    total_compression_decisions: int = 0
+    total_activation_quantizations: int = 0
+    total_expert_activations: int = 0
+    total_kv_events: int = 0
+    total_mtp_fsp_events: int = 0
+    total_layer_forward_events: int = 0
+    total_weight_bits_read: float = 0.0
+    total_activation_bits: float = 0.0
+    total_kv_bytes: float = 0.0
+
+    def _trim(self, events: list[Any]) -> None:
+        if self.retention_limit is None:
+            return
+        limit = max(0, int(self.retention_limit))
+        if len(events) > limit:
+            del events[: len(events) - limit]
 
     def record_compression(self, decision: CompressionDecision) -> None:
+        self.total_compression_decisions += 1
+        self.total_weight_bits_read += float(decision.estimated_bits)
         self.compression_decisions.append(decision)
+        self._trim(self.compression_decisions)
 
     def record_activation(self, quantization: ActivationQuantization) -> None:
+        self.total_activation_quantizations += 1
+        self.total_activation_bits += float(quantization.activation_bits)
         self.activation_quantizations.append(quantization)
+        self._trim(self.activation_quantizations)
 
     def record_expert(self, expert_id: str, reason: str, cost: float = 1.0) -> None:
+        self.total_expert_activations += 1
         self.expert_activations.append(ExpertActivation(expert_id, reason, cost))
+        self._trim(self.expert_activations)
 
     def record_kv(self, segment_id: str, mode: str, bytes_used: float, exact_anchors: int = 0, note: str = "") -> None:
+        self.total_kv_events += 1
+        self.total_kv_bytes += float(bytes_used)
         self.kv_events.append(KVModeEvent(segment_id, mode, bytes_used, exact_anchors, note))
+        self._trim(self.kv_events)
 
     def record_mtp_fsp(self, block_id: str, horizon: int, accepted: bool, confidence: float, contract_revision: int = 0, reason: str = "") -> None:
+        self.total_mtp_fsp_events += 1
         self.mtp_fsp_events.append(MTPFSPEvent(block_id, horizon, accepted, confidence, contract_revision, reason))
+        self._trim(self.mtp_fsp_events)
 
     def record_layer_forward(self, event: LayerForwardEvent) -> None:
+        self.total_layer_forward_events += 1
         self.layer_forward_events.append(event)
+        self._trim(self.layer_forward_events)
 
     @property
     def cost_trace(self) -> CostTrace:
         return CostTrace(
-            weight_bits_read=sum(decision.estimated_bits for decision in self.compression_decisions),
-            activation_bits=sum(item.activation_bits for item in self.activation_quantizations),
-            kv_bytes=sum(item.bytes_used for item in self.kv_events),
-            experts_activated=len(self.expert_activations),
+            weight_bits_read=self.total_weight_bits_read,
+            activation_bits=self.total_activation_bits,
+            kv_bytes=self.total_kv_bytes,
+            experts_activated=self.total_expert_activations,
         )
 
     def explain_failure(self, reason: str = "") -> list[str]:
@@ -144,6 +176,23 @@ class CompressionTraceLedger:
             "kv_events": [asdict(item) for item in self.kv_events],
             "mtp_fsp_events": [asdict(item) for item in self.mtp_fsp_events],
             "layer_forward_events": [asdict(item) for item in self.layer_forward_events],
+            "retention_limit": self.retention_limit,
+            "retained_event_counts": {
+                "compression_decisions": len(self.compression_decisions),
+                "activation_quantizations": len(self.activation_quantizations),
+                "expert_activations": len(self.expert_activations),
+                "kv_events": len(self.kv_events),
+                "mtp_fsp_events": len(self.mtp_fsp_events),
+                "layer_forward_events": len(self.layer_forward_events),
+            },
+            "total_event_counts": {
+                "compression_decisions": self.total_compression_decisions,
+                "activation_quantizations": self.total_activation_quantizations,
+                "expert_activations": self.total_expert_activations,
+                "kv_events": self.total_kv_events,
+                "mtp_fsp_events": self.total_mtp_fsp_events,
+                "layer_forward_events": self.total_layer_forward_events,
+            },
             "cost_trace": asdict(self.cost_trace),
         }
 

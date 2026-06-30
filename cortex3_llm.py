@@ -143,14 +143,28 @@ def _restore_future_contract_ledger(ledger: FutureContractLedger, payload: Mappi
 def _restore_compression_trace_ledger(ledger: CompressionTraceLedger | None, payload: Mapping[str, Any] | None) -> None:
     if ledger is None:
         return
+    configured_retention_limit = ledger.retention_limit
     ledger.compression_decisions.clear()
     ledger.activation_quantizations.clear()
     ledger.expert_activations.clear()
     ledger.kv_events.clear()
     ledger.mtp_fsp_events.clear()
     ledger.layer_forward_events.clear()
+    ledger.total_compression_decisions = 0
+    ledger.total_activation_quantizations = 0
+    ledger.total_expert_activations = 0
+    ledger.total_kv_events = 0
+    ledger.total_mtp_fsp_events = 0
+    ledger.total_layer_forward_events = 0
+    ledger.total_weight_bits_read = 0.0
+    ledger.total_activation_bits = 0.0
+    ledger.total_kv_bytes = 0.0
     if not payload:
         return
+    if configured_retention_limit is None and payload.get("retention_limit") is not None:
+        ledger.retention_limit = int(payload["retention_limit"])
+    else:
+        ledger.retention_limit = configured_retention_limit
     for item in payload.get("compression_decisions", ()):
         data = dict(item)
         ledger.compression_decisions.append(
@@ -168,6 +182,7 @@ def _restore_compression_trace_ledger(ledger: CompressionTraceLedger | None, pay
                 note=str(data.get("note", "")),
             )
         )
+    ledger._trim(ledger.compression_decisions)
     for item in payload.get("activation_quantizations", ()):
         data = dict(item)
         ledger.activation_quantizations.append(
@@ -180,6 +195,7 @@ def _restore_compression_trace_ledger(ledger: CompressionTraceLedger | None, pay
                 saturated=int(data.get("saturated", 0)),
             )
         )
+    ledger._trim(ledger.activation_quantizations)
     for item in payload.get("expert_activations", ()):
         data = dict(item)
         ledger.expert_activations.append(
@@ -189,6 +205,7 @@ def _restore_compression_trace_ledger(ledger: CompressionTraceLedger | None, pay
                 cost=float(data.get("cost", 1.0)),
             )
         )
+    ledger._trim(ledger.expert_activations)
     for item in payload.get("kv_events", ()):
         data = dict(item)
         ledger.kv_events.append(
@@ -200,6 +217,7 @@ def _restore_compression_trace_ledger(ledger: CompressionTraceLedger | None, pay
                 note=str(data.get("note", "")),
             )
         )
+    ledger._trim(ledger.kv_events)
     for item in payload.get("mtp_fsp_events", ()):
         data = dict(item)
         ledger.mtp_fsp_events.append(
@@ -212,6 +230,7 @@ def _restore_compression_trace_ledger(ledger: CompressionTraceLedger | None, pay
                 reason=str(data.get("reason", "")),
             )
         )
+    ledger._trim(ledger.mtp_fsp_events)
     for item in payload.get("layer_forward_events", ()):
         data = dict(item)
         ledger.layer_forward_events.append(
@@ -226,6 +245,24 @@ def _restore_compression_trace_ledger(ledger: CompressionTraceLedger | None, pay
                 note=str(data.get("note", "")),
             )
         )
+    ledger._trim(ledger.layer_forward_events)
+    total_counts = dict(payload.get("total_event_counts") or {})
+    ledger.total_compression_decisions = int(total_counts.get("compression_decisions", len(ledger.compression_decisions)))
+    ledger.total_activation_quantizations = int(total_counts.get("activation_quantizations", len(ledger.activation_quantizations)))
+    ledger.total_expert_activations = int(total_counts.get("expert_activations", len(ledger.expert_activations)))
+    ledger.total_kv_events = int(total_counts.get("kv_events", len(ledger.kv_events)))
+    ledger.total_mtp_fsp_events = int(total_counts.get("mtp_fsp_events", len(ledger.mtp_fsp_events)))
+    ledger.total_layer_forward_events = int(total_counts.get("layer_forward_events", len(ledger.layer_forward_events)))
+    cost_trace = dict(payload.get("cost_trace") or {})
+    ledger.total_weight_bits_read = float(
+        cost_trace.get("weight_bits_read", sum(item.estimated_bits for item in ledger.compression_decisions))
+    )
+    ledger.total_activation_bits = float(
+        cost_trace.get("activation_bits", sum(item.activation_bits for item in ledger.activation_quantizations))
+    )
+    ledger.total_kv_bytes = float(
+        cost_trace.get("kv_bytes", sum(item.bytes_used for item in ledger.kv_events))
+    )
 
 
 def _sha256_file(path: str | Path, *, chunk_size: int = 1024 * 1024) -> str:
@@ -1497,6 +1534,7 @@ class TrainingConfig:
     cortex_phase_replay_weight: float = 0.05
     cortex_objective_feedback_weight: float = 0.05
     cortex_objective_feedback_clip: float = 4.0
+    cortex_trace_retention_limit: int = 4096
     num_threads: int | None = None
 
     def __post_init__(self) -> None:
@@ -1526,6 +1564,8 @@ class TrainingConfig:
             raise ValueError("cortex_objective_feedback_weight must be non-negative")
         if self.cortex_objective_feedback_clip < 0:
             raise ValueError("cortex_objective_feedback_clip must be non-negative")
+        if self.cortex_trace_retention_limit < 0:
+            raise ValueError("cortex_trace_retention_limit must be non-negative")
         if self.resume and self.resume_if_exists:
             raise ValueError("resume and resume_if_exists are mutually exclusive")
 
@@ -1913,6 +1953,8 @@ class CortexTrainingPhaseController:
         self.tokenizer = tokenizer
         self.config = config
         self.run_dir = Path(run_dir)
+        if self.model.compression_ledger is not None:
+            self.model.compression_ledger.retention_limit = int(self.config.cortex_trace_retention_limit)
         self.verifier = DynamicSkillVerifier(default_skill_specs())
         self.reference_agent = ReferenceRuleAgent()
         self.trial_agent = CorruptedCompressedAgent()
@@ -2239,14 +2281,16 @@ class CortexTrainingPhaseController:
         compression_trace = self.model.compression_trace()
         compression_trace_counts = {}
         if compression_trace.get("enabled"):
-            compression_trace_counts = {
-                "compression_decisions": len(compression_trace.get("compression_decisions", ())),
-                "activation_quantizations": len(compression_trace.get("activation_quantizations", ())),
-                "expert_activations": len(compression_trace.get("expert_activations", ())),
-                "kv_events": len(compression_trace.get("kv_events", ())),
-                "mtp_fsp_events": len(compression_trace.get("mtp_fsp_events", ())),
-                "layer_forward_events": len(compression_trace.get("layer_forward_events", ())),
-            }
+            compression_trace_counts = dict(compression_trace.get("total_event_counts") or {})
+            if not compression_trace_counts:
+                compression_trace_counts = {
+                    "compression_decisions": len(compression_trace.get("compression_decisions", ())),
+                    "activation_quantizations": len(compression_trace.get("activation_quantizations", ())),
+                    "expert_activations": len(compression_trace.get("expert_activations", ())),
+                    "kv_events": len(compression_trace.get("kv_events", ())),
+                    "mtp_fsp_events": len(compression_trace.get("mtp_fsp_events", ())),
+                    "layer_forward_events": len(compression_trace.get("layer_forward_events", ())),
+                }
         return {
             "schema_version": 1,
             "phase_event_counts": dict(self.phase_counts),
@@ -2525,13 +2569,16 @@ class CortexTrainingPhaseController:
         compression_trace = self.model.compression_trace()
         trace_counts = {}
         if compression_trace.get("enabled"):
-            trace_counts = {
-                "compression_decisions": len(compression_trace.get("compression_decisions", ())),
-                "activation_quantizations": len(compression_trace.get("activation_quantizations", ())),
-                "kv_events": len(compression_trace.get("kv_events", ())),
-                "mtp_fsp_events": len(compression_trace.get("mtp_fsp_events", ())),
-                "layer_forward_events": len(compression_trace.get("layer_forward_events", ())),
-            }
+            trace_counts = dict(compression_trace.get("total_event_counts") or {})
+            if not trace_counts:
+                trace_counts = {
+                    "compression_decisions": len(compression_trace.get("compression_decisions", ())),
+                    "activation_quantizations": len(compression_trace.get("activation_quantizations", ())),
+                    "expert_activations": len(compression_trace.get("expert_activations", ())),
+                    "kv_events": len(compression_trace.get("kv_events", ())),
+                    "mtp_fsp_events": len(compression_trace.get("mtp_fsp_events", ())),
+                    "layer_forward_events": len(compression_trace.get("layer_forward_events", ())),
+                }
             if trace_counts["layer_forward_events"] > 0:
                 self.phase_counts["P2"] = max(self.phase_counts.get("P2", 0), trace_counts["layer_forward_events"])
         phases = []
@@ -2565,6 +2612,7 @@ class CortexTrainingPhaseController:
                 "last_objective_loss_total": self.last_objective_loss_total,
             },
             "trace_counts": trace_counts,
+            "retained_trace_counts": compression_trace.get("retained_event_counts", {}),
             "future_ledger": self.future_ledger.to_dict(),
             "phase_audits": _last_items(self.phase_audits, 2),
             "batch_contract_samples": _last_items(self.batch_contract_samples, 5),
