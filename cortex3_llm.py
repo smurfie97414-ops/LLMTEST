@@ -9841,20 +9841,46 @@ def _profile_autosize_uncertainty_refinement_inputs(
     measured_candidates: Sequence[Mapping[str, Any]],
     *,
     requested_count: int,
+    selected_shape_count: int = 1,
 ) -> tuple[Mapping[str, Any], ...]:
     if requested_count <= 0:
         return ()
+    passed = tuple(
+        sorted(
+            (
+                candidate
+                for candidate in measured_candidates
+                if bool(candidate.get("measurement_passed"))
+            ),
+            key=lambda candidate: (
+                float(candidate.get("measured_score", 0.0)),
+                int(candidate.get("tokens_per_optimizer_step", 0)),
+                -int(candidate.get("estimated_rank", 0)),
+                str(candidate.get("shape_key", "")),
+            ),
+            reverse=True,
+        )
+    )
+    if not passed:
+        return ()
+    robust_frontier_score = float(passed[0].get("measured_score", 0.0))
+    finalist_keys = {
+        str(candidate.get("shape_key", ""))
+        for candidate in passed[: max(1, int(selected_shape_count))]
+    }
     uncertain = tuple(
         candidate
-        for candidate in measured_candidates
-        if bool(candidate.get("measurement_passed"))
-        and float(candidate.get("measured_score_stddev", 0.0)) > 0.0
+        for candidate in passed
+        if float(candidate.get("measured_score_stddev", 0.0)) > 0.0
     )
     if len(uncertain) < 1:
         return ()
     ranked = sorted(
         uncertain,
         key=lambda candidate: (
+            float(candidate.get("measured_score_upper_confidence", candidate.get("measured_score", 0.0)))
+            - robust_frontier_score,
+            1 if str(candidate.get("shape_key", "")) in finalist_keys else 0,
             float(candidate.get("measured_score_upper_confidence", candidate.get("measured_score", 0.0)))
             - float(candidate.get("measured_score", 0.0)),
             float(candidate.get("measured_score_upper_confidence", 0.0)),
@@ -10426,6 +10452,7 @@ def run_llm_batch_profile_autosize(
             refinement_inputs = _profile_autosize_uncertainty_refinement_inputs(
                 aggregated_measurement_rows,
                 requested_count=requested_refine_uncertain_candidate_count,
+                selected_shape_count=selected_shape_count,
             )
             if not refinement_inputs:
                 return
