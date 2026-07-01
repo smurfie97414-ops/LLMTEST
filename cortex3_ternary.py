@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
 import warnings
 from dataclasses import asdict, dataclass, field
 from math import fsum
+from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 from cortex3 import CostTrace, TernaryBlock, ZeroState, ternarize_values
@@ -408,7 +410,110 @@ _CUPY_TERNARY_KERNEL_NAMES = {
 }
 _CUPY_TERNARY_KERNEL_CACHE: dict[Any, Any] = {}
 _NATIVE_TERNARY_AUTOTUNE_CACHE: dict[tuple[Any, ...], tuple[str, tuple[tuple[str, float], ...]]] = {}
+_NATIVE_TERNARY_AUTOTUNE_LOADED_PATHS: set[str] = set()
 _CUPY_IMPORT_ERROR: Exception | None = None
+
+
+def _autotune_key_to_dict(key: tuple[Any, ...]) -> dict[str, Any]:
+    (
+        dtype,
+        rows,
+        in_features,
+        out_features,
+        residual_runtime,
+        has_bias,
+        device_index,
+        device_name,
+        compute_major,
+        compute_minor,
+    ) = key
+    return {
+        "dtype": str(dtype),
+        "rows": int(rows),
+        "in_features": int(in_features),
+        "out_features": int(out_features),
+        "residual_runtime": bool(residual_runtime),
+        "has_bias": bool(has_bias),
+        "device_index": int(device_index),
+        "device_name": str(device_name),
+        "compute_major": int(compute_major),
+        "compute_minor": int(compute_minor),
+    }
+
+
+def _autotune_key_from_dict(data: Mapping[str, Any]) -> tuple[Any, ...]:
+    return (
+        str(data["dtype"]),
+        int(data["rows"]),
+        int(data["in_features"]),
+        int(data["out_features"]),
+        int(bool(data.get("residual_runtime", False))),
+        int(bool(data.get("has_bias", True))),
+        int(data.get("device_index", 0)),
+        str(data["device_name"]),
+        int(data["compute_major"]),
+        int(data["compute_minor"]),
+    )
+
+
+def clear_native_ternary_autotune_cache() -> int:
+    removed = len(_NATIVE_TERNARY_AUTOTUNE_CACHE)
+    _NATIVE_TERNARY_AUTOTUNE_CACHE.clear()
+    _NATIVE_TERNARY_AUTOTUNE_LOADED_PATHS.clear()
+    return removed
+
+
+def native_ternary_autotune_cache_snapshot() -> dict[str, Any]:
+    entries: list[dict[str, Any]] = []
+    for key, (selected, candidates) in sorted(_NATIVE_TERNARY_AUTOTUNE_CACHE.items(), key=lambda item: repr(item[0])):
+        entry = _autotune_key_to_dict(key)
+        entry.update({
+            "selected": selected,
+            "candidate_ms": [
+                {"variant": str(name), "ms": float(ms)}
+                for name, ms in candidates
+            ],
+        })
+        entries.append(entry)
+    return {
+        "schema_version": 1,
+        "entry_count": len(entries),
+        "entries": entries,
+    }
+
+
+def save_native_ternary_autotune_cache(path: str | Path) -> Path:
+    output = Path(path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(native_ternary_autotune_cache_snapshot(), indent=2, sort_keys=True), encoding="utf-8")
+    return output
+
+
+def load_native_ternary_autotune_cache(path: str | Path, *, merge: bool = True) -> int:
+    source = Path(path)
+    if not source.exists():
+        return 0
+    payload = json.loads(source.read_text(encoding="utf-8"))
+    if int(payload.get("schema_version", 0)) != 1:
+        raise ValueError(f"unsupported native ternary autotune cache schema: {payload.get('schema_version')!r}")
+    if not merge:
+        _NATIVE_TERNARY_AUTOTUNE_CACHE.clear()
+    loaded = 0
+    for raw_entry in payload.get("entries", ()):
+        entry = dict(raw_entry)
+        selected = str(entry.get("selected", ""))
+        if selected not in {"tiled", "warp"}:
+            raise ValueError(f"invalid autotune selected variant: {selected!r}")
+        candidates = tuple(
+            (str(item["variant"]), float(item["ms"]))
+            for item in entry.get("candidate_ms", ())
+            if str(item.get("variant", "")) in {"tiled", "warp"}
+        )
+        if not candidates:
+            raise ValueError("autotune cache entry has no candidate_ms values")
+        _NATIVE_TERNARY_AUTOTUNE_CACHE[_autotune_key_from_dict(entry)] = (selected, candidates)
+        loaded += 1
+    return loaded
 
 
 def _load_cupy() -> Any:
@@ -796,6 +901,8 @@ class BitLinearConfig:
     native_cuda_autotune: bool = True
     native_cuda_autotune_warmup: int = 1
     native_cuda_autotune_repeat: int = 3
+    native_cuda_autotune_cache_path: str | None = None
+    native_cuda_autotune_cache_write: bool = True
 
 
 class BitLinear(nn.Module):
@@ -821,6 +928,7 @@ class BitLinear(nn.Module):
         self._last_native_autotuned = False
         self._last_native_autotune_cache_hit = False
         self._last_native_autotune_candidate_ms: tuple[tuple[str, float], ...] = ()
+        self._native_cuda_instance_variant_cache: dict[tuple[Any, ...], tuple[str, tuple[tuple[str, float], ...]]] = {}
         nn.init.kaiming_uniform_(self.float_weight, a=5 ** 0.5)
         self.requantize()
 
@@ -984,6 +1092,39 @@ class BitLinear(nn.Module):
             int(props.minor),
         )
 
+    def _native_cuda_instance_autotune_key(self, x: Any) -> tuple[Any, ...]:
+        rows = int(x.numel() // self.config.in_features)
+        return (
+            str(x.dtype),
+            int(rows),
+            int(self.config.in_features),
+            int(self.config.out_features),
+            int(bool(self.config.residual_runtime)),
+            int(self.bias is not None),
+            int(x.get_device()),
+        )
+
+    def _native_cuda_autotune_cache_path(self) -> Path | None:
+        if not self.config.native_cuda_autotune_cache_path:
+            return None
+        return Path(self.config.native_cuda_autotune_cache_path).expanduser()
+
+    def _ensure_native_cuda_autotune_profile_loaded(self) -> None:
+        path = self._native_cuda_autotune_cache_path()
+        if path is None:
+            return
+        resolved = str(path.resolve(strict=False))
+        if resolved in _NATIVE_TERNARY_AUTOTUNE_LOADED_PATHS:
+            return
+        load_native_ternary_autotune_cache(path, merge=True)
+        _NATIVE_TERNARY_AUTOTUNE_LOADED_PATHS.add(resolved)
+
+    def _persist_native_cuda_autotune_profile(self) -> None:
+        path = self._native_cuda_autotune_cache_path()
+        if path is None or not self.config.native_cuda_autotune_cache_write:
+            return
+        save_native_ternary_autotune_cache(path)
+
     def _launch_native_cuda_kernel(self, x: Any, variant: str) -> Any:
         cp, kernel = _cupy_ternary_kernel(x.dtype, variant)
         x_flat = x.detach().contiguous().view(-1, self.config.in_features)
@@ -1068,10 +1209,20 @@ class BitLinear(nn.Module):
             return variant
         if not self.config.native_cuda_autotune:
             return self._heuristic_native_cuda_variant(x)
+        instance_key = self._native_cuda_instance_autotune_key(x)
+        instance_cached = self._native_cuda_instance_variant_cache.get(instance_key)
+        if instance_cached is not None:
+            selected, candidates = instance_cached
+            self._last_native_autotuned = True
+            self._last_native_autotune_cache_hit = True
+            self._last_native_autotune_candidate_ms = candidates
+            return selected
+        self._ensure_native_cuda_autotune_profile_loaded()
         key = self._native_cuda_autotune_key(x)
         cached = _NATIVE_TERNARY_AUTOTUNE_CACHE.get(key)
         if cached is not None:
             selected, candidates = cached
+            self._native_cuda_instance_variant_cache[instance_key] = (selected, candidates)
             self._last_native_autotuned = True
             self._last_native_autotune_cache_hit = True
             self._last_native_autotune_candidate_ms = candidates
@@ -1095,6 +1246,8 @@ class BitLinear(nn.Module):
         selected = min(candidates, key=lambda item: item[1])[0]
         measured = tuple((name, float(ms)) for name, ms in candidates)
         _NATIVE_TERNARY_AUTOTUNE_CACHE[key] = (selected, measured)
+        self._native_cuda_instance_variant_cache[instance_key] = (selected, measured)
+        self._persist_native_cuda_autotune_profile()
         self._last_native_autotuned = True
         self._last_native_autotune_candidate_ms = measured
         return selected

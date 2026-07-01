@@ -13,9 +13,13 @@ from cortex3_ternary import (
     BitLinearConfig,
     CompressionTraceLedger,
     ResidualSynapseBuffer,
+    clear_native_ternary_autotune_cache,
+    load_native_ternary_autotune_cache,
     make_compression_decision,
     native_ternary_cuda_available,
+    native_ternary_autotune_cache_snapshot,
     quantize_activation_values,
+    save_native_ternary_autotune_cache,
     torch_available,
 )
 
@@ -234,6 +238,7 @@ class ReportingAndTernaryTest(unittest.TestCase):
     def test_native_ternary_auto_kernel_autotunes_and_reuses_cache(self):
         import torch
 
+        clear_native_ternary_autotune_cache()
         layer = BitLinear(BitLinearConfig(
             96,
             80,
@@ -257,6 +262,51 @@ class ReportingAndTernaryTest(unittest.TestCase):
         self.assertTrue(layer._last_native_autotune_cache_hit)
         self.assertEqual(tuple(layer._last_native_autotune_candidate_ms), first_candidates)
         self.assertEqual(layer._last_native_kernel_family, selected)
+
+    @unittest.skipUnless(
+        __import__("torch").cuda.is_available() and native_ternary_cuda_available(),
+        "CUDA plus CuPy native ternary kernel is required",
+    )
+    def test_native_ternary_autotune_cache_can_persist_and_reload(self):
+        import torch
+
+        clear_native_ternary_autotune_cache()
+        with tempfile.TemporaryDirectory() as tmp:
+            profile = Path(tmp) / "autotune-profile.json"
+            layer = BitLinear(BitLinearConfig(
+                64,
+                48,
+                activation_bits=0,
+                require_native_cuda_kernel=True,
+                native_cuda_kernel_variant="auto",
+                native_cuda_autotune_warmup=0,
+                native_cuda_autotune_repeat=1,
+                native_cuda_autotune_cache_path=str(profile),
+            )).cuda()
+            x = torch.randn(6, 64, device="cuda", dtype=torch.float16)
+            layer._native_cuda_packed_output(x)
+            first_family = layer._last_native_kernel_family
+            self.assertTrue(profile.exists())
+            self.assertGreater(native_ternary_autotune_cache_snapshot()["entry_count"], 0)
+
+            save_native_ternary_autotune_cache(profile)
+            clear_native_ternary_autotune_cache()
+            self.assertEqual(native_ternary_autotune_cache_snapshot()["entry_count"], 0)
+            self.assertGreater(load_native_ternary_autotune_cache(profile), 0)
+
+            reloaded = BitLinear(BitLinearConfig(
+                64,
+                48,
+                activation_bits=0,
+                require_native_cuda_kernel=True,
+                native_cuda_kernel_variant="auto",
+                native_cuda_autotune_warmup=0,
+                native_cuda_autotune_repeat=1,
+                native_cuda_autotune_cache_path=str(profile),
+            )).cuda()
+            reloaded._native_cuda_packed_output(x)
+            self.assertTrue(reloaded._last_native_autotune_cache_hit)
+            self.assertEqual(reloaded._last_native_kernel_family, first_family)
 
     def test_bitlinear_matches_float_linear_when_activation_quantization_is_disabled(self):
         import torch

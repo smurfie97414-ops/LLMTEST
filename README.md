@@ -149,9 +149,9 @@ python tools/benchmark_ternary_kernel.py --dtype fp16
 python tools/benchmark_learned_memory_policy.py --device cuda
 ```
 
-`requirements-cuda-cu128.txt` installe aussi `cupy-cuda12x` et `ml_dtypes`, nécessaires aux kernels CUDA natifs `native_int2_cupy_cuda_*`. En mode `auto`, `BitLinear` mesure `tiled` et `warp` sur la shape CUDA courante, cache le meilleur choix par device/dtype/shape, puis trace `autotuned`, `autotune_cache_hit` et les temps candidats. Sur RTX 5070, les benchmarks courts locaux donnent :
+`requirements-cuda-cu128.txt` installe aussi `cupy-cuda12x` et `ml_dtypes`, nécessaires aux kernels CUDA natifs `native_int2_cupy_cuda_*`. En mode `auto`, `BitLinear` mesure `tiled` et `warp` sur la shape CUDA courante, cache le meilleur choix par device/dtype/shape, peut sauvegarder/recharger un profil JSON via `--autotune-cache`, puis trace `autotuned`, `autotune_cache_hit`, les temps candidats et le coût STE dense. Sur RTX 5070, les benchmarks courts locaux donnent :
 
-- `batch=128, in=256, out=256, fp16` : autotune `warp_reduction_int2`, candidats `tiled=0.3356 ms`, `warp=0.2120 ms`, runtime natif `0.1144 ms` contre `0.2432 ms` pour unpack+`F.linear`, soit `2.13x`, erreur max `0.000976`.
+- `batch=128, in=256, out=256, fp16` : autotune `warp_reduction_int2`, candidats `tiled=0.1665 ms`, `warp=0.1368 ms`, runtime natif `0.0971 ms` contre `0.2095 ms` pour unpack+`F.linear`, soit `2.16x`, STE dense `0.1963 ms`, erreur max `0.000976`.
 - `batch=512, in=512, out=512, fp16` : autotune `warp_reduction_int2`, candidats `tiled=0.5668 ms`, `warp=0.3368 ms`, runtime natif `0.2561 ms` contre `0.2734 ms` pour unpack+`F.linear`, soit `1.07x`, erreur max `0.000976`.
 
 `tools/benchmark_learned_memory_policy.py` exécute une ablation courte contrôlée : mêmes poids partagés, mémoire apprise active contre mémoire désactivée, puis entraînement de la seule politique exact/latent/drop. Le rapport JSON expose les losses avant/après, le gradient mémoire, les décisions exact/latent/drop et le delta `before - after`.

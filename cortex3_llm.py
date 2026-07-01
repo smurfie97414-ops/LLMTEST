@@ -1536,6 +1536,8 @@ class TransformerConfig:
     ternary_activation_bits: int = 4
     use_native_ternary_kernel: bool = True
     require_native_ternary_kernel: bool = False
+    native_ternary_autotune_cache_path: str | None = None
+    native_ternary_autotune_cache_write: bool = True
     use_skill_aware_experts: bool = False
     skill_expert_count: int = 4
     skill_expert_top_k: int = 2
@@ -1593,6 +1595,8 @@ def _make_transformer_linear(
             log_prefix=log_prefix,
             use_native_cuda_kernel=config.use_native_ternary_kernel,
             require_native_cuda_kernel=config.require_native_ternary_kernel,
+            native_cuda_autotune_cache_path=config.native_ternary_autotune_cache_path,
+            native_cuda_autotune_cache_write=config.native_ternary_autotune_cache_write,
         ),
         ledger=ledger,
     )
@@ -5493,6 +5497,8 @@ class LLMTrainer:
         checkpoint_model_config.setdefault("learned_memory_temperature", 1.0)
         checkpoint_model_config.setdefault("use_native_ternary_kernel", True)
         checkpoint_model_config.setdefault("require_native_ternary_kernel", False)
+        checkpoint_model_config.setdefault("native_ternary_autotune_cache_path", None)
+        checkpoint_model_config.setdefault("native_ternary_autotune_cache_write", True)
         checkpoint_model_config.setdefault("use_certificate_head", False)
         checkpoint_model_config.setdefault("certificate_latent_size", 64)
         if checkpoint_model_config != asdict(self.model.config):

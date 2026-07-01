@@ -284,6 +284,7 @@ Quand `use_ternary_core=True`, les lineaires principaux deviennent des `BitLinea
 - quantization d'activation ;
 - layer forward events ;
 - `PackedTernaryDispatch` avec backend `packed_int2_torch`, `packed_int2_cuda`, `native_int2_cupy_cuda_tiled_shared_memory_int2` ou `native_int2_cupy_cuda_warp_reduction_int2`, plus les champs `autotuned`, `autotune_cache_hit` et `autotune_candidate_ms`.
+- `TransformerConfig.native_ternary_autotune_cache_path` peut brancher un profil JSON d'autotune dans les `BitLinear` du vrai training.
 
 ### Interaction Avec Les Autres Phases
 
@@ -719,7 +720,7 @@ Etat actuel :
 
 - `BitLinear` tourne dans le forward avec valeur runtime issue de buffers `packed_codes` int2 ;
 - sur CUDA, le forward peut lancer les kernels natifs CuPy RawKernel `tiled_shared_memory_int2` ou `warp_reduction_int2` via DLPack zero-copy ;
-- en mode `auto`, le forward mesure les deux variants sur la shape courante, cache le meilleur choix par device/dtype/shape et trace les temps candidats ;
+- en mode `auto`, le forward mesure les deux variants sur la shape courante, cache le meilleur choix par device/dtype/shape, peut persister/recharger le profil et trace les temps candidats ;
 - le coeur est requantifie apres optimizer step et apres patchs P7/P10 ;
 - les traces P2 prouvent une execution ternaire-compatible pendant le run ;
 - un smoke test CUDA verifie les backends natifs sur GPU local avec gradient STE non nul ;
@@ -727,7 +728,7 @@ Etat actuel :
 
 Limite restante :
 
-- les kernels natifs actuels couvrent deja une variante tuilée shared-memory, une variante warp-reduction et un autotune mesure/cache par shape, mais doivent encore etre packages plus bas niveau et persister/exporter leurs profils d'autotune pour grands batchs LLM ;
+- les kernels natifs actuels couvrent deja une variante tuilée shared-memory, une variante warp-reduction, un autotune mesure/cache par shape et un profil JSON persistant, mais doivent encore etre packages plus bas niveau et reduire le cout STE/backward pour grands batchs LLM ;
 - les benchmarks doivent etre elargis a VRAM, energie estimee, tailles LLM reelles et qualite de convergence.
 
 Critere de fermeture :

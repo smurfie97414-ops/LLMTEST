@@ -41,7 +41,7 @@ Remaining Phase 1 hardening:
 Current executable coverage:
 
 - `TernaryBlock`, `ternarize_values`, zero states and estimated bit accounting.
-- `cortex3_ternary.BitLinear` provides a sign+mask layer with shared scales, activation quantization, optional residual runtime, packed int2 ternary weight buffers and native CuPy RawKernel CUDA paths (`tiled_shared_memory_int2` and `warp_reduction_int2`) for CUDA tensors; `auto` mode now measures both variants with CUDA events, caches the best choice by device/dtype/shape and traces autotune candidates/cache hits. PyTorch is a required dependency and CuPy is required for the native CUDA path.
+- `cortex3_ternary.BitLinear` provides a sign+mask layer with shared scales, activation quantization, optional residual runtime, packed int2 ternary weight buffers and native CuPy RawKernel CUDA paths (`tiled_shared_memory_int2` and `warp_reduction_int2`) for CUDA tensors; `auto` mode now measures both variants with CUDA events, caches the best choice by device/dtype/shape, can persist/reload JSON autotune profiles, keeps a layer-local fast cache to avoid repeated host-side selection, and traces autotune candidates/cache hits. PyTorch is a required dependency and CuPy is required for the native CUDA path.
 - `ResidualSynapseBuffer` stores reconstruction residuals for compressed blocks.
 - `CompressionTraceLedger` records compression decisions, activation quantization, expert activations, KV mode events, MTP/FSP events, packed ternary dispatches and native CUDA kernel dispatch counts.
 - Compression decisions include active count, provisional/certified zeros, estimated bits, threshold and residual L1.
@@ -53,7 +53,7 @@ Remaining:
 
 - Feed layer-forward traces into persisted cycle reports outside inference-specific trace summaries.
 - Use layer-forward traces as first-class evidence in causal attribution block probes.
-- Extend the current tiled/warp CuPy RawKernels toward lower-level CUDA/C++ packaging, persistent autotune export/import, and latency/VRAM/energy benchmarks across larger LLM-shaped batches.
+- Extend the current tiled/warp CuPy RawKernels toward lower-level CUDA/C++ packaging, reduced STE/backward overhead, and latency/VRAM/energy benchmarks across larger LLM-shaped batches.
 
 ## Phase 3 - MTP/FSP under contract
 
@@ -416,7 +416,7 @@ Evidence:
 
 - Local GPU environment after dependency correction: NVIDIA GeForce RTX 5070, driver CUDA `13.2`, `torch==2.11.0+cu128`, `torch.version.cuda==12.8`, `cuda_available=True`, `cuda_device_count=1`, `distributed_available=True`, `gloo_available=True`, `nccl_available=False` on Windows.
 - CUDA dependency correction: the previous environment had `torch==2.12.1+cpu` despite a visible RTX 5070. Installed the official CUDA wheel with `pip install --force-reinstall torch==2.11.0+cu128 --index-url https://download.pytorch.org/whl/cu128`; `requirements-cuda-cu128.txt` records the reproducible install command and now includes `cupy-cuda12x`/`ml_dtypes` for the native ternary CUDA kernel.
-- Native ternary kernel validation: `tools\benchmark_ternary_kernel.py --batch 128 --in-features 256 --out-features 256 --dtype fp16 --kernel-variant auto --autotune-warmup 1 --autotune-repeat 3 --warmup 3 --repeat 10` passed on RTX 5070 with measured autotune candidates `tiled=0.3356 ms`, `warp=0.2120 ms`, selected `warp_reduction_int2`, max error `0.000976`, packed weight compression `8x`, native `0.1144 ms`, PyTorch unpack+linear `0.2432 ms`, speedup `2.13x`. A short larger check `batch=512,in=512,out=512,fp16` measured `tiled=0.5668 ms`, `warp=0.3368 ms`, selected `warp_reduction_int2`, native `0.2561 ms`, PyTorch unpack+linear `0.2734 ms`, speedup `1.07x`.
+- Native ternary kernel validation: `tools\benchmark_ternary_kernel.py --batch 128 --in-features 256 --out-features 256 --dtype fp16 --kernel-variant auto --autotune-warmup 1 --autotune-repeat 2 --warmup 3 --repeat 10 --autotune-cache runs\native_ternary_autotune_profile_short.json` passed on RTX 5070 with persisted profile, measured autotune candidates `tiled=0.1665 ms`, `warp=0.1368 ms`, selected `warp_reduction_int2`, max error `0.000976`, packed weight compression `8x`, native `0.0971 ms`, PyTorch unpack+linear `0.2095 ms`, speedup `2.16x`, STE dense `0.1963 ms`, estimated native+STE forward `0.2933 ms`. A short larger check `batch=512,in=512,out=512,fp16` measured `tiled=0.5668 ms`, `warp=0.3368 ms`, selected `warp_reduction_int2`, native `0.2561 ms`, PyTorch unpack+linear `0.2734 ms`, speedup `1.07x`.
 - Doctor validation: `tools\train_llm.py doctor --out-dir runs\llm-doctor-cuda-validation --require-cuda --precision bf16 --device cuda` passed with CUDA visible and bf16 resolving on `cuda`.
 - `.\.venv\Scripts\python.exe tools\train_llm.py smoke --out-dir runs\llm-smoke-dev-48 --steps 48 --require-win`
 - Smoke proof: baseline score `0.022321`, Cortex score `0.145833`, Cortex/baseline `6.533x`, next-token-loss regression ratio `1.020`, proof passed.
