@@ -608,9 +608,11 @@ P10 :
 7. verifie diversite/collapse ;
 8. accepte ou rejette ;
 9. archive la decision ;
-10. cree rollback token ;
-11. applique une proposition acceptee comme patch signe sur vrais poids Transformer ;
-12. mesure repair loss, protected loss et delta de poids.
+10. persiste l'archive evolutive complete dans `archive.json` et les evenements rollback dans `rollback.json` ;
+11. recharge ces archives via `cortex_improvement_archive_dir` quand un run independant partage le meme dossier ;
+12. cree rollback token ;
+13. applique une proposition acceptee comme patch signe sur vrais poids Transformer ;
+14. mesure repair loss, protected loss et delta de poids.
 
 ### Interaction Avec Les Autres Phases
 
@@ -622,6 +624,7 @@ P10 est la boucle d'amelioration recursive au-dessus des autres phases :
 - P10 propose une amelioration plus generale ;
 - P2 est requantifie apres patch ;
 - P9 peut consolider l'effet.
+- les runs suivants peuvent repartir d'une archive P10 deja peuplee sans reprendre le checkpoint, ce qui garde la pression de diversite et l'historique rollback actifs entre runs independants.
 
 ### Impact Apprentissage
 
@@ -629,6 +632,7 @@ P10 agit par :
 
 - replay P10 ;
 - patch direct des poids ;
+- archive evolutive durable qui influence les gates de diversite des runs suivants ;
 - signaux vers `L_recursive_improvement_validity`.
 
 ### Preuve Runtime

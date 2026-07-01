@@ -3511,6 +3511,7 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             train = MemmapCausalDataset(manifest, split="train")
             val = MemmapCausalDataset(manifest, split="val")
             run_dir = root / "cortex-resume"
+            archive_dir = root / "shared-p10-archive"
             try:
                 first = LLMTrainer(
                     CortexTransformerLM(model_config),
@@ -3527,6 +3528,7 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                         cortex_phase_interval=1,
                         cortex_phase_probe_tasks=1,
                         cortex_phase_max_proposals=1,
+                        cortex_improvement_archive_dir=str(archive_dir),
                     ),
                     run_dir=run_dir,
                     model_kind="cortex3_multi_horizon",
@@ -3597,6 +3599,32 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                     improvement_archive["accepted_count"] + improvement_archive["rejected_count"],
                     0,
                 )
+                self.assertTrue((archive_dir / "archive.json").exists())
+                self.assertTrue((archive_dir / "rollback.json").exists())
+                persistent_archive = json.loads((archive_dir / "archive.json").read_text(encoding="utf-8"))
+                self.assertTrue(persistent_archive["accepted"])
+                self.assertTrue(persistent_archive["accepted"][0]["decision"]["evaluation"]["trial_report"])
+                independent_controller = CortexTrainingPhaseController(
+                    CortexTransformerLM(model_config),
+                    tokenizer,
+                    TrainingConfig(
+                        steps=1,
+                        batch_size=1,
+                        eval_interval=1,
+                        checkpoint_interval=1,
+                        cortex_improvement_archive_dir=str(archive_dir),
+                    ),
+                    run_dir=root / "independent-p10",
+                )
+                self.assertGreater(
+                    independent_controller.improvement.archive.accepted_count
+                    + independent_controller.improvement.archive.rejected_count,
+                    0,
+                )
+                self.assertGreater(
+                    independent_controller.integration_counts["recursive_persistent_archive_loaded_decisions"],
+                    0,
+                )
                 sidecar = json.loads((run_dir / "checkpoint_final.pt.json").read_text(encoding="utf-8"))
                 self.assertTrue(sidecar["cortex_phase_state_present"])
                 self.assertTrue(
@@ -3665,6 +3693,11 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                     + sidecar["cortex_phase_state_summary"]["improvement_archive_rejected"],
                     0,
                 )
+                self.assertGreater(sidecar["cortex_phase_state_summary"]["improvement_persistent_archive_decisions"], 0)
+                self.assertEqual(
+                    sidecar["cortex_phase_state_summary"]["improvement_persistent_archive_state"]["archive_dir"],
+                    str(archive_dir),
+                )
                 legacy_state = checkpoint["cortex_phase_state"]
                 legacy_state.pop("last_objective_loss_terms", None)
                 legacy_state.pop("objective_feedback_term_totals", None)
@@ -3690,6 +3723,7 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                         cortex_phase_interval=1,
                         cortex_phase_probe_tasks=1,
                         cortex_phase_max_proposals=1,
+                        cortex_improvement_archive_dir=str(archive_dir),
                     ),
                     run_dir=run_dir,
                     model_kind="cortex3_multi_horizon",

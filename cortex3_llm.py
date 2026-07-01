@@ -54,7 +54,7 @@ from cortex3_future import (
     OutputGoalContract,
     OutputGoalDecision,
 )
-from cortex3_improvement import AcceptanceDecision, ProposalKind, RecursiveImprovementEngine, RollbackEvent
+from cortex3_improvement import AcceptanceDecision, ProposalKind, RecursiveImprovementEngine
 from cortex3_inference import InferenceConfig, InferencePath, UltraFastInferenceEngine
 from cortex3_ledgers import BitLedger, CausalLedger, CausalTrace, SkillLedger, SkillState, UncertaintyLedger
 from cortex3_memory import CognitiveMemory, CognitiveMemoryConfig, CompiledCircuitMemoryBinding, MemoryMode, MemorySegment
@@ -734,13 +734,9 @@ def _restore_sleep_state(sleep: SleepPhaseConsolidator, payload: Mapping[str, An
 
 
 def _improvement_state(improvement: RecursiveImprovementEngine) -> dict[str, Any]:
-    archive = improvement.archive.to_dict()
     return {
-        "archive": {
-            "accepted_count": int(archive.get("accepted_count", 0)),
-            "rejected_count": int(archive.get("rejected_count", 0)),
-            "kind_counts": dict(archive.get("kind_counts", {})),
-        },
+        "schema_version": 2,
+        "archive": improvement.archive.to_dict(),
         "rollback": improvement.rollback.to_dict(),
     }
 
@@ -749,19 +745,15 @@ def _restore_improvement_state(improvement: RecursiveImprovementEngine, payload:
     if not payload:
         return
     archive_payload = dict(payload.get("archive") or {})
-    improvement.archive.restore_summary(
-        accepted_count=int(archive_payload.get("accepted_count", 0)),
-        rejected_count=int(archive_payload.get("rejected_count", 0)),
-        kind_counts=dict(archive_payload.get("kind_counts") or {}),
-    )
-    improvement.rollback.events = [
-        RollbackEvent(
-            proposal_id=str(item.get("proposal_id", "")),
-            rollback_token=str(item.get("rollback_token", "")),
-            reason=str(item.get("reason", "")),
+    if archive_payload.get("accepted") or archive_payload.get("rejected"):
+        improvement.archive.restore_records(archive_payload)
+    else:
+        improvement.archive.restore_summary(
+            accepted_count=int(archive_payload.get("accepted_count", 0)),
+            rejected_count=int(archive_payload.get("rejected_count", 0)),
+            kind_counts=dict(archive_payload.get("kind_counts") or {}),
         )
-        for item in dict(payload.get("rollback") or {}).get("events", ())
-    ]
+    improvement.rollback.restore(dict(payload.get("rollback") or {}))
 
 
 def _sha256_file(path: str | Path, *, chunk_size: int = 1024 * 1024) -> str:
@@ -2386,6 +2378,7 @@ class TrainingConfig:
     cortex_objective_feedback_weight: float = 0.05
     cortex_objective_feedback_clip: float = 4.0
     cortex_trace_retention_limit: int = 4096
+    cortex_improvement_archive_dir: str | None = None
     num_threads: int | None = None
 
     def __post_init__(self) -> None:
@@ -2427,6 +2420,8 @@ class TrainingConfig:
             raise ValueError("cortex_objective_feedback_clip must be non-negative")
         if self.cortex_trace_retention_limit < 0:
             raise ValueError("cortex_trace_retention_limit must be non-negative")
+        if self.cortex_improvement_archive_dir is not None and not str(self.cortex_improvement_archive_dir).strip():
+            raise ValueError("cortex_improvement_archive_dir must not be empty when provided")
         if self.resume and self.resume_if_exists:
             raise ValueError("resume and resume_if_exists are mutually exclusive")
 
@@ -3832,6 +3827,8 @@ def _cortex_phase_deliverable_audit_from_summary(summary: Mapping[str, Any]) -> 
         and count("recursive_pareto_gate_decisions") > 0
         and count("recursive_rollback_tokens") > 0
         and count("recursive_diversity_checks") > 0
+        and count("recursive_persistent_archive_saves") > 0
+        and int(number("improvement_persistent_archive_decisions")) > 0
         and int(number("recursive_model_application_count")) > 0
         and number("recursive_model_parameter_delta_l1") > 0.0
         and number("recursive_model_repair_loss_delta") > 0.0
@@ -3843,12 +3840,15 @@ def _cortex_phase_deliverable_audit_from_summary(summary: Mapping[str, Any]) -> 
             "recursive_pareto_gate_decisions": count("recursive_pareto_gate_decisions"),
             "recursive_rollback_tokens": count("recursive_rollback_tokens"),
             "recursive_diversity_checks": count("recursive_diversity_checks"),
+            "recursive_persistent_archive_saves": count("recursive_persistent_archive_saves"),
+            "improvement_persistent_archive_decisions": int(number("improvement_persistent_archive_decisions")),
+            "improvement_persistent_rollback_events": int(number("improvement_persistent_rollback_events")),
             "recursive_model_application_count": int(number("recursive_model_application_count")),
             "recursive_model_parameter_delta_l1": number("recursive_model_parameter_delta_l1"),
             "recursive_model_repair_loss_delta": number("recursive_model_repair_loss_delta"),
             "recursive_model_non_regressing": recursive_model_non_regressing,
         },
-        "recursive improvement must propose, sandbox, evaluate, gate, apply a signed model patch, preserve rollback tokens and run diversity checks",
+        "recursive improvement must propose, sandbox, evaluate, gate, persist evolutionary and rollback archives, apply a signed model patch, preserve rollback tokens and run diversity checks",
     )
 
     failed_checks = tuple(f"{check['phase']}:{check['deliverable']}" for check in checks if not check["passed"])
@@ -3924,6 +3924,20 @@ class CortexTrainingPhaseController:
         )
         self.sleep = SleepPhaseConsolidator(self.verifier)
         self.improvement = RecursiveImprovementEngine(self.verifier)
+        self.improvement_archive_dir = (
+            Path(config.cortex_improvement_archive_dir)
+            if config.cortex_improvement_archive_dir is not None
+            else self.run_dir / "recursive_improvement_archive"
+        )
+        self.improvement_persistent_archive_state: dict[str, Any] = {
+            "archive_dir": str(self.improvement_archive_dir),
+            "archive_loaded": False,
+            "rollback_loaded": False,
+            "accepted_count": 0,
+            "rejected_count": 0,
+            "decision_count": 0,
+            "rollback_event_count": 0,
+        }
         self.phase_counts: dict[str, int] = {phase.id: 0 for phase in CORTEX3_PHASES}
         self.errors: list[dict[str, Any]] = []
         self.batch_contract_samples: list[dict[str, Any]] = []
@@ -3968,12 +3982,33 @@ class CortexTrainingPhaseController:
         self.recursive_model_parameter_delta_l1 = 0.0
         self.recursive_model_repair_loss_delta = 0.0
         self.recursive_model_protected_loss_delta = 0.0
+        self._load_persistent_improvement_archive()
 
     def _touch(self, phase_id: str) -> None:
         self.phase_counts[phase_id] = self.phase_counts.get(phase_id, 0) + 1
 
     def _count(self, key: str, amount: int = 1) -> None:
         self.integration_counts[key] = self.integration_counts.get(key, 0) + int(amount)
+
+    def _load_persistent_improvement_archive(self) -> None:
+        state = self.improvement.load_persistent_state(self.improvement_archive_dir)
+        self.improvement_persistent_archive_state = dict(state)
+        if bool(state.get("archive_loaded")):
+            self.integration_counts["recursive_persistent_archive_loads"] = (
+                self.integration_counts.get("recursive_persistent_archive_loads", 0) + 1
+            )
+            self.integration_counts["recursive_persistent_archive_loaded_decisions"] = int(state.get("decision_count", 0))
+        if bool(state.get("rollback_loaded")):
+            self.integration_counts["recursive_persistent_rollback_loaded_events"] = int(state.get("rollback_event_count", 0))
+
+    def _persist_improvement_archive(self, *, step: int) -> dict[str, Any]:
+        state = self.improvement.save_persistent_state(self.improvement_archive_dir)
+        state = {**state, "step": int(step)}
+        self.improvement_persistent_archive_state = dict(state)
+        self._count("recursive_persistent_archive_saves")
+        self.integration_counts["recursive_persistent_archive_decisions"] = int(state.get("decision_count", 0))
+        self.integration_counts["recursive_persistent_rollback_events"] = int(state.get("rollback_event_count", 0))
+        return state
 
     def _record_error(self, phase_id: str, exc: Exception) -> None:
         self.errors.append({"phase": phase_id, "type": type(exc).__name__, "message": str(exc)})
@@ -5105,6 +5140,8 @@ class CortexTrainingPhaseController:
             "memory_state": _memory_state(self.memory),
             "sleep_state": _sleep_state(self.sleep),
             "improvement_state": _improvement_state(self.improvement),
+            "improvement_archive_dir": str(self.improvement_archive_dir),
+            "improvement_persistent_archive_state": dict(self.improvement_persistent_archive_state),
         }
 
     def load_state_dict(self, payload: Mapping[str, Any] | None) -> None:
@@ -5220,6 +5257,10 @@ class CortexTrainingPhaseController:
         _restore_memory_state(self.memory, payload.get("memory_state"))
         _restore_sleep_state(self.sleep, payload.get("sleep_state"))
         _restore_improvement_state(self.improvement, payload.get("improvement_state"))
+        self.improvement_persistent_archive_state = dict(
+            payload.get("improvement_persistent_archive_state")
+            or self.improvement_persistent_archive_state
+        )
 
     def checkpoint_state_summary(self) -> dict[str, Any]:
         compression_trace = self.model.compression_trace()
@@ -5386,6 +5427,14 @@ class CortexTrainingPhaseController:
             "recursive_model_protected_loss_delta": float(self.recursive_model_protected_loss_delta),
             "recursive_model_applications": _last_items(self.recursive_model_applications, 5),
             "error_count": len(self.errors),
+            "improvement_archive_dir": str(self.improvement_archive_dir),
+            "improvement_persistent_archive_state": dict(self.improvement_persistent_archive_state),
+            "improvement_persistent_archive_decisions": int(
+                self.improvement_persistent_archive_state.get("decision_count", 0) or 0
+            ),
+            "improvement_persistent_rollback_events": int(
+                self.improvement_persistent_archive_state.get("rollback_event_count", 0) or 0
+            ),
         }
         summary["architecture_audit"] = _cortex_architecture_audit_from_summary(summary)
         summary["phase_deliverable_audit"] = _cortex_phase_deliverable_audit_from_summary(summary)
@@ -5891,6 +5940,8 @@ class CortexTrainingPhaseController:
                 )
                 self._count("recursive_diversity_checks", len(improvement_report.decisions))
                 self._count("recursive_reward_hacking_checks", len(improvement_report.decisions))
+                persistent_archive = self._persist_improvement_archive(step=step)
+                audit["recursive_improvement"]["persistent_archive"] = persistent_archive
                 if improvement_report.decisions:
                     accepted_decision = next((decision for decision in improvement_report.decisions if decision.accepted), None)
                     if accepted_decision is None:
@@ -6135,6 +6186,14 @@ class CortexTrainingPhaseController:
                 "recursive_model_applications": _last_items(self.recursive_model_applications, 5),
                 "improvement_archive_accepted": self.improvement.archive.accepted_count,
                 "improvement_archive_rejected": self.improvement.archive.rejected_count,
+                "improvement_archive_dir": str(self.improvement_archive_dir),
+                "improvement_persistent_archive_state": dict(self.improvement_persistent_archive_state),
+                "improvement_persistent_archive_decisions": int(
+                    self.improvement_persistent_archive_state.get("decision_count", 0) or 0
+                ),
+                "improvement_persistent_rollback_events": int(
+                    self.improvement_persistent_archive_state.get("rollback_event_count", 0) or 0
+                ),
                 "objective_feedback_events": self.objective_feedback_events,
                 "objective_feedback_average_loss": (
                     self.objective_feedback_total / max(1, self.objective_feedback_events)
@@ -6226,6 +6285,12 @@ class CortexTrainingPhaseController:
                     "recursive_model_applications": _last_items(self.recursive_model_applications, 5),
                     "improvement_archive_accepted": self.improvement.archive.accepted_count,
                     "improvement_archive_rejected": self.improvement.archive.rejected_count,
+                    "improvement_persistent_archive_decisions": int(
+                        self.improvement_persistent_archive_state.get("decision_count", 0) or 0
+                    ),
+                    "improvement_persistent_rollback_events": int(
+                        self.improvement_persistent_archive_state.get("rollback_event_count", 0) or 0
+                    ),
                     "error_count": len(self.errors),
                 }
             ),
@@ -6299,6 +6364,12 @@ class CortexTrainingPhaseController:
                     "recursive_model_applications": _last_items(self.recursive_model_applications, 5),
                     "improvement_archive_accepted": self.improvement.archive.accepted_count,
                     "improvement_archive_rejected": self.improvement.archive.rejected_count,
+                    "improvement_persistent_archive_decisions": int(
+                        self.improvement_persistent_archive_state.get("decision_count", 0) or 0
+                    ),
+                    "improvement_persistent_rollback_events": int(
+                        self.improvement_persistent_archive_state.get("rollback_event_count", 0) or 0
+                    ),
                     "error_count": len(self.errors),
                 }
             ),
@@ -6325,6 +6396,8 @@ class CortexTrainingPhaseController:
             "sleep_frontier_reports": _last_items(self.sleep_frontier_reports, 3),
             "frontier_repair_candidates": _last_items(self.frontier_repair_candidates, 3),
             "improvement_state_summary": _improvement_state(self.improvement),
+            "improvement_archive_dir": str(self.improvement_archive_dir),
+            "improvement_persistent_archive_state": dict(self.improvement_persistent_archive_state),
             "regrowth_model_applications": _last_items(self.regrowth_model_applications, 5),
             "recursive_model_applications": _last_items(self.recursive_model_applications, 5),
             "phase_audits": _last_items(self.phase_audits, 2),

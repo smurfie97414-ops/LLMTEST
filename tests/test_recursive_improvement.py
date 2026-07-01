@@ -270,6 +270,35 @@ class RecursiveImprovementTest(unittest.TestCase):
         self.assertEqual(event.rollback_token, record.rollback_token)
         self.assertEqual(rollback.to_dict()["events"][0]["reason"], "post-merge regression simulation")
 
+    def test_persistent_archive_round_trips_full_decisions_and_rollbacks(self):
+        verifier, report = _cycle()
+        engine = RecursiveImprovementEngine(verifier)
+        improvement = engine.run(report, max_proposals=2, seed=3, n_per_skill=1)
+        original_record = improvement.archive.accepted[0]
+        engine.rollback.rollback(original_record, reason="post-run protected regression")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            saved = engine.save_persistent_state(tmp)
+            restored = RecursiveImprovementEngine(verifier)
+            loaded = restored.load_persistent_state(tmp)
+
+        self.assertTrue(loaded["archive_loaded"])
+        self.assertTrue(loaded["rollback_loaded"])
+        self.assertEqual(saved["decision_count"], loaded["decision_count"])
+        self.assertEqual(restored.archive.accepted_count, engine.archive.accepted_count)
+        self.assertEqual(restored.archive.rejected_count, engine.archive.rejected_count)
+        self.assertEqual(len(restored.archive.accepted), len(engine.archive.accepted))
+        restored_record = restored.archive.accepted[0]
+        self.assertEqual(restored_record.proposal.proposal_id, original_record.proposal.proposal_id)
+        self.assertEqual(restored_record.rollback_token, original_record.rollback_token)
+        self.assertEqual(restored_record.decision.reason, original_record.decision.reason)
+        self.assertAlmostEqual(
+            restored_record.decision.evaluation.trial_report.aggregate_score,
+            original_record.decision.evaluation.trial_report.aggregate_score,
+        )
+        self.assertEqual(restored.rollback.events[0].rollback_token, original_record.rollback_token)
+        self.assertIn("post-run", restored.rollback.events[0].reason)
+
     def test_reporting_can_persist_recursive_improvement_report(self):
         verifier, report = _cycle(seed=4)
         improvement = RecursiveImprovementEngine(verifier).run(report, max_proposals=2, seed=4, n_per_skill=1)

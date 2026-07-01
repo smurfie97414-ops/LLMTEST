@@ -1,16 +1,22 @@
 from __future__ import annotations
 
+import json
 from collections import Counter
 from dataclasses import asdict, dataclass, field
 from enum import Enum
+from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 
 from cortex3 import (
+    Anchor,
     CandidateAnswer,
+    CostTrace,
     CorruptedCompressedAgent,
     DynamicSkillVerifier,
     ReferenceRuleAgent,
+    SkillReport,
     Task,
+    VerificationCaseResult,
     VerificationSuiteReport,
 )
 from cortex3_cycle import CycleReport
@@ -19,6 +25,176 @@ from cortex3_selection import TrialProposal, TrialSelector
 
 
 Agent = Callable[[Task], CandidateAnswer | str]
+PERSISTENT_IMPROVEMENT_ARCHIVE_SCHEMA_VERSION = 1
+
+
+def _write_json(path: Path, payload: Mapping[str, Any]) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(path.name + ".tmp")
+    tmp_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    tmp_path.replace(path)
+    return path
+
+
+def _cost_to_dict(cost: CostTrace) -> dict[str, Any]:
+    return asdict(cost)
+
+
+def _cost_from_dict(payload: Mapping[str, Any] | None) -> CostTrace:
+    data = dict(payload or {})
+    return CostTrace(
+        weight_bits_read=float(data.get("weight_bits_read", 0.0)),
+        activation_bits=float(data.get("activation_bits", 0.0)),
+        kv_bytes=float(data.get("kv_bytes", 0.0)),
+        generated_tokens=int(data.get("generated_tokens", 0)),
+        latent_steps=int(data.get("latent_steps", 0)),
+        experts_activated=int(data.get("experts_activated", 0)),
+        verifier_steps=int(data.get("verifier_steps", 0)),
+        wall_time_ms=float(data.get("wall_time_ms", 0.0)),
+    )
+
+
+def _anchor_to_dict(anchor: Anchor) -> dict[str, Any]:
+    return asdict(anchor)
+
+
+def _anchor_from_dict(payload: Mapping[str, Any]) -> Anchor:
+    data = dict(payload)
+    return Anchor(
+        kind=str(data.get("kind", "")),
+        value=str(data.get("value", "")),
+        source_id=str(data.get("source_id", "")),
+        importance=float(data.get("importance", 1.0)),
+    )
+
+
+def _task_to_dict(task: Task) -> dict[str, Any]:
+    return {
+        "task_id": task.task_id,
+        "skill": task.skill,
+        "prompt": task.prompt,
+        "expected": task.expected,
+        "metadata": dict(task.metadata),
+        "anchors": [_anchor_to_dict(anchor) for anchor in task.anchors],
+        "group_id": task.group_id,
+    }
+
+
+def _task_from_dict(payload: Mapping[str, Any]) -> Task:
+    data = dict(payload)
+    return Task(
+        task_id=str(data.get("task_id", "")),
+        skill=str(data.get("skill", "")),
+        prompt=str(data.get("prompt", "")),
+        expected=data.get("expected"),
+        metadata=dict(data.get("metadata") or {}),
+        anchors=tuple(_anchor_from_dict(item) for item in data.get("anchors", ())),
+        group_id=None if data.get("group_id") is None else str(data.get("group_id")),
+    )
+
+
+def _candidate_to_dict(answer: CandidateAnswer) -> dict[str, Any]:
+    return {
+        "text": answer.text,
+        "confidence": float(answer.confidence),
+        "certificate": dict(answer.certificate),
+        "cost": _cost_to_dict(answer.cost),
+        "raw": dict(answer.raw),
+    }
+
+
+def _candidate_from_dict(payload: Mapping[str, Any]) -> CandidateAnswer:
+    data = dict(payload)
+    return CandidateAnswer(
+        text=str(data.get("text", "")),
+        confidence=float(data.get("confidence", 0.0)),
+        certificate=dict(data.get("certificate") or {}),
+        cost=_cost_from_dict(data.get("cost")),
+        raw=dict(data.get("raw") or {}),
+    )
+
+
+def _case_to_dict(case: VerificationCaseResult) -> dict[str, Any]:
+    return {
+        "task": _task_to_dict(case.task),
+        "passed": bool(case.passed),
+        "score": float(case.score),
+        "answer": _candidate_to_dict(case.answer),
+        "expected": case.expected,
+        "reason": case.reason,
+        "verifier_cost": _cost_to_dict(case.verifier_cost),
+    }
+
+
+def _case_from_dict(payload: Mapping[str, Any]) -> VerificationCaseResult:
+    data = dict(payload)
+    task = _task_from_dict(dict(data.get("task") or {}))
+    return VerificationCaseResult(
+        task=task,
+        passed=bool(data.get("passed", False)),
+        score=float(data.get("score", 0.0)),
+        answer=_candidate_from_dict(dict(data.get("answer") or {})),
+        expected=data.get("expected", task.expected),
+        reason=str(data.get("reason", "")),
+        verifier_cost=_cost_from_dict(data.get("verifier_cost")),
+    )
+
+
+def _skill_report_to_dict(report: SkillReport) -> dict[str, Any]:
+    return {
+        "skill": report.skill,
+        "total": int(report.total),
+        "passed": int(report.passed),
+        "score": float(report.score),
+        "failures": [_case_to_dict(case) for case in report.failures],
+        "cases": [_case_to_dict(case) for case in report.cases],
+    }
+
+
+def _skill_report_from_dict(payload: Mapping[str, Any]) -> SkillReport:
+    data = dict(payload)
+    return SkillReport(
+        skill=str(data.get("skill", "")),
+        total=int(data.get("total", 0)),
+        passed=int(data.get("passed", 0)),
+        score=float(data.get("score", 0.0)),
+        failures=tuple(_case_from_dict(item) for item in data.get("failures", ())),
+        cases=tuple(_case_from_dict(item) for item in data.get("cases", ())),
+    )
+
+
+def _suite_report_to_dict(report: VerificationSuiteReport) -> dict[str, Any]:
+    return {
+        "skill_reports": {
+            skill: _skill_report_to_dict(skill_report)
+            for skill, skill_report in report.skill_reports.items()
+        },
+        "total": int(report.total),
+        "passed": int(report.passed),
+        "aggregate_score": float(report.aggregate_score),
+        "total_cost": _cost_to_dict(report.total_cost),
+    }
+
+
+def _minimal_suite_report(score: float) -> VerificationSuiteReport:
+    return VerificationSuiteReport({}, total=0, passed=0, aggregate_score=float(score), total_cost=CostTrace())
+
+
+def _suite_report_from_dict(payload: Mapping[str, Any] | None, *, fallback_score: float = 0.0) -> VerificationSuiteReport:
+    if not payload:
+        return _minimal_suite_report(fallback_score)
+    data = dict(payload)
+    skill_reports = {
+        str(skill): _skill_report_from_dict(dict(skill_report))
+        for skill, skill_report in dict(data.get("skill_reports") or {}).items()
+    }
+    return VerificationSuiteReport(
+        skill_reports=skill_reports,
+        total=int(data.get("total", 0)),
+        passed=int(data.get("passed", 0)),
+        aggregate_score=float(data.get("aggregate_score", fallback_score)),
+        total_cost=_cost_from_dict(data.get("total_cost")),
+    )
 
 
 class ProposalKind(str, Enum):
@@ -61,6 +237,23 @@ class ImprovementProposal:
         data = asdict(self)
         data["kind"] = self.kind.value
         return data
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "ImprovementProposal":
+        data = dict(payload)
+        return cls(
+            proposal_id=str(data.get("proposal_id", "")),
+            title=str(data.get("title", "")),
+            kind=ProposalKind(str(data.get("kind", ProposalKind.TEST.value))),
+            affected_skills=tuple(str(item) for item in data.get("affected_skills", ())),
+            expected_quality_delta=float(data.get("expected_quality_delta", 0.0)),
+            expected_cost_delta=float(data.get("expected_cost_delta", 0.0)),
+            expected_robustness_delta=float(data.get("expected_robustness_delta", 0.0)),
+            risk=float(data.get("risk", 0.0)),
+            diversity_tags=tuple(str(item) for item in data.get("diversity_tags", ())),
+            patch_payload=dict(data.get("patch_payload") or {}),
+            parent_ids=tuple(str(item) for item in data.get("parent_ids", ())),
+        )
 
 
 class ProposalGenerator:
@@ -291,6 +484,18 @@ class SandboxTrial:
             "notes": self.notes,
         }
 
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any], proposal: ImprovementProposal) -> "SandboxTrial":
+        data = dict(payload)
+        return cls(
+            proposal=proposal,
+            sandbox_id=str(data.get("sandbox_id", f"sandbox-{proposal.proposal_id}")),
+            agent=CorruptedCompressedAgent(),
+            touched_files=tuple(str(item) for item in data.get("touched_files", ())),
+            rollback_token=str(data.get("rollback_token", f"rollback-{proposal.proposal_id}")),
+            notes=str(data.get("notes", "restored persistent sandbox trial")),
+        )
+
 
 class SandboxTrainer:
     def train(self, proposal: ImprovementProposal, *, baseline_agent: Agent, reference_agent: Agent) -> SandboxTrial:
@@ -332,6 +537,9 @@ class SandboxEvaluation:
         return {
             "proposal_id": self.proposal.proposal_id,
             "sandbox": self.sandbox.to_dict(),
+            "baseline_report": _suite_report_to_dict(self.baseline_report),
+            "trial_report": _suite_report_to_dict(self.trial_report),
+            "robustness_report": _suite_report_to_dict(self.robustness_report),
             "baseline_score": self.baseline_report.aggregate_score,
             "trial_score": self.trial_report.aggregate_score,
             "robustness_score": self.robustness_report.aggregate_score,
@@ -346,6 +554,41 @@ class SandboxEvaluation:
             "collapse_flags": list(self.collapse_flags),
             "pareto_candidate": self.pareto_candidate,
         }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any], proposal: ImprovementProposal) -> "SandboxEvaluation":
+        data = dict(payload)
+        baseline_report = _suite_report_from_dict(
+            data.get("baseline_report"),
+            fallback_score=float(data.get("baseline_score", 0.0)),
+        )
+        trial_report = _suite_report_from_dict(
+            data.get("trial_report"),
+            fallback_score=float(data.get("trial_score", 0.0)),
+        )
+        robustness_report = _suite_report_from_dict(
+            data.get("robustness_report"),
+            fallback_score=float(data.get("robustness_score", 0.0)),
+        )
+        return cls(
+            proposal=proposal,
+            sandbox=SandboxTrial.from_dict(dict(data.get("sandbox") or {}), proposal),
+            baseline_report=baseline_report,
+            trial_report=trial_report,
+            robustness_report=robustness_report,
+            quality_delta=float(data.get("quality_delta", trial_report.aggregate_score - baseline_report.aggregate_score)),
+            cost_delta=float(data.get("cost_delta", 0.0)),
+            robustness_delta=float(data.get("robustness_delta", 0.0)),
+            baseline_calibration_gap=float(data.get("baseline_calibration_gap", 0.0)),
+            trial_calibration_gap=float(data.get("trial_calibration_gap", 0.0)),
+            calibration_delta=float(data.get("calibration_delta", 0.0)),
+            protected_losses={
+                str(key): float(value)
+                for key, value in dict(data.get("protected_losses") or {}).items()
+            },
+            reward_hacking_flags=tuple(str(item) for item in data.get("reward_hacking_flags", ())),
+            collapse_flags=tuple(str(item) for item in data.get("collapse_flags", ())),
+        )
 
 
 class RewardHackingDetector:
@@ -500,6 +743,16 @@ class AcceptanceDecision:
             "evaluation": self.evaluation.to_dict(),
         }
 
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any], proposal: ImprovementProposal) -> "AcceptanceDecision":
+        data = dict(payload)
+        return cls(
+            accepted=bool(data.get("accepted", False)),
+            reason=str(data.get("reason", "")),
+            evaluation=SandboxEvaluation.from_dict(dict(data.get("evaluation") or {}), proposal),
+            diversity_flags=tuple(str(item) for item in data.get("diversity_flags", ())),
+        )
+
 
 class PatchAcceptanceGate:
     def __init__(self, selector: TrialSelector | None = None, diversity: DiversityPreserver | None = None):
@@ -538,6 +791,18 @@ class ArchiveRecord:
             "rollback_token": self.rollback_token,
         }
 
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "ArchiveRecord":
+        data = dict(payload)
+        proposal = ImprovementProposal.from_dict(dict(data.get("proposal") or {}))
+        decision = AcceptanceDecision.from_dict(dict(data.get("decision") or {}), proposal)
+        rollback_token = str(
+            data.get("rollback_token")
+            or decision.evaluation.sandbox.rollback_token
+            or f"rollback-{proposal.proposal_id}"
+        )
+        return cls(proposal=proposal, decision=decision, rollback_token=rollback_token)
+
 
 class EvolutionaryArchive:
     def __init__(self) -> None:
@@ -573,12 +838,40 @@ class EvolutionaryArchive:
         return counts
 
     def restore_summary(self, *, accepted_count: int, rejected_count: int, kind_counts: Mapping[str, int]) -> None:
-        self.restored_accepted_count = int(accepted_count)
-        self.restored_rejected_count = int(rejected_count)
-        self.restored_accepted_kind_counts = Counter({
-            ProposalKind(kind): int(count)
-            for kind, count in dict(kind_counts).items()
-        })
+        live_accepted_count = len(self.accepted)
+        live_rejected_count = len(self.rejected)
+        self.restored_accepted_count = max(0, int(accepted_count) - live_accepted_count)
+        self.restored_rejected_count = max(0, int(rejected_count) - live_rejected_count)
+        live_kind_counts = Counter(record.proposal.kind for record in self.accepted)
+        restored_counts: Counter[ProposalKind] = Counter()
+        for kind, count in dict(kind_counts).items():
+            proposal_kind = ProposalKind(kind)
+            remaining = int(count) - int(live_kind_counts.get(proposal_kind, 0))
+            if remaining > 0:
+                restored_counts[proposal_kind] = remaining
+        self.restored_accepted_kind_counts = restored_counts
+
+    def restore_records(self, payload: Mapping[str, Any]) -> None:
+        data = dict(payload)
+        records = [
+            ArchiveRecord.from_dict(item)
+            for item in tuple(data.get("accepted", ())) + tuple(data.get("rejected", ()))
+        ]
+        self.records = records
+        self.restore_summary(
+            accepted_count=int(data.get("accepted_count", len(self.accepted))),
+            rejected_count=int(data.get("rejected_count", len(self.rejected))),
+            kind_counts=dict(data.get("kind_counts") or {}),
+        )
+
+    def save(self, path: str | Path) -> Path:
+        return _write_json(Path(path), self.to_dict())
+
+    @classmethod
+    def load(cls, path: str | Path) -> "EvolutionaryArchive":
+        archive = cls()
+        archive.restore_records(json.loads(Path(path).read_text(encoding="utf-8")))
+        return archive
 
     def to_dict(self) -> dict[str, Any]:
         kind_counts = {
@@ -586,6 +879,7 @@ class EvolutionaryArchive:
             for kind, count in self.accepted_kind_counts().items()
         }
         return {
+            "schema_version": PERSISTENT_IMPROVEMENT_ARCHIVE_SCHEMA_VERSION,
             "accepted": [record.to_dict() for record in self.accepted],
             "rejected": [record.to_dict() for record in self.rejected],
             "restored_accepted_count": self.restored_accepted_count,
@@ -605,6 +899,15 @@ class RollbackEvent:
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "RollbackEvent":
+        data = dict(payload)
+        return cls(
+            proposal_id=str(data.get("proposal_id", "")),
+            rollback_token=str(data.get("rollback_token", "")),
+            reason=str(data.get("reason", "")),
+        )
+
 
 class RollbackSystem:
     def __init__(self) -> None:
@@ -615,8 +918,24 @@ class RollbackSystem:
         self.events.append(event)
         return event
 
+    def restore(self, payload: Mapping[str, Any] | None) -> None:
+        data = dict(payload or {})
+        self.events = [RollbackEvent.from_dict(item) for item in data.get("events", ())]
+
+    def save(self, path: str | Path) -> Path:
+        return _write_json(Path(path), self.to_dict())
+
+    @classmethod
+    def load(cls, path: str | Path) -> "RollbackSystem":
+        rollback = cls()
+        rollback.restore(json.loads(Path(path).read_text(encoding="utf-8")))
+        return rollback
+
     def to_dict(self) -> dict[str, Any]:
-        return {"events": [event.to_dict() for event in self.events]}
+        return {
+            "schema_version": PERSISTENT_IMPROVEMENT_ARCHIVE_SCHEMA_VERSION,
+            "events": [event.to_dict() for event in self.events],
+        }
 
 
 @dataclass(frozen=True)
@@ -654,6 +973,57 @@ class RecursiveImprovementEngine:
         self.gate = gate or PatchAcceptanceGate()
         self.archive = archive or EvolutionaryArchive()
         self.rollback = rollback or RollbackSystem()
+
+    def load_persistent_state(self, archive_dir: str | Path) -> dict[str, Any]:
+        directory = Path(archive_dir)
+        archive_path = directory / "archive.json"
+        rollback_path = directory / "rollback.json"
+        archive_loaded = archive_path.exists()
+        rollback_loaded = rollback_path.exists()
+        if archive_loaded:
+            self.archive.restore_records(json.loads(archive_path.read_text(encoding="utf-8")))
+        if rollback_loaded:
+            self.rollback.restore(json.loads(rollback_path.read_text(encoding="utf-8")))
+        return {
+            "schema_version": PERSISTENT_IMPROVEMENT_ARCHIVE_SCHEMA_VERSION,
+            "archive_dir": str(directory),
+            "archive_path": str(archive_path),
+            "rollback_path": str(rollback_path),
+            "archive_loaded": archive_loaded,
+            "rollback_loaded": rollback_loaded,
+            "accepted_count": self.archive.accepted_count,
+            "rejected_count": self.archive.rejected_count,
+            "decision_count": self.archive.accepted_count + self.archive.rejected_count,
+            "rollback_event_count": len(self.rollback.events),
+            "kind_counts": {
+                kind.value: int(count)
+                for kind, count in self.archive.accepted_kind_counts().items()
+            },
+        }
+
+    def save_persistent_state(self, archive_dir: str | Path) -> dict[str, Any]:
+        directory = Path(archive_dir)
+        archive_path = self.archive.save(directory / "archive.json")
+        rollback_path = self.rollback.save(directory / "rollback.json")
+        manifest = {
+            "schema_version": PERSISTENT_IMPROVEMENT_ARCHIVE_SCHEMA_VERSION,
+            "archive_path": str(archive_path),
+            "rollback_path": str(rollback_path),
+            "accepted_count": self.archive.accepted_count,
+            "rejected_count": self.archive.rejected_count,
+            "decision_count": self.archive.accepted_count + self.archive.rejected_count,
+            "rollback_event_count": len(self.rollback.events),
+            "kind_counts": {
+                kind.value: int(count)
+                for kind, count in self.archive.accepted_kind_counts().items()
+            },
+        }
+        manifest_path = _write_json(directory / "manifest.json", manifest)
+        return {
+            **manifest,
+            "archive_dir": str(directory),
+            "manifest_path": str(manifest_path),
+        }
 
     def run(
         self,

@@ -259,19 +259,21 @@ Current executable coverage:
 - `RewardHackingDetector` flags declared overfitting, robustness-suite collapse and overconfident failures on affected skills.
 - `DiversityPreserver` prevents one proposal kind from dominating the evolutionary archive.
 - `PatchAcceptanceGate` requires Pareto improvement, no protected-skill regression, no calibration regression, no reward hacking and no diversity/collapse failure.
-- `EvolutionaryArchive` records accepted and rejected decisions with proposal lineage and kind counts.
-- `RollbackSystem` records rollback events from accepted proposal tokens.
-- `RecursiveImprovementEngine` orchestrates proposal generation, prioritized external proposals, sandbox training, dynamic evaluation, acceptance and archive recording from a `CycleReport`.
+- `EvolutionaryArchive` records accepted and rejected decisions with proposal lineage, full sandbox/evaluation payloads and kind counts; it can save/load the complete archive as `archive.json` instead of only restoring counters.
+- `RollbackSystem` records rollback events from accepted proposal tokens and can save/load them as `rollback.json`.
+- `RecursiveImprovementEngine` orchestrates proposal generation, prioritized external proposals, sandbox training, dynamic evaluation, acceptance and archive recording from a `CycleReport`; it also writes a persistent manifest for the archive/rollback pair.
 - `write_cycle_run` can persist recursive improvement reports into `summary.json`.
 - `tools/run_cycle_report.py` writes Phase 10 traces by default unless `--skip-improvement` is passed.
-- The full LLM Cortex phase controller converts verifier-approved recursive-improvement gate decisions into causal replay examples, feeds accepted P7 compiled Frontier repairs into P10 before generic proposals, applies accepted proposals as signed bounded patches to real Transformer parameters, and persists patch id, rollback token, parameter deltas, repair-loss improvement, protected-loss non-regression and proposal payload in checkpoints.
+- The full LLM Cortex phase controller converts verifier-approved recursive-improvement gate decisions into causal replay examples, feeds accepted P7 compiled Frontier repairs into P10 before generic proposals, applies accepted proposals as signed bounded patches to real Transformer parameters, persists patch id, rollback token, parameter deltas, repair-loss improvement, protected-loss non-regression and proposal payload in checkpoints, and loads/saves reusable P10 archives through `TrainingConfig.cortex_improvement_archive_dir` even when a later run does not resume the checkpoint.
 
 Evidence:
 
 - `.\.venv\Scripts\python.exe -m unittest tests.test_recursive_improvement`
 - `.\.venv\Scripts\python.exe -m unittest discover -s tests`
 - `tests.test_recursive_improvement.RecursiveImprovementTest.test_engine_prioritizes_accepted_frontier_repair_proposals` verifies that a Frontier repair becomes the first P10 proposal and is accepted under the normal gates.
+- `tests.test_recursive_improvement.RecursiveImprovementTest.test_persistent_archive_round_trips_full_decisions_and_rollbacks` verifies full accepted/rejected decisions, evaluation reports and rollback tokens round-trip through persistent archive files.
 - `tests/test_llm_pretraining.py::LLMPretrainingHarnessTest::test_cortex_phase_state_survives_checkpoint_resume` verifies that P1-P10 replay state plus P2/P3 internal ledgers persist through a checkpoint resume and keep influencing optimizer steps.
+- The same LLM resume test now also verifies that a fresh independent `CortexTrainingPhaseController` with a different run directory reloads the shared P10 archive from `cortex_improvement_archive_dir` without using the checkpoint.
 - `tests.test_llm_pretraining.LLMPretrainingHarnessTest.test_full_cortex_phase_controller_uses_all_modules_during_training` verifies the applied recursive model patch has `proposal_kind == "compiled_frontier"` and carries the Frontier repair payload.
 - `tests.test_certificates.CertificatesTest.test_compiled_circuit_certificate_binds_contract_and_lineage` verifies the compiled-circuit certificate tool accepts valid lineage and rejects a tampered contract.
 - Smoke: `RecursiveImprovementEngine(...).run(..., max_proposals=3)` accepted Pareto-improving sandbox proposals with no touched files.
@@ -279,7 +281,6 @@ Evidence:
 
 Remaining:
 
-- Persist evolutionary and rollback archives across independent long runs.
 - Run multi-generation proposal evolution with diversity pressure.
 
 ## Frontier Skill Discovery
