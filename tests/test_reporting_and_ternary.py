@@ -191,7 +191,11 @@ class ReportingAndTernaryTest(unittest.TestCase):
         dispatch = layer.ledger.packed_ternary_dispatches[-1]
         self.assertTrue(dispatch.backend.startswith("native_int2_cupy_cuda_"))
         self.assertTrue(dispatch.native_kernel)
-        self.assertEqual(dispatch.kernel_variant, "tiled_shared_memory_int2")
+        self.assertTrue(dispatch.autotuned)
+        self.assertEqual({name for name, _ in dispatch.autotune_candidate_ms}, {"tiled", "warp"})
+        selected = min(dispatch.autotune_candidate_ms, key=lambda item: item[1])[0]
+        expected_variant = "tiled_shared_memory_int2" if selected == "tiled" else "warp_reduction_int2"
+        self.assertEqual(dispatch.kernel_variant, expected_variant)
 
     @unittest.skipUnless(
         __import__("torch").cuda.is_available() and native_ternary_cuda_available(),
@@ -227,28 +231,32 @@ class ReportingAndTernaryTest(unittest.TestCase):
         __import__("torch").cuda.is_available() and native_ternary_cuda_available(),
         "CUDA plus CuPy native ternary kernel is required",
     )
-    def test_native_ternary_auto_kernel_selects_tiled_and_warp_shapes(self):
+    def test_native_ternary_auto_kernel_autotunes_and_reuses_cache(self):
         import torch
 
-        small = BitLinear(BitLinearConfig(
-            256,
-            256,
+        layer = BitLinear(BitLinearConfig(
+            96,
+            80,
             activation_bits=0,
             require_native_cuda_kernel=True,
             native_cuda_kernel_variant="auto",
+            native_cuda_autotune_warmup=0,
+            native_cuda_autotune_repeat=1,
         )).cuda()
-        small._native_cuda_packed_output(torch.randn(16, 256, device="cuda", dtype=torch.float16))
-        self.assertEqual(small._last_native_kernel_variant, "tiled_shared_memory_int2")
+        x = torch.randn(7, 96, device="cuda", dtype=torch.float16)
 
-        large = BitLinear(BitLinearConfig(
-            512,
-            512,
-            activation_bits=0,
-            require_native_cuda_kernel=True,
-            native_cuda_kernel_variant="auto",
-        )).cuda()
-        large._native_cuda_packed_output(torch.randn(32, 512, device="cuda", dtype=torch.float16))
-        self.assertEqual(large._last_native_kernel_variant, "warp_reduction_int2")
+        layer._native_cuda_packed_output(x)
+        first_candidates = tuple(layer._last_native_autotune_candidate_ms)
+        self.assertTrue(layer._last_native_autotuned)
+        self.assertFalse(layer._last_native_autotune_cache_hit)
+        self.assertEqual({name for name, _ in first_candidates}, {"tiled", "warp"})
+        selected = min(first_candidates, key=lambda item: item[1])[0]
+        self.assertEqual(layer._last_native_kernel_family, selected)
+
+        layer._native_cuda_packed_output(x)
+        self.assertTrue(layer._last_native_autotune_cache_hit)
+        self.assertEqual(tuple(layer._last_native_autotune_candidate_ms), first_candidates)
+        self.assertEqual(layer._last_native_kernel_family, selected)
 
     def test_bitlinear_matches_float_linear_when_activation_quantization_is_disabled(self):
         import torch

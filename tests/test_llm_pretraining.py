@@ -1024,6 +1024,7 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             if phase_report["native_ternary_kernel_required"]:
                 self.assertGreater(influence["native_ternary_kernel_dispatches"], 0)
                 self.assertTrue(influence["native_ternary_kernel_variants"])
+                self.assertGreater(influence["native_ternary_autotuned_dispatches"], 0)
             self.assertGreater(influence["variable_input_compression_events"], 0)
             self.assertGreater(influence["learned_memory_policy_events"], 0)
             self.assertGreater(influence["learned_memory_anchor_supervision_events"], 0)

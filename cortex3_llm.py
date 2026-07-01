@@ -165,6 +165,8 @@ def _restore_compression_trace_ledger(ledger: CompressionTraceLedger | None, pay
     ledger.total_packed_ternary_dispatches = 0
     ledger.total_native_ternary_kernel_dispatches = 0
     ledger.total_torch_packed_ternary_dispatches = 0
+    ledger.total_native_ternary_autotuned_dispatches = 0
+    ledger.total_native_ternary_autotune_cache_hits = 0
     ledger.total_weight_bits_read = 0.0
     ledger.total_activation_bits = 0.0
     ledger.total_kv_bytes = 0.0
@@ -276,6 +278,13 @@ def _restore_compression_trace_ledger(ledger: CompressionTraceLedger | None, pay
                 note=str(data.get("note", "")),
                 native_kernel=bool(data.get("native_kernel", False)),
                 kernel_variant=str(data.get("kernel_variant", "")),
+                autotuned=bool(data.get("autotuned", False)),
+                autotune_cache_hit=bool(data.get("autotune_cache_hit", False)),
+                autotune_candidate_ms=tuple(
+                    (str(pair[0]), float(pair[1]))
+                    for pair in data.get("autotune_candidate_ms", ())
+                    if isinstance(pair, (list, tuple)) and len(pair) == 2
+                ),
             )
         )
     ledger._trim(ledger.packed_ternary_dispatches)
@@ -297,6 +306,18 @@ def _restore_compression_trace_ledger(ledger: CompressionTraceLedger | None, pay
         total_counts.get(
             "torch_packed_ternary_dispatches",
             max(0, ledger.total_packed_ternary_dispatches - ledger.total_native_ternary_kernel_dispatches),
+        )
+    )
+    ledger.total_native_ternary_autotuned_dispatches = int(
+        total_counts.get(
+            "native_ternary_autotuned_dispatches",
+            sum(1 for item in ledger.packed_ternary_dispatches if item.autotuned),
+        )
+    )
+    ledger.total_native_ternary_autotune_cache_hits = int(
+        total_counts.get(
+            "native_ternary_autotune_cache_hits",
+            sum(1 for item in ledger.packed_ternary_dispatches if item.autotune_cache_hit),
         )
     )
     cost_trace = dict(payload.get("cost_trace") or {})
@@ -2809,13 +2830,19 @@ def _cortex_architecture_audit_from_summary(summary: Mapping[str, Any]) -> dict[
     )
     add(
         "native_ternary_cuda_kernel",
-        (not native_ternary_required) or trace_count("native_ternary_kernel_dispatches") > 0,
+        (not native_ternary_required)
+        or (
+            trace_count("native_ternary_kernel_dispatches") > 0
+            and trace_count("native_ternary_autotuned_dispatches") > 0
+        ),
         {
             "native_ternary_kernel_required": native_ternary_required,
             "native_ternary_kernel_dispatches": trace_count("native_ternary_kernel_dispatches"),
             "torch_packed_ternary_dispatches": trace_count("torch_packed_ternary_dispatches"),
+            "native_ternary_autotuned_dispatches": trace_count("native_ternary_autotuned_dispatches"),
+            "native_ternary_autotune_cache_hits": trace_count("native_ternary_autotune_cache_hits"),
         },
-        "CUDA full-architecture runs must launch a native packed int2 ternary kernel, not only a PyTorch matmul over unpacked weights",
+        "CUDA full-architecture runs must launch an autotuned native packed int2 ternary kernel, not only a PyTorch matmul over unpacked weights",
     )
     add(
         "skill_aware_experts",
@@ -3089,7 +3116,13 @@ def _cortex_phase_deliverable_audit_from_summary(summary: Mapping[str, Any]) -> 
         and trace("activation_quantizations") > 0
         and trace("compression_decisions") > 0
         and trace("packed_ternary_dispatches") > 0
-        and ((not native_ternary_required) or trace("native_ternary_kernel_dispatches") > 0),
+        and (
+            (not native_ternary_required)
+            or (
+                trace("native_ternary_kernel_dispatches") > 0
+                and trace("native_ternary_autotuned_dispatches") > 0
+            )
+        ),
         {
             "layer_forward_events": trace("layer_forward_events"),
             "activation_quantizations": trace("activation_quantizations"),
@@ -3097,8 +3130,10 @@ def _cortex_phase_deliverable_audit_from_summary(summary: Mapping[str, Any]) -> 
             "packed_ternary_dispatches": trace("packed_ternary_dispatches"),
             "native_ternary_kernel_required": native_ternary_required,
             "native_ternary_kernel_dispatches": trace("native_ternary_kernel_dispatches"),
+            "native_ternary_autotuned_dispatches": trace("native_ternary_autotuned_dispatches"),
+            "native_ternary_autotune_cache_hits": trace("native_ternary_autotune_cache_hits"),
         },
-        "BitLinear sign+mask, activation quantization, compression decisions, packed dispatch, and required native CUDA kernel must all run",
+        "BitLinear sign+mask, activation quantization, compression decisions, packed dispatch, and required autotuned native CUDA kernel must all run",
     )
     add(
         "P3",
@@ -4294,6 +4329,16 @@ class CortexTrainingPhaseController:
                         for item in compression_trace.get("packed_ternary_dispatches", ())
                         if bool(dict(item).get("native_kernel", False)) or str(dict(item).get("backend", "")).startswith("native_")
                     ),
+                    "native_ternary_autotuned_dispatches": sum(
+                        1
+                        for item in compression_trace.get("packed_ternary_dispatches", ())
+                        if bool(dict(item).get("autotuned", False))
+                    ),
+                    "native_ternary_autotune_cache_hits": sum(
+                        1
+                        for item in compression_trace.get("packed_ternary_dispatches", ())
+                        if bool(dict(item).get("autotune_cache_hit", False))
+                    ),
                 }
                 compression_trace_counts["torch_packed_ternary_dispatches"] = max(
                     0,
@@ -4814,6 +4859,8 @@ class CortexTrainingPhaseController:
                 "native_ternary_kernel_dispatches": trace_counts.get("native_ternary_kernel_dispatches", 0),
                 "torch_packed_ternary_dispatches": trace_counts.get("torch_packed_ternary_dispatches", 0),
                 "native_ternary_kernel_variants": tuple(compression_trace.get("native_ternary_kernel_variants", ())),
+                "native_ternary_autotuned_dispatches": trace_counts.get("native_ternary_autotuned_dispatches", 0),
+                "native_ternary_autotune_cache_hits": trace_counts.get("native_ternary_autotune_cache_hits", 0),
                 "variable_input_compression_events": trace_counts.get("kv_events", 0),
                 "skill_expert_activations": trace_counts.get("expert_activations", 0),
                 "certificate_head_forward_events": int(self.model.certificate_forward_events),

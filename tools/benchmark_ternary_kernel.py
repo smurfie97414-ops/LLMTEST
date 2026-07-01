@@ -45,6 +45,9 @@ def benchmark_case(
     out_features: int,
     dtype: torch.dtype,
     kernel_variant: str,
+    enable_autotune: bool,
+    autotune_warmup: int,
+    autotune_repeat: int,
     warmup: int,
     repeat: int,
 ) -> dict[str, Any]:
@@ -56,6 +59,9 @@ def benchmark_case(
             residual_runtime=False,
             require_native_cuda_kernel=True,
             native_cuda_kernel_variant=kernel_variant,
+            native_cuda_autotune=enable_autotune,
+            native_cuda_autotune_warmup=autotune_warmup,
+            native_cuda_autotune_repeat=autotune_repeat,
             log_prefix="bench-native-ternary",
         )
     ).cuda()
@@ -83,6 +89,10 @@ def benchmark_case(
         "dtype": str(dtype).replace("torch.", ""),
         "native_backend": f"native_int2_cupy_cuda_{layer._last_native_kernel_variant}",
         "kernel_variant": layer._last_native_kernel_variant,
+        "kernel_family": layer._last_native_kernel_family,
+        "autotuned": bool(layer._last_native_autotuned),
+        "autotune_cache_hit": bool(layer._last_native_autotune_cache_hit),
+        "autotune_candidate_ms": dict(layer._last_native_autotune_candidate_ms),
         "native_ms": native_ms,
         "torch_unpack_linear_ms": unpacked_ms,
         "speedup_vs_torch_unpack_linear": unpacked_ms / max(native_ms, 1e-9),
@@ -103,6 +113,9 @@ def main() -> None:
     parser.add_argument("--out-features", type=int, default=512)
     parser.add_argument("--dtype", choices=tuple(DTYPES), default="fp16")
     parser.add_argument("--kernel-variant", choices=("auto", "tiled", "warp"), default="auto")
+    parser.add_argument("--disable-autotune", action="store_true")
+    parser.add_argument("--autotune-warmup", type=int, default=1)
+    parser.add_argument("--autotune-repeat", type=int, default=3)
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--repeat", type=int, default=100)
     parser.add_argument("--json-out", type=Path, default=None)
@@ -120,6 +133,9 @@ def main() -> None:
         out_features=args.out_features,
         dtype=DTYPES[args.dtype],
         kernel_variant=args.kernel_variant,
+        enable_autotune=not args.disable_autotune,
+        autotune_warmup=args.autotune_warmup,
+        autotune_repeat=args.autotune_repeat,
         warmup=args.warmup,
         repeat=args.repeat,
     )

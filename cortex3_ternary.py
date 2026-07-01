@@ -407,6 +407,7 @@ _CUPY_TERNARY_KERNEL_NAMES = {
     },
 }
 _CUPY_TERNARY_KERNEL_CACHE: dict[Any, Any] = {}
+_NATIVE_TERNARY_AUTOTUNE_CACHE: dict[tuple[Any, ...], tuple[str, tuple[tuple[str, float], ...]]] = {}
 _CUPY_IMPORT_ERROR: Exception | None = None
 
 
@@ -534,6 +535,9 @@ class PackedTernaryDispatch:
     note: str = ""
     native_kernel: bool = False
     kernel_variant: str = ""
+    autotuned: bool = False
+    autotune_cache_hit: bool = False
+    autotune_candidate_ms: tuple[tuple[str, float], ...] = ()
 
 
 @dataclass
@@ -555,6 +559,8 @@ class CompressionTraceLedger:
     total_packed_ternary_dispatches: int = 0
     total_native_ternary_kernel_dispatches: int = 0
     total_torch_packed_ternary_dispatches: int = 0
+    total_native_ternary_autotuned_dispatches: int = 0
+    total_native_ternary_autotune_cache_hits: int = 0
     total_weight_bits_read: float = 0.0
     total_activation_bits: float = 0.0
     total_kv_bytes: float = 0.0
@@ -604,6 +610,10 @@ class CompressionTraceLedger:
         self.total_packed_ternary_dispatches += 1
         if event.native_kernel or event.backend.startswith("native_"):
             self.total_native_ternary_kernel_dispatches += 1
+            if event.autotuned:
+                self.total_native_ternary_autotuned_dispatches += 1
+            if event.autotune_cache_hit:
+                self.total_native_ternary_autotune_cache_hits += 1
         else:
             self.total_torch_packed_ternary_dispatches += 1
         self.total_packed_weight_bytes += float(event.packed_weight_bytes)
@@ -670,6 +680,8 @@ class CompressionTraceLedger:
                 "packed_ternary_dispatches": self.total_packed_ternary_dispatches,
                 "native_ternary_kernel_dispatches": self.total_native_ternary_kernel_dispatches,
                 "torch_packed_ternary_dispatches": self.total_torch_packed_ternary_dispatches,
+                "native_ternary_autotuned_dispatches": self.total_native_ternary_autotuned_dispatches,
+                "native_ternary_autotune_cache_hits": self.total_native_ternary_autotune_cache_hits,
             },
             "cost_trace": asdict(self.cost_trace),
             "packed_weight_bytes_read": self.total_packed_weight_bytes,
@@ -781,6 +793,9 @@ class BitLinearConfig:
     use_native_cuda_kernel: bool = True
     require_native_cuda_kernel: bool = False
     native_cuda_kernel_variant: str = "auto"
+    native_cuda_autotune: bool = True
+    native_cuda_autotune_warmup: int = 1
+    native_cuda_autotune_repeat: int = 3
 
 
 class BitLinear(nn.Module):
@@ -801,6 +816,11 @@ class BitLinear(nn.Module):
         self._last_active_weights = int(config.out_features * config.in_features)
         self._last_total_weights = int(config.out_features * config.in_features)
         self._last_estimated_bits = float(config.out_features * config.in_features)
+        self._last_native_kernel_variant = ""
+        self._last_native_kernel_family = ""
+        self._last_native_autotuned = False
+        self._last_native_autotune_cache_hit = False
+        self._last_native_autotune_candidate_ms: tuple[tuple[str, float], ...] = ()
         nn.init.kaiming_uniform_(self.float_weight, a=5 ** 0.5)
         self.requantize()
 
@@ -939,20 +959,32 @@ class BitLinear(nn.Module):
             weight = weight + self.residual_weight.to(device=device, dtype=dtype)
         return weight
 
-    def _native_cuda_packed_output(self, x: Any) -> Any:
-        if not x.is_cuda:
-            raise RuntimeError("native ternary kernel requires CUDA input")
-        if x.dtype not in _CUPY_TERNARY_KERNEL_NAMES["tiled"]:
-            raise RuntimeError(f"native ternary kernel does not support dtype {x.dtype}")
-        if not self.config.shared_scale:
-            raise RuntimeError("native ternary kernel currently requires per-output shared scales")
-        variant = self.config.native_cuda_kernel_variant
-        if variant == "auto":
-            flattened_rows = int(x.numel() // self.config.in_features)
-            variant = "warp" if self.config.in_features >= 384 and flattened_rows * self.config.out_features >= 16384 else "tiled"
-        if variant not in {"tiled", "warp"}:
-            raise RuntimeError(f"unsupported native_cuda_kernel_variant={self.config.native_cuda_kernel_variant!r}")
-        self._last_native_kernel_variant = f"{variant}_shared_memory_int2" if variant == "tiled" else "warp_reduction_int2"
+    @staticmethod
+    def _native_cuda_variant_label(variant: str) -> str:
+        return f"{variant}_shared_memory_int2" if variant == "tiled" else "warp_reduction_int2"
+
+    def _heuristic_native_cuda_variant(self, x: Any) -> str:
+        flattened_rows = int(x.numel() // self.config.in_features)
+        return "warp" if self.config.in_features >= 384 and flattened_rows * self.config.out_features >= 16384 else "tiled"
+
+    def _native_cuda_autotune_key(self, x: Any) -> tuple[Any, ...]:
+        device_index = int(x.get_device())
+        props = torch.cuda.get_device_properties(device_index)
+        rows = int(x.numel() // self.config.in_features)
+        return (
+            str(x.dtype),
+            int(rows),
+            int(self.config.in_features),
+            int(self.config.out_features),
+            int(bool(self.config.residual_runtime)),
+            int(self.bias is not None),
+            int(device_index),
+            str(props.name),
+            int(props.major),
+            int(props.minor),
+        )
+
+    def _launch_native_cuda_kernel(self, x: Any, variant: str) -> Any:
         cp, kernel = _cupy_ternary_kernel(x.dtype, variant)
         x_flat = x.detach().contiguous().view(-1, self.config.in_features)
         output = torch.empty(
@@ -1010,6 +1042,75 @@ class BitLinear(nn.Module):
             )
         return output
 
+    def _time_native_cuda_variant(self, x: Any, variant: str) -> float:
+        warmup = max(0, int(self.config.native_cuda_autotune_warmup))
+        repeat = max(1, int(self.config.native_cuda_autotune_repeat))
+        for _ in range(warmup):
+            self._launch_native_cuda_kernel(x, variant)
+        torch.cuda.synchronize(x.device)
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        for _ in range(repeat):
+            self._launch_native_cuda_kernel(x, variant)
+        end.record()
+        torch.cuda.synchronize(x.device)
+        return float(start.elapsed_time(end) / repeat)
+
+    def _select_native_cuda_variant(self, x: Any) -> str:
+        variant = self.config.native_cuda_kernel_variant
+        self._last_native_autotuned = False
+        self._last_native_autotune_cache_hit = False
+        self._last_native_autotune_candidate_ms = ()
+        if variant != "auto":
+            if variant not in {"tiled", "warp"}:
+                raise RuntimeError(f"unsupported native_cuda_kernel_variant={self.config.native_cuda_kernel_variant!r}")
+            return variant
+        if not self.config.native_cuda_autotune:
+            return self._heuristic_native_cuda_variant(x)
+        key = self._native_cuda_autotune_key(x)
+        cached = _NATIVE_TERNARY_AUTOTUNE_CACHE.get(key)
+        if cached is not None:
+            selected, candidates = cached
+            self._last_native_autotuned = True
+            self._last_native_autotune_cache_hit = True
+            self._last_native_autotune_candidate_ms = candidates
+            return selected
+        prewarm_failures: list[str] = []
+        for candidate in ("tiled", "warp"):
+            try:
+                self._launch_native_cuda_kernel(x, candidate)
+            except Exception as exc:
+                prewarm_failures.append(f"{candidate}:{type(exc).__name__}:{exc}")
+        torch.cuda.synchronize(x.device)
+        candidates: list[tuple[str, float]] = []
+        failures: list[str] = list(prewarm_failures)
+        for candidate in ("tiled", "warp"):
+            try:
+                candidates.append((candidate, self._time_native_cuda_variant(x, candidate)))
+            except Exception as exc:
+                failures.append(f"{candidate}:{type(exc).__name__}:{exc}")
+        if not candidates:
+            raise RuntimeError("native CUDA autotune failed for all variants: " + "; ".join(failures))
+        selected = min(candidates, key=lambda item: item[1])[0]
+        measured = tuple((name, float(ms)) for name, ms in candidates)
+        _NATIVE_TERNARY_AUTOTUNE_CACHE[key] = (selected, measured)
+        self._last_native_autotuned = True
+        self._last_native_autotune_candidate_ms = measured
+        return selected
+
+    def _native_cuda_packed_output(self, x: Any) -> Any:
+        if not x.is_cuda:
+            raise RuntimeError("native ternary kernel requires CUDA input")
+        if x.dtype not in _CUPY_TERNARY_KERNEL_NAMES["tiled"]:
+            raise RuntimeError(f"native ternary kernel does not support dtype {x.dtype}")
+        if not self.config.shared_scale:
+            raise RuntimeError("native ternary kernel currently requires per-output shared scales")
+        variant = self._select_native_cuda_variant(x)
+        self._last_native_kernel_family = variant
+        self._last_native_kernel_variant = self._native_cuda_variant_label(variant)
+        return self._launch_native_cuda_kernel(x, variant)
+
     def _quantize_input(self, x: Any) -> Any:
         if self.config.activation_bits <= 0:
             return x
@@ -1046,7 +1147,11 @@ class BitLinear(nn.Module):
                     native_kernel = True
                     kernel_variant = getattr(self, "_last_native_kernel_variant", "native_int2")
                     backend = f"native_int2_cupy_cuda_{kernel_variant}"
-                    native_note = f"native CuPy RawKernel {kernel_variant} kernel"
+                    if getattr(self, "_last_native_autotuned", False):
+                        cache_note = "cache-hit" if getattr(self, "_last_native_autotune_cache_hit", False) else "measured"
+                        native_note = f"native CuPy RawKernel {kernel_variant} kernel autotuned {cache_note}"
+                    else:
+                        native_note = f"native CuPy RawKernel {kernel_variant} kernel"
                 except Exception as exc:
                     if self.config.require_native_cuda_kernel:
                         raise
@@ -1079,6 +1184,13 @@ class BitLinear(nn.Module):
                 ),
                 native_kernel=native_kernel,
                 kernel_variant=getattr(self, "_last_native_kernel_variant", "") if native_kernel else "torch_unpack_linear",
+                autotuned=bool(getattr(self, "_last_native_autotuned", False)) if native_kernel else False,
+                autotune_cache_hit=bool(getattr(self, "_last_native_autotune_cache_hit", False)) if native_kernel else False,
+                autotune_candidate_ms=(
+                    tuple(getattr(self, "_last_native_autotune_candidate_ms", ()))
+                    if native_kernel
+                    else ()
+                ),
             ))
         else:
             output = F.linear(xq, ste_weight, self.bias)

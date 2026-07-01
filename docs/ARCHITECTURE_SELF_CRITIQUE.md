@@ -1,6 +1,6 @@
 # Cortex-3 Architecture Self-Critique
 
-Etat: boucle d'audit 1 apres integration du kernel CUDA natif tuilé/warp.
+Etat: boucle d'audit 2 apres integration du kernel CUDA natif tuilé/warp et de l'autotune CUDA mesure/cache.
 
 Ce document sert de registre de critique et de correction. Il ne remplace pas les tests longs interdits pour cette iteration; il se limite aux preuves courtes disponibles, aux rapports du code et aux benchmarks GPU courts.
 
@@ -18,10 +18,11 @@ Ce document sert de registre de critique et de correction. Il ne remplace pas le
 
 ### C2. Auto-selection kernel trop grossiere
 
-- Critique: le premier seuil envoyait `batch=128,in=256,out=256` vers `warp`, alors que `tiled` etait plus rapide.
-- Correction: seuil `auto` ajuste: `warp` seulement pour `in_features >= 384` et produit sorties suffisant; sinon `tiled`.
-- Verification courte: benchmark auto 256 choisit `tiled_shared_memory_int2`; benchmark auto 512 choisit `warp_reduction_int2`.
-- Statut: corrige pour les deux formes courtes testees; reste a remplacer par autotuner mesure/cache.
+- Critique: un seuil fixe ne peut pas etre "extraordinairement efficace" sur ce PC, car le meilleur variant depend du GPU, dtype, batch, K, N, bias/residual et du bruit runtime.
+- Correction boucle 1: seuil heuristique ajuste temporairement.
+- Correction boucle 2: remplacement par autotune CUDA-event. En mode `auto`, `BitLinear` prechauffe `tiled` et `warp`, mesure les deux variants, choisit le temps minimal, cache par device/dtype/shape et trace `autotuned`, `autotune_cache_hit`, `autotune_candidate_ms`.
+- Verification courte: tests CUDA exigent candidates `tiled/warp`, choix egal au meilleur temps mesure et cache-hit au deuxieme appel; benchmark RTX 5070 `128x256x256 fp16` selectionne `warp_reduction_int2` apres mesure `tiled=0.3356 ms`, `warp=0.2120 ms`.
+- Statut: corrige pour la selection runtime locale; reste a persister/exporter les profils et a benchmarker davantage de shapes LLM.
 
 ### C3. Observabilite des kernels insuffisante
 
@@ -37,7 +38,15 @@ Ce document sert de registre de critique et de correction. Il ne remplace pas le
 - Verification courte: l'ablation exige gradient memoire non nul, delta `before - after` positif sur total et next-token loss, deplacement des probabilites exact/latent/drop et decisions comptabilisees.
 - Statut: corrige pour la preuve courte; reste a scaler sur long contexte held-out et cout memoire reel.
 
-## Critique phase par phase
+### C5. Autotune biaise par le premier warmup
+
+- Critique: le premier benchmark `auto` mesurait le premier candidat avec des couts de warmup/allocation et pouvait sur-penaliser `tiled`.
+- Debug: comparaison `auto`, puis variants forces `tiled` et `warp`; le probleme venait de la sequence de mesure, pas d'un crash kernel.
+- Correction: pre-warm de tous les candidats avant toute mesure comparative, puis warmup/repeat par variant avec CUDA events.
+- Verification courte: `py_compile`, tests CUDA ciblés et benchmark auto relances; les candidates sont maintenant exposees et le choix correspond au minimum mesure.
+- Statut: corrige pour cette boucle.
+
+## Critique phase par phase - boucle 2
 
 ### P1 - Verifier OS
 
@@ -49,11 +58,11 @@ Ce document sert de registre de critique et de correction. Il ne remplace pas le
 
 ### P2 - Ternary Core
 
-- Ce qui est solide: poids ternaires packes int2, quantization activations, STE, sync des buffers packes pendant training, kernels CUDA natifs tuiles/warp, audit LLM exigeant native kernel sur CUDA.
-- Preuve actuelle: tests CUDA courts, benchmark RTX 5070, full Cortex court.
-- Faiblesse: kernels encore CuPy/NVRTC, pas extension C++/CUDA packagee; autotuning heuristique; pas de mesure energie/VRAM longue; pas encore de backward kernel custom.
+- Ce qui est solide: poids ternaires packes int2, quantization activations, STE, sync des buffers packes pendant training, kernels CUDA natifs tuiles/warp, autotune CUDA-event par shape, audit LLM exigeant native kernel autotune sur CUDA.
+- Preuve actuelle: tests CUDA courts, benchmark RTX 5070, full Cortex court avec `native_ternary_autotuned_dispatches`.
+- Faiblesse: kernels encore CuPy/NVRTC, pas extension C++/CUDA packagee; profils autotune non persistants entre process; pas de mesure energie/VRAM longue; pas encore de backward kernel custom.
 - Risque architectural: le forward ternaire natif existe, mais le gradient passe encore par STE dense; le gain training total depend donc du cout supplementaire du chemin STE.
-- Correction prioritaire restante: autotuner mesure/cache, profiler le surcout STE, puis reduire le cout gradient sans enlever la semantique ternaire.
+- Correction prioritaire restante: profiler le surcout STE, exporter/importer le cache autotune, puis reduire le cout gradient sans enlever la semantique ternaire.
 
 ### P3 - Future Contract / FSP / MTP
 
@@ -154,8 +163,8 @@ Ce document sert de registre de critique et de correction. Il ne remplace pas le
 ### Ternary Core W in {-1,0,+1}
 
 - Statut: le forward lit les codes packes int2 et lance CUDA natif sur GPU.
-- Faiblesse: backward dense STE, autotuning heuristique.
-- Correction restante: profiler et reduire le cout STE; cache autotune.
+- Faiblesse: backward dense STE, cache autotune seulement en memoire process.
+- Correction restante: profiler et reduire le cout STE; persister/exporter cache autotune.
 
 ### Skill-aware Experts
 
@@ -195,7 +204,7 @@ Ce document sert de registre de critique et de correction. Il ne remplace pas le
 
 ## File de correction priorisee apres boucle 1
 
-1. P2: ajouter autotune mesure/cache par shape/dtype/variant pour ne plus utiliser un seuil fixe.
+1. P2: exporter/importer profils autotune et profiler le cout STE dense.
 2. P4: scaler l'ablation learned memory vs deterministic memory sur anchors long-context synthetiques puis held-out.
 3. P6/P7: afficher partout `repair_loss_before`, `repair_loss_after`, `protected_loss_before`, `protected_loss_after`, delta et convention.
 4. P8: aligner `TernaryKernelDispatcher` inference avec les variants `BitLinear` natifs.
