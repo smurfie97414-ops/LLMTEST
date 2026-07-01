@@ -10248,6 +10248,7 @@ def run_llm_batch_profile_autosize(
     refine_uncertain_extra_seed_count: int = 1,
     refine_uncertain_step_multiplier: int = 2,
     refine_uncertain_repeat_count: int = 2,
+    refinement_budget_candidate_action_report_cap: int = 64,
     confirm_selected_candidate_count: int | None = None,
     confirm_selected_extra_seed_count: int = 1,
     confirm_selected_step_multiplier: int = 2,
@@ -10295,6 +10296,9 @@ def run_llm_batch_profile_autosize(
     requested_refine_uncertain_repeat_count = int(refine_uncertain_repeat_count)
     if requested_refine_uncertain_repeat_count < 1:
         raise ValueError("refine_uncertain_repeat_count must be positive")
+    requested_refinement_budget_candidate_action_report_cap = int(refinement_budget_candidate_action_report_cap)
+    if requested_refinement_budget_candidate_action_report_cap < 0:
+        raise ValueError("refinement_budget_candidate_action_report_cap must be >= 0")
     requested_confirm_selected_candidate_count = (
         int(selected_shape_count)
         if confirm_selected_candidate_count is None
@@ -10481,6 +10485,8 @@ def run_llm_batch_profile_autosize(
     refinement_rounds: list[Mapping[str, Any]] = []
     refinement_budget_actions: list[Mapping[str, Any]] = []
     refinement_budget_candidate_actions: list[Mapping[str, Any]] = []
+    refinement_budget_candidate_action_total_count = 0
+    refinement_budget_candidate_actions_truncated = False
     confirmation_rounds: list[Mapping[str, Any]] = []
     refinement_seeds: tuple[int, ...] = ()
     confirmation_seeds: tuple[int, ...] = ()
@@ -10691,8 +10697,32 @@ def run_llm_batch_profile_autosize(
                     }
                 )
 
+        def refinement_budget_action_payload(
+            candidate: Mapping[str, Any],
+            *,
+            selected_refinement_keys: set[str] | None = None,
+        ) -> Mapping[str, Any]:
+            payload = {
+                "shape_key": str(candidate.get("shape_key", "")),
+                "estimated_rank": int(candidate.get("estimated_rank", 0)),
+                "strategy": str(candidate.get("refinement_budget_strategy", "")),
+                "expected_gain": float(candidate.get("refinement_expected_gain", 0.0)),
+                "uncertainty_width": float(candidate.get("refinement_uncertainty_width", 0.0)),
+                "posterior_utility": float(candidate.get("refinement_posterior_utility", 0.0)),
+                "measurement_cost_tokens": int(candidate.get("refinement_measurement_cost_tokens", 0)),
+                "gain_per_cost": float(candidate.get("refinement_gain_per_cost", 0.0)),
+                "is_selected_finalist": bool(candidate.get("refinement_is_selected_finalist")),
+                "planned_steps": int(candidate.get("refinement_planned_steps", requested_refine_uncertain_step_multiplier)),
+                "planned_repeat_count": int(candidate.get("refinement_planned_repeat_count", requested_refine_uncertain_repeat_count)),
+                "planned_extra_seed_count": int(candidate.get("refinement_planned_extra_seed_count", requested_refine_uncertain_extra_seed_count)),
+            }
+            if selected_refinement_keys is not None:
+                payload["selected_for_refinement"] = str(candidate.get("shape_key", "")) in selected_refinement_keys
+            return payload
+
         def refine_uncertain_candidates(*, round_index: int) -> None:
             nonlocal measurement_inputs, refinement_seeds, synthesized_refinement_seed_count
+            nonlocal refinement_budget_candidate_action_total_count, refinement_budget_candidate_actions_truncated
             if (
                 requested_refine_uncertain_candidate_count <= 0
                 or requested_refine_uncertain_extra_seed_count <= 0
@@ -10801,42 +10831,32 @@ def run_llm_batch_profile_autosize(
                     for candidate in refinement_inputs
                 }
                 round_budget_actions = tuple(
-                    {
-                        "shape_key": str(candidate.get("shape_key", "")),
-                        "estimated_rank": int(candidate.get("estimated_rank", 0)),
-                        "strategy": str(candidate.get("refinement_budget_strategy", "")),
-                        "expected_gain": float(candidate.get("refinement_expected_gain", 0.0)),
-                        "uncertainty_width": float(candidate.get("refinement_uncertainty_width", 0.0)),
-                        "posterior_utility": float(candidate.get("refinement_posterior_utility", 0.0)),
-                        "measurement_cost_tokens": int(candidate.get("refinement_measurement_cost_tokens", 0)),
-                        "gain_per_cost": float(candidate.get("refinement_gain_per_cost", 0.0)),
-                        "is_selected_finalist": bool(candidate.get("refinement_is_selected_finalist")),
-                        "planned_steps": int(candidate.get("refinement_planned_steps", refinement_profile_steps)),
-                        "planned_repeat_count": int(candidate.get("refinement_planned_repeat_count", requested_refine_uncertain_repeat_count)),
-                        "planned_extra_seed_count": int(candidate.get("refinement_planned_extra_seed_count", len(extra_seeds))),
-                    }
+                    refinement_budget_action_payload(candidate)
                     for candidate in refinement_inputs
                 )
+                refinement_action_frontier_total_count = len(refinement_action_frontier)
+                if requested_refinement_budget_candidate_action_report_cap > 0:
+                    reported_refinement_action_frontier = tuple(
+                        refinement_action_frontier[:requested_refinement_budget_candidate_action_report_cap]
+                    )
+                else:
+                    reported_refinement_action_frontier = tuple(refinement_action_frontier)
+                refinement_action_frontier_truncated = (
+                    len(reported_refinement_action_frontier) < refinement_action_frontier_total_count
+                )
                 round_budget_candidate_actions = tuple(
-                    {
-                        "shape_key": str(candidate.get("shape_key", "")),
-                        "estimated_rank": int(candidate.get("estimated_rank", 0)),
-                        "strategy": str(candidate.get("refinement_budget_strategy", "")),
-                        "expected_gain": float(candidate.get("refinement_expected_gain", 0.0)),
-                        "uncertainty_width": float(candidate.get("refinement_uncertainty_width", 0.0)),
-                        "posterior_utility": float(candidate.get("refinement_posterior_utility", 0.0)),
-                        "measurement_cost_tokens": int(candidate.get("refinement_measurement_cost_tokens", 0)),
-                        "gain_per_cost": float(candidate.get("refinement_gain_per_cost", 0.0)),
-                        "is_selected_finalist": bool(candidate.get("refinement_is_selected_finalist")),
-                        "selected_for_refinement": str(candidate.get("shape_key", "")) in selected_refinement_keys,
-                        "planned_steps": int(candidate.get("refinement_planned_steps", refinement_profile_steps)),
-                        "planned_repeat_count": int(candidate.get("refinement_planned_repeat_count", requested_refine_uncertain_repeat_count)),
-                        "planned_extra_seed_count": int(candidate.get("refinement_planned_extra_seed_count", len(extra_seeds))),
-                    }
-                    for candidate in refinement_action_frontier
+                    refinement_budget_action_payload(
+                        candidate,
+                        selected_refinement_keys=selected_refinement_keys,
+                    )
+                    for candidate in reported_refinement_action_frontier
                 )
                 refinement_budget_actions.extend(round_budget_actions)
                 refinement_budget_candidate_actions.extend(round_budget_candidate_actions)
+                refinement_budget_candidate_action_total_count += refinement_action_frontier_total_count
+                refinement_budget_candidate_actions_truncated = (
+                    refinement_budget_candidate_actions_truncated or refinement_action_frontier_truncated
+                )
                 refinement_rounds.append(
                     {
                         "round_index": int(round_index),
@@ -10850,7 +10870,10 @@ def run_llm_batch_profile_autosize(
                         "refinement_repeat_count": requested_refine_uncertain_repeat_count,
                         "refinement_budget_strategy": "expected_gain_per_cost",
                         "refinement_budget_actions": round_budget_actions,
+                        "refinement_budget_candidate_action_report_cap": requested_refinement_budget_candidate_action_report_cap,
+                        "refinement_budget_candidate_action_total_count": refinement_action_frontier_total_count,
                         "refinement_budget_candidate_action_count": len(round_budget_candidate_actions),
+                        "refinement_budget_candidate_actions_truncated": refinement_action_frontier_truncated,
                         "refinement_budget_candidate_actions": round_budget_candidate_actions,
                         "details": tuple(refinement_details),
                     }
@@ -11522,7 +11545,10 @@ def run_llm_batch_profile_autosize(
             "refinement_budget_strategy": "expected_gain_per_cost",
             "refinement_budget_action_count": len(refinement_budget_actions),
             "refinement_budget_actions": tuple(refinement_budget_actions),
+            "refinement_budget_candidate_action_report_cap": requested_refinement_budget_candidate_action_report_cap,
+            "refinement_budget_candidate_action_total_count": refinement_budget_candidate_action_total_count,
             "refinement_budget_candidate_action_count": len(refinement_budget_candidate_actions),
+            "refinement_budget_candidate_actions_truncated": refinement_budget_candidate_actions_truncated,
             "refinement_budget_candidate_actions": tuple(refinement_budget_candidate_actions),
             "confirmation_enabled": (
                 effective_measure_candidate_count > 0
@@ -11823,6 +11849,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     profile_autosize.add_argument("--refine-uncertain-extra-seed-count", type=int, default=1, help="extra measurement seeds per refined uncertain candidate")
     profile_autosize.add_argument("--refine-uncertain-step-multiplier", type=int, default=2, help="multiply profile steps for refinement seeds to reduce short-run overhead noise")
     profile_autosize.add_argument("--refine-uncertain-repeat-count", type=int, default=2, help="repeat each refinement seed profile to reduce runtime jitter before final ranking")
+    profile_autosize.add_argument("--refinement-budget-candidate-action-report-cap", type=int, default=64, help="maximum candidate refinement budget actions written to JSON per round; 0 writes the full action frontier")
     profile_autosize.add_argument("--confirm-selected-candidate-count", type=int, default=None, help="final measured candidates to re-profile before selection; default confirms every requested selected shape")
     profile_autosize.add_argument("--confirm-selected-extra-seed-count", type=int, default=1, help="fresh confirmation seeds per final selected candidate before final ranking")
     profile_autosize.add_argument("--confirm-selected-step-multiplier", type=int, default=2, help="multiply profile steps for final selected candidate confirmation")
@@ -12225,6 +12252,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             refine_uncertain_extra_seed_count=args.refine_uncertain_extra_seed_count,
             refine_uncertain_step_multiplier=args.refine_uncertain_step_multiplier,
             refine_uncertain_repeat_count=args.refine_uncertain_repeat_count,
+            refinement_budget_candidate_action_report_cap=args.refinement_budget_candidate_action_report_cap,
             confirm_selected_candidate_count=args.confirm_selected_candidate_count,
             confirm_selected_extra_seed_count=args.confirm_selected_extra_seed_count,
             confirm_selected_step_multiplier=args.confirm_selected_step_multiplier,
