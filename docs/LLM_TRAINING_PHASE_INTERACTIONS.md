@@ -222,7 +222,7 @@ Correspondance runtime :
 | Ternary Core | `BitLinear`, quantization, requantization, packed int2 dispatch | P2 `238652` events + audit `packed_ternary_hardware_runtime` |
 | Skill-aware Experts | `SkillAwareExpertMoE` conditionne par Skill Ledger/replay | audit `skill_aware_experts`, `skill_expert_context_events`, `skill_expert_replay_context_events` |
 | Future Contract / FSP | `FutureContractEngine` + observed tokens | P3 replay + contract decisions |
-| Adaptive Multi-Token Decoding | MTP horizons + inference route | audit `adaptive_multi_token_decoding` |
+| Adaptive Multi-Token Decoding | MTP horizons + inference route + model-backed adaptive block gate | audit `adaptive_multi_token_decoding`, `inference_model_backed_adaptive_mtp_*` |
 | Latent Reasoning Workspace | `LatentReasoningWorkspace` multi-step + binding cert head | audits `latent_reasoning_workspace`, P5 et checkpoint |
 | Certificate Generator | `CertificateHead` + verifier | P5 certificate verification |
 | Frontier FastSolve persistant | `FrontierCircuitRegistry` + `CompiledFrontierAgent` | registre restaure, binding P4 restaure, output-goal et certificat compile |
@@ -554,7 +554,7 @@ Le chemin choisi controle :
 - early exit ;
 - self-speculative future contracts ;
 - dispatch kernel ternaire.
-- generation greedy courte depuis le `lm_head` du Transformer quand aucun FastSolve Frontier couvert ne fournit la reponse.
+- generation adaptative depuis le `lm_head` et les tetes MTP du Transformer quand aucun FastSolve Frontier couvert ne fournit la reponse : le premier token vient du next-token head, le second token de bloc vient du horizon-2 MTP head, puis `FutureContractEngine` accepte ou rejette le bloc.
 
 ### Interaction Avec Les Autres Phases
 
@@ -569,7 +569,7 @@ P8 utilise :
 
 ### Impact Apprentissage
 
-P8 fournit des exemples verifies par route et mesure la capacite par cout effectif. Il aide le modele a apprendre une politique ou la qualite verifiee compte plus que le debit brut. Depuis C71, les rapports exigent aussi `inference_model_backed_events` et `inference_model_backed_generated_tokens`, ce qui prouve que P8 ne s'appuie plus seulement sur une reponse symbolique externe. Depuis C72, ces generations model-backed deviennent aussi du replay P8 verifie ou correctif (`inference_model_backed_replay_events`), donc elles influencent directement `replay_loss`.
+P8 fournit des exemples verifies par route et mesure la capacite par cout effectif. Il aide le modele a apprendre une politique ou la qualite verifiee compte plus que le debit brut. Depuis C71, les rapports exigent aussi `inference_model_backed_events` et `inference_model_backed_generated_tokens`, ce qui prouve que P8 ne s'appuie plus seulement sur une reponse symbolique externe. Depuis C72, ces generations model-backed deviennent aussi du replay P8 verifie ou correctif (`inference_model_backed_replay_events`), donc elles influencent directement `replay_loss`. Depuis C75, le chemin model-backed n'est plus un greedy loop isole : il produit des propositions de blocs MTP/FSP, les gate via le meme `FutureContractEngine` que P3, compte propositions/checks/acceptations/rejets dans `inference_model_backed_adaptive_mtp_*`, et l'audit architecture echoue si cette jonction P3/P8 n'a pas tourne.
 
 ## Phase 9 - Sleep / Consolidation
 

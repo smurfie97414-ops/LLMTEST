@@ -2346,12 +2346,31 @@ class CortexTransformerLM(nn.Module):
 
 
 class CortexTransformerInferenceAgent:
-    def __init__(self, model: CortexTransformerLM, tokenizer: LLMTokenizer, *, max_new_tokens: int = 8):
+    def __init__(
+        self,
+        model: CortexTransformerLM,
+        tokenizer: LLMTokenizer,
+        *,
+        max_new_tokens: int = 8,
+        max_block_tokens: int = 2,
+        future_engine: FutureContractEngine | None = None,
+    ):
         if max_new_tokens < 1:
             raise ValueError("max_new_tokens must be positive")
+        if max_block_tokens < 1:
+            raise ValueError("max_block_tokens must be positive")
         self.model = model
         self.tokenizer = tokenizer
         self.max_new_tokens = int(max_new_tokens)
+        self.max_block_tokens = int(max(1, min(max_block_tokens, max(model.config.horizons))))
+        self.future_engine = future_engine or FutureContractEngine(
+            MTPFSPConfig(
+                hidden_size=model.config.d_model,
+                vocab_size=model.config.vocab_size,
+                horizons=model.config.horizons,
+            ),
+            trace_ledger=model.compression_ledger,
+        )
         self.call_count = 0
         self.last_event: dict[str, Any] | None = None
 
@@ -2361,6 +2380,38 @@ class CortexTransformerInferenceAgent:
             f"Task: {task.prompt}\n"
             "Answer:"
         )
+
+    def _contract_domain_and_risk(self, task: Task) -> tuple[str, float]:
+        if task.skill in {"arithmetic", "algebra"}:
+            return "math", 0.80
+        if task.skill == "code_unit_tests":
+            return "code", 0.80
+        if task.skill in {"long_context_anchor", "entity_tracking"}:
+            return "exact_anchor", 0.70
+        if task.skill == "calibration":
+            return "calibration", 0.75
+        return "general", 0.05
+
+    def _last_confidence(self, output: LLMForwardOutput, token_confidence: float) -> float:
+        if output.confidence is None:
+            return float(token_confidence)
+        return float(output.confidence[0, -1].detach().clamp(0.0, 1.0).cpu())
+
+    def _contract_logits_by_horizon(
+        self,
+        output: LLMForwardOutput,
+        *,
+        remaining: int,
+    ) -> dict[int, torch.Tensor]:
+        if 1 not in output.mtp_logits:
+            return {}
+        rows = [output.mtp_logits[1][0, -1].float()]
+        logits_by_horizon: dict[int, torch.Tensor] = {1: torch.stack(rows, dim=0)}
+        max_contiguous = min(self.max_block_tokens, int(remaining))
+        if max_contiguous >= 2 and 2 in output.mtp_logits:
+            rows.append(output.mtp_logits[2][0, -1].float())
+            logits_by_horizon[2] = torch.stack(rows, dim=0)
+        return logits_by_horizon
 
     def __call__(self, task: Task) -> CandidateAnswer:
         self.call_count += 1
@@ -2373,19 +2424,80 @@ class CortexTransformerInferenceAgent:
         generated: list[int] = []
         confidences: list[float] = []
         certificate_payload: dict[str, Any] = {}
+        block_events: list[dict[str, Any]] = []
+        forward_count = 0
+        contract_checks = 0
+        proposed_blocks = 0
+        proposed_tokens = 0
+        accepted_blocks = 0
+        rejected_blocks = 0
+        accepted_tokens = 0
+        rejected_tokens = 0
+        accepted_mtp_tokens = 0
         self.model.eval()
         try:
             with torch.no_grad():
-                for _ in range(self.max_new_tokens):
+                while len(generated) < self.max_new_tokens:
                     window = ids[-self.model.config.seq_len :]
                     x = torch.tensor([window], dtype=torch.long, device=device)
                     output = self.model(x)
+                    forward_count += 1
                     probs = torch.softmax(output.logits[0, -1].float(), dim=-1)
                     confidence, token = torch.max(probs, dim=-1)
                     token_id = int(token.detach().cpu())
-                    generated.append(token_id)
-                    confidences.append(float(confidence.detach().cpu()))
-                    ids.append(token_id)
+                    token_confidence = float(confidence.detach().cpu())
+                    remaining = self.max_new_tokens - len(generated)
+                    emitted_tokens = [token_id]
+                    decision: ContractDecision | None = None
+                    contract_logits = self._contract_logits_by_horizon(output, remaining=remaining)
+                    if contract_logits:
+                        domain, risk = self._contract_domain_and_risk(task)
+                        contract = self.future_engine.draft_contract_from_logits(
+                            contract_logits,
+                            confidence=self._last_confidence(output, token_confidence),
+                            domain=domain,
+                            risk=risk,
+                            contract_id=f"p8-model-{task.task_id}-{self.call_count}-{forward_count}",
+                            temporal_loss=0.0,
+                        )
+                        proposed = [token_id]
+                        if contract.accepted_horizon >= 2 and 2 in contract_logits:
+                            proposed.append(int(contract_logits[2][1].argmax(dim=-1).detach().cpu()))
+                        decision = self.future_engine.gate_contract(contract, observed_tokens=proposed)
+                        contract_checks += 1
+                        proposed_blocks += 1
+                        proposed_tokens += len(proposed)
+                        if decision.accepted and decision.contract.accepted_horizon > 1:
+                            emitted_tokens = proposed[: decision.contract.accepted_horizon]
+                            accepted_blocks += 1
+                            accepted_tokens += len(emitted_tokens)
+                            accepted_mtp_tokens += max(0, len(emitted_tokens) - 1)
+                        else:
+                            rejected_blocks += 1
+                            rejected_tokens += max(0, len(proposed) - 1)
+                        block_events.append(
+                            {
+                                "contract_id": decision.contract.contract_id,
+                                "domain": decision.contract.domain,
+                                "risk": decision.contract.risk,
+                                "requested_horizon": decision.contract.requested_horizon,
+                                "accepted_horizon": decision.contract.accepted_horizon,
+                                "proposed_token_ids": tuple(proposed),
+                                "contract_token_ids": tuple(decision.contract.token_ids),
+                                "emitted_token_ids": tuple(emitted_tokens),
+                                "accepted": bool(decision.accepted and decision.contract.accepted_horizon > 1),
+                                "gate_accepted": bool(decision.accepted),
+                                "reason": decision.reason,
+                                "confidence": decision.contract.confidence,
+                                "cost": asdict(decision.cost),
+                            }
+                        )
+                    for emitted in emitted_tokens:
+                        generated.append(int(emitted))
+                        confidences.append(token_confidence)
+                        ids.append(int(emitted))
+                        if int(emitted) == self.tokenizer.eos_id:
+                            break
                     if output.certificate is not None:
                         cert = output.certificate
                         latent_state = LatentProofState(
@@ -2411,7 +2523,7 @@ class CortexTransformerInferenceAgent:
                                 "model_latent_workspace_feedback_norm": float(workspace.feedback[0].detach().norm().cpu()),
                             }
                         )
-                    if token_id == self.tokenizer.eos_id:
+                    if generated and generated[-1] == self.tokenizer.eos_id:
                         break
         finally:
             if was_training:
@@ -2419,6 +2531,23 @@ class CortexTransformerInferenceAgent:
         text = self.tokenizer.decode(generated).strip()
         confidence_value = sum(confidences) / max(1, len(confidences))
         prompt_token_count = max(0, len(ids) - len(generated))
+        adaptive_payload = {
+            "adaptive_mtp_decoding": True,
+            "adaptive_mtp_max_block_tokens": int(self.max_block_tokens),
+            "adaptive_mtp_forward_count": int(forward_count),
+            "adaptive_mtp_contract_checks": int(contract_checks),
+            "adaptive_mtp_proposed_blocks": int(proposed_blocks),
+            "adaptive_mtp_proposed_tokens": int(proposed_tokens),
+            "adaptive_mtp_accepted_blocks": int(accepted_blocks),
+            "adaptive_mtp_rejected_blocks": int(rejected_blocks),
+            "adaptive_mtp_accepted_tokens": int(accepted_tokens),
+            "adaptive_mtp_rejected_tokens": int(rejected_tokens),
+            "adaptive_mtp_accepted_mtp_tokens": int(accepted_mtp_tokens),
+            "adaptive_mtp_block_events": tuple(block_events),
+            "adaptive_mtp_local_acceptance_rate": (
+                float(accepted_blocks) / max(1, int(proposed_blocks))
+            ),
+        }
         event = {
             "task_id": task.task_id,
             "skill": task.skill,
@@ -2428,18 +2557,24 @@ class CortexTransformerInferenceAgent:
             "decoded_text": text,
             "confidence": float(confidence_value),
             **certificate_payload,
+            **adaptive_payload,
         }
         self.last_event = event
         return CandidateAnswer(
             text=text,
             confidence=float(max(0.0, min(0.99, confidence_value))),
             certificate={
-                "cortex_transformer_inference": "greedy_lm_head",
+                "cortex_transformer_inference": "adaptive_mtp_fsp",
                 "model_backed_inference": True,
                 "generated_token_count": len(generated),
                 **certificate_payload,
+                **adaptive_payload,
             },
-            cost=CostTrace(generated_tokens=max(1, len(generated)), latent_steps=max(1, len(generated))),
+            cost=CostTrace(
+                generated_tokens=max(1, len(generated)),
+                latent_steps=max(1, int(forward_count) + int(contract_checks)),
+                verifier_steps=int(rejected_blocks),
+            ),
             raw={"model_backed_inference": event},
         )
 
@@ -3792,15 +3927,23 @@ def _cortex_architecture_audit_from_summary(summary: Mapping[str, Any]) -> dict[
         and integer("future_contract_decisions") > 0
         and trace_count("mtp_fsp_events") > 0
         and integer("inference_model_backed_events") > 0
-        and integer("inference_model_backed_replay_events") > 0,
+        and integer("inference_model_backed_replay_events") > 0
+        and integer("inference_model_backed_adaptive_mtp_events") > 0
+        and integer("inference_model_backed_adaptive_mtp_contract_checks") > 0
+        and integer("inference_model_backed_adaptive_mtp_proposed_blocks") > 0,
         {
             "P8": phase_count("P8"),
             "future_contract_decisions": integer("future_contract_decisions"),
             "mtp_fsp_events": trace_count("mtp_fsp_events"),
             "inference_model_backed_events": integer("inference_model_backed_events"),
             "inference_model_backed_replay_events": integer("inference_model_backed_replay_events"),
+            "inference_model_backed_adaptive_mtp_events": integer("inference_model_backed_adaptive_mtp_events"),
+            "inference_model_backed_adaptive_mtp_contract_checks": integer("inference_model_backed_adaptive_mtp_contract_checks"),
+            "inference_model_backed_adaptive_mtp_proposed_blocks": integer("inference_model_backed_adaptive_mtp_proposed_blocks"),
+            "inference_model_backed_adaptive_mtp_accepted_blocks": integer("inference_model_backed_adaptive_mtp_accepted_blocks"),
+            "inference_model_backed_adaptive_mtp_rejected_blocks": integer("inference_model_backed_adaptive_mtp_rejected_blocks"),
         },
-        "adaptive multi-token path must be active with MTP/FSP evidence, a real Transformer-backed answer source and verified replay feedback",
+        "adaptive multi-token path must be active inside the real Transformer-backed answer source, with MTP/FSP contract checks and verified replay feedback",
     )
     add(
         "frontier_heldout_generalization_gate",
@@ -4288,7 +4431,10 @@ def _cortex_phase_deliverable_audit_from_summary(summary: Mapping[str, Any]) -> 
         and count("inference_latent_kv_events") > 0
         and count("inference_model_backed_events") > 0
         and count("inference_model_backed_forced_careful_events") > 0
-        and count("inference_model_backed_replay_events") > 0,
+        and count("inference_model_backed_replay_events") > 0
+        and count("inference_model_backed_adaptive_mtp_events") > 0
+        and count("inference_model_backed_adaptive_mtp_contract_checks") > 0
+        and count("inference_model_backed_adaptive_mtp_proposed_blocks") > 0,
         {
             "fast": count("inference_fast_path_events"),
             "normal": count("inference_normal_path_events"),
@@ -4303,8 +4449,13 @@ def _cortex_phase_deliverable_audit_from_summary(summary: Mapping[str, Any]) -> 
             "model_backed_replay_events": count("inference_model_backed_replay_events"),
             "model_backed_repair_replay_events": count("inference_model_backed_repair_replay_events"),
             "model_backed_verified_replay_events": count("inference_model_backed_verified_replay_events"),
+            "model_backed_adaptive_mtp_events": count("inference_model_backed_adaptive_mtp_events"),
+            "model_backed_adaptive_mtp_contract_checks": count("inference_model_backed_adaptive_mtp_contract_checks"),
+            "model_backed_adaptive_mtp_proposed_blocks": count("inference_model_backed_adaptive_mtp_proposed_blocks"),
+            "model_backed_adaptive_mtp_accepted_blocks": count("inference_model_backed_adaptive_mtp_accepted_blocks"),
+            "model_backed_adaptive_mtp_rejected_blocks": count("inference_model_backed_adaptive_mtp_rejected_blocks"),
         },
-        "all inference paths plus budget predictor, early exit, self-speculative MTP, latent KV, ternary dispatch, a real Transformer-backed answer source and verified feedback replay must run",
+        "all inference paths plus budget predictor, early exit, self-speculative MTP, latent KV, ternary dispatch, a real Transformer-backed adaptive MTP/FSP answer source and verified feedback replay must run",
     )
     add(
         "P9",
@@ -4445,7 +4596,11 @@ class CortexTrainingPhaseController:
         self.attribution_policy = AttributionPolicyMemory()
         self.attribution = CausalAttributionEngine(self.verifier, policy_memory=self.attribution_policy)
         self.regrowth = MinimalRegrowthEngine(self.verifier)
-        self.model_inference_agent = CortexTransformerInferenceAgent(self.model, self.tokenizer)
+        self.model_inference_agent = CortexTransformerInferenceAgent(
+            self.model,
+            self.tokenizer,
+            future_engine=self.future_engine,
+        )
         self.inference = UltraFastInferenceEngine(
             self.verifier,
             self.model_inference_agent,
@@ -6582,6 +6737,16 @@ class CortexTrainingPhaseController:
             "inference_model_backed_replay_events": int(self.integration_counts.get("inference_model_backed_replay_events", 0)),
             "inference_model_backed_repair_replay_events": int(self.integration_counts.get("inference_model_backed_repair_replay_events", 0)),
             "inference_model_backed_verified_replay_events": int(self.integration_counts.get("inference_model_backed_verified_replay_events", 0)),
+            "inference_model_backed_adaptive_mtp_events": int(self.integration_counts.get("inference_model_backed_adaptive_mtp_events", 0)),
+            "inference_model_backed_adaptive_mtp_forward_count": int(self.integration_counts.get("inference_model_backed_adaptive_mtp_forward_count", 0)),
+            "inference_model_backed_adaptive_mtp_contract_checks": int(self.integration_counts.get("inference_model_backed_adaptive_mtp_contract_checks", 0)),
+            "inference_model_backed_adaptive_mtp_proposed_blocks": int(self.integration_counts.get("inference_model_backed_adaptive_mtp_proposed_blocks", 0)),
+            "inference_model_backed_adaptive_mtp_proposed_tokens": int(self.integration_counts.get("inference_model_backed_adaptive_mtp_proposed_tokens", 0)),
+            "inference_model_backed_adaptive_mtp_accepted_blocks": int(self.integration_counts.get("inference_model_backed_adaptive_mtp_accepted_blocks", 0)),
+            "inference_model_backed_adaptive_mtp_rejected_blocks": int(self.integration_counts.get("inference_model_backed_adaptive_mtp_rejected_blocks", 0)),
+            "inference_model_backed_adaptive_mtp_accepted_tokens": int(self.integration_counts.get("inference_model_backed_adaptive_mtp_accepted_tokens", 0)),
+            "inference_model_backed_adaptive_mtp_rejected_tokens": int(self.integration_counts.get("inference_model_backed_adaptive_mtp_rejected_tokens", 0)),
+            "inference_model_backed_adaptive_mtp_accepted_mtp_tokens": int(self.integration_counts.get("inference_model_backed_adaptive_mtp_accepted_mtp_tokens", 0)),
             "frontier_registry_loaded_events": int(self.integration_counts.get("frontier_registry_loaded_events", 0)),
             "frontier_registry_loaded_circuits": int(self.integration_counts.get("frontier_registry_loaded_circuits", 0)),
             "frontier_restored_fastsolve_events": int(self.integration_counts.get("frontier_restored_fastsolve_events", 0)),
@@ -7022,6 +7187,16 @@ class CortexTrainingPhaseController:
                 model_backed_events.append(payload)
                 self._count("inference_model_backed_events")
                 self._count("inference_model_backed_generated_tokens", int(payload.get("generated_token_count", 0) or 0))
+                self._count("inference_model_backed_adaptive_mtp_events", 1 if bool(payload.get("adaptive_mtp_decoding")) else 0)
+                self._count("inference_model_backed_adaptive_mtp_forward_count", int(payload.get("adaptive_mtp_forward_count", 0) or 0))
+                self._count("inference_model_backed_adaptive_mtp_contract_checks", int(payload.get("adaptive_mtp_contract_checks", 0) or 0))
+                self._count("inference_model_backed_adaptive_mtp_proposed_blocks", int(payload.get("adaptive_mtp_proposed_blocks", 0) or 0))
+                self._count("inference_model_backed_adaptive_mtp_proposed_tokens", int(payload.get("adaptive_mtp_proposed_tokens", 0) or 0))
+                self._count("inference_model_backed_adaptive_mtp_accepted_blocks", int(payload.get("adaptive_mtp_accepted_blocks", 0) or 0))
+                self._count("inference_model_backed_adaptive_mtp_rejected_blocks", int(payload.get("adaptive_mtp_rejected_blocks", 0) or 0))
+                self._count("inference_model_backed_adaptive_mtp_accepted_tokens", int(payload.get("adaptive_mtp_accepted_tokens", 0) or 0))
+                self._count("inference_model_backed_adaptive_mtp_rejected_tokens", int(payload.get("adaptive_mtp_rejected_tokens", 0) or 0))
+                self._count("inference_model_backed_adaptive_mtp_accepted_mtp_tokens", int(payload.get("adaptive_mtp_accepted_mtp_tokens", 0) or 0))
                 if bool(inferred.passed):
                     self._count("inference_model_backed_verified_events")
 
@@ -7042,6 +7217,10 @@ class CortexTrainingPhaseController:
                         "failed_model_answer": "" if passed else inferred.answer.text,
                         "model_generated_token_count": int(dict(event).get("generated_token_count", 0) or 0),
                         "model_generated_token_ids": tuple(dict(event).get("generated_token_ids", ())),
+                        "adaptive_mtp_contract_checks": int(dict(event).get("adaptive_mtp_contract_checks", 0) or 0),
+                        "adaptive_mtp_proposed_blocks": int(dict(event).get("adaptive_mtp_proposed_blocks", 0) or 0),
+                        "adaptive_mtp_accepted_blocks": int(dict(event).get("adaptive_mtp_accepted_blocks", 0) or 0),
+                        "adaptive_mtp_rejected_blocks": int(dict(event).get("adaptive_mtp_rejected_blocks", 0) or 0),
                     },
                 )
                 if replay is None:
@@ -7503,6 +7682,16 @@ class CortexTrainingPhaseController:
                 "inference_model_backed_replay_events": int(self.integration_counts.get("inference_model_backed_replay_events", 0)),
                 "inference_model_backed_repair_replay_events": int(self.integration_counts.get("inference_model_backed_repair_replay_events", 0)),
                 "inference_model_backed_verified_replay_events": int(self.integration_counts.get("inference_model_backed_verified_replay_events", 0)),
+                "inference_model_backed_adaptive_mtp_events": int(self.integration_counts.get("inference_model_backed_adaptive_mtp_events", 0)),
+                "inference_model_backed_adaptive_mtp_forward_count": int(self.integration_counts.get("inference_model_backed_adaptive_mtp_forward_count", 0)),
+                "inference_model_backed_adaptive_mtp_contract_checks": int(self.integration_counts.get("inference_model_backed_adaptive_mtp_contract_checks", 0)),
+                "inference_model_backed_adaptive_mtp_proposed_blocks": int(self.integration_counts.get("inference_model_backed_adaptive_mtp_proposed_blocks", 0)),
+                "inference_model_backed_adaptive_mtp_proposed_tokens": int(self.integration_counts.get("inference_model_backed_adaptive_mtp_proposed_tokens", 0)),
+                "inference_model_backed_adaptive_mtp_accepted_blocks": int(self.integration_counts.get("inference_model_backed_adaptive_mtp_accepted_blocks", 0)),
+                "inference_model_backed_adaptive_mtp_rejected_blocks": int(self.integration_counts.get("inference_model_backed_adaptive_mtp_rejected_blocks", 0)),
+                "inference_model_backed_adaptive_mtp_accepted_tokens": int(self.integration_counts.get("inference_model_backed_adaptive_mtp_accepted_tokens", 0)),
+                "inference_model_backed_adaptive_mtp_rejected_tokens": int(self.integration_counts.get("inference_model_backed_adaptive_mtp_rejected_tokens", 0)),
+                "inference_model_backed_adaptive_mtp_accepted_mtp_tokens": int(self.integration_counts.get("inference_model_backed_adaptive_mtp_accepted_mtp_tokens", 0)),
                 "sleep_frontier_fastsolve_events": int(self.integration_counts.get("sleep_frontier_fastsolve_events", 0)),
                 "restored_frontier_fastsolve_reports": _last_items(self.restored_frontier_fastsolve_reports, 3),
                 "frontier_repair_candidate_count": len(self.frontier_repair_candidates),
@@ -7651,6 +7840,16 @@ class CortexTrainingPhaseController:
                     "inference_model_backed_replay_events": int(self.integration_counts.get("inference_model_backed_replay_events", 0)),
                     "inference_model_backed_repair_replay_events": int(self.integration_counts.get("inference_model_backed_repair_replay_events", 0)),
                     "inference_model_backed_verified_replay_events": int(self.integration_counts.get("inference_model_backed_verified_replay_events", 0)),
+                    "inference_model_backed_adaptive_mtp_events": int(self.integration_counts.get("inference_model_backed_adaptive_mtp_events", 0)),
+                    "inference_model_backed_adaptive_mtp_forward_count": int(self.integration_counts.get("inference_model_backed_adaptive_mtp_forward_count", 0)),
+                    "inference_model_backed_adaptive_mtp_contract_checks": int(self.integration_counts.get("inference_model_backed_adaptive_mtp_contract_checks", 0)),
+                    "inference_model_backed_adaptive_mtp_proposed_blocks": int(self.integration_counts.get("inference_model_backed_adaptive_mtp_proposed_blocks", 0)),
+                    "inference_model_backed_adaptive_mtp_proposed_tokens": int(self.integration_counts.get("inference_model_backed_adaptive_mtp_proposed_tokens", 0)),
+                    "inference_model_backed_adaptive_mtp_accepted_blocks": int(self.integration_counts.get("inference_model_backed_adaptive_mtp_accepted_blocks", 0)),
+                    "inference_model_backed_adaptive_mtp_rejected_blocks": int(self.integration_counts.get("inference_model_backed_adaptive_mtp_rejected_blocks", 0)),
+                    "inference_model_backed_adaptive_mtp_accepted_tokens": int(self.integration_counts.get("inference_model_backed_adaptive_mtp_accepted_tokens", 0)),
+                    "inference_model_backed_adaptive_mtp_rejected_tokens": int(self.integration_counts.get("inference_model_backed_adaptive_mtp_rejected_tokens", 0)),
+                    "inference_model_backed_adaptive_mtp_accepted_mtp_tokens": int(self.integration_counts.get("inference_model_backed_adaptive_mtp_accepted_mtp_tokens", 0)),
                     "sleep_frontier_fastsolve_events": int(self.integration_counts.get("sleep_frontier_fastsolve_events", 0)),
                     "restored_frontier_fastsolve_reports": _last_items(self.restored_frontier_fastsolve_reports, 3),
                     "frontier_repair_candidate_count": len(self.frontier_repair_candidates),
@@ -7782,6 +7981,16 @@ class CortexTrainingPhaseController:
                     "inference_model_backed_replay_events": int(self.integration_counts.get("inference_model_backed_replay_events", 0)),
                     "inference_model_backed_repair_replay_events": int(self.integration_counts.get("inference_model_backed_repair_replay_events", 0)),
                     "inference_model_backed_verified_replay_events": int(self.integration_counts.get("inference_model_backed_verified_replay_events", 0)),
+                    "inference_model_backed_adaptive_mtp_events": int(self.integration_counts.get("inference_model_backed_adaptive_mtp_events", 0)),
+                    "inference_model_backed_adaptive_mtp_forward_count": int(self.integration_counts.get("inference_model_backed_adaptive_mtp_forward_count", 0)),
+                    "inference_model_backed_adaptive_mtp_contract_checks": int(self.integration_counts.get("inference_model_backed_adaptive_mtp_contract_checks", 0)),
+                    "inference_model_backed_adaptive_mtp_proposed_blocks": int(self.integration_counts.get("inference_model_backed_adaptive_mtp_proposed_blocks", 0)),
+                    "inference_model_backed_adaptive_mtp_proposed_tokens": int(self.integration_counts.get("inference_model_backed_adaptive_mtp_proposed_tokens", 0)),
+                    "inference_model_backed_adaptive_mtp_accepted_blocks": int(self.integration_counts.get("inference_model_backed_adaptive_mtp_accepted_blocks", 0)),
+                    "inference_model_backed_adaptive_mtp_rejected_blocks": int(self.integration_counts.get("inference_model_backed_adaptive_mtp_rejected_blocks", 0)),
+                    "inference_model_backed_adaptive_mtp_accepted_tokens": int(self.integration_counts.get("inference_model_backed_adaptive_mtp_accepted_tokens", 0)),
+                    "inference_model_backed_adaptive_mtp_rejected_tokens": int(self.integration_counts.get("inference_model_backed_adaptive_mtp_rejected_tokens", 0)),
+                    "inference_model_backed_adaptive_mtp_accepted_mtp_tokens": int(self.integration_counts.get("inference_model_backed_adaptive_mtp_accepted_mtp_tokens", 0)),
                     "regrowth_model_application_count": len(self.regrowth_model_applications),
                     "regrowth_model_parameter_delta_l1": float(self.regrowth_model_parameter_delta_l1),
                     "regrowth_model_repair_loss_delta": float(self.regrowth_model_repair_loss_delta),

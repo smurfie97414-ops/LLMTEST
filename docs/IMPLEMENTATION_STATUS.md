@@ -200,7 +200,7 @@ Current executable coverage:
 - `TernaryKernelDispatcher` records packed sign+mask dispatch metadata with active weights, packed bytes and CPU/CUDA dispatch mode.
 - `SelfSpeculativeDecoder` drafts MTP/FSP contracts, caps accepted horizon to the selected route and records MTP/FSP trace events.
 - `UltraFastInferenceEngine` integrates the verifier OS, cognitive memory reconstruction and memory-augmented answer recovery, latent KV traces, specialist expert traces, proof certificates, future contracts, output-goal contracts and oracle-audited verified capability per effective cost.
-- In the full LLM harness, P8 now uses `CortexTransformerInferenceAgent` as the default answer source: it runs the real `CortexTransformerLM`, greedy-decodes from `lm_head`, carries model `CertificateHead` metadata, accounts generated-token cost and records `inference_model_backed_*` events required by architecture/deliverable audits.
+- In the full LLM harness, P8 now uses `CortexTransformerInferenceAgent` as the default answer source: it runs the real `CortexTransformerLM`, decodes with an adaptive MTP/FSP block gate instead of a pure greedy loop, proposes contiguous next-token + horizon-2 blocks from the model heads, accepts multi-token blocks only through `FutureContractEngine`, records rejected blocks explicitly, carries model `CertificateHead` metadata, accounts generated-token/contract cost and records `inference_model_backed_adaptive_mtp_*` events required by architecture/deliverable audits.
 - P8 model-backed outputs now feed verified replay: a passing generation is replayed as-is, while a failing generation creates an oracle-corrective P8 replay example carrying the failed model answer and generated token ids. The audit requires nonzero `inference_model_backed_replay_events`, so the real Transformer-backed route must influence `replay_loss`.
 - When a compiled Frontier circuit is available and shared P4 memory is supplied, `UltraFastInferenceEngine` only uses the compiled FastSolve answer after the circuit memory binding is established and reconstructed.
 - On checkpoint resume, the full LLM controller validates restored P8 FastSolve before continuing: selected compiled circuit, oracle verification, P4 binding fidelity, output-goal contract and compiled-circuit certificate must all pass.
@@ -223,7 +223,7 @@ Evidence:
 Remaining:
 
 - Add persistent checkpoint selection across runs instead of training a fresh smoke checkpoint per report.
-- Calibrate early-exit confidence and MTP acceptance on real generated distributions.
+- Calibrate early-exit confidence and adaptive model-backed MTP block acceptance on real generated distributions.
 - Replace the current packed int2 CUDA dispatch path with fused hardware-specific kernels once the reference packed path has stable quality/gradient evidence.
 - Benchmark fast/normal/careful choices across larger verified suites and report path Pareto fronts.
 

@@ -3380,6 +3380,15 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             self.assertGreater(influence["inference_model_backed_generated_tokens"], 0)
             self.assertGreater(influence["inference_model_backed_forced_careful_events"], 0)
             self.assertGreater(influence["inference_model_backed_replay_events"], 0)
+            self.assertGreater(influence["inference_model_backed_adaptive_mtp_events"], 0)
+            self.assertGreater(influence["inference_model_backed_adaptive_mtp_contract_checks"], 0)
+            self.assertGreater(influence["inference_model_backed_adaptive_mtp_proposed_blocks"], 0)
+            self.assertGreater(influence["inference_model_backed_adaptive_mtp_proposed_tokens"], 0)
+            self.assertEqual(
+                influence["inference_model_backed_adaptive_mtp_proposed_blocks"],
+                influence["inference_model_backed_adaptive_mtp_accepted_blocks"]
+                + influence["inference_model_backed_adaptive_mtp_rejected_blocks"],
+            )
             self.assertEqual(
                 influence["inference_model_backed_replay_events"],
                 influence["inference_model_backed_repair_replay_events"]
@@ -3406,6 +3415,21 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             self.assertEqual(sleep_circuit["training"]["source_kind"], "sleep_consolidation")
             self.assertTrue(sleep_circuit["heldout"]["gate_passed"], sleep_circuit)
             self.assertTrue(phase_report["frontier_repair_candidates"], phase_report)
+            model_backed_phase_events = [
+                event
+                for audit in phase_report["phase_audits"]
+                for event in audit.get("model_backed_inference_events", ())
+            ]
+            self.assertTrue(model_backed_phase_events, phase_report)
+            self.assertTrue(
+                any(
+                    event.get("adaptive_mtp_decoding")
+                    and event.get("adaptive_mtp_contract_checks", 0) > 0
+                    and event.get("adaptive_mtp_proposed_blocks", 0) > 0
+                    for event in model_backed_phase_events
+                ),
+                model_backed_phase_events,
+            )
             latest_frontier_repair = phase_report["frontier_repair_candidates"][-1]
             self.assertTrue(latest_frontier_repair["accepted"], latest_frontier_repair)
             self.assertTrue(latest_frontier_repair["frontier_compiled_selected"], latest_frontier_repair)
@@ -3504,6 +3528,10 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             self.assertEqual(
                 persisted["training_influence"]["inference_model_backed_replay_events"],
                 influence["inference_model_backed_replay_events"],
+            )
+            self.assertEqual(
+                persisted["training_influence"]["inference_model_backed_adaptive_mtp_contract_checks"],
+                influence["inference_model_backed_adaptive_mtp_contract_checks"],
             )
             self.assertEqual(
                 persisted["training_influence"]["skill_expert_context_events"],
@@ -3653,6 +3681,14 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 self.assertGreater(first_influence["inference_model_backed_events"], 0)
                 self.assertGreater(first_influence["inference_model_backed_generated_tokens"], 0)
                 self.assertGreater(first_influence["inference_model_backed_replay_events"], 0)
+                self.assertGreater(first_influence["inference_model_backed_adaptive_mtp_events"], 0)
+                self.assertGreater(first_influence["inference_model_backed_adaptive_mtp_contract_checks"], 0)
+                self.assertGreater(first_influence["inference_model_backed_adaptive_mtp_proposed_blocks"], 0)
+                self.assertEqual(
+                    first_influence["inference_model_backed_adaptive_mtp_proposed_blocks"],
+                    first_influence["inference_model_backed_adaptive_mtp_accepted_blocks"]
+                    + first_influence["inference_model_backed_adaptive_mtp_rejected_blocks"],
+                )
                 self.assertGreater(first_influence["sleep_frontier_compiled_circuit_count"], 0)
                 self.assertGreater(first_influence["sleep_frontier_fastsolve_events"], 0)
                 self.assertGreater(first_influence["attribution_policy_updates"], 0)
@@ -3703,6 +3739,10 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                     0,
                 )
                 self.assertGreater(len(checkpoint["cortex_phase_state"]["future_ledger"]["decisions"]), 0)
+                self.assertGreater(
+                    checkpoint["cortex_phase_state"]["integration_counts"]["inference_model_backed_adaptive_mtp_contract_checks"],
+                    0,
+                )
                 self.assertGreater(len(checkpoint["cortex_phase_state"]["future_ledger"]["output_goal_decisions"]), 0)
                 self.assertGreater(
                     len(checkpoint["cortex_phase_state"]["compression_trace_ledger"]["layer_forward_events"]),
@@ -3840,6 +3880,14 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                     sidecar["cortex_phase_state_summary"]["last_objective_loss_total"],
                 )
                 self.assertGreater(sidecar["cortex_phase_state_summary"]["future_contract_decisions"], 0)
+                self.assertGreater(
+                    sidecar["cortex_phase_state_summary"]["inference_model_backed_adaptive_mtp_contract_checks"],
+                    0,
+                )
+                self.assertGreater(
+                    sidecar["cortex_phase_state_summary"]["inference_model_backed_adaptive_mtp_proposed_blocks"],
+                    0,
+                )
                 self.assertGreater(sidecar["cortex_phase_state_summary"]["output_goal_contract_decisions"], 0)
                 self.assertGreater(sidecar["cortex_phase_state_summary"]["output_goal_contract_accepted"], 0)
                 self.assertGreater(
@@ -3983,6 +4031,14 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             self.assertGreaterEqual(
                 resumed_influence["future_contract_decisions"],
                 first_influence["future_contract_decisions"],
+            )
+            self.assertGreaterEqual(
+                resumed_influence["inference_model_backed_adaptive_mtp_contract_checks"],
+                first_influence["inference_model_backed_adaptive_mtp_contract_checks"],
+            )
+            self.assertGreaterEqual(
+                resumed_influence["inference_model_backed_adaptive_mtp_proposed_blocks"],
+                first_influence["inference_model_backed_adaptive_mtp_proposed_blocks"],
             )
             self.assertGreaterEqual(
                 resumed_influence["output_goal_contract_decisions"],
