@@ -63,7 +63,7 @@ from cortex3_memory import CognitiveMemory, CognitiveMemoryConfig, CompiledCircu
 from cortex3_objective import FINAL_LOSS_TERMS, build_objective_report
 from cortex3_phases import CORTEX3_PHASES
 from cortex3_regrowth import MinimalRegrowthEngine, RegrowthActionKind, RegrowthPlan
-from cortex3_sleep import ExampleOrigin, SleepPhaseConsolidator, TrainingExample
+from cortex3_sleep import ExampleOrigin, LocalExternalProvenanceAdapter, SleepPhaseConsolidator, TrainingExample
 from cortex3_ternary import (
     ActivationQuantization,
     BitLinear,
@@ -211,6 +211,12 @@ CORTEX_PHASE_REPORT_REQUIRED_TRAINING_INFLUENCE_KEYS: tuple[str, ...] = (
     "memory_latent_segments",
     "sleep_real_exogenous_llm_examples",
     "sleep_real_exogenous_llm_batch_events",
+    "sleep_external_provenance_configured",
+    "sleep_external_provenance_adapter_events",
+    "sleep_external_provenance_accepted_examples",
+    "sleep_external_provenance_rejected_records",
+    "sleep_external_provenance_duplicate_records",
+    "sleep_external_provenance_reports",
     "sleep_frontier_fastsolve_events",
     "sleep_frontier_memory_binding_events",
     "frontier_compiled_circuit_count",
@@ -1076,6 +1082,7 @@ def _restore_sleep_state(sleep: SleepPhaseConsolidator, payload: Mapping[str, An
     sleep.replay.examples = [_training_example_from_payload(item) for item in payload.get("replay_examples", ())]
     sleep.synthetic.examples = [_training_example_from_payload(item) for item in payload.get("synthetic_examples", ())]
     sleep.reservoir.examples = [_training_example_from_payload(item) for item in payload.get("reservoir_examples", ())]
+    sleep.reservoir.rebuild_provenance_index()
 
 
 def _improvement_state(improvement: RecursiveImprovementEngine) -> dict[str, Any]:
@@ -3298,9 +3305,17 @@ class TrainingConfig:
     cortex_objective_feedback_clip: float = 4.0
     cortex_trace_retention_limit: int = 4096
     cortex_improvement_archive_dir: str | None = None
+    cortex_external_provenance_paths: tuple[str, ...] = ()
+    cortex_external_provenance_max_examples: int = 16
+    cortex_external_provenance_max_chars_per_record: int = 2048
     num_threads: int | None = None
 
     def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "cortex_external_provenance_paths",
+            tuple(str(path) for path in self.cortex_external_provenance_paths),
+        )
         if self.steps < 1:
             raise ValueError("steps must be positive")
         if self.batch_size < 1:
@@ -3343,6 +3358,10 @@ class TrainingConfig:
             raise ValueError("cortex_trace_retention_limit must be non-negative")
         if self.cortex_improvement_archive_dir is not None and not str(self.cortex_improvement_archive_dir).strip():
             raise ValueError("cortex_improvement_archive_dir must not be empty when provided")
+        if self.cortex_external_provenance_max_examples < 1:
+            raise ValueError("cortex_external_provenance_max_examples must be positive")
+        if self.cortex_external_provenance_max_chars_per_record < 1:
+            raise ValueError("cortex_external_provenance_max_chars_per_record must be positive")
         if self.resume and self.resume_if_exists:
             raise ValueError("resume and resume_if_exists are mutually exclusive")
 
@@ -4483,6 +4502,10 @@ def _cortex_architecture_audit_from_summary(summary: Mapping[str, Any]) -> dict[
         and integer("sleep_replay_examples") > 0
         and integer("sleep_synthetic_examples") > 0
         and integer("sleep_real_exogenous_llm_examples") > 0
+        and (
+            not bool(summary.get("sleep_external_provenance_configured"))
+            or integer("sleep_external_provenance_accepted_examples") > 0
+        )
         and integer("replay_batch_count") > 0
         and integer("sleep_frontier_compiled_circuit_count") > 0
         and integer("sleep_frontier_heldout_total") > 0
@@ -4495,6 +4518,11 @@ def _cortex_architecture_audit_from_summary(summary: Mapping[str, Any]) -> dict[
             "sleep_replay_examples": integer("sleep_replay_examples"),
             "sleep_synthetic_examples": integer("sleep_synthetic_examples"),
             "sleep_real_exogenous_llm_examples": integer("sleep_real_exogenous_llm_examples"),
+            "sleep_external_provenance_configured": bool(summary.get("sleep_external_provenance_configured")),
+            "sleep_external_provenance_adapter_events": integer("sleep_external_provenance_adapter_events"),
+            "sleep_external_provenance_accepted_examples": integer("sleep_external_provenance_accepted_examples"),
+            "sleep_external_provenance_rejected_records": integer("sleep_external_provenance_rejected_records"),
+            "sleep_external_provenance_duplicate_records": integer("sleep_external_provenance_duplicate_records"),
             "replay_batch_count": integer("replay_batch_count"),
             "sleep_frontier_compiled_circuit_count": integer("sleep_frontier_compiled_circuit_count"),
             "sleep_frontier_heldout_passed": integer("sleep_frontier_heldout_passed"),
@@ -4503,7 +4531,7 @@ def _cortex_architecture_audit_from_summary(summary: Mapping[str, Any]) -> dict[
             "sleep_frontier_fastsolve_events": integer("sleep_frontier_fastsolve_events"),
             "sleep_frontier_memory_binding_events": integer("sleep_frontier_memory_binding_events"),
         },
-        "sleep/consolidation must emit verified replay, then compile accepted experience into held-out gated executable Frontier circuits used by FastSolve",
+        "sleep/consolidation must emit verified replay, accept configured oracle-verified external provenance, then compile accepted experience into held-out gated executable Frontier circuits used by FastSolve",
     )
     add(
         "recursive_improvement",
@@ -4917,6 +4945,10 @@ def _cortex_phase_deliverable_audit_from_summary(summary: Mapping[str, Any]) -> 
         and int(summary.get("sleep_synthetic_examples", 0) or 0) > 0
         and int(summary.get("sleep_reservoir_examples", 0) or 0) > 0
         and int(summary.get("sleep_real_exogenous_llm_examples", 0) or 0) > 0
+        and (
+            not bool(summary.get("sleep_external_provenance_configured"))
+            or int(number("sleep_external_provenance_accepted_examples")) > 0
+        )
         and count("sleep_real_exogenous_llm_batch_events") > 0
         and count("sleep_metamorphic_examples") > 0
         and count("sleep_anti_collapse_decisions") > 0
@@ -4932,6 +4964,11 @@ def _cortex_phase_deliverable_audit_from_summary(summary: Mapping[str, Any]) -> 
             "sleep_synthetic_examples": int(summary.get("sleep_synthetic_examples", 0) or 0),
             "sleep_reservoir_examples": int(summary.get("sleep_reservoir_examples", 0) or 0),
             "sleep_real_exogenous_llm_examples": int(summary.get("sleep_real_exogenous_llm_examples", 0) or 0),
+            "sleep_external_provenance_configured": bool(summary.get("sleep_external_provenance_configured")),
+            "sleep_external_provenance_adapter_events": int(number("sleep_external_provenance_adapter_events")),
+            "sleep_external_provenance_accepted_examples": int(number("sleep_external_provenance_accepted_examples")),
+            "sleep_external_provenance_rejected_records": int(number("sleep_external_provenance_rejected_records")),
+            "sleep_external_provenance_duplicate_records": int(number("sleep_external_provenance_duplicate_records")),
             "sleep_real_exogenous_llm_batch_events": count("sleep_real_exogenous_llm_batch_events"),
             "sleep_metamorphic_examples": count("sleep_metamorphic_examples"),
             "sleep_anti_collapse_decisions": count("sleep_anti_collapse_decisions"),
@@ -4942,7 +4979,7 @@ def _cortex_phase_deliverable_audit_from_summary(summary: Mapping[str, Any]) -> 
             "sleep_frontier_fastsolve_events": count("sleep_frontier_fastsolve_events"),
             "sleep_frontier_memory_binding_events": int(summary.get("sleep_frontier_memory_binding_events", 0) or 0),
         },
-        "sleep phase must combine replay, verified synthetic/metamorphic, real reservoir, anti-collapse scheduling, memory-retained held-out Frontier compilation and FastSolve",
+        "sleep phase must combine replay, verified synthetic/metamorphic, real reservoir, configured oracle-verified external provenance, anti-collapse scheduling, memory-retained held-out Frontier compilation and FastSolve",
     )
     add(
         "P10",
@@ -5094,6 +5131,7 @@ class CortexTrainingPhaseController:
         self.phase_audits: list[dict[str, Any]] = []
         self.frontier_reports: list[dict[str, Any]] = []
         self.sleep_frontier_reports: list[dict[str, Any]] = []
+        self.external_provenance_reports: list[dict[str, Any]] = []
         self.restored_frontier_fastsolve_reports: list[dict[str, Any]] = []
         self.frontier_compiled_fastsolve_events = 0
         self.frontier_repair_candidates: list[dict[str, Any]] = []
@@ -5149,6 +5187,7 @@ class CortexTrainingPhaseController:
         self.recursive_model_repair_loss_delta = 0.0
         self.recursive_model_protected_loss_delta = 0.0
         self._load_persistent_improvement_archive()
+        self._ingest_configured_external_provenance()
 
     def _touch(self, phase_id: str) -> None:
         self.phase_counts[phase_id] = self.phase_counts.get(phase_id, 0) + 1
@@ -5447,6 +5486,43 @@ class CortexTrainingPhaseController:
             self._count("learned_memory_utility_credit_events", len(learned))
             self._refresh_learned_memory_utility_prior(source=source)
         return credits
+
+    def _ingest_configured_external_provenance(self) -> Mapping[str, Any] | None:
+        paths = tuple(self.config.cortex_external_provenance_paths)
+        if not paths:
+            return None
+        adapter = LocalExternalProvenanceAdapter(
+            paths,
+            source_name="training-config",
+            max_chars_per_record=int(self.config.cortex_external_provenance_max_chars_per_record),
+        )
+        record_iter = adapter.iter_records(max_records=int(self.config.cortex_external_provenance_max_examples) * 4)
+        report = self.sleep.reservoir.ingest_external_records(
+            record_iter,
+            verifier=self.verifier,
+            max_examples=int(self.config.cortex_external_provenance_max_examples),
+        )
+        records_seen = sum(int(value) for value in dict(report.source_kind_counts).values())
+        payload = {
+            **report.to_dict(),
+            "configured_paths": list(paths),
+            "max_examples": int(self.config.cortex_external_provenance_max_examples),
+            "max_chars_per_record": int(self.config.cortex_external_provenance_max_chars_per_record),
+        }
+        self.external_provenance_reports.append(payload)
+        self._count("sleep_external_provenance_adapter_events")
+        self._count("sleep_external_provenance_source_paths", len(paths))
+        self._count("sleep_external_provenance_records", records_seen)
+        self._count("sleep_external_provenance_accepted_examples", report.accepted_count)
+        self._count("sleep_external_provenance_rejected_records", report.rejected_count)
+        self._count("sleep_external_provenance_skipped_records", report.skipped_count)
+        self._count("sleep_external_provenance_duplicate_records", report.duplicate_count)
+        if report.accepted_count <= 0:
+            raise ValueError(
+                "configured external provenance paths produced no oracle-verified P9 real exogenous examples"
+            )
+        self._count("sleep_real_reservoir_events", report.accepted_count)
+        return payload
 
     def _real_exogenous_llm_examples(self) -> tuple[TrainingExample, ...]:
         return tuple(
@@ -7038,6 +7114,7 @@ class CortexTrainingPhaseController:
             "phase_audits": list(self.phase_audits),
             "frontier_reports": list(self.frontier_reports),
             "sleep_frontier_reports": list(self.sleep_frontier_reports),
+            "external_provenance_reports": list(self.external_provenance_reports),
             "restored_frontier_fastsolve_reports": list(self.restored_frontier_fastsolve_reports),
             "frontier_compiled_fastsolve_events": int(self.frontier_compiled_fastsolve_events),
             "frontier_repair_candidates": list(self.frontier_repair_candidates),
@@ -7125,6 +7202,10 @@ class CortexTrainingPhaseController:
         self.phase_audits = [dict(item) for item in payload.get("phase_audits", ())]
         self.frontier_reports = [dict(item) for item in payload.get("frontier_reports", ())]
         self.sleep_frontier_reports = [dict(item) for item in payload.get("sleep_frontier_reports", ())]
+        self.external_provenance_reports = [
+            dict(item)
+            for item in payload.get("external_provenance_reports", ())
+        ]
         self.restored_frontier_fastsolve_reports = [
             dict(item)
             for item in payload.get("restored_frontier_fastsolve_reports", ())
@@ -7482,6 +7563,12 @@ class CortexTrainingPhaseController:
             "sleep_real_exogenous_llm_examples": len(real_exogenous_llm_examples),
             "sleep_real_exogenous_llm_batch_events": int(self.integration_counts.get("sleep_real_exogenous_llm_batch_events", 0)),
             "sleep_real_exogenous_llm_tokens": int(self.integration_counts.get("sleep_real_exogenous_llm_tokens", 0)),
+            "sleep_external_provenance_configured": bool(self.config.cortex_external_provenance_paths),
+            "sleep_external_provenance_adapter_events": int(self.integration_counts.get("sleep_external_provenance_adapter_events", 0)),
+            "sleep_external_provenance_accepted_examples": int(self.integration_counts.get("sleep_external_provenance_accepted_examples", 0)),
+            "sleep_external_provenance_rejected_records": int(self.integration_counts.get("sleep_external_provenance_rejected_records", 0)),
+            "sleep_external_provenance_duplicate_records": int(self.integration_counts.get("sleep_external_provenance_duplicate_records", 0)),
+            "sleep_external_provenance_reports": _last_items(self.external_provenance_reports, 3),
             "frontier_compiled_circuit_count": int(frontier_registry_summary["circuit_count"]),
             "frontier_compiled_skill_count": int(frontier_registry_summary["compiled_skill_count"]),
             **frontier_heldout_summary,
@@ -8508,6 +8595,12 @@ class CortexTrainingPhaseController:
                 "sleep_real_exogenous_llm_examples": len(real_exogenous_llm_examples),
                 "sleep_real_exogenous_llm_batch_events": int(self.integration_counts.get("sleep_real_exogenous_llm_batch_events", 0)),
                 "sleep_real_exogenous_llm_tokens": int(self.integration_counts.get("sleep_real_exogenous_llm_tokens", 0)),
+                "sleep_external_provenance_configured": bool(self.config.cortex_external_provenance_paths),
+                "sleep_external_provenance_adapter_events": int(self.integration_counts.get("sleep_external_provenance_adapter_events", 0)),
+                "sleep_external_provenance_accepted_examples": int(self.integration_counts.get("sleep_external_provenance_accepted_examples", 0)),
+                "sleep_external_provenance_rejected_records": int(self.integration_counts.get("sleep_external_provenance_rejected_records", 0)),
+                "sleep_external_provenance_duplicate_records": int(self.integration_counts.get("sleep_external_provenance_duplicate_records", 0)),
+                "sleep_external_provenance_reports": _last_items(self.external_provenance_reports, 3),
                 "frontier_compiled_circuit_count": int(frontier_registry_summary["circuit_count"]),
                 "frontier_compiled_skill_count": int(frontier_registry_summary["compiled_skill_count"]),
                 **frontier_heldout_summary,
@@ -8679,6 +8772,12 @@ class CortexTrainingPhaseController:
                     "sleep_real_exogenous_llm_examples": len(real_exogenous_llm_examples),
                     "sleep_real_exogenous_llm_batch_events": int(self.integration_counts.get("sleep_real_exogenous_llm_batch_events", 0)),
                     "sleep_real_exogenous_llm_tokens": int(self.integration_counts.get("sleep_real_exogenous_llm_tokens", 0)),
+                    "sleep_external_provenance_configured": bool(self.config.cortex_external_provenance_paths),
+                    "sleep_external_provenance_adapter_events": int(self.integration_counts.get("sleep_external_provenance_adapter_events", 0)),
+                    "sleep_external_provenance_accepted_examples": int(self.integration_counts.get("sleep_external_provenance_accepted_examples", 0)),
+                    "sleep_external_provenance_rejected_records": int(self.integration_counts.get("sleep_external_provenance_rejected_records", 0)),
+                    "sleep_external_provenance_duplicate_records": int(self.integration_counts.get("sleep_external_provenance_duplicate_records", 0)),
+                    "sleep_external_provenance_reports": _last_items(self.external_provenance_reports, 3),
                     "frontier_compiled_circuit_count": int(frontier_registry_summary["circuit_count"]),
                     "frontier_compiled_skill_count": int(frontier_registry_summary["compiled_skill_count"]),
                     **frontier_heldout_summary,
@@ -8834,6 +8933,12 @@ class CortexTrainingPhaseController:
                     "sleep_real_exogenous_llm_examples": len(real_exogenous_llm_examples),
                     "sleep_real_exogenous_llm_batch_events": int(self.integration_counts.get("sleep_real_exogenous_llm_batch_events", 0)),
                     "sleep_real_exogenous_llm_tokens": int(self.integration_counts.get("sleep_real_exogenous_llm_tokens", 0)),
+                    "sleep_external_provenance_configured": bool(self.config.cortex_external_provenance_paths),
+                    "sleep_external_provenance_adapter_events": int(self.integration_counts.get("sleep_external_provenance_adapter_events", 0)),
+                    "sleep_external_provenance_accepted_examples": int(self.integration_counts.get("sleep_external_provenance_accepted_examples", 0)),
+                    "sleep_external_provenance_rejected_records": int(self.integration_counts.get("sleep_external_provenance_rejected_records", 0)),
+                    "sleep_external_provenance_duplicate_records": int(self.integration_counts.get("sleep_external_provenance_duplicate_records", 0)),
+                    "sleep_external_provenance_reports": _last_items(self.external_provenance_reports, 3),
                     **frontier_heldout_summary,
                     "sleep_frontier_fastsolve_events": int(self.integration_counts.get("sleep_frontier_fastsolve_events", 0)),
                     "inference_model_backed_events": int(self.integration_counts.get("inference_model_backed_events", 0)),
@@ -11358,6 +11463,9 @@ class LLMExperimentRunner:
             "cortex_phase_max_proposals": int(payload.get("cortex_phase_max_proposals", 1)),
             "cortex_phase_regularization_weight": float(payload.get("cortex_phase_regularization_weight", 0.001)),
             "cortex_phase_replay_weight": float(payload.get("cortex_phase_replay_weight", 0.05)),
+            "cortex_external_provenance_paths": tuple(str(path) for path in payload.get("cortex_external_provenance_paths", ())),
+            "cortex_external_provenance_max_examples": int(payload.get("cortex_external_provenance_max_examples", 16)),
+            "cortex_external_provenance_max_chars_per_record": int(payload.get("cortex_external_provenance_max_chars_per_record", 2048)),
             "num_threads": payload.get("num_threads"),
         }
 
@@ -11495,6 +11603,9 @@ class LLMExperimentRunner:
             cortex_phase_max_proposals=int(training_payload["cortex_phase_max_proposals"]),
             cortex_phase_regularization_weight=float(training_payload["cortex_phase_regularization_weight"]),
             cortex_phase_replay_weight=float(training_payload["cortex_phase_replay_weight"]),
+            cortex_external_provenance_paths=tuple(str(path) for path in training_payload.get("cortex_external_provenance_paths", ())),
+            cortex_external_provenance_max_examples=int(training_payload.get("cortex_external_provenance_max_examples", 16)),
+            cortex_external_provenance_max_chars_per_record=int(training_payload.get("cortex_external_provenance_max_chars_per_record", 2048)),
             num_threads=training_payload.get("num_threads"),
         )
         return ComparisonConfig(

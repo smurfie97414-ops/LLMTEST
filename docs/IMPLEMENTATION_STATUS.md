@@ -243,13 +243,15 @@ Current executable coverage:
 - `SkillConsolidationScheduler` prioritizes protected/fragile skills, applies an explicit rare-skill boost and schedules only examples accepted by the anti-collapse filter.
 - `SleepPhaseConsolidator` orchestrates failure replay, tool-solved examples, metamorphic families, real/exogenous examples, anti-collapse filtering and scheduling from a `CycleReport`.
 - The full LLM phase controller now populates the real/exogenous reservoir from decoded `observe_input_batch` token spans, verifies each span with the exact instruction-following oracle, persists `from_llm_input_batch` provenance, and rejects P9 consolidation if no real LLM span has reached the reservoir.
+- `LocalExternalProvenanceAdapter` streams bounded `.txt` and `.jsonl` local source records into `RealExogenousReservoir`; records are deduplicated by stable content hash, verified through the declared Cortex oracle before acceptance, persisted with source path/line/chunk/hash provenance, and reported as accepted/rejected/skipped/duplicate rather than silently treated as generic replay.
+- `TrainingConfig.cortex_external_provenance_paths` lets a real LLM training controller ingest configured external provenance before training starts; if paths are configured but no oracle-verified P9 real example is accepted, controller initialization fails instead of falling back to synthetic or internally fabricated "real" examples.
 - `SleepPhaseReport` now records baseline, accepted and scheduled rare-skill fractions plus rare-skill gain, diversity delta and calibration-gap delta, making the Phase 9 success criteria directly inspectable.
 - `write_cycle_run` can persist sleep phase reports into `summary.json`.
 - `tools/run_cycle_report.py` writes Phase 9 sleep traces by default unless `--skip-sleep` is passed.
 - The full LLM trainer tokenizes accepted sleep examples with the active BPE tokenizer and replays them as causal batches in the Cortex loss.
 - `FrontierSkillDiscovery.compile_sleep_consolidation` now promotes accepted sleep examples by coherent consolidation family into held-out gated `BitLinear` micro-circuits with `training.source_kind="sleep_consolidation"`.
 - The full LLM phase controller saves those sleep-promoted circuits into the persistent Frontier registry, binds them into P4 cognitive memory, immediately verifies a `CompiledFrontierAgent` FastSolve on the exact promoted circuit, adds verified P9 replay from the compiled answer, and feeds the circuit into P10 as a `compiled_frontier` proposal.
-- Architecture and deliverable audits now reject P9 if sleep consolidation only creates replay or only uses internally fabricated "real" tasks; they require nonzero `sleep_real_exogenous_llm_examples`, `sleep_real_exogenous_llm_batch_events`, `sleep_frontier_compiled_circuit_count`, held-out pass equality, P4 memory binding and `sleep_frontier_fastsolve_events`.
+- Architecture and deliverable audits now reject P9 if sleep consolidation only creates replay or only uses internally fabricated "real" tasks; they require nonzero `sleep_real_exogenous_llm_examples`, `sleep_real_exogenous_llm_batch_events`, `sleep_frontier_compiled_circuit_count`, held-out pass equality, P4 memory binding and `sleep_frontier_fastsolve_events`, and additionally require nonzero oracle-verified external provenance acceptance whenever external paths are configured.
 - Cortex phase replay batches, including Phase 9 sleep/consolidation examples, future-contract ledger decisions, bounded ternary compression trace histories, cognitive-memory segments, compiled-circuit bindings, sleep pools and recursive-improvement archive summaries are now saved in checkpoints and restored on resume, so long runs do not lose P4/P9/P10 context, P2 instrumentation or P3 contract state after interruption.
 - Resume validation now proves sleep/frontier circuits are not only present in reports: a restored compiled circuit is executed through FastSolve with restored P4 memory before training continues.
 - `CompressionTraceLedger` keeps total P2 event counters and aggregate effective-cost inputs separately from retained detailed events; the LLM harness limits retained detailed traces with `cortex_trace_retention_limit` to prevent long GPU runs from growing trace memory without bound.
@@ -262,10 +264,12 @@ Evidence:
 - Temporary artifact write with `tools\run_cycle_report.py --out-dir <temp> --run-id final-smoke` includes both `inference` and `sleep_phase`.
 - `tests/test_llm_pretraining.py::LLMPretrainingHarnessTest::test_full_cortex_phase_controller_uses_all_modules_during_training` verifies nonzero sleep replay batches, replay updates, sleep-frontier circuits, held-out gates, FastSolve events, P10 sleep-frontier proposals and persistent registry entries during LLM training.
 - `tests/test_llm_pretraining.py::LLMPretrainingHarnessTest::test_cortex_phase_state_survives_checkpoint_resume` verifies sleep-frontier reports and counts survive checkpoint/resume, executes restored FastSolve with restored P4 memory, and fails on a missing persisted registry when circuits are advertised.
+- `tests/test_sleep_phase.py::SleepPhaseTest::test_local_external_provenance_adapter_streams_deduplicates_and_oracle_verifies` verifies local `.txt`/`.jsonl` provenance ingestion, hash deduplication, oracle rejection and external certificates.
+- `tests/test_llm_pretraining.py::LLMPretrainingHarnessTest::test_phase_controller_ingests_configured_external_provenance_into_p9_reservoir` verifies configured external provenance is ingested into the P9 reservoir by the real LLM phase controller before training.
 
 Remaining:
 
-- Add external provenance adapters for real data sources.
+- Extend external provenance adapters beyond local files to streamed object stores or curated remote corpora once long/network-heavy validation is authorized.
 - Measure rare-skill retention, diversity, calibration and sleep-promoted circuit reuse over repeated sleep/wake cycles.
 
 ## Phase 10 - Recursive improvement gate

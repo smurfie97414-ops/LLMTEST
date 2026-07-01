@@ -1,6 +1,7 @@
 import json
 import tempfile
 import unittest
+from pathlib import Path
 
 from cortex3 import CandidateAnswer, CorruptedCompressedAgent, DynamicSkillVerifier, ReferenceRuleAgent, Task, default_skill_specs
 from cortex3_cycle import CortexCycle
@@ -10,6 +11,7 @@ from cortex3_sleep import (
     AntiCollapseFilter,
     ExampleOrigin,
     FailureReplayBuffer,
+    LocalExternalProvenanceAdapter,
     MetamorphicFamilyBuilder,
     RealExogenousReservoir,
     SleepPhaseConsolidator,
@@ -34,6 +36,72 @@ def _arithmetic_task(task_id: str = "arith-sleep") -> Task:
 
 
 class SleepPhaseTest(unittest.TestCase):
+    def test_local_external_provenance_adapter_streams_deduplicates_and_oracle_verifies(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            text_path = root / "source.txt"
+            jsonl_path = root / "source.jsonl"
+            text_path.write_text(
+                "CORTEX-3 external source span alpha\n"
+                "CORTEX-3 external source span alpha\n",
+                encoding="utf-8",
+            )
+            jsonl_path.write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "prompt": "Compute exactly: 6 * 7. Return only the integer.",
+                                "answer": "42",
+                                "expected": 42,
+                                "skill": "arithmetic",
+                                "metadata": {"source_tag": "valid_math"},
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "prompt": "Compute exactly: 6 * 7. Return only the integer.",
+                                "answer": "41",
+                                "expected": 42,
+                                "skill": "arithmetic",
+                                "metadata": {"source_tag": "bad_math"},
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "prompt": "Unknown skill record should be rejected, not crash.",
+                                "answer": "ok",
+                                "expected": "ok",
+                                "skill": "not_registered",
+                                "metadata": {"source_tag": "unknown_skill"},
+                            }
+                        ),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            records = LocalExternalProvenanceAdapter((text_path, jsonl_path), source_name="unit").records()
+            limited_records = tuple(
+                LocalExternalProvenanceAdapter((text_path, jsonl_path), source_name="unit").iter_records(max_records=1)
+            )
+            report = RealExogenousReservoir().ingest_external_records(records, verifier=_verifier())
+
+        self.assertEqual(len(limited_records), 1)
+        self.assertEqual(report.accepted_count, 2)
+        self.assertEqual(report.duplicate_count, 1)
+        self.assertEqual(report.rejected_count, 2)
+        self.assertEqual(report.source_kind_counts["local_text"], 2)
+        self.assertEqual(report.source_kind_counts["local_jsonl"], 3)
+        for example in report.accepted_examples:
+            self.assertEqual(example.origin, ExampleOrigin.REAL_EXOGENOUS)
+            self.assertFalse(example.synthetic)
+            self.assertTrue(example.answer.certificate["external_provenance_verified"])
+            self.assertTrue(example.metadata["external_provenance_adapter"])
+            verification = _verifier().oracle_registry.verify(example.oracle, example.task, example.answer)
+            self.assertTrue(verification.passed)
+
     def test_verified_synthetic_pool_requires_trust_label(self):
         task = _arithmetic_task()
         unlabeled = TrainingExample(

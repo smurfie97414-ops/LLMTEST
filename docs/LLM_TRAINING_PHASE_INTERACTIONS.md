@@ -40,6 +40,7 @@ Preuve post-integration des deux nouvelles briques :
 - `test_full_cortex_phase_controller_uses_all_modules_during_training` verifie aussi que P5 execute les nouveaux certificats `algebra_linear` et code visible/cache/proprietes pendant le controleur P1-P10.
 - `test_cortex_phase_state_survives_checkpoint_resume` : reprise checkpoint avec restauration des decisions output-goal dans la ledger P3, maintien des evenements P5 algebra/code et maintien des audits architecture/livrables.
 - Le rapport final full-Cortex est maintenant gate par `validate_cortex_phase_report_contract` et le schema publie `docs/CORTEX_PHASE_REPORT_SCHEMA.json`: P1-P10, les composants architecture, les livrables, les replay des phases causales et les termes de l'objectif final doivent etre presents avant l'ecriture disque.
+- `test_local_external_provenance_adapter_streams_deduplicates_and_oracle_verifies` et `test_phase_controller_ingests_configured_external_provenance_into_p9_reservoir` prouvent que P9 consomme des sources externes locales `.txt/.jsonl`, deduplique par hash, rejette les records non valides par oracle et les branche dans le reservoir `REAL_EXOGENOUS` du controleur LLM avant training.
 
 Le long run devra produire un nouveau sidecar sous le commit de cette integration pour remplacer l'ancien audit `22/22` par l'audit courant plus strict incluant `native_ternary_cuda_kernel` et `future_output_goal_contracts`.
 
@@ -587,7 +588,7 @@ P8 fournit des exemples verifies par route et mesure la capacite par cout effect
 
 ### Entree
 
-P9 recoit le cycle P1, donc les echecs, reussites, fragilites et competences. Depuis C70, il recoit aussi les spans reels du corpus observes par `observe_input_batch`, decodes avec le tokenizer actif et verifies comme exemples exacts `REAL_EXOGENOUS`.
+P9 recoit le cycle P1, donc les echecs, reussites, fragilites et competences. Depuis C70, il recoit aussi les spans reels du corpus observes par `observe_input_batch`, decodes avec le tokenizer actif et verifies comme exemples exacts `REAL_EXOGENOUS`. Depuis C81, il peut aussi recevoir des sources externes locales configurees par `TrainingConfig.cortex_external_provenance_paths`; le controleur echoue si ces sources ne produisent aucun record oracle-verifie.
 
 ### Travail Execute
 
@@ -597,6 +598,7 @@ P9 construit :
 - exemples tool-solved ;
 - variantes metamorphiques ;
 - reservoir reel/exogene issu des vrais batchs LLM, avec metadata `from_llm_input_batch` et hash de span ;
+- reservoir reel/exogene issu de sources locales `.txt/.jsonl`, avec source path, ligne, chunk, hash stable, deduplication et certificat `external_provenance_verified` ;
 - filtre anti-collapse ;
 - schedule de consolidation ;
 - promotion des familles coherentes acceptees en circuits Frontier `sleep_consolidation` ;
@@ -614,11 +616,11 @@ Le filtre rejette les exemples qui menacent :
 
 ### Interaction Avec Les Autres Phases
 
-P9 consolide les signaux de P1/P6/P7/P8/P10 et les spans reels du dataloader en replay entrainable, puis compile certaines familles acceptees en circuits persistants utilisables par le registre Frontier.
+P9 consolide les signaux de P1/P6/P7/P8/P10, les spans reels du dataloader et les sources externes locales configurees en replay entrainable, puis compile certaines familles acceptees en circuits persistants utilisables par le registre Frontier.
 
 ### Impact Apprentissage
 
-P9 est une memoire d'entrainement verifiee et une source de compilation. Elle transforme les corrections lentes, les exemples tool/metamorphiques et les spans reels verifies du corpus en exemples causalement entrainables, puis transforme une famille coherente en competence FastSolve held-out gated. Dans le checkpoint, P9 conserve ses replays, ses pools sleep, les exemples reservoir `REAL_EXOGENOUS` marques `from_llm_input_batch`, ses rapports `sleep_frontier_reports`, les compteurs `sleep_frontier_*` et les circuits dans `frontier_registry`.
+P9 est une memoire d'entrainement verifiee et une source de compilation. Elle transforme les corrections lentes, les exemples tool/metamorphiques, les spans reels verifies du corpus et les sources externes oracle-verifiees en exemples causalement entrainables, puis transforme une famille coherente en competence FastSolve held-out gated. Dans le checkpoint, P9 conserve ses replays, ses pools sleep, les exemples reservoir `REAL_EXOGENOUS` marques `from_llm_input_batch` ou `external_provenance_adapter`, ses rapports `sleep_frontier_reports`, les rapports `external_provenance_reports`, les compteurs `sleep_frontier_*` et les circuits dans `frontier_registry`.
 
 ## Phase 10 - Recursive Improvement
 

@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import random
 from collections import Counter
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from math import log2
-from typing import Any, Iterable, Mapping, Sequence
+from pathlib import Path
+from typing import Any, Iterable, Iterator, Mapping, Sequence
 
 from cortex3 import (
     CandidateAnswer,
@@ -116,6 +119,240 @@ def _normalized_prompt(prompt: str) -> str:
     return " ".join(prompt.lower().split())
 
 
+def _stable_text_hash(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True)
+class ExternalProvenanceRecord:
+    record_id: str
+    source_id: str
+    source_kind: str
+    task: Task
+    answer: CandidateAnswer
+    oracle: str
+    verification_level: int
+    difficulty: float | None = None
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "record_id": self.record_id,
+            "source_id": self.source_id,
+            "source_kind": self.source_kind,
+            "task_id": self.task.task_id,
+            "skill": self.task.skill,
+            "prompt": self.task.prompt,
+            "answer": self.answer.text,
+            "oracle": self.oracle,
+            "verification_level": self.verification_level,
+            "difficulty": self.difficulty,
+            "metadata": dict(self.metadata),
+        }
+
+
+@dataclass(frozen=True)
+class ExternalProvenanceIngestionReport:
+    accepted_examples: tuple[TrainingExample, ...]
+    rejected_records: tuple[Mapping[str, Any], ...]
+    skipped_records: tuple[Mapping[str, Any], ...]
+    duplicate_record_ids: tuple[str, ...]
+    source_kind_counts: Mapping[str, int]
+
+    @property
+    def accepted_count(self) -> int:
+        return len(self.accepted_examples)
+
+    @property
+    def rejected_count(self) -> int:
+        return len(self.rejected_records)
+
+    @property
+    def skipped_count(self) -> int:
+        return len(self.skipped_records)
+
+    @property
+    def duplicate_count(self) -> int:
+        return len(self.duplicate_record_ids)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "accepted_count": self.accepted_count,
+            "rejected_count": self.rejected_count,
+            "skipped_count": self.skipped_count,
+            "duplicate_count": self.duplicate_count,
+            "accepted_examples": [example.to_dict() for example in self.accepted_examples],
+            "rejected_records": [dict(item) for item in self.rejected_records],
+            "skipped_records": [dict(item) for item in self.skipped_records],
+            "duplicate_record_ids": list(self.duplicate_record_ids),
+            "source_kind_counts": dict(self.source_kind_counts),
+        }
+
+
+class LocalExternalProvenanceAdapter:
+    def __init__(
+        self,
+        paths: Sequence[str | Path],
+        *,
+        source_name: str = "local",
+        max_chars_per_record: int = 2048,
+        min_chars: int = 1,
+        default_skill: str = "instruction_following",
+    ):
+        if not paths:
+            raise ValueError("external provenance adapter requires at least one path")
+        if max_chars_per_record < 1:
+            raise ValueError("max_chars_per_record must be positive")
+        if min_chars < 1:
+            raise ValueError("min_chars must be positive")
+        self.paths = tuple(Path(path) for path in paths)
+        self.source_name = source_name
+        self.max_chars_per_record = int(max_chars_per_record)
+        self.min_chars = int(min_chars)
+        self.default_skill = default_skill
+
+    def iter_records(self, *, max_records: int | None = None) -> Iterator[ExternalProvenanceRecord]:
+        emitted = 0
+        for path in self.paths:
+            if not path.exists():
+                raise FileNotFoundError(f"external provenance path does not exist: {path}")
+            iterator = self._jsonl_records(path) if path.suffix.lower() == ".jsonl" else self._text_records(path)
+            for record in iterator:
+                yield record
+                emitted += 1
+                if max_records is not None and emitted >= max_records:
+                    return
+
+    def records(self, *, max_records: int | None = None) -> tuple[ExternalProvenanceRecord, ...]:
+        return tuple(self.iter_records(max_records=max_records))
+
+    def _record_from_span(
+        self,
+        *,
+        path: Path,
+        source_kind: str,
+        text: str,
+        line_number: int,
+        chunk_index: int,
+        prompt: str | None = None,
+        expected: Any | None = None,
+        answer: str | None = None,
+        skill: str | None = None,
+        metadata: Mapping[str, Any] | None = None,
+        verification_level: int = 2,
+    ) -> ExternalProvenanceRecord | None:
+        span = text.strip()
+        if len(span) < self.min_chars:
+            return None
+        content_hash = _stable_text_hash(f"{prompt or span}\0{expected if expected is not None else span}\0{answer or span}")
+        task_skill = str(skill or self.default_skill)
+        task_expected = expected if expected is not None else span
+        task_prompt = str(prompt) if prompt is not None else "Reproduce this external source span exactly:\n" + span
+        answer_text = str(answer) if answer is not None else str(task_expected)
+        source_id = f"{self.source_name}-{path.name}-{line_number}-{chunk_index}-{content_hash[:12]}"
+        record_metadata = {
+            "external_provenance_adapter": True,
+            "source_name": self.source_name,
+            "source_kind": source_kind,
+            "source_path": str(path),
+            "line_number": int(line_number),
+            "chunk_index": int(chunk_index),
+            "external_content_sha256": content_hash,
+            "text_char_count": len(span),
+        }
+        if metadata:
+            record_metadata.update(dict(metadata))
+        task = Task(
+            f"external-{source_id}",
+            task_skill,
+            task_prompt,
+            task_expected,
+            record_metadata,
+            group_id=f"external-{content_hash[:16]}",
+        )
+        return ExternalProvenanceRecord(
+            record_id=f"external-record-{content_hash[:16]}",
+            source_id=source_id,
+            source_kind=source_kind,
+            task=task,
+            answer=CandidateAnswer(
+                answer_text,
+                confidence=0.99,
+                certificate={
+                    "external_provenance_adapter": True,
+                    "external_content_sha256": content_hash,
+                    "source_kind": source_kind,
+                },
+            ),
+            oracle=task_skill,
+            verification_level=verification_level,
+            metadata=record_metadata,
+        )
+
+    def _text_records(self, path: Path) -> Iterator[ExternalProvenanceRecord]:
+        with path.open("r", encoding="utf-8") as handle:
+            for line_number, line in enumerate(handle, start=1):
+                span = line.strip()
+                if len(span) < self.min_chars:
+                    continue
+                for chunk_index, start in enumerate(range(0, len(span), self.max_chars_per_record)):
+                    record = self._record_from_span(
+                        path=path,
+                        source_kind="local_text",
+                        text=span[start:start + self.max_chars_per_record],
+                        line_number=line_number,
+                        chunk_index=chunk_index,
+                    )
+                    if record is not None:
+                        yield record
+
+    def _jsonl_records(self, path: Path) -> Iterator[ExternalProvenanceRecord]:
+        with path.open("r", encoding="utf-8") as handle:
+            for line_number, line in enumerate(handle, start=1):
+                raw = line.strip()
+                if not raw:
+                    continue
+                try:
+                    payload = json.loads(raw)
+                except json.JSONDecodeError as exc:
+                    raise ValueError(f"invalid external provenance JSONL at {path}:{line_number}: {exc}") from exc
+                if not isinstance(payload, Mapping):
+                    raise ValueError(f"external provenance JSONL record at {path}:{line_number} must be an object")
+                metadata = dict(payload.get("metadata") or {})
+                if "prompt" in payload and "answer" in payload:
+                    prompt = str(payload["prompt"])
+                    answer = str(payload["answer"])
+                    expected = payload.get("expected", answer)
+                    text = f"{prompt}\n{expected}"
+                    record = self._record_from_span(
+                        path=path,
+                        source_kind="local_jsonl",
+                        text=text,
+                        line_number=line_number,
+                        chunk_index=0,
+                        prompt=prompt,
+                        expected=expected,
+                        answer=answer,
+                        skill=str(payload.get("skill", self.default_skill)),
+                        metadata=metadata,
+                        verification_level=int(payload.get("verification_level", 2)),
+                    )
+                elif "text" in payload:
+                    record = self._record_from_span(
+                        path=path,
+                        source_kind="local_jsonl_text",
+                        text=str(payload["text"]),
+                        line_number=line_number,
+                        chunk_index=0,
+                        metadata=metadata,
+                        verification_level=int(payload.get("verification_level", 2)),
+                    )
+                else:
+                    raise ValueError(f"external provenance JSONL record at {path}:{line_number} requires `text` or `prompt`+`answer`")
+                if record is not None:
+                    yield record
+
+
 class FailureReplayBuffer:
     def __init__(self, max_size: int = 512):
         if max_size < 1:
@@ -172,6 +409,18 @@ class RealExogenousReservoir:
             raise ValueError("real reservoir must keep at least one example")
         self.max_size = max_size
         self.examples: list[TrainingExample] = []
+        self._external_hashes: set[str] = set()
+
+    def rebuild_provenance_index(self) -> None:
+        self._external_hashes = {
+            str(value)
+            for example in self.examples
+            for value in (
+                dict(example.metadata).get("external_content_sha256"),
+                dict(example.metadata).get("text_sha256"),
+            )
+            if value
+        }
 
     def add(
         self,
@@ -202,12 +451,103 @@ class RealExogenousReservoir:
             metadata=provenance,
         )
         self.examples.append(example)
+        for key in ("external_content_sha256", "text_sha256"):
+            value = provenance.get(key)
+            if value:
+                self._external_hashes.add(str(value))
         if len(self.examples) > self.max_size:
             self.examples = self.examples[-self.max_size:]
+            self.rebuild_provenance_index()
         return example
 
     def by_skill(self, skill: str) -> tuple[TrainingExample, ...]:
         return tuple(example for example in self.examples if example.targeted_skill == skill)
+
+    def ingest_external_records(
+        self,
+        records: Iterable[ExternalProvenanceRecord],
+        *,
+        verifier: DynamicSkillVerifier,
+        max_examples: int | None = None,
+    ) -> ExternalProvenanceIngestionReport:
+        accepted: list[TrainingExample] = []
+        rejected: list[Mapping[str, Any]] = []
+        skipped: list[Mapping[str, Any]] = []
+        duplicates: list[str] = []
+        source_kind_counts: Counter[str] = Counter()
+        self.rebuild_provenance_index()
+        for record in records:
+            metadata = dict(record.metadata)
+            content_hash = str(metadata.get("external_content_sha256") or _stable_text_hash(record.answer.text))
+            source_kind_counts[record.source_kind] += 1
+            if content_hash in self._external_hashes:
+                duplicates.append(record.record_id)
+                continue
+            try:
+                verification = verifier.oracle_registry.verify(record.oracle, record.task, record.answer)
+            except KeyError as exc:
+                rejected.append({
+                    "record_id": record.record_id,
+                    "source_id": record.source_id,
+                    "source_kind": record.source_kind,
+                    "reason": str(exc),
+                    "score": 0.0,
+                })
+                continue
+            if not verification.passed:
+                rejected.append({
+                    "record_id": record.record_id,
+                    "source_id": record.source_id,
+                    "source_kind": record.source_kind,
+                    "reason": verification.reason,
+                    "score": float(verification.score),
+                })
+                continue
+            if max_examples is not None and len(accepted) >= max_examples:
+                skipped.append({
+                    "record_id": record.record_id,
+                    "source_id": record.source_id,
+                    "source_kind": record.source_kind,
+                    "reason": "max_examples limit reached after oracle verification",
+                    "score": float(verification.score),
+                })
+                continue
+            example = self.add(
+                record.task,
+                CandidateAnswer(
+                    record.answer.text,
+                    confidence=max(float(record.answer.confidence), float(verification.score)),
+                    certificate={
+                        **dict(record.answer.certificate),
+                        "external_provenance_verified": True,
+                    },
+                    cost=record.answer.cost,
+                    raw={
+                        **dict(record.answer.raw),
+                        "external_provenance_record": record.record_id,
+                        "verification_reason": verification.reason,
+                    },
+                ),
+                source_id=record.source_id,
+                oracle=record.oracle,
+                verification_level=record.verification_level,
+                difficulty=record.difficulty,
+                metadata={
+                    **metadata,
+                    "external_content_sha256": content_hash,
+                    "verification_reason": verification.reason,
+                    "verification_score": float(verification.score),
+                },
+            )
+            accepted.append(example)
+            self._external_hashes.add(content_hash)
+        return ExternalProvenanceIngestionReport(
+            accepted_examples=tuple(accepted),
+            rejected_records=tuple(rejected),
+            skipped_records=tuple(skipped),
+            duplicate_record_ids=tuple(duplicates),
+            source_kind_counts=dict(source_kind_counts),
+        )
 
 
 class ToolSolvedExampleFactory:

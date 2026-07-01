@@ -11,6 +11,7 @@ from unittest.mock import patch
 import torch
 
 from cortex3_objective import FINAL_LOSS_TERMS
+from cortex3_sleep import ExampleOrigin
 from cortex3_llm import (
     CORTEX_PHASE_REPORT_JSON_SCHEMA,
     CORTEX_PHASE_REPORT_REQUIRED_ARCHITECTURE_COMPONENTS,
@@ -100,6 +101,12 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 },
                 "objective_feedback_term_names": list(FINAL_LOSS_TERMS),
                 "regrowth_model_applications": [{"non_regression_passed": True}],
+                "sleep_external_provenance_configured": False,
+                "sleep_external_provenance_adapter_events": 0,
+                "sleep_external_provenance_accepted_examples": 0,
+                "sleep_external_provenance_rejected_records": 0,
+                "sleep_external_provenance_duplicate_records": 0,
+                "sleep_external_provenance_reports": [],
                 "recursive_model_applications": [{"non_regression_passed": True}],
                 "recursive_model_rollback_artifacts": [{"rollback_artifact_path": "rollback.pt"}],
                 "recursive_model_rollback_applications": [{"rollback_token": "rollback-p10"}],
@@ -3300,6 +3307,72 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             TrainingConfig(cortex_phase_frontier_per_failure=0)
         with self.assertRaisesRegex(ValueError, "cortex_phase_frontier_epochs"):
             TrainingConfig(cortex_phase_frontier_epochs=0)
+
+    def test_phase_controller_ingests_configured_external_provenance_into_p9_reservoir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            external_path = root / "external.txt"
+            external_path.write_text("CORTEX-3 verified external provenance span\n", encoding="utf-8")
+            corpus = self._corpus(root, repeats=8)
+            tokenizer = LLMTokenizer.train(corpus, vocab_size=128, min_frequency=1)
+            model_config = TransformerConfig(
+                vocab_size=128,
+                seq_len=16,
+                d_model=32,
+                n_heads=4,
+                n_layers=1,
+                dropout=0.0,
+                horizons=(1, 2, 4, 8),
+                use_cortex_heads=True,
+                use_ternary_core=True,
+                use_skill_aware_experts=True,
+                use_variable_in_compressor=True,
+                use_learned_memory_policy=True,
+                use_certificate_head=True,
+                use_latent_reasoning_workspace=True,
+            )
+            controller = CortexTrainingPhaseController(
+                CortexTransformerLM(model_config),
+                tokenizer,
+                TrainingConfig(
+                    steps=1,
+                    batch_size=1,
+                    cortex_external_provenance_paths=(str(external_path),),
+                    cortex_external_provenance_max_examples=2,
+                    cortex_external_provenance_max_chars_per_record=256,
+                ),
+                run_dir=root / "run",
+            )
+            state = controller.state_dict()
+            restored = CortexTrainingPhaseController(
+                CortexTransformerLM(model_config),
+                tokenizer,
+                TrainingConfig(steps=1, batch_size=1),
+                run_dir=root / "restored",
+            )
+            restored.load_state_dict(state)
+
+        provenance_examples = [
+            example
+            for example in controller.sleep.reservoir.examples
+            if bool(example.metadata.get("external_provenance_adapter"))
+        ]
+        self.assertEqual(len(provenance_examples), 1)
+        self.assertEqual(provenance_examples[0].origin, ExampleOrigin.REAL_EXOGENOUS)
+        self.assertTrue(provenance_examples[0].answer.certificate["external_provenance_verified"])
+        self.assertEqual(controller.integration_counts["sleep_external_provenance_adapter_events"], 1)
+        self.assertEqual(controller.integration_counts["sleep_external_provenance_accepted_examples"], 1)
+        self.assertEqual(controller.integration_counts["sleep_real_reservoir_events"], 1)
+        self.assertEqual(controller.external_provenance_reports[-1]["accepted_count"], 1)
+        self.assertEqual(controller.external_provenance_reports[-1]["configured_paths"], [str(external_path)])
+        restored_provenance_examples = [
+            example
+            for example in restored.sleep.reservoir.examples
+            if bool(example.metadata.get("external_provenance_adapter"))
+        ]
+        self.assertEqual(len(restored_provenance_examples), 1)
+        self.assertEqual(restored.external_provenance_reports[-1]["accepted_count"], 1)
+        self.assertEqual(restored.integration_counts["sleep_external_provenance_accepted_examples"], 1)
 
     def test_full_cortex_phase_controller_uses_all_modules_during_training(self):
         with tempfile.TemporaryDirectory() as tmp:
