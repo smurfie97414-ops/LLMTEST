@@ -567,7 +567,11 @@ P9 construit :
 - variantes metamorphiques ;
 - reservoir reel/exogene ;
 - filtre anti-collapse ;
-- schedule de consolidation.
+- schedule de consolidation ;
+- promotion des familles coherentes acceptees en circuits Frontier `sleep_consolidation` ;
+- verification held-out separee ;
+- FastSolve immediat via `CompiledFrontierAgent` ;
+- proposition P10 `compiled_frontier` issue du sommeil.
 
 Le filtre rejette les exemples qui menacent :
 
@@ -579,11 +583,11 @@ Le filtre rejette les exemples qui menacent :
 
 ### Interaction Avec Les Autres Phases
 
-P9 consolide les signaux de P1/P6/P7/P8/P10 en replay entrainable.
+P9 consolide les signaux de P1/P6/P7/P8/P10 en replay entrainable, puis compile certaines familles acceptees en circuits persistants utilisables par le registre Frontier.
 
 ### Impact Apprentissage
 
-P9 est une memoire d'entrainement verifiee. Elle transforme les corrections lentes et verifiees en exemples causalement entrainables. Dans le checkpoint, P9 apporte `24` replays, soit la source de replay la plus dense observee.
+P9 est une memoire d'entrainement verifiee et une source de compilation. Elle transforme les corrections lentes et verifiees en exemples causalement entrainables, puis transforme une famille coherente en competence FastSolve held-out gated. Dans le checkpoint, P9 conserve ses replays, ses pools sleep, ses rapports `sleep_frontier_reports`, les compteurs `sleep_frontier_*` et les circuits dans `frontier_registry`.
 
 ## Phase 10 - Recursive Improvement
 
@@ -776,13 +780,14 @@ Critere de fermeture :
 
 Etat actuel :
 
-- P1/P6/P7/P9/P10 creent detection lente, attribution, reparation, replay, consolidation et patchs ;
+- P1/P6/P7/P9/P10 creent detection lente, attribution, reparation, replay, consolidation, compilation sleep-frontier et patchs ;
 - Frontier Skill Discovery compile les regressions sources slow-solvees plus leurs variantes en micro-circuits `BitLinear` persistants ;
+- P9 utilise maintenant le meme mecanisme sur les familles sleep acceptees, avec `source_kind="sleep_consolidation"`, held-out gate, FastSolve immediat et proposition P10 ;
 - avant promotion, ces circuits passent maintenant un gate held-out court ; si ce gate echoue, le held-out verifie devient support metamorphique pour une recompilation bornee puis une nouvelle suite held-out est generee ;
 - P5 certifie l'origine compilee avec un contrat `compiled_circuit` verifie par checksum, lineage source/frontier/held-out, DSV, gate held-out et verification runtime ;
 - P8 consomme le registre compile pour repondre en FastSolve sur les taches couvertes par ids, signatures numeriques, metadonnees non-label ou ancres, pas seulement par nom de skill ;
 - P7 evalue le meme circuit comme candidat de reparation avant regrowth parametrique ;
-- P10 promeut les reparations compilees acceptees en propositions `compiled_frontier` prioritaires avant son patch modele signe.
+- P10 promeut les reparations compilees acceptees et les circuits sleep-frontier en propositions `compiled_frontier` prioritaires avant son patch modele signe.
 
 Limite actuelle :
 

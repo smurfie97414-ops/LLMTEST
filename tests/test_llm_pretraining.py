@@ -3252,7 +3252,7 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 "P6:causal_attribution_counterfactual_dimensions",
                 "P7:minimal_regrowth_action_space_repair_plan_and_model_patch",
                 "P8:fast_normal_careful_budget_early_exit_mod_speculative_kernels",
-                "P9:sleep_replay_synthetic_real_reservoir_anti_collapse_schedule",
+                "P9:sleep_replay_synthetic_real_reservoir_anti_collapse_schedule_frontier_compile",
                 "P10:recursive_improvement_sandbox_pareto_signed_model_patch_rollback_diversity",
             }
             self.assertEqual(set(deliverable_audit["checks_by_deliverable"]), expected_deliverables)
@@ -3314,11 +3314,30 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 influence["frontier_heldout_gate_passed_circuit_count"],
                 influence["frontier_compiled_circuit_count"],
             )
+            self.assertGreater(influence["sleep_frontier_compiled_circuit_count"], 0)
+            self.assertGreater(influence["sleep_frontier_heldout_total"], 0)
+            self.assertEqual(
+                influence["sleep_frontier_heldout_passed"],
+                influence["sleep_frontier_heldout_total"],
+            )
+            self.assertEqual(
+                influence["sleep_frontier_heldout_gate_passed_circuit_count"],
+                influence["sleep_frontier_compiled_circuit_count"],
+            )
             self.assertGreater(influence["frontier_compiled_fastsolve_events"], 0)
+            self.assertGreater(influence["sleep_frontier_fastsolve_events"], 0)
             self.assertGreater(influence["frontier_repair_candidate_count"], 0)
             self.assertGreater(influence["frontier_repair_accepted_events"], 0)
             self.assertGreater(influence["recursive_frontier_proposal_events"], 0)
+            self.assertGreater(phase_report["integration_counts"]["recursive_sleep_frontier_proposal_events"], 0)
             self.assertTrue((Path(influence["frontier_registry_path"]) / "frontier_registry.json").exists())
+            self.assertTrue(phase_report["sleep_frontier_reports"], phase_report)
+            latest_sleep_frontier = phase_report["sleep_frontier_reports"][-1]
+            self.assertTrue(latest_sleep_frontier["passed"], latest_sleep_frontier)
+            self.assertTrue(latest_sleep_frontier["fastsolve"], latest_sleep_frontier)
+            sleep_circuit = latest_sleep_frontier["circuits"][0]
+            self.assertEqual(sleep_circuit["training"]["source_kind"], "sleep_consolidation")
+            self.assertTrue(sleep_circuit["heldout"]["gate_passed"], sleep_circuit)
             self.assertTrue(phase_report["frontier_repair_candidates"], phase_report)
             latest_frontier_repair = phase_report["frontier_repair_candidates"][-1]
             self.assertTrue(latest_frontier_repair["accepted"], latest_frontier_repair)
@@ -3401,6 +3420,7 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 influence["frontier_repair_accepted_events"],
             )
             self.assertTrue(persisted["frontier_repair_candidates"], persisted)
+            self.assertTrue(persisted["sleep_frontier_reports"], persisted)
             self.assertGreater(persisted["frontier_registry_summary"]["circuit_count"], 0)
             persisted_circuit = persisted["frontier_registry_summary"]["circuits"][0]
             self.assertTrue(persisted_circuit["heldout_tasks"], persisted_circuit)
@@ -3410,6 +3430,13 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 persisted_circuit["report"]["heldout"]["total"],
                 persisted_circuit,
             )
+            sleep_persisted_circuits = [
+                circuit
+                for circuit in persisted["frontier_registry_summary"]["circuits"]
+                if circuit["report"]["training"].get("source_kind") == "sleep_consolidation"
+            ]
+            self.assertTrue(sleep_persisted_circuits, persisted["frontier_registry_summary"])
+            self.assertTrue(sleep_persisted_circuits[0]["report"]["heldout"]["gate_passed"])
             self.assertEqual(
                 persisted["training_influence"]["objective_feedback_events"],
                 influence["objective_feedback_events"],
@@ -3504,6 +3531,8 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 self.assertGreater(first_influence["output_goal_contract_decisions"], 0)
                 self.assertGreater(first_influence["output_goal_contract_accepted"], 0)
                 self.assertGreater(first_influence["ternary_core_forward_events"], 0)
+                self.assertGreater(first_influence["sleep_frontier_compiled_circuit_count"], 0)
+                self.assertGreater(first_influence["sleep_frontier_fastsolve_events"], 0)
                 checkpoint = torch.load(run_dir / "checkpoint_final.pt", map_location="cpu", weights_only=False)
                 self.assertIn("cortex_phase_state", checkpoint)
                 self.assertGreater(len(checkpoint["cortex_phase_state"]["replay_batches"]), 0)
@@ -3620,6 +3649,9 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 self.assertGreater(sidecar["cortex_phase_state_summary"]["uncertainty_ledger_observations"], 0)
                 self.assertGreater(sidecar["cortex_phase_state_summary"]["memory_recent_segments"], 0)
                 self.assertGreater(sidecar["cortex_phase_state_summary"]["sleep_replay_examples"], 0)
+                self.assertGreater(sidecar["cortex_phase_state_summary"]["sleep_frontier_compiled_circuit_count"], 0)
+                self.assertGreater(sidecar["cortex_phase_state_summary"]["sleep_frontier_fastsolve_events"], 0)
+                self.assertTrue(sidecar["cortex_phase_state_summary"]["sleep_frontier_reports"])
                 self.assertGreater(
                     sidecar["cortex_phase_state_summary"]["improvement_archive_accepted"]
                     + sidecar["cortex_phase_state_summary"]["improvement_archive_rejected"],
@@ -3758,6 +3790,14 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             self.assertGreaterEqual(
                 resumed_influence["sleep_replay_examples"],
                 first_influence["sleep_replay_examples"],
+            )
+            self.assertGreaterEqual(
+                resumed_influence["sleep_frontier_compiled_circuit_count"],
+                first_influence["sleep_frontier_compiled_circuit_count"],
+            )
+            self.assertGreaterEqual(
+                resumed_influence["sleep_frontier_fastsolve_events"],
+                first_influence["sleep_frontier_fastsolve_events"],
             )
             self.assertGreaterEqual(
                 resumed_influence["improvement_archive_accepted"] + resumed_influence["improvement_archive_rejected"],

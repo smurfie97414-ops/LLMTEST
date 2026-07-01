@@ -4,6 +4,7 @@ import unittest
 
 from cortex3 import CandidateAnswer, CorruptedCompressedAgent, DynamicSkillVerifier, ReferenceRuleAgent, Task, default_skill_specs
 from cortex3_cycle import CortexCycle
+from cortex3_frontier import CompiledFrontierAgent, FrontierCircuitRegistry, FrontierSkillDiscovery
 from cortex3_reporting import write_cycle_run
 from cortex3_sleep import (
     AntiCollapseFilter,
@@ -155,6 +156,39 @@ class SleepPhaseTest(unittest.TestCase):
         scheduled_ids = {example_id for item in sleep.schedule for example_id in item.synthetic_examples + item.replay_examples + item.real_examples}
         rejected_ids = {example.example_id for example in sleep.rejected_examples}
         self.assertFalse(scheduled_ids.intersection(rejected_ids))
+
+    def test_sleep_phase_acceptance_compiles_to_heldout_frontier_circuit(self):
+        verifier = _verifier()
+        report = CortexCycle(verifier).run(ReferenceRuleAgent(), CorruptedCompressedAgent(), seed=5, n_per_skill=1)
+        sleep = SleepPhaseConsolidator(verifier).ingest_cycle(report, seed=5)
+        registry = FrontierCircuitRegistry()
+
+        frontier = FrontierSkillDiscovery(verifier).compile_sleep_consolidation(
+            sleep,
+            seed=5,
+            max_skills=1,
+            epochs=60,
+            registry=registry,
+        )
+
+        self.assertTrue(frontier.passed, frontier.to_dict())
+        self.assertEqual(len(frontier.circuits), 1)
+        circuit = frontier.circuits[0]
+        self.assertEqual(circuit.training["source_kind"], "sleep_consolidation")
+        self.assertGreater(circuit.training["sleep_accepted_examples"], 0)
+        self.assertGreater(circuit.training["sleep_support_examples"], 0)
+        self.assertTrue(circuit.training["sleep_source_example_ids"])
+        self.assertTrue(circuit.heldout["gate_passed"])
+        self.assertEqual(circuit.heldout["passed"], circuit.heldout["total"])
+        self.assertEqual(registry.compiled_skills(), (circuit.skill,))
+        runtime = registry.circuits_for_skill(circuit.skill)[0]
+        self.assertTrue(runtime.heldout_tasks)
+        task = runtime.verified_tasks[0]
+        answer = CompiledFrontierAgent(registry, verifier=verifier)(task)
+        self.assertTrue(answer.raw["frontier_compiled_selected"])
+        self.assertTrue(answer.certificate["frontier_heldout_gate_passed"])
+        self.assertTrue(answer.certificate["frontier_compiled_contract_verified"])
+        self.assertTrue(verifier.oracle_registry.verify(task.skill, task, answer).passed)
 
     def test_real_exogenous_reservoir_and_reporting_persist_sleep_phase(self):
         verifier = _verifier()

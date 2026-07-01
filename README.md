@@ -78,6 +78,12 @@ Hierarchical Dynamic Verifier
           ├── attribute regression
           ├── minimal regrowth
           └── sleep / consolidation buffer
+                    │
+                    ▼
+             Frontier Circuit Registry
+                    │
+                    ├── FastSolve reuse
+                    └── recursive compiled proposals
 ```
 
 ## Implémentation actuelle
@@ -94,11 +100,11 @@ Cette base contient maintenant :
 - `cortex3_attribution.py` : Phase 6 attribution causale avec ablations par blocs, experts, KV mode, horizon MTP, précision d'activation, contrat FSP, routage counterfactual et clustering de régressions ;
 - `cortex3_regrowth.py` : Phase 7 regrowth minimal exécutable avec action space de réparation, simulation gain/coût, gate de non-régression et annealing vers re-cristallisation ;
 - `cortex3_inference.py` : Phase 8 inférence fast/normal/careful avec routeur de difficulté, prédicteur de budget, early exit, Mixture-of-Depths `BitLinear`, KV latent, self-speculative MTP, certificats et dispatch kernel ternaire ;
-- `cortex3_sleep.py` : Phase 9 sleep anti-collapse avec replay d'échecs, données synthétiques vérifiées et labellisées, réservoir réel/exogène, familles métamorphiques, filtre anti-collapse et scheduler de consolidation ;
-- `cortex3_improvement.py` : Phase 10 Recursive Improvement Engine avec génération de propositions, propositions prioritaires issues des réparations Frontier compilées, sandbox en mémoire, évaluateur dynamique, gate Pareto/protection/diversité, archive évolutive et rollback ;
+- `cortex3_sleep.py` : Phase 9 sleep anti-collapse avec replay d'échecs, données synthétiques vérifiées et labellisées, réservoir réel/exogène, familles métamorphiques, filtre anti-collapse, scheduler de consolidation et promotion de familles acceptées en circuits Frontier persistants ;
+- `cortex3_improvement.py` : Phase 10 Recursive Improvement Engine avec génération de propositions, propositions prioritaires issues des réparations Frontier compilées et des circuits sleep-frontier, sandbox en mémoire, évaluateur dynamique, gate Pareto/protection/diversité, archive évolutive et rollback ;
 - `cortex3_objective.py` : loss finale du plan avec 17 termes pondérés et les 15 métriques absolues, dont `Verified Capability per Effective Joule` ;
 - `cortex3_experiments.py` : expériences A-E du plan, de la détection de défauts injectés à la sandbox d'auto-amélioration ;
-- `cortex3_frontier.py` : découverte de compétences frontières avec slow-solve vérifié des régressions sources et variantes, compilation en micro-circuit `BitLinear`, recompilation sur support métamorphique jusqu'au gate held-out court, registre runtime de circuits DSV/held-out-passing, contrats output-goal P3, certificats P5 de contrat compilé incluant lineage held-out, sélection par couverture réelle via `CompiledFrontierAgent`, persistance `frontier_registry.json` + checkpoints, branchement P8 via `UltraFastInferenceEngine` et preuve d'usage FastSolve/réparation P7/proposition P10 compilée dans l'audit LLM ;
+- `cortex3_frontier.py` : découverte de compétences frontières avec slow-solve vérifié des régressions sources et variantes, compilation en micro-circuit `BitLinear`, recompilation sur support métamorphique jusqu'au gate held-out court, promotion P9 sleep-consolidation par familles cohérentes, registre runtime de circuits DSV/held-out-passing, contrats output-goal P3, certificats P5 de contrat compilé incluant lineage held-out, sélection par couverture réelle via `CompiledFrontierAgent`, persistance `frontier_registry.json` + checkpoints, branchement P8 via `UltraFastInferenceEngine` et preuve d'usage FastSolve/réparation P7/proposition P10 compilée dans l'audit LLM ;
 - `cortex3_microtrain.py` : micro-modèle PyTorch entraînable avec cœur `BitLinear`, agent DSV, exemples issus du verifier/sleep phase et checkpoints `.pt` ;
 - `cortex3_autoregressive.py` : décodeur micro-autoregressif PyTorch avec vocabulaire caractère, génération greedy ou blockwise sous Future Contract, pertes comportement/MTP multi-horizons/contrat futur, agent DSV et checkpoints `.pt` ;
 - `cortex3_llm.py` : harness de pré-entraînement LLM réel avec export Hugging Face `datasets`, tokenizer BPE `tokenizers`, corpus texte streamé vers memmap avec identité SHA-256, dataset causal, Transformer complet, baseline next-token, objectif Cortex multi-horizon, compresseur Variable-In différentiable, politique mémoire apprise exact/latent/drop, observation d'ancres exactes depuis les batchs LLM, coeur ternaire `BitLinear` packe int2 avec audit du kernel CUDA natif, MoE skill-aware entraînable, certificate head latent, ledgers Bit/Skill/Causal/Uncertainty persistants, AMP/DDP, checkpoints strictement liés au corpus, courbes et rapport comparatif ;
@@ -245,7 +251,7 @@ Ce smoke construit un corpus texte déterministe, entraîne un tokenizer BPE, é
 - `baseline_ntp/checkpoint_final.pt`
 - `cortex3/checkpoint_final.pt`
 
-Quand les horizons sont complets `[1, 2, 4, 8]`, le modèle Cortex active aussi le core ternaire `BitLinear`, la politique mémoire apprise exact/latent/drop et le contrôleur de phases P1-P10 pendant l'entraînement. Ce contrôleur exécute le Verifier OS, les contrats MTP/FSP token-level, les contrats output-goal, la mémoire cognitive, les certificats, l'attribution, le regrowth, le routage fast/normal/careful, la sleep phase et le gate d'amélioration récursive. Il ajoute une régularisation Cortex au loss, transforme les exemples sleep acceptés en replay causal tokenisé, applique les réparations P7 acceptées directement au Transformer via un patch borné et non-régressif des paramètres ciblés, convertit les propositions P10 acceptées en patchs signés avec rollback token, exige des dispatchs ternaires packés, écrit `cortex_phase_report.json`, et la preuve comparative exige `cortex_phase_integration_passed=true` dès qu'un run annonce l'architecture Cortex complète.
+Quand les horizons sont complets `[1, 2, 4, 8]`, le modèle Cortex active aussi le core ternaire `BitLinear`, la politique mémoire apprise exact/latent/drop et le contrôleur de phases P1-P10 pendant l'entraînement. Ce contrôleur exécute le Verifier OS, les contrats MTP/FSP token-level, les contrats output-goal, la mémoire cognitive, les certificats, l'attribution, le regrowth, le routage fast/normal/careful, la sleep phase et le gate d'amélioration récursive. Il ajoute une régularisation Cortex au loss, transforme les exemples sleep acceptés en replay causal tokenisé, compile aussi certaines familles sleep acceptées en circuits Frontier held-out gated, vérifie leur FastSolve via `CompiledFrontierAgent`, les persiste dans `frontier_registry`, applique les réparations P7 acceptées directement au Transformer via un patch borné et non-régressif des paramètres ciblés, convertit les propositions P10 acceptées en patchs signés avec rollback token, exige des dispatchs ternaires packés, écrit `cortex_phase_report.json`, et la preuve comparative exige `cortex_phase_integration_passed=true` dès qu'un run annonce l'architecture Cortex complète.
 
 Pour un corpus plus large :
 

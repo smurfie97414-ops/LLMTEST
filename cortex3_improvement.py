@@ -175,6 +175,71 @@ class ProposalGenerator:
                 break
         return tuple(proposals)
 
+    def from_sleep_frontier_circuits(
+        self,
+        circuits: Iterable[Mapping[str, Any]],
+        *,
+        max_proposals: int = 4,
+    ) -> tuple[ImprovementProposal, ...]:
+        proposals: list[ImprovementProposal] = []
+        seen: set[str] = set()
+        for circuit in circuits:
+            payload = dict(circuit)
+            if not bool(payload.get("passed")):
+                continue
+            training = dict(payload.get("training") or {})
+            if str(training.get("source_kind", "")) != "sleep_consolidation":
+                continue
+            heldout = dict(payload.get("heldout") or {})
+            heldout_total = int(heldout.get("total", 0) or 0)
+            heldout_passed = int(heldout.get("passed", 0) or 0)
+            if heldout_total <= 0 or heldout_passed < heldout_total or not bool(heldout.get("gate_passed", False)):
+                continue
+            skill = str(payload.get("skill") or "")
+            task_ids = tuple(str(item) for item in payload.get("frontier_task_ids", ()))
+            if not skill or not task_ids:
+                continue
+            proposal_id = f"sleep-frontier-{skill}-{task_ids[0]}"
+            if proposal_id in seen:
+                continue
+            seen.add(proposal_id)
+            dsv = dict(payload.get("dsv") or {})
+            quality_delta = max(0.02, float(heldout.get("aggregate_score", 0.0) or 0.0) * 0.05)
+            proposals.append(ImprovementProposal(
+                proposal_id=proposal_id,
+                title=f"promote sleep consolidation circuit for {skill}",
+                kind=ProposalKind.COMPILED_FRONTIER,
+                affected_skills=(skill,),
+                expected_quality_delta=quality_delta,
+                expected_cost_delta=-max(0.01, quality_delta * 0.20),
+                expected_robustness_delta=max(0.02, float(heldout.get("pass_rate", 0.0) or 0.0) * 0.05),
+                risk=0.04,
+                diversity_tags=("compiled_frontier", "sleep_consolidation", skill),
+                patch_payload={
+                    "action": "compile_sleep_consolidation_frontier",
+                    "mode": "repair_skill",
+                    "target": skill,
+                    "task_id": task_ids[0],
+                    "source_failure_ids": tuple(str(item) for item in payload.get("source_failure_ids", ())),
+                    "frontier_task_ids": task_ids,
+                    "heldout_task_ids": tuple(str(item) for item in payload.get("heldout_task_ids", ())),
+                    "sleep_source_example_ids": tuple(str(item) for item in training.get("sleep_source_example_ids", ())),
+                    "sleep_accepted_examples": int(training.get("sleep_accepted_examples", 0) or 0),
+                    "sleep_support_examples": int(training.get("sleep_support_examples", 0) or 0),
+                    "frontier_compiled_verified": True,
+                    "frontier_heldout_gate_passed": True,
+                    "frontier_heldout_passed": heldout_passed,
+                    "frontier_heldout_total": heldout_total,
+                    "frontier_heldout_pass_rate": float(heldout.get("pass_rate", 0.0) or 0.0),
+                    "frontier_dsv_passed": int(dsv.get("passed", 0) or 0),
+                    "frontier_dsv_total": int(dsv.get("total", 0) or 0),
+                    "source_kind": "sleep_consolidation",
+                },
+            ))
+            if len(proposals) >= max_proposals:
+                break
+        return tuple(proposals)
+
 
 class ProposalPatchedAgent:
     def __init__(self, base: Agent, reference: Agent, proposal: ImprovementProposal):

@@ -224,20 +224,25 @@ Current executable coverage:
 - `write_cycle_run` can persist sleep phase reports into `summary.json`.
 - `tools/run_cycle_report.py` writes Phase 9 sleep traces by default unless `--skip-sleep` is passed.
 - The full LLM trainer tokenizes accepted sleep examples with the active BPE tokenizer and replays them as causal batches in the Cortex loss.
+- `FrontierSkillDiscovery.compile_sleep_consolidation` now promotes accepted sleep examples by coherent consolidation family into held-out gated `BitLinear` micro-circuits with `training.source_kind="sleep_consolidation"`.
+- The full LLM phase controller saves those sleep-promoted circuits into the persistent Frontier registry, immediately verifies a `CompiledFrontierAgent` FastSolve on the exact promoted circuit, adds verified P9 replay from the compiled answer, and feeds the circuit into P10 as a `compiled_frontier` proposal.
+- Architecture and deliverable audits now reject P9 if sleep consolidation only creates replay; they require nonzero `sleep_frontier_compiled_circuit_count`, held-out pass equality and `sleep_frontier_fastsolve_events`.
 - Cortex phase replay batches, including Phase 9 sleep/consolidation examples, future-contract ledger decisions, bounded ternary compression trace histories, cognitive-memory segments, sleep pools and recursive-improvement archive summaries are now saved in checkpoints and restored on resume, so long runs do not lose P4/P9/P10 context, P2 instrumentation or P3 contract state after interruption.
 - `CompressionTraceLedger` keeps total P2 event counters and aggregate effective-cost inputs separately from retained detailed events; the LLM harness limits retained detailed traces with `cortex_trace_retention_limit` to prevent long GPU runs from growing trace memory without bound.
 
 Evidence:
 
 - `.\.venv\Scripts\python.exe -m unittest tests.test_sleep_phase`
+- `.\.venv\Scripts\python.exe -m unittest tests.test_sleep_phase.SleepPhaseTest.test_sleep_phase_acceptance_compiles_to_heldout_frontier_circuit`
 - `.\.venv\Scripts\python.exe -m unittest discover -s tests`
 - Temporary artifact write with `tools\run_cycle_report.py --out-dir <temp> --run-id final-smoke` includes both `inference` and `sleep_phase`.
-- `tests/test_llm_pretraining.py::LLMPretrainingHarnessTest::test_full_cortex_phase_controller_uses_all_modules_during_training` verifies nonzero sleep replay batches and replay updates during LLM training.
+- `tests/test_llm_pretraining.py::LLMPretrainingHarnessTest::test_full_cortex_phase_controller_uses_all_modules_during_training` verifies nonzero sleep replay batches, replay updates, sleep-frontier circuits, held-out gates, FastSolve events, P10 sleep-frontier proposals and persistent registry entries during LLM training.
+- `tests/test_llm_pretraining.py::LLMPretrainingHarnessTest::test_cortex_phase_state_survives_checkpoint_resume` verifies sleep-frontier reports and counts survive checkpoint/resume.
 
 Remaining:
 
 - Add external provenance adapters for real data sources.
-- Measure rare-skill retention, diversity and calibration over repeated sleep/wake cycles.
+- Measure rare-skill retention, diversity, calibration and sleep-promoted circuit reuse over repeated sleep/wake cycles.
 
 ## Phase 10 - Recursive improvement gate
 

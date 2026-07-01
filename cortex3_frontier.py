@@ -14,7 +14,15 @@ from cortex3 import Anchor, CandidateAnswer, CompressionAdversary, CostTrace, Dy
 from cortex3_certificates import CertificateVerifier, LatentProofState, build_compiled_circuit_certificate
 from cortex3_cycle import CycleReport
 from cortex3_future import FutureContractEngine, MTPFSPConfig, OutputGoalDecision
-from cortex3_microtrain import CheckpointManager, CortexMicroModel, CortexMicroTrainer, MicroModelAgent, examples_from_tasks
+from cortex3_microtrain import (
+    CheckpointManager,
+    CortexMicroModel,
+    CortexMicroTrainer,
+    MicroModelAgent,
+    MicroTrainingExample,
+    examples_from_sleep_report,
+    examples_from_tasks,
+)
 
 
 _NUMBER_RE = re.compile(r"-?\d+(?:\.\d+)?")
@@ -617,6 +625,195 @@ class FrontierSkillDiscovery:
                     variants.append(variant)
                     seen.add(variant.task_id)
         return tuple(variants)
+
+    def compile_sleep_consolidation(
+        self,
+        sleep_report: Any,
+        *,
+        seed: int = 0,
+        max_skills: int = 2,
+        support_per_verified: int = 2,
+        heldout_per_support: int = 1,
+        min_heldout_pass_rate: float = 1.0,
+        max_generalization_rounds: int = 2,
+        epochs: int = 80,
+        registry: FrontierCircuitRegistry | None = None,
+    ) -> FrontierDiscoveryReport:
+        if max_skills < 1:
+            return FrontierDiscoveryReport(tuple(), tuple(), False)
+        if support_per_verified < 1:
+            raise ValueError("support_per_verified must be positive")
+        if heldout_per_support < 1:
+            raise ValueError("heldout_per_support must be positive")
+        if max_generalization_rounds < 1:
+            raise ValueError("max_generalization_rounds must be positive")
+        if epochs < 1:
+            raise ValueError("epochs must be positive")
+        if not 0.0 <= float(min_heldout_pass_rate) <= 1.0:
+            raise ValueError("min_heldout_pass_rate must be between 0 and 1")
+
+        raw_examples = tuple(getattr(sleep_report, "accepted_examples", ()))
+        sleep_examples_by_task = {
+            example.task.task_id: example
+            for example in raw_examples
+            if getattr(example, "has_trust_label", False)
+            and float(getattr(example, "contamination_risk", 1.0)) <= 0.35
+        }
+        promoted_examples = tuple(
+            example
+            for example in examples_from_sleep_report(sleep_report)
+            if example.task.task_id in sleep_examples_by_task
+        )
+        scheduled_skills = []
+        for item in getattr(sleep_report, "schedule", ()):
+            skill = str(getattr(item, "skill", ""))
+            if skill and skill not in scheduled_skills:
+                scheduled_skills.append(skill)
+        if not scheduled_skills:
+            counts = Counter(example.task.skill for example in promoted_examples)
+            scheduled_skills = [skill for skill, _ in counts.most_common()]
+        selected = tuple(scheduled_skills[:max_skills])
+
+        circuits: list[FrontierCompiledCircuit] = []
+        trainer = CortexMicroTrainer()
+        for index, skill in enumerate(selected):
+            skill_promoted = tuple(example for example in promoted_examples if example.task.skill == skill)
+            grouped: dict[str, list[MicroTrainingExample]] = {}
+            for example in skill_promoted:
+                group_key = str(example.task.group_id or f"task:{example.task.task_id}")
+                grouped.setdefault(group_key, []).append(example)
+            ordered_groups = sorted(
+                grouped.values(),
+                key=lambda items: (
+                    len({item.answer for item in items}) == 1,
+                    any(item.task.group_id is not None for item in items),
+                    len(items),
+                ),
+                reverse=True,
+            )
+            base_examples: list[MicroTrainingExample] = []
+            seen_task_ids: set[str] = set()
+            source_example_ids: list[str] = []
+            for example in (ordered_groups[0] if ordered_groups else ()):
+                if example.task.task_id in seen_task_ids:
+                    continue
+                sleep_example = sleep_examples_by_task[example.task.task_id]
+                answer = CandidateAnswer(example.answer, confidence=example.confidence)
+                verification = self.verifier.oracle_registry.verify(skill, example.task, answer)
+                if not verification.passed:
+                    continue
+                base_examples.append(example)
+                seen_task_ids.add(example.task.task_id)
+                source_example_ids.append(str(getattr(sleep_example, "example_id", example.task.task_id)))
+            if not base_examples:
+                continue
+
+            training_task_list = [example.task for example in base_examples]
+            training_examples: list[MicroTrainingExample] = list(base_examples)
+            excluded_task_ids = set(seen_task_ids)
+            model: CortexMicroModel | None = None
+            training = None
+            dsv = None
+            heldout_tasks: tuple[Task, ...] = ()
+            heldout_dsv = None
+            heldout_pass_rate = 0.0
+            heldout_gate_passed = False
+            generalization_rounds: list[dict[str, Any]] = []
+            support_added = 0
+            for round_idx in range(max_generalization_rounds):
+                support_tasks = self._verified_metamorphic_variants(
+                    tuple(training_task_list),
+                    seed=seed + 6101 + index + round_idx * 997,
+                    per_source=support_per_verified,
+                    excluded_task_ids=excluded_task_ids,
+                )
+                if support_tasks:
+                    support_examples = examples_from_tasks(support_tasks, self.solver, source="sleep_frontier_support")
+                    training_examples.extend(support_examples)
+                    training_task_list.extend(support_tasks)
+                    support_added += len(support_tasks)
+                    excluded_task_ids.update(task.task_id for task in support_tasks)
+                training_tasks = tuple(training_task_list)
+                model, training = trainer.train(tuple(training_examples), epochs=epochs, lr=0.05)
+                agent = MicroModelAgent(model)
+                dsv = self.verifier.evaluate_tasks(agent, training_tasks)
+                heldout_seed_tasks = support_tasks or training_tasks
+                heldout_tasks = self._verified_metamorphic_variants(
+                    heldout_seed_tasks,
+                    seed=seed + 9151 + index + round_idx * 997,
+                    per_source=heldout_per_support,
+                    excluded_task_ids=excluded_task_ids,
+                )
+                heldout_dsv = self.verifier.evaluate_tasks(agent, heldout_tasks)
+                heldout_pass_rate = float(heldout_dsv.passed) / max(1, int(heldout_dsv.total))
+                heldout_gate_passed = bool(
+                    heldout_dsv.total > 0
+                    and heldout_dsv.passed == heldout_dsv.total
+                    and heldout_pass_rate >= float(min_heldout_pass_rate)
+                )
+                generalization_rounds.append(
+                    {
+                        "round": round_idx,
+                        "support_tasks": len(support_tasks),
+                        "training_tasks": len(training_tasks),
+                        "heldout_passed": heldout_dsv.passed,
+                        "heldout_total": heldout_dsv.total,
+                        "heldout_pass_rate": heldout_pass_rate,
+                        "gate_passed": heldout_gate_passed,
+                    }
+                )
+                if heldout_gate_passed:
+                    break
+                if round_idx + 1 < max_generalization_rounds:
+                    retry_tasks = tuple(task for task in heldout_tasks if task.task_id not in excluded_task_ids)
+                    if retry_tasks:
+                        retry_examples = examples_from_tasks(retry_tasks, self.solver, source="sleep_frontier_retry_heldout")
+                        training_examples.extend(retry_examples)
+                        training_task_list.extend(retry_tasks)
+                        excluded_task_ids.update(task.task_id for task in retry_tasks)
+            if model is None or training is None or dsv is None or heldout_dsv is None:
+                continue
+            training_tasks = tuple(training_task_list)
+            compiled_bits, active_weights, total_weights = _compiled_weight_bits(model)
+            compiled = FrontierCompiledCircuit(
+                skill=skill,
+                source_failure_ids=tuple(source_example_ids),
+                frontier_task_ids=tuple(task.task_id for task in training_tasks),
+                heldout_task_ids=tuple(task.task_id for task in heldout_tasks),
+                verified_slow_solutions=len(training_tasks),
+                invariants=_extract_invariants(skill, training_tasks),
+                training={
+                    **training.to_dict(),
+                    "source_kind": "sleep_consolidation",
+                    "sleep_accepted_examples": len(base_examples),
+                    "sleep_support_examples": support_added,
+                    "sleep_source_example_ids": tuple(source_example_ids),
+                },
+                dsv={
+                    "passed": dsv.passed,
+                    "total": dsv.total,
+                    "aggregate_score": dsv.aggregate_score,
+                    "verified_capability_per_cost": dsv.verified_capability_per_cost,
+                },
+                heldout={
+                    "passed": heldout_dsv.passed,
+                    "total": heldout_dsv.total,
+                    "pass_rate": heldout_pass_rate,
+                    "min_pass_rate": float(min_heldout_pass_rate),
+                    "aggregate_score": heldout_dsv.aggregate_score,
+                    "verified_capability_per_cost": heldout_dsv.verified_capability_per_cost,
+                    "gate_passed": heldout_gate_passed,
+                    "generalization_rounds": tuple(generalization_rounds),
+                },
+                compiled_weight_bits=compiled_bits,
+                active_weights=active_weights,
+                total_weights=total_weights,
+                passed=dsv.passed == dsv.total and training.after_accuracy >= training.before_accuracy and heldout_gate_passed,
+            )
+            circuits.append(compiled)
+            if registry is not None and compiled.passed:
+                registry.register(compiled, model, training_tasks, heldout_tasks=heldout_tasks)
+        return FrontierDiscoveryReport(tuple(circuits), selected, bool(circuits) and all(circuit.passed for circuit in circuits))
 
     def discover(
         self,

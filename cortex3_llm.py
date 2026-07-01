@@ -3057,8 +3057,13 @@ def _frontier_heldout_summary(registry_payload: Mapping[str, Any]) -> dict[str, 
     heldout_total = 0
     heldout_passed = 0
     gate_passed_circuits = 0
+    sleep_circuits = 0
+    sleep_heldout_total = 0
+    sleep_heldout_passed = 0
+    sleep_gate_passed_circuits = 0
     for circuit in circuits:
         report = dict(circuit.get("report") or {})
+        training = dict(report.get("training") or {})
         heldout = dict(report.get("heldout") or {})
         total = int(heldout.get("total", 0) or 0)
         passed = int(heldout.get("passed", 0) or 0)
@@ -3066,11 +3071,21 @@ def _frontier_heldout_summary(registry_payload: Mapping[str, Any]) -> dict[str, 
         heldout_passed += passed
         if total > 0 and passed >= total and bool(heldout.get("gate_passed", False)):
             gate_passed_circuits += 1
+        if str(training.get("source_kind", "")) == "sleep_consolidation":
+            sleep_circuits += 1
+            sleep_heldout_total += total
+            sleep_heldout_passed += passed
+            if total > 0 and passed >= total and bool(heldout.get("gate_passed", False)):
+                sleep_gate_passed_circuits += 1
     return {
         "frontier_heldout_circuit_count": len(circuits),
         "frontier_heldout_gate_passed_circuit_count": gate_passed_circuits,
         "frontier_heldout_total": heldout_total,
         "frontier_heldout_passed": heldout_passed,
+        "sleep_frontier_compiled_circuit_count": sleep_circuits,
+        "sleep_frontier_heldout_total": sleep_heldout_total,
+        "sleep_frontier_heldout_passed": sleep_heldout_passed,
+        "sleep_frontier_heldout_gate_passed_circuit_count": sleep_gate_passed_circuits,
     }
 
 
@@ -3426,14 +3441,24 @@ def _cortex_architecture_audit_from_summary(summary: Mapping[str, Any]) -> dict[
         phase_count("P9") > 0
         and integer("sleep_replay_examples") > 0
         and integer("sleep_synthetic_examples") > 0
-        and integer("replay_batch_count") > 0,
+        and integer("replay_batch_count") > 0
+        and integer("sleep_frontier_compiled_circuit_count") > 0
+        and integer("sleep_frontier_heldout_total") > 0
+        and integer("sleep_frontier_heldout_passed") == integer("sleep_frontier_heldout_total")
+        and integer("sleep_frontier_heldout_gate_passed_circuit_count") == integer("sleep_frontier_compiled_circuit_count")
+        and integer("sleep_frontier_fastsolve_events") > 0,
         {
             "P9": phase_count("P9"),
             "sleep_replay_examples": integer("sleep_replay_examples"),
             "sleep_synthetic_examples": integer("sleep_synthetic_examples"),
             "replay_batch_count": integer("replay_batch_count"),
+            "sleep_frontier_compiled_circuit_count": integer("sleep_frontier_compiled_circuit_count"),
+            "sleep_frontier_heldout_passed": integer("sleep_frontier_heldout_passed"),
+            "sleep_frontier_heldout_total": integer("sleep_frontier_heldout_total"),
+            "sleep_frontier_heldout_gate_passed_circuit_count": integer("sleep_frontier_heldout_gate_passed_circuit_count"),
+            "sleep_frontier_fastsolve_events": integer("sleep_frontier_fastsolve_events"),
         },
-        "sleep/consolidation must emit verified replay plus synthetic examples",
+        "sleep/consolidation must emit verified replay, then compile accepted experience into held-out gated executable Frontier circuits used by FastSolve",
     )
     add(
         "recursive_improvement",
@@ -3739,13 +3764,18 @@ def _cortex_phase_deliverable_audit_from_summary(summary: Mapping[str, Any]) -> 
     )
     add(
         "P9",
-        "sleep_replay_synthetic_real_reservoir_anti_collapse_schedule",
+        "sleep_replay_synthetic_real_reservoir_anti_collapse_schedule_frontier_compile",
         int(summary.get("sleep_replay_examples", 0) or 0) > 0
         and int(summary.get("sleep_synthetic_examples", 0) or 0) > 0
         and int(summary.get("sleep_reservoir_examples", 0) or 0) > 0
         and count("sleep_metamorphic_examples") > 0
         and count("sleep_anti_collapse_decisions") > 0
-        and count("sleep_consolidation_schedule_items") > 0,
+        and count("sleep_consolidation_schedule_items") > 0
+        and int(summary.get("sleep_frontier_compiled_circuit_count", 0) or 0) > 0
+        and int(summary.get("sleep_frontier_heldout_total", 0) or 0) > 0
+        and int(summary.get("sleep_frontier_heldout_passed", 0) or 0)
+        == int(summary.get("sleep_frontier_heldout_total", 0) or 0)
+        and count("sleep_frontier_fastsolve_events") > 0,
         {
             "sleep_replay_examples": int(summary.get("sleep_replay_examples", 0) or 0),
             "sleep_synthetic_examples": int(summary.get("sleep_synthetic_examples", 0) or 0),
@@ -3753,8 +3783,12 @@ def _cortex_phase_deliverable_audit_from_summary(summary: Mapping[str, Any]) -> 
             "sleep_metamorphic_examples": count("sleep_metamorphic_examples"),
             "sleep_anti_collapse_decisions": count("sleep_anti_collapse_decisions"),
             "sleep_consolidation_schedule_items": count("sleep_consolidation_schedule_items"),
+            "sleep_frontier_compiled_circuit_count": int(summary.get("sleep_frontier_compiled_circuit_count", 0) or 0),
+            "sleep_frontier_heldout_passed": int(summary.get("sleep_frontier_heldout_passed", 0) or 0),
+            "sleep_frontier_heldout_total": int(summary.get("sleep_frontier_heldout_total", 0) or 0),
+            "sleep_frontier_fastsolve_events": count("sleep_frontier_fastsolve_events"),
         },
-        "sleep phase must combine replay, verified synthetic/metamorphic, real reservoir, anti-collapse and scheduling",
+        "sleep phase must combine replay, verified synthetic/metamorphic, real reservoir, anti-collapse scheduling and held-out gated Frontier compilation",
     )
     add(
         "P10",
@@ -3862,6 +3896,7 @@ class CortexTrainingPhaseController:
         self.batch_contract_samples: list[dict[str, Any]] = []
         self.phase_audits: list[dict[str, Any]] = []
         self.frontier_reports: list[dict[str, Any]] = []
+        self.sleep_frontier_reports: list[dict[str, Any]] = []
         self.frontier_compiled_fastsolve_events = 0
         self.frontier_repair_candidates: list[dict[str, Any]] = []
         self.frontier_repair_accepted_events = 0
@@ -4350,6 +4385,121 @@ class CortexTrainingPhaseController:
             self.phase_replay_example_ids.append(f"llm-p9-{self.phase_replay_examples['P9']}-{example.example_id}")
             self._record_training_example_ledgers(example, phase_id="P9")
 
+    def _frontier_report_key(self, report: Mapping[str, Any]) -> tuple[str, tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+        return (
+            str(report.get("skill", "")),
+            tuple(str(item) for item in report.get("source_failure_ids", ())),
+            tuple(str(item) for item in report.get("frontier_task_ids", ())),
+            tuple(str(item) for item in report.get("heldout_task_ids", ())),
+        )
+
+    def _compile_sleep_frontier(
+        self,
+        sleep_report: Any,
+        *,
+        step: int,
+    ) -> dict[str, Any]:
+        report = self.frontier_discovery.compile_sleep_consolidation(
+            sleep_report,
+            seed=self.config.seed + step + 31337,
+            max_skills=max(1, int(self.config.cortex_phase_frontier_max_skills)),
+            support_per_verified=2,
+            heldout_per_support=1,
+            max_generalization_rounds=2,
+            epochs=max(40, int(self.config.cortex_phase_frontier_epochs)),
+            registry=self.frontier_registry,
+        )
+        payload = report.to_dict()
+        passed_circuits = tuple(circuit for circuit in report.circuits if circuit.passed)
+        self._count("sleep_frontier_compilation_events")
+        self._count("sleep_frontier_compiled_circuits", len(passed_circuits))
+        self._count(
+            "sleep_frontier_heldout_gates",
+            sum(1 for circuit in passed_circuits if bool(circuit.heldout.get("gate_passed", False))),
+        )
+        if not passed_circuits:
+            raise ValueError("P9 sleep consolidation produced no held-out gated Frontier circuit")
+
+        registry_dir = self.run_dir / "frontier_registry"
+        registry_path = self.frontier_registry.save(registry_dir)
+        self.integration_counts["frontier_registry_saves"] = self.integration_counts.get("frontier_registry_saves", 0) + 1
+        passed_keys = {self._frontier_report_key(circuit.to_dict()) for circuit in passed_circuits}
+        runtime_circuits = tuple(
+            circuit
+            for skill in self.frontier_registry.compiled_skills()
+            for circuit in self.frontier_registry.circuits_for_skill(skill)
+            if self._frontier_report_key(circuit.report.to_dict()) in passed_keys
+        )
+        if not runtime_circuits:
+            raise ValueError("P9 sleep Frontier circuits were compiled but not present in the runtime registry")
+
+        fastsolve_reports: list[dict[str, Any]] = []
+        for runtime_circuit in runtime_circuits:
+            if not runtime_circuit.verified_tasks:
+                continue
+            local_registry = FrontierCircuitRegistry()
+            local_registry.register(
+                runtime_circuit.report,
+                runtime_circuit.model,
+                runtime_circuit.verified_tasks,
+                heldout_tasks=runtime_circuit.heldout_tasks,
+                checkpoint_path=runtime_circuit.checkpoint_path,
+            )
+            task = runtime_circuit.verified_tasks[0]
+            answer = CompiledFrontierAgent(local_registry, verifier=self.verifier)(task)
+            verification = self.verifier.oracle_registry.verify(task.skill, task, answer)
+            if not verification.passed:
+                raise ValueError(f"P9 compiled sleep Frontier fastsolve failed oracle for {task.task_id}: {verification.reason}")
+            self._count("sleep_frontier_fastsolve_events")
+            self._count("frontier_compiled_fastsolve_events")
+            self.frontier_compiled_fastsolve_events += 1
+            self.bit_ledger.ingest_cost(answer.cost, note=f"P9:sleep-frontier-fastsolve:{task.skill}")
+            self.uncertainty_ledger.record(task.skill, answer.confidence, True)
+            self._record_causal_trace(
+                trace_id=f"P9-sleep-frontier-{step}-{task.task_id}",
+                skill=task.skill,
+                confidence=answer.confidence,
+                anchors=len(task.anchors),
+                certificate_fields=answer.certificate.keys(),
+                verifier_level=2,
+            )
+            self._add_verified_phase_replay(
+                "P9",
+                task,
+                answer=answer,
+                metadata={
+                    "sleep_frontier_fastsolve": True,
+                    "frontier_skill": runtime_circuit.skill,
+                    "frontier_task_ids": runtime_circuit.report.frontier_task_ids,
+                    "frontier_heldout_task_ids": runtime_circuit.report.heldout_task_ids,
+                    "frontier_heldout_gate_passed": bool(runtime_circuit.report.heldout.get("gate_passed", False)),
+                    "frontier_compiled_contract_verified": bool(answer.certificate.get("frontier_compiled_contract_verified", False)),
+                },
+            )
+            fastsolve_reports.append(
+                {
+                    "task_id": task.task_id,
+                    "skill": task.skill,
+                    "answer": answer.text,
+                    "verified": verification.passed,
+                    "frontier_compiled_contract_verified": bool(
+                        answer.certificate.get("frontier_compiled_contract_verified", False)
+                    ),
+                    "heldout_gate_passed": bool(runtime_circuit.report.heldout.get("gate_passed", False)),
+                    "heldout_passed": int(runtime_circuit.report.heldout.get("passed", 0)),
+                    "heldout_total": int(runtime_circuit.report.heldout.get("total", 0)),
+                }
+            )
+        if not fastsolve_reports:
+            raise ValueError("P9 sleep Frontier circuits compiled but no runtime FastSolve task was verified")
+        final_payload = {
+            **payload,
+            "registry_path": str(registry_path),
+            "fastsolve": tuple(fastsolve_reports),
+        }
+        self.sleep_frontier_reports.append(final_payload)
+        return final_payload
+
     def _batch_from_task(self, task: Task, answer: CandidateAnswer | str) -> torch.Tensor:
         candidate = CandidateAnswer.coerce(answer)
         text = (
@@ -4805,6 +4955,7 @@ class CortexTrainingPhaseController:
             "batch_contract_samples": list(self.batch_contract_samples),
             "phase_audits": list(self.phase_audits),
             "frontier_reports": list(self.frontier_reports),
+            "sleep_frontier_reports": list(self.sleep_frontier_reports),
             "frontier_compiled_fastsolve_events": int(self.frontier_compiled_fastsolve_events),
             "frontier_repair_candidates": list(self.frontier_repair_candidates),
             "frontier_repair_accepted_events": int(self.frontier_repair_accepted_events),
@@ -4871,6 +5022,7 @@ class CortexTrainingPhaseController:
         self.batch_contract_samples = [dict(item) for item in payload.get("batch_contract_samples", ())]
         self.phase_audits = [dict(item) for item in payload.get("phase_audits", ())]
         self.frontier_reports = [dict(item) for item in payload.get("frontier_reports", ())]
+        self.sleep_frontier_reports = [dict(item) for item in payload.get("sleep_frontier_reports", ())]
         self.frontier_compiled_fastsolve_events = int(payload.get("frontier_compiled_fastsolve_events", 0))
         self.frontier_repair_candidates = [dict(item) for item in payload.get("frontier_repair_candidates", ())]
         self.frontier_repair_accepted_events = int(payload.get("frontier_repair_accepted_events", 0))
@@ -5113,10 +5265,12 @@ class CortexTrainingPhaseController:
             "frontier_compiled_skill_count": int(frontier_registry_summary["compiled_skill_count"]),
             **frontier_heldout_summary,
             "frontier_compiled_fastsolve_events": int(self.frontier_compiled_fastsolve_events),
+            "sleep_frontier_fastsolve_events": int(self.integration_counts.get("sleep_frontier_fastsolve_events", 0)),
             "frontier_repair_candidate_count": len(self.frontier_repair_candidates),
             "frontier_repair_accepted_events": int(self.frontier_repair_accepted_events),
             "frontier_registry_path": str(self.run_dir / "frontier_registry"),
             "frontier_reports": _last_items(self.frontier_reports, 3),
+            "sleep_frontier_reports": _last_items(self.sleep_frontier_reports, 3),
             "frontier_repair_candidates": _last_items(self.frontier_repair_candidates, 3),
             "improvement_archive_accepted": self.improvement.archive.accepted_count,
             "improvement_archive_rejected": self.improvement.archive.rejected_count,
@@ -5552,6 +5706,7 @@ class CortexTrainingPhaseController:
                 self._add_sleep_replay(sleep_report.accepted_examples)
                 self._touch("P9")
                 audit["sleep"] = sleep_report.to_dict()
+                audit["sleep_frontier_compilation"] = self._compile_sleep_frontier(sleep_report, step=step)
                 self._count("sleep_anti_collapse_decisions")
                 self._count("sleep_consolidation_schedule_items", len(sleep_report.schedule))
                 self._count(
@@ -5576,6 +5731,17 @@ class CortexTrainingPhaseController:
                     self.frontier_repair_candidates,
                     max_proposals=max(1, int(self.config.cortex_phase_max_proposals)),
                 )
+                sleep_frontier_circuits = tuple(
+                    circuit
+                    for report_payload in self.sleep_frontier_reports[-2:]
+                    for circuit in tuple(dict(report_payload).get("circuits", ()))
+                    if isinstance(circuit, Mapping)
+                )
+                sleep_frontier_proposals = self.improvement.generator.from_sleep_frontier_circuits(
+                    sleep_frontier_circuits,
+                    max_proposals=max(1, int(self.config.cortex_phase_max_proposals)),
+                )
+                compiled_frontier_proposals = tuple(frontier_improvement_proposals) + tuple(sleep_frontier_proposals)
                 p10_proposal_budget = max(
                     int(self.config.cortex_phase_max_proposals),
                     min(
@@ -5592,13 +5758,16 @@ class CortexTrainingPhaseController:
                     max_proposals=p10_proposal_budget,
                     seed=self.config.seed + step,
                     n_per_skill=self.config.cortex_phase_probe_tasks,
-                    extra_proposals=frontier_improvement_proposals,
+                    extra_proposals=compiled_frontier_proposals,
                 )
                 self._touch("P10")
                 audit["recursive_improvement"] = improvement_report.to_dict()
                 audit["recursive_improvement"]["proposal_budget"] = p10_proposal_budget
-                audit["recursive_improvement"]["frontier_proposal_count"] = len(frontier_improvement_proposals)
-                self._count("recursive_frontier_proposal_events", len(frontier_improvement_proposals))
+                audit["recursive_improvement"]["frontier_proposal_count"] = len(compiled_frontier_proposals)
+                audit["recursive_improvement"]["frontier_repair_proposal_count"] = len(frontier_improvement_proposals)
+                audit["recursive_improvement"]["sleep_frontier_proposal_count"] = len(sleep_frontier_proposals)
+                self._count("recursive_frontier_proposal_events", len(compiled_frontier_proposals))
+                self._count("recursive_sleep_frontier_proposal_events", len(sleep_frontier_proposals))
                 self._count("recursive_proposal_events", len(improvement_report.proposals))
                 self._count("recursive_sandbox_trials", len(improvement_report.decisions))
                 self._count("recursive_dynamic_evaluations", len(improvement_report.decisions))
@@ -5830,6 +5999,7 @@ class CortexTrainingPhaseController:
                 "frontier_compiled_skill_count": int(frontier_registry_summary["compiled_skill_count"]),
                 **frontier_heldout_summary,
                 "frontier_compiled_fastsolve_events": int(self.frontier_compiled_fastsolve_events),
+                "sleep_frontier_fastsolve_events": int(self.integration_counts.get("sleep_frontier_fastsolve_events", 0)),
                 "frontier_repair_candidate_count": len(self.frontier_repair_candidates),
                 "frontier_repair_accepted_events": int(self.frontier_repair_accepted_events),
                 "recursive_frontier_proposal_events": int(self.integration_counts.get("recursive_frontier_proposal_events", 0)),
@@ -5917,6 +6087,7 @@ class CortexTrainingPhaseController:
                     "frontier_compiled_skill_count": int(frontier_registry_summary["compiled_skill_count"]),
                     **frontier_heldout_summary,
                     "frontier_compiled_fastsolve_events": int(self.frontier_compiled_fastsolve_events),
+                    "sleep_frontier_fastsolve_events": int(self.integration_counts.get("sleep_frontier_fastsolve_events", 0)),
                     "frontier_repair_candidate_count": len(self.frontier_repair_candidates),
                     "frontier_repair_accepted_events": int(self.frontier_repair_accepted_events),
                     "recursive_frontier_proposal_events": int(self.integration_counts.get("recursive_frontier_proposal_events", 0)),
@@ -5987,6 +6158,8 @@ class CortexTrainingPhaseController:
                     "sleep_replay_examples": len(self.sleep.replay.examples),
                     "sleep_synthetic_examples": len(self.sleep.synthetic.examples),
                     "sleep_reservoir_examples": len(self.sleep.reservoir.examples),
+                    **frontier_heldout_summary,
+                    "sleep_frontier_fastsolve_events": int(self.integration_counts.get("sleep_frontier_fastsolve_events", 0)),
                     "regrowth_model_application_count": len(self.regrowth_model_applications),
                     "regrowth_model_parameter_delta_l1": float(self.regrowth_model_parameter_delta_l1),
                     "regrowth_model_repair_loss_delta": float(self.regrowth_model_repair_loss_delta),
@@ -6022,6 +6195,7 @@ class CortexTrainingPhaseController:
             },
             "frontier_registry_summary": self.frontier_registry.to_dict(),
             "frontier_reports": _last_items(self.frontier_reports, 3),
+            "sleep_frontier_reports": _last_items(self.sleep_frontier_reports, 3),
             "frontier_repair_candidates": _last_items(self.frontier_repair_candidates, 3),
             "improvement_state_summary": _improvement_state(self.improvement),
             "regrowth_model_applications": _last_items(self.regrowth_model_applications, 5),
