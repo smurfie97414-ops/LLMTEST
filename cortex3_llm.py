@@ -10204,6 +10204,7 @@ def run_llm_batch_profile_autosize(
     confirm_selected_repeat_count: int = 2,
     confirm_selected_max_rounds: int | None = None,
     confirm_selected_decision_resolution_extra_rounds: int | None = None,
+    confirm_selected_decision_resolution_adaptive_extra_rounds: int = 2,
     measured_selection_metric: str = "throughput_gpu",
     min_cases: int = 1,
     require_multi_shape: bool = False,
@@ -10275,6 +10276,11 @@ def run_llm_batch_profile_autosize(
         and requested_confirm_selected_decision_resolution_extra_rounds < 0
     ):
         raise ValueError("confirm_selected_decision_resolution_extra_rounds must be >= 0")
+    requested_confirm_selected_decision_resolution_adaptive_extra_rounds = int(
+        confirm_selected_decision_resolution_adaptive_extra_rounds
+    )
+    if requested_confirm_selected_decision_resolution_adaptive_extra_rounds < 0:
+        raise ValueError("confirm_selected_decision_resolution_adaptive_extra_rounds must be >= 0")
     if measure_candidate_strategy not in PROFILE_AUTOSIZE_MEASUREMENT_STRATEGIES:
         raise ValueError(
             f"unknown measure_candidate_strategy {measure_candidate_strategy!r}; "
@@ -10437,6 +10443,11 @@ def run_llm_batch_profile_autosize(
         if requested_confirm_selected_decision_resolution_extra_rounds is None
         else requested_confirm_selected_decision_resolution_extra_rounds
     )
+    confirmation_decision_resolution_adaptive_extra_rounds = 0
+    confirmation_decision_resolution_uncertainty = 0.0
+    confirmation_decision_resolution_margin_deficit = 0.0
+    confirmation_decision_resolution_overlap_ratio = 0.0
+    confirmation_decision_resolution_total_rounds = effective_confirm_selected_decision_resolution_extra_rounds
     if effective_measure_candidate_count > 0:
         aggregated_measurement_rows: list[Mapping[str, Any]] = []
         already_measured_shape_keys: set[str] = set()
@@ -10813,6 +10824,46 @@ def run_llm_batch_profile_autosize(
                 inputs.append(candidate)
             return tuple(inputs)
 
+        def decision_resolution_adaptive_budget(state: Mapping[str, Any]) -> Mapping[str, Any]:
+            if (
+                effective_confirm_selected_decision_resolution_extra_rounds <= 0
+                or requested_confirm_selected_decision_resolution_adaptive_extra_rounds <= 0
+                or tuple(state.get("pending_candidates", ()))
+                or confirmation_decision_resolved(state)
+            ):
+                return {
+                    "adaptive_extra_rounds": 0,
+                    "uncertainty": 0.0,
+                    "margin_deficit": max(0.0, -float(state.get("decision_margin", 0.0))),
+                    "overlap_ratio": 0.0,
+                }
+            inputs = decision_resolution_inputs(state)
+            interval_widths = tuple(
+                max(
+                    0.0,
+                    float(candidate.get("measured_score_upper_confidence", candidate.get("measured_score", 0.0)))
+                    - float(candidate.get("measured_score_lower_confidence", candidate.get("measured_score", 0.0))),
+                )
+                for candidate in inputs
+            )
+            uncertainty = max(interval_widths, default=0.0)
+            margin_deficit = max(0.0, -float(state.get("decision_margin", 0.0)))
+            if uncertainty <= 0.0 or margin_deficit <= 0.0:
+                adaptive_extra_rounds = 0
+                overlap_ratio = 0.0
+            else:
+                overlap_ratio = margin_deficit / max(1e-9, uncertainty)
+                adaptive_extra_rounds = min(
+                    requested_confirm_selected_decision_resolution_adaptive_extra_rounds,
+                    max(1, int(math.ceil(overlap_ratio))),
+                )
+            return {
+                "adaptive_extra_rounds": adaptive_extra_rounds,
+                "uncertainty": uncertainty,
+                "margin_deficit": margin_deficit,
+                "overlap_ratio": overlap_ratio,
+            }
+
         def confirm_selected_candidates(
             *,
             round_index: int,
@@ -10991,7 +11042,18 @@ def run_llm_batch_profile_autosize(
                 )
                 if confirmed_count <= 0:
                     break
-            for resolution_round_offset in range(effective_confirm_selected_decision_resolution_extra_rounds):
+            adaptive_budget_state = decision_resolution_adaptive_budget(selected_confirmation_frontier_state())
+            confirmation_decision_resolution_adaptive_extra_rounds = int(
+                adaptive_budget_state["adaptive_extra_rounds"]
+            )
+            confirmation_decision_resolution_uncertainty = float(adaptive_budget_state["uncertainty"])
+            confirmation_decision_resolution_margin_deficit = float(adaptive_budget_state["margin_deficit"])
+            confirmation_decision_resolution_overlap_ratio = float(adaptive_budget_state["overlap_ratio"])
+            confirmation_decision_resolution_total_rounds = (
+                effective_confirm_selected_decision_resolution_extra_rounds
+                + confirmation_decision_resolution_adaptive_extra_rounds
+            )
+            for resolution_round_offset in range(confirmation_decision_resolution_total_rounds):
                 confirmation_state = selected_confirmation_frontier_state()
                 if tuple(confirmation_state["pending_candidates"]):
                     break
@@ -11188,6 +11250,12 @@ def run_llm_batch_profile_autosize(
             "confirm_selected_repeat_count": requested_confirm_selected_repeat_count,
             "confirm_selected_max_rounds": effective_confirm_selected_max_rounds,
             "confirm_selected_decision_resolution_extra_rounds": effective_confirm_selected_decision_resolution_extra_rounds,
+            "confirm_selected_decision_resolution_adaptive_extra_round_cap": requested_confirm_selected_decision_resolution_adaptive_extra_rounds,
+            "confirm_selected_decision_resolution_adaptive_extra_rounds": confirmation_decision_resolution_adaptive_extra_rounds,
+            "confirm_selected_decision_resolution_total_rounds": confirmation_decision_resolution_total_rounds,
+            "confirmation_decision_resolution_uncertainty": confirmation_decision_resolution_uncertainty,
+            "confirmation_decision_resolution_margin_deficit": confirmation_decision_resolution_margin_deficit,
+            "confirmation_decision_resolution_overlap_ratio": confirmation_decision_resolution_overlap_ratio,
             "confirmation_rounds_used": len(confirmation_rounds),
             "confirmation_decision_resolution_rounds_used": sum(
                 1 for round_ in confirmation_rounds if str(round_.get("round_kind", "")) == "decision_margin_resolution"
@@ -11470,6 +11538,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     profile_autosize.add_argument("--confirm-selected-repeat-count", type=int, default=2, help="repeat each final selected confirmation seed profile to reduce runtime jitter")
     profile_autosize.add_argument("--confirm-selected-max-rounds", type=int, default=None, help="maximum finalist/frontier confirmation rounds; default covers the measured frontier")
     profile_autosize.add_argument("--confirm-selected-decision-resolution-extra-rounds", type=int, default=None, help="extra decision-margin resolution rounds after the measured frontier is confirmed; default covers the measured frontier")
+    profile_autosize.add_argument("--confirm-selected-decision-resolution-adaptive-extra-rounds", type=int, default=2, help="maximum additional decision-margin resolution rounds added when confirmed winner/challenger intervals still overlap; 0 disables variance-adaptive extension")
     profile_autosize.add_argument("--measured-selection-metric", choices=PROFILE_AUTOSIZE_MEASURED_SELECTION_METRICS, default="throughput_gpu")
     profile_autosize.add_argument("--min-cases", type=int, default=1)
     profile_autosize.add_argument("--require-multi-shape", action="store_true")
@@ -11869,6 +11938,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             confirm_selected_repeat_count=args.confirm_selected_repeat_count,
             confirm_selected_max_rounds=args.confirm_selected_max_rounds,
             confirm_selected_decision_resolution_extra_rounds=args.confirm_selected_decision_resolution_extra_rounds,
+            confirm_selected_decision_resolution_adaptive_extra_rounds=args.confirm_selected_decision_resolution_adaptive_extra_rounds,
             measured_selection_metric=args.measured_selection_metric,
             min_cases=args.min_cases,
             require_multi_shape=args.require_multi_shape,
