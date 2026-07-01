@@ -10757,12 +10757,14 @@ def run_llm_batch_profile_autosize(
                     pending_reasons.append("decision_frontier_challenger_unconfirmed")
             return {
                 "selected_shape_keys": selected_shape_keys,
+                "selected_candidates": tuple(selected_candidates),
                 "selected_lower_confidence": selected_lower_confidence,
                 "best_challenger_shape_key": (
                     str(best_challenger["shape_key"])
                     if best_challenger is not None
                     else ""
                 ),
+                "best_challenger_candidate": best_challenger,
                 "best_challenger_upper_confidence": best_challenger_upper_confidence,
                 "decision_margin": float(selected_lower_confidence - best_challenger_upper_confidence),
                 "pending_candidates": tuple(pending),
@@ -10773,7 +10775,34 @@ def run_llm_batch_profile_autosize(
         def selected_confirmation_missing() -> tuple[Mapping[str, Any], ...]:
             return tuple(selected_confirmation_frontier_state()["pending_candidates"])
 
-        def confirm_selected_candidates(*, round_index: int) -> int:
+        def confirmation_decision_resolved(state: Mapping[str, Any]) -> bool:
+            return (
+                not str(state.get("best_challenger_shape_key", ""))
+                or float(state.get("decision_margin", 0.0)) > 0.0
+            )
+
+        def decision_resolution_inputs(state: Mapping[str, Any]) -> tuple[Mapping[str, Any], ...]:
+            if confirmation_decision_resolved(state):
+                return ()
+            best_challenger = state.get("best_challenger_candidate")
+            if best_challenger is None:
+                return ()
+            inputs: list[Mapping[str, Any]] = []
+            seen: set[str] = set()
+            for candidate in tuple(state.get("selected_candidates", ())) + (best_challenger,):
+                shape_key = str(candidate["shape_key"])
+                if shape_key in seen:
+                    continue
+                seen.add(shape_key)
+                inputs.append(candidate)
+            return tuple(inputs)
+
+        def confirm_selected_candidates(
+            *,
+            round_index: int,
+            confirmation_inputs: Sequence[Mapping[str, Any]] | None = None,
+            round_kind: str = "selected_candidate_confirmation",
+        ) -> int:
             nonlocal measurement_inputs, confirmation_seeds, synthesized_confirmation_seed_count
             if (
                 requested_confirm_selected_candidate_count <= 0
@@ -10781,7 +10810,11 @@ def run_llm_batch_profile_autosize(
                 or not aggregated_measurement_rows
             ):
                 return 0
-            confirmation_inputs = selected_confirmation_missing()[: int(requested_confirm_selected_candidate_count)]
+            confirmation_inputs = (
+                selected_confirmation_missing()[: int(requested_confirm_selected_candidate_count)]
+                if confirmation_inputs is None
+                else tuple(confirmation_inputs)
+            )
             if not confirmation_inputs:
                 return 0
             used_seed_set = {
@@ -10867,7 +10900,7 @@ def run_llm_batch_profile_autosize(
                 confirmation_rounds.append(
                     {
                         "round_index": int(round_index),
-                        "round_kind": "selected_candidate_confirmation",
+                        "round_kind": round_kind,
                         "candidate_count": len(confirmed_rows),
                         "shape_keys": tuple(str(item["shape_key"]) for item in confirmed_rows),
                         "estimated_ranks": tuple(int(item.get("estimated_rank", 0)) for item in confirmed_rows),
@@ -10929,11 +10962,21 @@ def run_llm_batch_profile_autosize(
         refine_uncertain_candidates(round_index=round_index + 1)
         if requested_confirm_selected_candidate_count > 0 and requested_confirm_selected_extra_seed_count > 0:
             for confirm_round_offset in range(effective_confirm_selected_max_rounds):
-                if not selected_confirmation_missing():
+                confirmation_state = selected_confirmation_frontier_state()
+                pending_inputs = tuple(confirmation_state["pending_candidates"])
+                if not pending_inputs and confirmation_decision_resolved(confirmation_state):
                     confirmation_complete = True
                     break
+                if pending_inputs:
+                    confirmation_inputs = pending_inputs[: int(requested_confirm_selected_candidate_count)]
+                    confirmation_round_kind = "selected_candidate_confirmation"
+                else:
+                    confirmation_inputs = decision_resolution_inputs(confirmation_state)
+                    confirmation_round_kind = "decision_margin_resolution"
                 confirmed_count = confirm_selected_candidates(
                     round_index=round_index + 2 + confirm_round_offset,
+                    confirmation_inputs=confirmation_inputs,
+                    round_kind=confirmation_round_kind,
                 )
                 if confirmed_count <= 0:
                     break
@@ -10942,13 +10985,13 @@ def run_llm_batch_profile_autosize(
             confirmation_frontier_state = {
                 key: value
                 for key, value in selected_confirmation_frontier_state().items()
-                if key != "pending_candidates"
+                if key not in {"pending_candidates", "selected_candidates", "best_challenger_candidate"}
             }
         elif effective_measure_candidate_count > 0:
             confirmation_frontier_state = {
                 key: value
                 for key, value in selected_confirmation_frontier_state().items()
-                if key != "pending_candidates"
+                if key not in {"pending_candidates", "selected_candidates", "best_challenger_candidate"}
             }
         measured_candidates = tuple(aggregated_measurement_rows)
         measured_candidate_profile_count = sum(
@@ -10973,6 +11016,12 @@ def run_llm_batch_profile_autosize(
         selection_source = "measured"
         selection_pool = measured_passed_candidates
     selected = tuple(selection_pool[: int(selected_shape_count)])
+    confirmation_best_challenger_shape_key = str(confirmation_frontier_state.get("best_challenger_shape_key", ""))
+    confirmation_decision_margin = float(confirmation_frontier_state.get("decision_margin", 0.0))
+    confirmation_decision_resolved = (
+        not confirmation_best_challenger_shape_key
+        or confirmation_decision_margin > 0.0
+    )
     failed_checks: list[str] = []
     if not selected:
         if not ranked_candidates:
@@ -10994,11 +11043,17 @@ def run_llm_batch_profile_autosize(
         and selected
         and requested_confirm_selected_candidate_count > 0
         and requested_confirm_selected_extra_seed_count > 0
-        and not confirmation_complete
     ):
-        failed_checks.append("selected_confirmation_incomplete")
+        if not confirmation_complete:
+            failed_checks.append("selected_confirmation_incomplete")
+        elif not confirmation_decision_resolved:
+            failed_checks.append("selected_confirmation_decision_unresolved")
+    matrix_blocking_checks = {
+        "selected_confirmation_incomplete",
+        "selected_confirmation_decision_unresolved",
+    }
     matrix_report: Mapping[str, Any] | None = None
-    if selected:
+    if selected and not any(item in matrix_blocking_checks for item in failed_checks):
         selected_shapes = tuple(dict(item["shape"]) for item in selected)
         matrix_report = run_llm_batch_profile_matrix(
             out_dir=output_dir / "matrix",
@@ -11105,6 +11160,9 @@ def run_llm_batch_profile_autosize(
             "confirm_selected_repeat_count": requested_confirm_selected_repeat_count,
             "confirm_selected_max_rounds": effective_confirm_selected_max_rounds,
             "confirmation_rounds_used": len(confirmation_rounds),
+            "confirmation_decision_resolution_rounds_used": sum(
+                1 for round_ in confirmation_rounds if str(round_.get("round_kind", "")) == "decision_margin_resolution"
+            ),
             "confirmed_candidate_count": sum(int(round_["candidate_count"]) for round_ in confirmation_rounds),
             "confirmation_profile_count": sum(
                 int(round_["candidate_count"]) * int(round_["extra_seed_count"]) * int(round_.get("confirmation_repeat_count", 1))
@@ -11113,12 +11171,13 @@ def run_llm_batch_profile_autosize(
             "confirmation_seed_count": len(confirmation_seeds),
             "confirmation_seeds": confirmation_seeds,
             "confirmation_complete": confirmation_complete,
+            "confirmation_decision_resolved": confirmation_decision_resolved,
             "confirmed_shape_keys": tuple(sorted(confirmed_shape_keys)) if effective_measure_candidate_count > 0 else (),
             "confirmation_selected_shape_keys": tuple(confirmation_frontier_state.get("selected_shape_keys", ())),
             "confirmation_selected_lower_confidence": float(confirmation_frontier_state.get("selected_lower_confidence", 0.0)),
-            "confirmation_best_challenger_shape_key": str(confirmation_frontier_state.get("best_challenger_shape_key", "")),
+            "confirmation_best_challenger_shape_key": confirmation_best_challenger_shape_key,
             "confirmation_best_challenger_upper_confidence": float(confirmation_frontier_state.get("best_challenger_upper_confidence", 0.0)),
-            "confirmation_decision_margin": float(confirmation_frontier_state.get("decision_margin", 0.0)),
+            "confirmation_decision_margin": confirmation_decision_margin,
             "confirmation_pending_shape_keys": tuple(confirmation_frontier_state.get("pending_shape_keys", ())),
             "confirmation_pending_reasons": tuple(confirmation_frontier_state.get("pending_reasons", ())),
             "synthesized_confirmation_seed_count": synthesized_confirmation_seed_count,
