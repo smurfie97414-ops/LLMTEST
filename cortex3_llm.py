@@ -9888,6 +9888,9 @@ def _profile_autosize_uncertainty_refinement_inputs(
     *,
     requested_count: int,
     selected_shape_count: int = 1,
+    refinement_steps: int = 1,
+    refinement_repeat_count: int = 1,
+    refinement_extra_seed_count: int = 1,
 ) -> tuple[Mapping[str, Any], ...]:
     if requested_count <= 0:
         return ()
@@ -9921,18 +9924,48 @@ def _profile_autosize_uncertainty_refinement_inputs(
     )
     if len(uncertain) < 1:
         return ()
+    actions: list[Mapping[str, Any]] = []
+    for candidate in uncertain:
+        shape_key = str(candidate.get("shape_key", ""))
+        lower_confidence = float(candidate.get("measured_score_lower_confidence", candidate.get("measured_score", 0.0)))
+        upper_confidence = float(candidate.get("measured_score_upper_confidence", candidate.get("measured_score", 0.0)))
+        mean_score = float(candidate.get("measured_score_mean", candidate.get("measured_score", 0.0)))
+        stddev_score = float(candidate.get("measured_score_stddev", 0.0))
+        uncertainty_width = max(0.0, upper_confidence - lower_confidence)
+        expected_gain = max(0.0, upper_confidence - robust_frontier_score)
+        finalist_bonus = 0.25 * max(0.0, robust_frontier_score) if shape_key in finalist_keys else 0.0
+        posterior_utility = expected_gain + (0.50 * uncertainty_width) + (0.25 * max(0.0, mean_score)) + finalist_bonus
+        measurement_cost = (
+            max(1, int(candidate.get("tokens_per_optimizer_step", 0)))
+            * max(1, int(refinement_steps))
+            * max(1, int(refinement_repeat_count))
+            * max(1, int(refinement_extra_seed_count))
+        )
+        gain_per_cost = posterior_utility / max(1.0, float(measurement_cost))
+        actions.append(
+            {
+                **candidate,
+                "refinement_budget_strategy": "expected_gain_per_cost",
+                "refinement_expected_gain": expected_gain,
+                "refinement_uncertainty_width": uncertainty_width,
+                "refinement_posterior_utility": posterior_utility,
+                "refinement_measurement_cost_tokens": int(measurement_cost),
+                "refinement_gain_per_cost": float(gain_per_cost),
+                "refinement_frontier_score": robust_frontier_score,
+                "refinement_is_selected_finalist": shape_key in finalist_keys,
+                "refinement_planned_steps": max(1, int(refinement_steps)),
+                "refinement_planned_repeat_count": max(1, int(refinement_repeat_count)),
+                "refinement_planned_extra_seed_count": max(1, int(refinement_extra_seed_count)),
+            }
+        )
     ranked = sorted(
-        uncertain,
+        actions,
         key=lambda candidate: (
-            float(candidate.get("measured_score_upper_confidence", candidate.get("measured_score", 0.0)))
-            - robust_frontier_score,
-            1 if str(candidate.get("shape_key", "")) in finalist_keys else 0,
-            float(candidate.get("measured_score_upper_confidence", candidate.get("measured_score", 0.0)))
-            - float(candidate.get("measured_score", 0.0)),
+            float(candidate.get("refinement_gain_per_cost", 0.0)),
+            float(candidate.get("refinement_posterior_utility", 0.0)),
+            float(candidate.get("refinement_expected_gain", 0.0)),
+            1 if bool(candidate.get("refinement_is_selected_finalist")) else 0,
             float(candidate.get("measured_score_upper_confidence", 0.0)),
-            float(candidate.get("measured_score_stddev", 0.0)),
-            float(candidate.get("measured_score_mean", 0.0)),
-            int(candidate.get("tokens_per_optimizer_step", 0)),
             -int(candidate.get("estimated_rank", 0)),
             str(candidate.get("shape_key", "")),
         ),
@@ -10429,6 +10462,7 @@ def run_llm_batch_profile_autosize(
     measurement_inputs: tuple[Mapping[str, Any], ...] = ()
     measurement_rounds: list[Mapping[str, Any]] = []
     refinement_rounds: list[Mapping[str, Any]] = []
+    refinement_budget_actions: list[Mapping[str, Any]] = []
     confirmation_rounds: list[Mapping[str, Any]] = []
     refinement_seeds: tuple[int, ...] = ()
     confirmation_seeds: tuple[int, ...] = ()
@@ -10659,17 +10693,20 @@ def run_llm_batch_profile_autosize(
             )[:requested_refine_uncertain_extra_seed_count]
             if not extra_seeds:
                 return
+            refinement_profile_steps = max(1, int(steps) * requested_refine_uncertain_step_multiplier)
             refinement_inputs = _profile_autosize_uncertainty_refinement_inputs(
                 aggregated_measurement_rows,
                 requested_count=requested_refine_uncertain_candidate_count,
                 selected_shape_count=selected_shape_count,
+                refinement_steps=refinement_profile_steps,
+                refinement_repeat_count=requested_refine_uncertain_repeat_count,
+                refinement_extra_seed_count=len(extra_seeds),
             )
             if not refinement_inputs:
                 return
 
             refined_rows: list[Mapping[str, Any]] = []
             refinement_details: list[Mapping[str, Any]] = []
-            refinement_profile_steps = max(1, int(steps) * requested_refine_uncertain_step_multiplier)
             for candidate in refinement_inputs:
                 shape_key = str(candidate["shape_key"])
                 row_index = next(
@@ -10719,6 +10756,13 @@ def run_llm_batch_profile_autosize(
                         "extra_seeds": extra_seeds,
                         "refinement_steps": refinement_profile_steps,
                         "refinement_repeat_count": requested_refine_uncertain_repeat_count,
+                        "refinement_budget_strategy": str(candidate.get("refinement_budget_strategy", "")),
+                        "refinement_expected_gain": float(candidate.get("refinement_expected_gain", 0.0)),
+                        "refinement_uncertainty_width": float(candidate.get("refinement_uncertainty_width", 0.0)),
+                        "refinement_posterior_utility": float(candidate.get("refinement_posterior_utility", 0.0)),
+                        "refinement_measurement_cost_tokens": int(candidate.get("refinement_measurement_cost_tokens", 0)),
+                        "refinement_gain_per_cost": float(candidate.get("refinement_gain_per_cost", 0.0)),
+                        "refinement_is_selected_finalist": bool(candidate.get("refinement_is_selected_finalist")),
                         "before": before,
                         "after": {
                             "measured_score": float(refined.get("measured_score", 0.0)),
@@ -10734,6 +10778,24 @@ def run_llm_batch_profile_autosize(
                 measurement_inputs = tuple(aggregated_measurement_rows)
                 refinement_seeds = extra_seeds
                 synthesized_refinement_seed_count = sum(1 for seed in refinement_seeds if seed not in provided_seed_set)
+                round_budget_actions = tuple(
+                    {
+                        "shape_key": str(candidate.get("shape_key", "")),
+                        "estimated_rank": int(candidate.get("estimated_rank", 0)),
+                        "strategy": str(candidate.get("refinement_budget_strategy", "")),
+                        "expected_gain": float(candidate.get("refinement_expected_gain", 0.0)),
+                        "uncertainty_width": float(candidate.get("refinement_uncertainty_width", 0.0)),
+                        "posterior_utility": float(candidate.get("refinement_posterior_utility", 0.0)),
+                        "measurement_cost_tokens": int(candidate.get("refinement_measurement_cost_tokens", 0)),
+                        "gain_per_cost": float(candidate.get("refinement_gain_per_cost", 0.0)),
+                        "is_selected_finalist": bool(candidate.get("refinement_is_selected_finalist")),
+                        "planned_steps": int(candidate.get("refinement_planned_steps", refinement_profile_steps)),
+                        "planned_repeat_count": int(candidate.get("refinement_planned_repeat_count", requested_refine_uncertain_repeat_count)),
+                        "planned_extra_seed_count": int(candidate.get("refinement_planned_extra_seed_count", len(extra_seeds))),
+                    }
+                    for candidate in refinement_inputs
+                )
+                refinement_budget_actions.extend(round_budget_actions)
                 refinement_rounds.append(
                     {
                         "round_index": int(round_index),
@@ -10745,6 +10807,8 @@ def run_llm_batch_profile_autosize(
                         "extra_seeds": extra_seeds,
                         "refinement_steps": refinement_profile_steps,
                         "refinement_repeat_count": requested_refine_uncertain_repeat_count,
+                        "refinement_budget_strategy": "expected_gain_per_cost",
+                        "refinement_budget_actions": round_budget_actions,
                         "details": tuple(refinement_details),
                     }
                 )
@@ -11412,6 +11476,9 @@ def run_llm_batch_profile_autosize(
             "refinement_seeds": refinement_seeds,
             "synthesized_refinement_seed_count": synthesized_refinement_seed_count,
             "refinement_rounds": tuple(refinement_rounds),
+            "refinement_budget_strategy": "expected_gain_per_cost",
+            "refinement_budget_action_count": len(refinement_budget_actions),
+            "refinement_budget_actions": tuple(refinement_budget_actions),
             "confirmation_enabled": (
                 effective_measure_candidate_count > 0
                 and requested_confirm_selected_candidate_count > 0
