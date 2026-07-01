@@ -195,6 +195,23 @@ def _contract_decisions_from_inference(inference_results: Sequence[Any]) -> list
     return out
 
 
+def _output_goal_rejection_rate(future_ledger: Any | None, inference_results: Sequence[Any]) -> float:
+    if future_ledger is not None:
+        decisions = list(getattr(future_ledger, "output_goal_decisions", ()) or ())
+        if decisions:
+            rejected = sum(1 for decision in decisions if not getattr(decision, "accepted", False))
+            return _safe_ratio(rejected, len(decisions))
+    output_goal_contracts: list[Mapping[str, Any]] = []
+    for contract in _contract_decisions_from_inference(inference_results):
+        output_goal = contract.get("output_goal_contract")
+        if isinstance(output_goal, Mapping):
+            output_goal_contracts.append(dict(output_goal))
+    if not output_goal_contracts:
+        return 0.0
+    rejected = sum(1 for contract in output_goal_contracts if not bool(contract.get("accepted", False)))
+    return _safe_ratio(rejected, len(output_goal_contracts))
+
+
 def _mtp_rejection_rate(future_ledger: Any | None, inference_results: Sequence[Any]) -> float:
     decisions = _contract_decisions_from_future(future_ledger)
     if decisions:
@@ -324,12 +341,13 @@ def _loss_terms(
     trial = cycle_report.trial
     reference = cycle_report.reference
     mtp_rejection = _mtp_rejection_rate(future_ledger, inference_results)
+    output_goal_rejection = _output_goal_rejection_rate(future_ledger, inference_results)
     anchor_accuracy = _anchor_accuracy(inference_results, cycle_report)
     detection_rate = _verifier_detection_rate(fault_results)
     raw: dict[str, tuple[float, str]] = {
         "L_behavior": (1.0 - trial.aggregate_score, "1 - trial aggregate verified score"),
         "L_multi_horizon": (mtp_rejection, "MTP/FSP rejection rate"),
-        "L_future_contract": (mtp_rejection, "future contracts rejected by gate"),
+        "L_future_contract": (max(mtp_rejection, output_goal_rejection), "token or output-goal future contracts rejected by gate"),
         "L_distillation_behavior": (max(0.0, reference.aggregate_score - trial.aggregate_score), "reference minus trial score"),
         "L_distillation_uncertainty": (cycle_report.calibration_gap, "cycle uncertainty calibration gap"),
         "L_latent_certificate": (_certificate_failure_rate(inference_results), "inference certificate failures"),

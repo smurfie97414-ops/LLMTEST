@@ -224,12 +224,48 @@ class ContractDecision:
     cost: CostTrace
 
 
+@dataclass(frozen=True)
+class OutputGoalContract:
+    contract_id: str
+    task_id: str
+    skill: str
+    expected_type: str
+    expected_text: str
+    required_anchor_values: tuple[str, ...]
+    obligations: tuple[str, ...]
+    risk: float
+
+
+@dataclass(frozen=True)
+class OutputGoalDecision:
+    contract: OutputGoalContract
+    answer_text: str
+    accepted: bool
+    reason: str
+    violations: tuple[str, ...]
+    cost: CostTrace
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "contract": asdict(self.contract),
+            "answer_text": self.answer_text,
+            "accepted": self.accepted,
+            "reason": self.reason,
+            "violations": list(self.violations),
+            "cost": asdict(self.cost),
+        }
+
+
 @dataclass
 class FutureContractLedger:
     decisions: list[ContractDecision] = field(default_factory=list)
+    output_goal_decisions: list[OutputGoalDecision] = field(default_factory=list)
 
     def record(self, decision: ContractDecision) -> None:
         self.decisions.append(decision)
+
+    def record_output_goal(self, decision: OutputGoalDecision) -> None:
+        self.output_goal_decisions.append(decision)
 
     @property
     def accepted(self) -> int:
@@ -248,6 +284,8 @@ class FutureContractLedger:
         cost = CostTrace()
         for decision in self.decisions:
             cost = cost.merge(decision.cost)
+        for decision in self.output_goal_decisions:
+            cost = cost.merge(decision.cost)
         return cost
 
     def to_dict(self) -> dict[str, Any]:
@@ -256,6 +294,9 @@ class FutureContractLedger:
             "rejected": self.rejected,
             "acceptance_rate": self.acceptance_rate,
             "total_cost": asdict(self.total_cost),
+            "output_goal_accepted": sum(1 for decision in self.output_goal_decisions if decision.accepted),
+            "output_goal_rejected": sum(1 for decision in self.output_goal_decisions if not decision.accepted),
+            "output_goal_decisions": [decision.to_dict() for decision in self.output_goal_decisions],
             "decisions": [
                 {
                     "contract": asdict(decision.contract),
@@ -266,6 +307,44 @@ class FutureContractLedger:
                 for decision in self.decisions
             ],
         }
+
+
+_EXACT_OUTPUT_SKILLS = {
+    "arithmetic",
+    "algebra",
+    "calibration",
+    "entity_tracking",
+    "instruction_following",
+    "long_context_anchor",
+}
+
+
+def _expected_text(task: Task) -> str:
+    return "" if task.expected is None else str(task.expected)
+
+
+def _output_goal_obligations(task: Task) -> tuple[str, ...]:
+    prompt = task.prompt.lower()
+    obligations: list[str] = []
+    if task.expected is not None:
+        obligations.append("expected_value")
+    if task.skill in _EXACT_OUTPUT_SKILLS or "exact" in prompt or "exactly" in prompt:
+        obligations.append("exact_output")
+    if "return only" in prompt or "output only" in prompt or "reponds seulement" in prompt:
+        obligations.append("no_extra_text")
+    if task.anchors:
+        obligations.append("preserve_required_anchors")
+    if task.skill == "code_unit_tests":
+        obligations.append("executable_code_contract")
+    if task.skill == "calibration":
+        obligations.append("calibrated_unknown_contract")
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in obligations:
+        if item not in seen:
+            out.append(item)
+            seen.add(item)
+    return tuple(out)
 
 
 class FutureContractEngine:
@@ -433,6 +512,75 @@ class FutureContractEngine:
                 reason,
             )
         return decision
+
+    def draft_output_goal_contract(
+        self,
+        task: Task,
+        *,
+        risk: float = 0.0,
+        contract_id: str | None = None,
+    ) -> OutputGoalContract:
+        return OutputGoalContract(
+            contract_id=contract_id or f"{task.task_id}-output-goal",
+            task_id=task.task_id,
+            skill=task.skill,
+            expected_type=type(task.expected).__name__,
+            expected_text=_expected_text(task),
+            required_anchor_values=tuple(anchor.value for anchor in task.anchors),
+            obligations=_output_goal_obligations(task),
+            risk=max(0.0, min(1.0, float(risk))),
+        )
+
+    def gate_output_goal_contract(
+        self,
+        contract: OutputGoalContract,
+        answer: CandidateAnswer,
+        *,
+        output_verified: bool | None = None,
+    ) -> OutputGoalDecision:
+        answer_text = answer.text.strip()
+        expected_text = contract.expected_text.strip()
+        violations: list[str] = []
+        if "expected_value" in contract.obligations and not expected_text:
+            violations.append("missing_expected_value")
+        if "exact_output" in contract.obligations and expected_text and answer_text != expected_text:
+            violations.append("exact_output_mismatch")
+        if "no_extra_text" in contract.obligations and expected_text and answer_text != expected_text:
+            violations.append("extra_text_or_missing_required_value")
+        missing_anchors = tuple(value for value in contract.required_anchor_values if value and value not in answer.text)
+        if missing_anchors:
+            violations.append("required_anchor_missing")
+        if output_verified is False:
+            violations.append("oracle_verification_failed")
+        accepted = not violations
+        cost = CostTrace(
+            generated_tokens=max(1, len(answer_text.split())),
+            latent_steps=1 if contract.required_anchor_values else 0,
+            verifier_steps=1,
+        )
+        reason = "output-goal contract accepted" if accepted else "; ".join(violations)
+        decision = OutputGoalDecision(
+            contract=contract,
+            answer_text=answer.text,
+            accepted=accepted,
+            reason=reason,
+            violations=tuple(violations),
+            cost=cost,
+        )
+        self.ledger.record_output_goal(decision)
+        return decision
+
+    def gate_output_goal(
+        self,
+        task: Task,
+        answer: CandidateAnswer,
+        *,
+        risk: float = 0.0,
+        contract_id: str | None = None,
+        output_verified: bool | None = None,
+    ) -> OutputGoalDecision:
+        contract = self.draft_output_goal_contract(task, risk=risk, contract_id=contract_id)
+        return self.gate_output_goal_contract(contract, answer, output_verified=output_verified)
 
 
 def verified_answers_per_effective_cost(verified_answers: float, total_cost: CostTrace) -> float:

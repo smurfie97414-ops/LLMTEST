@@ -4,18 +4,18 @@ Etat: boucle d'audit 50 apres recentrage hors profiling/observabilite. La critiq
 
 Ce document sert de registre de critique et de correction. Il ne remplace pas les tests longs interdits pour cette iteration; il se limite aux preuves courtes disponibles, aux rapports du code et aux tests courts.
 
-Mise a jour C56: Frontier Skill Discovery ne s'arrete plus au rapport de micro-circuit compile. Les circuits DSV-passing peuvent maintenant etre enregistres dans `FrontierCircuitRegistry`, selectionnes par skill/invariants via `CompiledFrontierAgent`, verifies a l'appel, sauvegardes sur disque et recharges avec leurs checkpoints `BitLinear`.
+Mise a jour C57: P3 ne se limite plus aux contrats de blocs de tokens. Les contrats output-goal verifient maintenant la sortie complete, les obligations exact/no-extra-text et les ancres requises; ils sont branches dans P8, Frontier, P5, P7, P10, l'objectif final et les audits LLM.
 
 ## Audit transversal haut enjeu apres C55
 
 - P1 Dynamic Skill Verifier: la base DSV couvre bien les familles rares, metamorphiques et anti-metamorphiques. Le risque structurant restant n'est pas de mieux compter les tests, mais d'utiliser les competences detectees comme entrees directes de compilation et non comme simples regressions de rapport.
 - P2 Ternary Core: le backend ternaire natif est deja fortement travaille. Le risque haut enjeu restant est son emploi comme substrat de circuits compiles reutilisables, pas de nouvelles metriques de profiling.
-- P3 MTP/FSP: les contrats token-horizon sont branches dans le training. Le manque structurant est l'extension des contrats vers objectifs de sortie/skill, afin de proteger les circuits compiles au-dela du prochain token.
+- P3 MTP/FSP: les contrats token-horizon sont branches dans le training, et les nouveaux contrats output-goal protegent maintenant les objectifs de sortie/skill au-dela du prochain token.
 - P4 Cognitive Memory: la memoire apprise existe dans le Transformer LLM et la memoire autonome conserve les ancres. Le manque majeur reste d'attacher la retention memoire aux competences compilees et aux circuits persistants, pas seulement aux batches observes.
-- P5 Certificates: les certificats prouvent des sorties et des traces latentes. Ils certifient maintenant aussi l'origine compilee d'une competence reutilisee via un contrat `compiled_circuit` a checksum, afin qu'un FastSolve ne soit pas une boite noire.
+- P5 Certificates: les certificats prouvent des sorties et des traces latentes. Ils certifient maintenant aussi l'origine compilee d'une competence reutilisee via un contrat `compiled_circuit` a checksum, incluant le passage du contrat output-goal, afin qu'un FastSolve ne soit pas une boite noire.
 - P6 Attribution: les ablations savent localiser des causes. Le point fort enjeu est de transformer ces causes en selection de circuit compile ou regrowth cible, pas seulement en estimation.
 - P7 Minimal Regrowth: le LLM sait appliquer un patch borne aux vrais parametres. Le pont ajoute ici teste maintenant une competence compilee comme candidat de reparation verifie avant d'acheter du regrowth parametrique, puis conserve le regrowth existant sous gate stricte.
-- P8 Fast/Normal/Careful Inference: les routes existent, mais le chemin FastSolve manquait d'un backend de competence compilee issu du frontier slow-solve. C'est la rupture principale corrigee ici: le moteur d'inference accepte maintenant un registre frontier et utilise le circuit compile pour les taches couvertes.
+- P8 Fast/Normal/Careful Inference: les routes existent, le chemin FastSolve consomme maintenant un registre frontier, et chaque reponse inferee porte aussi un contrat output-goal qui peut faire echouer le gate si la sortie finale ne respecte pas l'objectif.
 - P9 Sleep Anti-Collapse: le replay et les exemples verifies alimentent le training. Le manque suivant sera de promouvoir certains exemples sleep/frontier en circuits persistants, pas seulement en batchs de replay.
 - P10 Recursive Improvement: les propositions peuvent appliquer des patchs signes. Le controleur LLM ne reste plus bloque sur une proposition unique apres reprise: il explore un budget borne de propositions tout en conservant les gates Pareto/protection/calibration/diversite/reward-hacking. Les reparations Frontier acceptees par P7 sont maintenant promues en propositions `compiled_frontier` prioritaires avant le patch modele P10.
 
@@ -27,6 +27,16 @@ Mise a jour C56: Frontier Skill Discovery ne s'arrete plus au rapport de micro-c
 - Gate de qualite: pour une tache couverte par un circuit, `CompiledFrontierAgent` utilise le circuit compile par defaut. Il ne masque pas un echec de circuit par un fallback quand un circuit a ete selectionne; la verification DSV optionnelle est attachee a la reponse via certificat/raw.
 - Verification courte: `python -m py_compile cortex3_llm.py cortex3_frontier.py cortex3_inference.py tests\test_llm_pretraining.py tests\test_frontier_discovery.py`, `python -m unittest tests.test_certificates`, `python -m unittest tests.test_frontier_discovery`, `python -m unittest tests.test_inference`, `python -m unittest tests.test_recursive_improvement.RecursiveImprovementTest.test_engine_prioritizes_accepted_frontier_repair_proposals`, `python -m unittest tests.test_llm_pretraining.LLMPretrainingHarnessTest.test_full_cortex_phase_controller_uses_all_modules_during_training` et `python -m unittest tests.test_llm_pretraining.LLMPretrainingHarnessTest.test_cortex_phase_state_survives_checkpoint_resume` passent. Les tests prouvent que le circuit compile est selectionne, repond, porte `frontier_compiled_circuit`, passe l'oracle, reste utilisable apres sauvegarde/rechargement, est consomme par `UltraFastInferenceEngine` en chemin `FAST`, puis apparait dans le `cortex_phase_report` LLM avec `frontier_compiled_fastsolve_events > 0`. Ils verifient aussi que P5 accepte un contrat compile valide et rejette un contrat falsifie, que P7 produit au moins un `frontier_repair_candidate` accepte avec `frontier_compiled_contract_verified`, `frontier_compiled_verified`, `repair_passed`, non-regressant et `repair_score_delta > 0`, puis que P10 applique un patch modele dont `proposal_kind` vaut `compiled_frontier` et dont le payload provient de cette reparation.
 - Statut: corrige pour le premier pont executable SlowSolve -> Compile -> Certificate -> FastSolve -> Repair -> Recursive Improvement dans Frontier, P5, P7, P8, P10 et le controleur LLM. Prochaine cible haut enjeu: tester la generalisation frontier held-out puis enrichir les certificats multi-step algebra/code.
+
+### C57. Les contrats FSP etaient encore token-level, pas output-goal
+
+- Critique: P3 pouvait prouver qu'un bloc de tokens speculate respectait une prediction multi-horizon, mais ne prouvait pas encore que la sortie finale d'une competence compilee respectait le contrat de tache complet. Un FastSolve Frontier pouvait donc porter un certificat compile et passer l'oracle local sans que le contrat FSP encode explicitement les obligations "sortie exacte", "pas de texte extra" et "ancres requises".
+- Correction: ajout de `OutputGoalContract` et `OutputGoalDecision` dans `cortex3_future.py`. Le gate derive les obligations depuis la tache, verifie sortie attendue, exact/no-extra-text, ancres requises et statut oracle, puis persiste ces decisions dans `FutureContractLedger`. `CortexTrainingPhaseController` cree maintenant un contrat output-goal strict pour le resultat symbolique P3 `ACCEPT/REJECT`, l'ajoute aux replay metadata et echoue la phase si ce gate rejette.
+- Correction d'integration: `UltraFastInferenceEngine` ajoute un output-goal contract a chaque resultat d'inference, l'inclut dans `future_contract`, le place dans le certificat de reponse et refuse `InferenceResult.passed` si le gate echoue. `CompiledFrontierAgent` gate chaque reponse de circuit compile avec le meme contrat, puis injecte le pass/violations dans le certificat P5 `compiled_circuit`.
+- Correction P7/P10: `_evaluate_frontier_repair_candidate` exige maintenant `frontier_output_goal_contract_passed` et `frontier_compiled_contract_verified` avant d'accepter une reparation Frontier. `ProposalGenerator.from_frontier_repairs` transporte ensuite le contrat output-goal dans le payload `compiled_frontier` signe par P10.
+- Correction objectif/audit: `L_future_contract` prend maintenant le maximum entre rejet MTP token-level et rejet output-goal. L'audit d'architecture ajoute le composant `future_output_goal_contracts`, et l'audit de livrables P3 exige des checks output-goal en plus des checks de tokens observes.
+- Verification courte: `py_compile`, `tests.test_future_contracts`, `tests.test_inference`, `tests.test_frontier_discovery`, `tests.test_recursive_improvement.RecursiveImprovementTest.test_engine_prioritizes_accepted_frontier_repair_proposals`, `tests.test_llm_pretraining.LLMPretrainingHarnessTest.test_full_cortex_phase_controller_uses_all_modules_during_training`, `tests.test_llm_pretraining.LLMPretrainingHarnessTest.test_cortex_phase_state_survives_checkpoint_resume` et `tests.test_objective_metrics` passent.
+- Statut: corrige pour le pont P3 output-goal -> P8 inference -> Frontier FastSolve -> P5 certificate -> P7 repair -> P10 compiled_frontier -> objectif final/audit. Prochaine cible haut enjeu: generalisation Frontier held-out et certificats multi-step algebra/code, sans revenir a de simples ajouts d'observabilite.
 
 ## Boucle 1 - Corrections executees maintenant
 
@@ -642,9 +652,9 @@ Mise a jour C56: Frontier Skill Discovery ne s'arrete plus au rapport de micro-c
 
 ### Future Contract / FSP
 
-- Statut: contrats token horizon.
-- Faiblesse: contrats de but final limites.
-- Correction restante: output-goal contracts.
+- Statut: contrats token horizon + contrats output-goal pour sortie exacte, no-extra-text et ancres requises.
+- Faiblesse: generalisation held-out et calibration cout/qualite des contrats output-goal encore a prouver sur suites larges.
+- Correction restante: benchmarker MTP/output-goal sur suites held-out et checkpoints LLM plus grands.
 
 ### Adaptive Multi-Token Decoding
 
@@ -678,9 +688,8 @@ Mise a jour C56: Frontier Skill Discovery ne s'arrete plus au rapport de micro-c
 4. P6/P7: afficher partout `repair_loss_before`, `repair_loss_after`, `protected_loss_before`, `protected_loss_after`, delta et convention.
 5. P8: aligner `TernaryKernelDispatcher` inference avec les variants `BitLinear` natifs.
 6. P1: ajouter un audit de couverture oracle/generateur par famille.
-7. P3: ajouter contrats output-goal non token seulement.
-8. P5: ajouter certificats algebra multi-step.
-9. P9: audit diversity drift replay/sleep court.
-10. P10: renforcer reward-hacking probes.
-11. Training: produire un nouveau sidecar sous le commit courant quand les tests longs seront autorises.
-12. Proof: relancer une comparaison 48+ ou large corpus afin que `baseline_score_passed=true` et que la victoire Cortex ne depende pas d'une baseline nulle.
+7. P5: ajouter certificats algebra multi-step.
+8. P9: audit diversity drift replay/sleep court.
+9. P10: renforcer reward-hacking probes.
+10. Training: produire un nouveau sidecar sous le commit courant quand les tests longs seront autorises.
+11. Proof: relancer une comparaison 48+ ou large corpus afin que `baseline_score_passed=true` et que la victoire Cortex ne depende pas d'une baseline nulle.

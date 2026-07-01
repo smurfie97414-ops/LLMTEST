@@ -11,6 +11,7 @@ import torch
 from cortex3 import Anchor, CandidateAnswer, CompressionAdversary, CostTrace, DynamicSkillVerifier, ReferenceRuleAgent, Task
 from cortex3_certificates import CertificateVerifier, LatentProofState, build_compiled_circuit_certificate
 from cortex3_cycle import CycleReport
+from cortex3_future import FutureContractEngine, MTPFSPConfig, OutputGoalDecision
 from cortex3_microtrain import CheckpointManager, CortexMicroModel, CortexMicroTrainer, MicroModelAgent, examples_from_tasks
 
 
@@ -297,6 +298,7 @@ class CompiledFrontierAgent:
         self.verifier = verifier
         self.verify_outputs = verify_outputs
         self.certificate_verifier = CertificateVerifier()
+        self.output_goal_engine = FutureContractEngine(MTPFSPConfig(hidden_size=8, vocab_size=8))
 
     def _compiled_contract_certificate(
         self,
@@ -305,6 +307,7 @@ class CompiledFrontierAgent:
         answer: CandidateAnswer,
         *,
         output_verified: bool,
+        output_goal: OutputGoalDecision,
     ) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
         report_payload = circuit.report.to_dict()
         circuit_id = hashlib.blake2b(json_dumps(report_payload).encode("utf-8"), digest_size=16).hexdigest()
@@ -329,6 +332,10 @@ class CompiledFrontierAgent:
             "dsv_verified": int(circuit.report.dsv.get("passed", 0)),
             "dsv_total": int(circuit.report.dsv.get("total", 0)),
             "output_verified": bool(output_verified),
+            "output_goal_contract_id": output_goal.contract.contract_id,
+            "output_goal_contract_passed": bool(output_goal.accepted),
+            "output_goal_obligations": tuple(output_goal.contract.obligations),
+            "output_goal_violations": tuple(output_goal.violations),
         }
         latent_state = LatentProofState(
             state_id=f"compiled-frontier-{circuit_id}-{task.task_id}",
@@ -401,11 +408,25 @@ class CompiledFrontierAgent:
             certificate["frontier_verification_passed"] = verification.passed
             confidence = min(confidence, verification.score)
             output_verified = verification.passed
+        output_goal = self.output_goal_engine.gate_output_goal(
+            task,
+            answer,
+            risk=0.05,
+            contract_id=f"frontier-output-goal-{task.task_id}",
+            output_verified=output_verified,
+        )
+        cost = cost.merge(output_goal.cost)
+        certificate["frontier_output_goal_contract"] = output_goal.to_dict()
+        certificate["frontier_output_goal_contract_passed"] = output_goal.accepted
+        raw["frontier_output_goal_contract"] = output_goal.to_dict()
+        if not output_goal.accepted:
+            confidence = 0.0
         contract_certificate, contract_verification = self._compiled_contract_certificate(
             circuit,
             task,
             answer,
-            output_verified=output_verified,
+            output_verified=output_verified and output_goal.accepted,
+            output_goal=output_goal,
         )
         certificate["frontier_compiled_contract"] = contract_certificate
         certificate["frontier_compiled_contract_checksum"] = contract_certificate["checksum"]

@@ -2,8 +2,9 @@ import json
 import tempfile
 import unittest
 
-from cortex3 import CorruptedCompressedAgent, DynamicSkillVerifier, ReferenceRuleAgent, RegressionHarness, default_skill_specs
+from cortex3 import CandidateAnswer, CorruptedCompressedAgent, DynamicSkillVerifier, ReferenceRuleAgent, RegressionHarness, Task, default_skill_specs
 from cortex3_cycle import CortexCycle
+from cortex3_future import FutureContractEngine, MTPFSPConfig
 from cortex3_improvement import RecursiveImprovementEngine
 from cortex3_inference import UltraFastInferenceEngine
 from cortex3_objective import ABSOLUTE_METRICS, FINAL_LOSS_TERMS, ObjectiveWeights, build_objective_report
@@ -68,6 +69,22 @@ class ObjectiveMetricsTest(unittest.TestCase):
         self.assertGreaterEqual(objective.metrics.metrics["tasks_without_heavy_verification_percent"], 0.0)
         self.assertLessEqual(objective.loss.terms["L_latent_certificate"].raw, 1.0)
         self.assertLessEqual(objective.loss.terms["L_hardware_layout"].raw, 1.0)
+
+    def test_output_goal_rejection_feeds_future_contract_loss(self):
+        _, cycle, faults, improvement = _cycle_bundle()
+        engine = FutureContractEngine(MTPFSPConfig(hidden_size=4, vocab_size=8))
+        task = Task("objective-output-goal", "instruction_following", "Output OK exactly.", "OK")
+        engine.gate_output_goal(task, CandidateAnswer("NO", confidence=0.99), output_verified=False)
+
+        objective = build_objective_report(
+            cycle,
+            future_ledger=engine.ledger,
+            fault_results=faults,
+            improvement_report=improvement,
+        )
+
+        self.assertEqual(objective.loss.terms["L_future_contract"].raw, 1.0)
+        self.assertIn("output-goal", objective.loss.terms["L_future_contract"].evidence)
 
     def test_recursive_invalidity_counts_calibration_and_collapse(self):
         _, cycle, faults, _ = _cycle_bundle()

@@ -45,7 +45,15 @@ from cortex3_attribution import CausalAttributionEngine
 from cortex3_certificates import CertificateHead, CertificateHeadOutput, CertificateType, CertificateVerifier, LatentProofState, RandomDelatentizer, build_certificate, evaluate_certificate_efficiency
 from cortex3_cycle import CortexCycle
 from cortex3_frontier import CompiledFrontierAgent, FrontierCircuitRegistry, FrontierSkillDiscovery
-from cortex3_future import ContractDecision, FutureContract, FutureContractEngine, FutureContractLedger, MTPFSPConfig
+from cortex3_future import (
+    ContractDecision,
+    FutureContract,
+    FutureContractEngine,
+    FutureContractLedger,
+    MTPFSPConfig,
+    OutputGoalContract,
+    OutputGoalDecision,
+)
 from cortex3_improvement import AcceptanceDecision, ProposalKind, RecursiveImprovementEngine, RollbackEvent
 from cortex3_inference import InferenceConfig, InferencePath, UltraFastInferenceEngine
 from cortex3_ledgers import BitLedger, CausalLedger, CausalTrace, SkillLedger, SkillState, UncertaintyLedger
@@ -126,6 +134,7 @@ def _cost_trace_from_payload(payload: Mapping[str, Any] | None) -> CostTrace:
 
 def _restore_future_contract_ledger(ledger: FutureContractLedger, payload: Mapping[str, Any] | None) -> None:
     ledger.decisions.clear()
+    ledger.output_goal_decisions.clear()
     if not payload:
         return
     for raw_decision in payload.get("decisions", ()):
@@ -150,6 +159,30 @@ def _restore_future_contract_ledger(ledger: FutureContractLedger, payload: Mappi
                 contract=contract,
                 accepted=bool(decision_data.get("accepted", contract.accepted)),
                 reason=str(decision_data.get("reason", contract.reason)),
+                cost=_cost_trace_from_payload(cost_data),
+            )
+        )
+    for raw_decision in payload.get("output_goal_decisions", ()):
+        decision_data = dict(raw_decision)
+        contract_data = dict(decision_data.get("contract") or {})
+        cost_data = dict(decision_data.get("cost") or {})
+        contract = OutputGoalContract(
+            contract_id=str(contract_data.get("contract_id", "")),
+            task_id=str(contract_data.get("task_id", "")),
+            skill=str(contract_data.get("skill", "")),
+            expected_type=str(contract_data.get("expected_type", "")),
+            expected_text=str(contract_data.get("expected_text", "")),
+            required_anchor_values=tuple(str(value) for value in contract_data.get("required_anchor_values", ())),
+            obligations=tuple(str(value) for value in contract_data.get("obligations", ())),
+            risk=float(contract_data.get("risk", 0.0)),
+        )
+        ledger.output_goal_decisions.append(
+            OutputGoalDecision(
+                contract=contract,
+                answer_text=str(decision_data.get("answer_text", "")),
+                accepted=bool(decision_data.get("accepted", False)),
+                reason=str(decision_data.get("reason", "")),
+                violations=tuple(str(value) for value in decision_data.get("violations", ())),
                 cost=_cost_trace_from_payload(cost_data),
             )
         )
@@ -3253,6 +3286,19 @@ def _cortex_architecture_audit_from_summary(summary: Mapping[str, Any]) -> dict[
         "Future Contract/FSP must gate real multi-horizon token predictions",
     )
     add(
+        "future_output_goal_contracts",
+        phase_count("P3") > 0
+        and integer("output_goal_contract_decisions") > 0
+        and integer("output_goal_contract_accepted") > 0,
+        {
+            "P3": phase_count("P3"),
+            "output_goal_contract_decisions": integer("output_goal_contract_decisions"),
+            "output_goal_contract_accepted": integer("output_goal_contract_accepted"),
+            "output_goal_contract_rejected": integer("output_goal_contract_rejected"),
+        },
+        "Future Contract/FSP must bind complete output/skill goals beyond token ids",
+    )
+    add(
         "adaptive_multi_token_decoding",
         phase_count("P8") > 0 and integer("future_contract_decisions") > 0 and trace_count("mtp_fsp_events") > 0,
         {
@@ -3540,9 +3586,21 @@ def _cortex_phase_deliverable_audit_from_summary(summary: Mapping[str, Any]) -> 
     add(
         "P3",
         "mtp_fsp_confidence_temporal_contract_gate",
-        int(summary.get("future_contract_decisions", 0) or 0) > 0 and trace("mtp_fsp_events") > 0 and count("future_contract_observed_token_checks") > 0,
-        {"future_contract_decisions": int(summary.get("future_contract_decisions", 0) or 0), "mtp_fsp_events": trace("mtp_fsp_events"), "observed_token_checks": count("future_contract_observed_token_checks")},
-        "MTP/FSP must gate observed future tokens, not only instantiate heads",
+        int(summary.get("future_contract_decisions", 0) or 0) > 0
+        and int(summary.get("output_goal_contract_decisions", 0) or 0) > 0
+        and int(summary.get("output_goal_contract_accepted", 0) or 0) > 0
+        and trace("mtp_fsp_events") > 0
+        and count("future_contract_observed_token_checks") > 0
+        and count("future_output_goal_contract_checks") > 0,
+        {
+            "future_contract_decisions": int(summary.get("future_contract_decisions", 0) or 0),
+            "output_goal_contract_decisions": int(summary.get("output_goal_contract_decisions", 0) or 0),
+            "output_goal_contract_accepted": int(summary.get("output_goal_contract_accepted", 0) or 0),
+            "mtp_fsp_events": trace("mtp_fsp_events"),
+            "observed_token_checks": count("future_contract_observed_token_checks"),
+            "output_goal_checks": count("future_output_goal_contract_checks"),
+        },
+        "MTP/FSP must gate observed future tokens and a complete output-goal contract, not only instantiate heads",
     )
     add(
         "P4",
@@ -4070,14 +4128,31 @@ class CortexTrainingPhaseController:
                 f"Output the future contract gate result exactly: {decision_label}",
                 decision_label,
             )
+            decision_answer = self._answer_from_task_expected(decision_task)
+            output_goal = self.future_engine.gate_output_goal(
+                decision_task,
+                decision_answer,
+                risk=decision.contract.risk,
+                contract_id=f"{decision.contract.contract_id}-output-goal",
+                output_verified=True,
+            )
+            self._count("future_output_goal_contract_checks")
+            self.bit_ledger.ingest_cost(output_goal.cost, note=f"P3:output-goal:{output_goal.contract.contract_id}")
+            self.uncertainty_ledger.record("llm_pretraining_output_goal_contract", decision_answer.confidence, output_goal.accepted)
+            if not output_goal.accepted:
+                raise ValueError(f"P3 output-goal contract rejected: {output_goal.reason}")
             self._add_verified_phase_replay(
                 "P3",
                 decision_task,
+                answer=decision_answer,
                 metadata={
                     "contract_id": decision.contract.contract_id,
                     "accepted_horizon": decision.contract.accepted_horizon,
                     "observed_token_count": len(observed),
                     "reason": decision.reason,
+                    "output_goal_contract_id": output_goal.contract.contract_id,
+                    "output_goal_accepted": output_goal.accepted,
+                    "output_goal_violations": output_goal.violations,
                 },
             )
             self.batch_contract_samples.append(
@@ -4088,6 +4163,9 @@ class CortexTrainingPhaseController:
                     "confidence": decision.contract.confidence,
                     "observed_token_count": len(observed),
                     "reason": decision.reason,
+                    "output_goal_contract_id": output_goal.contract.contract_id,
+                    "output_goal_accepted": output_goal.accepted,
+                    "output_goal_violations": output_goal.violations,
                 }
             )
         except Exception as exc:
@@ -4326,7 +4404,15 @@ class CortexTrainingPhaseController:
             tuple(protected_tasks),
         )
         total_cost = answer.cost.merge(repaired.verifier_cost)
-        accepted = bool(repaired.passed and repaired.score > failure.score and non_regression.passed)
+        output_goal_passed = bool(answer.certificate.get("frontier_output_goal_contract_passed"))
+        compiled_contract_verified = bool(answer.certificate.get("frontier_compiled_contract_verified"))
+        accepted = bool(
+            repaired.passed
+            and repaired.score > failure.score
+            and non_regression.passed
+            and output_goal_passed
+            and compiled_contract_verified
+        )
         report = {
             "task_id": failure.task.task_id,
             "skill": failure.task.skill,
@@ -4344,7 +4430,9 @@ class CortexTrainingPhaseController:
             "accepted": accepted,
             "frontier_compiled_selected": bool(answer.raw.get("frontier_compiled_selected")),
             "frontier_compiled_verified": bool(answer.raw.get("frontier_compiled_verified")),
-            "frontier_compiled_contract_verified": bool(answer.certificate.get("frontier_compiled_contract_verified")),
+            "frontier_output_goal_contract_passed": output_goal_passed,
+            "frontier_output_goal_contract": dict(answer.certificate.get("frontier_output_goal_contract") or {}),
+            "frontier_compiled_contract_verified": compiled_contract_verified,
             "frontier_compiled_contract_checksum": str(answer.certificate.get("frontier_compiled_contract_checksum", "")),
             "certificate_fields": tuple(sorted(str(key) for key in answer.certificate)),
             "cost": asdict(total_cost),
@@ -4641,6 +4729,18 @@ class CortexTrainingPhaseController:
         )
         return accepted_report
 
+    def _output_goal_contract_summary(self) -> dict[str, Any]:
+        decisions = (
+            tuple(self.future_ledger.output_goal_decisions)
+            + tuple(self.inference.speculative.engine.ledger.output_goal_decisions)
+        )
+        return {
+            "output_goal_contract_decisions": len(decisions),
+            "output_goal_contract_accepted": sum(1 for decision in decisions if decision.accepted),
+            "output_goal_contract_rejected": sum(1 for decision in decisions if not decision.accepted),
+            "output_goal_contract_latest": [decision.to_dict() for decision in decisions[-5:]],
+        }
+
     def state_dict(self) -> dict[str, Any]:
         return {
             "schema_version": 1,
@@ -4884,6 +4984,7 @@ class CortexTrainingPhaseController:
         phase_counts = dict(self.phase_counts)
         if compression_trace_counts.get("layer_forward_events", 0) > 0:
             phase_counts["P2"] = max(phase_counts.get("P2", 0), compression_trace_counts["layer_forward_events"])
+        output_goal_summary = self._output_goal_contract_summary()
         summary = {
             "schema_version": 1,
             "phase_event_counts": phase_counts,
@@ -4907,6 +5008,7 @@ class CortexTrainingPhaseController:
             "objective_feedback_term_totals": dict(self.objective_feedback_term_totals),
             "objective_feedback_history": _last_items(self.objective_feedback_history, 5),
             "future_contract_decisions": len(self.future_ledger.decisions),
+            **output_goal_summary,
             "compression_trace_counts": compression_trace_counts,
             "native_ternary_backend_requested": str(self.model.config.native_ternary_backend),
             "native_ternary_backend_counts": native_backend_counts,
@@ -5500,12 +5602,14 @@ class CortexTrainingPhaseController:
                 "active_in_llm_training": count > 0,
                 "event_count": count,
             })
+        output_goal_summary = self._output_goal_contract_summary()
         return {
             "schema_version": 1,
             "enabled": True,
             "all_phases_active": all(item["active_in_llm_training"] for item in phases),
             "phases": phases,
             "phase_event_counts": dict(self.phase_counts),
+            **output_goal_summary,
             "native_ternary_backend_requested": str(self.model.config.native_ternary_backend),
             "native_ternary_backend_counts": native_backend_counts,
             "native_ternary_requantize_backend_counts": native_requantize_backend_counts,
@@ -5554,6 +5658,7 @@ class CortexTrainingPhaseController:
                     / max(1, int(self.learned_memory_policy_events))
                 ),
                 "future_contract_decisions": len(self.future_ledger.decisions),
+                **output_goal_summary,
                 "bit_ledger_total_effective_bits": self.bit_ledger.total_effective_bits,
                 "skill_ledger_states": len(self.skill_ledger.states),
                 "causal_ledger_traces": len(self.causal_ledger.traces),
@@ -5618,6 +5723,7 @@ class CortexTrainingPhaseController:
                     "objective_feedback_term_names": tuple(self.last_objective_loss_terms),
                     "objective_feedback_term_count": len(self.last_objective_loss_terms),
                     "future_contract_decisions": len(self.future_ledger.decisions),
+                    **output_goal_summary,
                     "compression_trace_counts": trace_counts,
                     "native_ternary_backend_requested": str(self.model.config.native_ternary_backend),
                     "native_ternary_backend_counts": native_backend_counts,
@@ -5688,6 +5794,7 @@ class CortexTrainingPhaseController:
                     "objective_feedback_term_names": tuple(self.last_objective_loss_terms),
                     "objective_feedback_term_count": len(self.last_objective_loss_terms),
                     "future_contract_decisions": len(self.future_ledger.decisions),
+                    **output_goal_summary,
                     "compression_trace_counts": trace_counts,
                     "native_ternary_backend_requested": str(self.model.config.native_ternary_backend),
                     "native_ternary_backend_counts": native_backend_counts,

@@ -35,9 +35,10 @@ Preuve post-integration des deux nouvelles briques :
 - `test_native_ternary_cuda_kernel_matches_packed_runtime_for_training_dtypes` : le kernel natif correspond au runtime packe en fp32, fp16 et bf16 ;
 - `test_native_ternary_cuda_fast_ste_backward_matches_dense_ste` : le backward fast STE CUDA correspond au dense STE en fp32, fp16 et bf16, avec `grad_input` calcule depuis les poids int2 packes et `grad_weight` + `grad_bias` calcules par extension ;
 - `test_native_ternary_cuda_requantize_pack_matches_torch_sync` : la requantization/packing CUDA fusionnee reproduit signs, mask, scales, residuals, packed codes et compte d'actifs du chemin PyTorch en fp32, fp16 et bf16 ;
-- `test_full_cortex_phase_controller_uses_all_modules_during_training` : mini training LLM complet avec audits exigeant `learned_cognitive_memory_policy`, `packed_ternary_hardware_runtime` et `native_ternary_cuda_kernel` quand CUDA est disponible.
+- `test_full_cortex_phase_controller_uses_all_modules_during_training` : mini training LLM complet avec audits exigeant `learned_cognitive_memory_policy`, `packed_ternary_hardware_runtime`, `native_ternary_cuda_kernel` quand CUDA est disponible et le nouveau composant `future_output_goal_contracts`.
+- `test_cortex_phase_state_survives_checkpoint_resume` : reprise checkpoint avec restauration des decisions output-goal dans la ledger P3 et maintien des audits architecture/livrables.
 
-Le long run devra produire un nouveau sidecar sous le commit de cette integration pour remplacer l'ancien audit `22/22` par l'audit courant plus strict incluant `native_ternary_cuda_kernel`.
+Le long run devra produire un nouveau sidecar sous le commit de cette integration pour remplacer l'ancien audit `22/22` par l'audit courant plus strict incluant `native_ternary_cuda_kernel` et `future_output_goal_contracts`.
 
 Evenements phase observes dans le checkpoint :
 
@@ -96,7 +97,7 @@ Le pipeline d'entrainement Cortex-3 part d'un vrai flux LLM :
    - traces du coeur ternaire et dispatchs packed int2,
    - activations MoE skill-aware.
 6. Le loss principal entraine le modele comme un LLM causal classique.
-7. Le loss Cortex ajoute multi-horizon, temporal consistency, confidence, variable input, learned memory policy et certificate.
+7. Le loss Cortex ajoute multi-horizon, temporal consistency, confidence, variable input, learned memory policy, certificate et pression `L_future_contract` issue aussi des contrats output-goal.
 8. Le controleur P1-P10 observe les batchs, lance les phases, produit replay, ledgers, audits, patchs P7/P10 et objectif final.
 9. Les checkpoints persistent modele, optimizer, scaler, RNG, replay, ledgers, phase state et sidecars d'audit.
 

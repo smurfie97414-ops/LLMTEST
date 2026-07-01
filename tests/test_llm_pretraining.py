@@ -3225,6 +3225,7 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 "causal_ledger",
                 "uncertainty_ledger",
                 "future_contract_fsp",
+                "future_output_goal_contracts",
                 "adaptive_multi_token_decoding",
                 "latent_reasoning_workspace",
                 "certificate_generator",
@@ -3274,6 +3275,8 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             self.assertGreater(influence["input_anchor_count"], 0)
             self.assertEqual(influence["input_anchor_fidelity_failures"], 0)
             self.assertGreater(influence["future_contract_decisions"], 0)
+            self.assertGreater(influence["output_goal_contract_decisions"], 0)
+            self.assertGreater(influence["output_goal_contract_accepted"], 0)
             self.assertGreater(influence["bit_ledger_total_effective_bits"], 0.0)
             self.assertGreater(influence["skill_ledger_states"], 0)
             self.assertGreater(influence["causal_ledger_traces"], 0)
@@ -3312,6 +3315,8 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             self.assertTrue(latest_frontier_repair["accepted"], latest_frontier_repair)
             self.assertTrue(latest_frontier_repair["frontier_compiled_selected"], latest_frontier_repair)
             self.assertTrue(latest_frontier_repair["frontier_compiled_verified"], latest_frontier_repair)
+            self.assertTrue(latest_frontier_repair["frontier_output_goal_contract_passed"], latest_frontier_repair)
+            self.assertTrue(latest_frontier_repair["frontier_output_goal_contract"]["accepted"], latest_frontier_repair)
             self.assertTrue(latest_frontier_repair["frontier_compiled_contract_verified"], latest_frontier_repair)
             self.assertTrue(latest_frontier_repair["frontier_compiled_contract_checksum"], latest_frontier_repair)
             self.assertTrue(latest_frontier_repair["repair_passed"], latest_frontier_repair)
@@ -3340,6 +3345,7 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             self.assertEqual(latest_recursive["proposal_kind"], "compiled_frontier", latest_recursive)
             self.assertEqual(latest_recursive["proposal_patch_payload"]["action"], "compile_frontier_repair", latest_recursive)
             self.assertTrue(latest_recursive["proposal_patch_payload"]["frontier_compiled_verified"], latest_recursive)
+            self.assertTrue(latest_recursive["proposal_patch_payload"]["frontier_output_goal_contract_passed"], latest_recursive)
             self.assertTrue(latest_recursive["signed_patch_id"], latest_recursive)
             self.assertTrue(latest_recursive["rollback_token"], latest_recursive)
             self.assertGreater(latest_recursive["parameter_delta_l1"], 0.0)
@@ -3470,6 +3476,8 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 self.assertGreater(first_influence["phase_replay_examples"], 0)
                 self.assertGreater(first_influence["objective_feedback_events"], 0)
                 self.assertGreater(first_influence["future_contract_decisions"], 0)
+                self.assertGreater(first_influence["output_goal_contract_decisions"], 0)
+                self.assertGreater(first_influence["output_goal_contract_accepted"], 0)
                 self.assertGreater(first_influence["ternary_core_forward_events"], 0)
                 checkpoint = torch.load(run_dir / "checkpoint_final.pt", map_location="cpu", weights_only=False)
                 self.assertIn("cortex_phase_state", checkpoint)
@@ -3496,6 +3504,7 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                     0,
                 )
                 self.assertGreater(len(checkpoint["cortex_phase_state"]["future_ledger"]["decisions"]), 0)
+                self.assertGreater(len(checkpoint["cortex_phase_state"]["future_ledger"]["output_goal_decisions"]), 0)
                 self.assertGreater(
                     len(checkpoint["cortex_phase_state"]["compression_trace_ledger"]["layer_forward_events"]),
                     0,
@@ -3557,6 +3566,8 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                     sidecar["cortex_phase_state_summary"]["last_objective_loss_total"],
                 )
                 self.assertGreater(sidecar["cortex_phase_state_summary"]["future_contract_decisions"], 0)
+                self.assertGreater(sidecar["cortex_phase_state_summary"]["output_goal_contract_decisions"], 0)
+                self.assertGreater(sidecar["cortex_phase_state_summary"]["output_goal_contract_accepted"], 0)
                 self.assertGreater(
                     sidecar["cortex_phase_state_summary"]["compression_trace_counts"]["layer_forward_events"],
                     0,
@@ -3653,6 +3664,14 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             self.assertGreaterEqual(
                 resumed_influence["future_contract_decisions"],
                 first_influence["future_contract_decisions"],
+            )
+            self.assertGreaterEqual(
+                resumed_influence["output_goal_contract_decisions"],
+                first_influence["output_goal_contract_decisions"],
+            )
+            self.assertGreaterEqual(
+                resumed_influence["output_goal_contract_accepted"],
+                first_influence["output_goal_contract_accepted"],
             )
             self.assertGreaterEqual(
                 resumed_influence["ternary_core_forward_events"],

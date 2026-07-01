@@ -38,14 +38,21 @@ class FrontierSkillDiscoveryTest(unittest.TestCase):
         self.assertTrue(answer.raw["frontier_compiled_selected"])
         self.assertTrue(answer.certificate["frontier_compiled_circuit"])
         self.assertTrue(answer.certificate["frontier_verification_passed"])
+        self.assertTrue(answer.certificate["frontier_output_goal_contract_passed"])
+        self.assertEqual(answer.certificate["frontier_output_goal_contract"]["contract"]["skill"], task.skill)
         self.assertTrue(answer.certificate["frontier_compiled_contract_verified"])
         self.assertEqual(answer.certificate["frontier_compiled_contract"]["certificate_type"], "compiled_circuit")
+        compiled_contract = answer.certificate["frontier_compiled_contract"]["claims"]["compiled_circuit_contract"]
+        self.assertTrue(compiled_contract["output_goal_contract_passed"])
+        self.assertEqual(compiled_contract["output_goal_contract_id"], answer.certificate["frontier_output_goal_contract"]["contract"]["contract_id"])
         self.assertTrue(answer.certificate["frontier_compiled_contract_checksum"])
         self.assertTrue(verifier.oracle_registry.verify(task.skill, task, answer).passed)
         engine = UltraFastInferenceEngine(verifier, CorruptedCompressedAgent(), compiled_frontier_registry=registry)
         inferred = engine.infer(task, forced_path=InferencePath.FAST)
         self.assertTrue(inferred.answer.raw["frontier_compiled_selected"])
         self.assertTrue(inferred.answer.certificate["frontier_compiled_circuit"])
+        self.assertTrue(inferred.answer.certificate["output_goal_contract_passed"])
+        self.assertTrue(inferred.future_contract["output_goal_contract"]["accepted"])
         self.assertTrue(inferred.passed)
 
     def test_frontier_discovery_report_is_persisted(self):
@@ -68,6 +75,7 @@ class FrontierSkillDiscoveryTest(unittest.TestCase):
         self.assertGreater(payload["frontier_discovery"]["circuits"][0]["compiled_weight_bits"], 0.0)
         self.assertEqual(registry_path.name, "frontier_registry.json")
         self.assertTrue(answer.raw["frontier_compiled_selected"])
+        self.assertTrue(answer.certificate["frontier_output_goal_contract_passed"])
         self.assertTrue(verifier.oracle_registry.verify(task.skill, task, answer).passed)
 
 

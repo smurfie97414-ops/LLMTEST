@@ -71,12 +71,13 @@ Current executable coverage:
 - `cortex3_autoregressive.ARLossComputer` adds trainable behavior, MTP multi-horizon, confidence and future-contract margin losses to the generated-answer checkpoint loop.
 - `ARDecoderAgent(use_future_contracts=True)` now routes generation through `FutureContractEngine`, accepts or rejects speculative token blocks, records per-block traces, preserves DSV pass rate and accounts for real decoder steps spent on speculation.
 - Inference result JSON now persists answer `cost` and `raw`, so autoregressive future-contract generation traces survive into run artifacts.
+- `OutputGoalContract` and `OutputGoalDecision` extend FSP beyond token ids: P3 now gates complete expected outputs, exact/no-extra-text obligations and required anchors, records output-goal decisions in the future-contract ledger, persists them through checkpoints and feeds rejected output-goals into `L_future_contract`.
+- `CortexTrainingPhaseController` emits a strict P3 output-goal contract for the `ACCEPT/REJECT` gate result; the phase raises instead of silently continuing if the output-goal gate rejects.
 
 Remaining:
 
 - Calibrate the standalone `MTPFSPHeads` module on larger held-out micro-task distributions, not only the seed smoke suite.
 - Compare MTP accepted blocks against verified quality per effective cost across checkpoint variants in cycle reports.
-- Add FSP output-goal contracts beyond token IDs.
 
 ## Phase 4 - Cognitive memory
 
@@ -121,7 +122,7 @@ Current executable coverage:
 - `evaluate_certificate_efficiency` measures token reduction, quality preservation and calibration preservation.
 - `write_cycle_run` can persist short certificates into `summary.json`.
 - `UltraFastInferenceEngine` treats proof-carrying certificate verification as a gate; a tampered latent proof makes `InferenceResult.passed` false and zeroes verified capability per cost.
-- `CompiledFrontierAgent` attaches a verified P5 compiled-circuit certificate to every selected Frontier circuit answer; the LLM phase report persists `frontier_compiled_contract_verified` and the contract checksum for accepted P7 repairs.
+- `CompiledFrontierAgent` attaches a verified P5 compiled-circuit certificate to every selected Frontier circuit answer; the compiled-circuit contract now also binds the P3 output-goal contract id, obligations, pass state and violations. The LLM phase report persists `frontier_compiled_contract_verified`, `frontier_output_goal_contract_passed` and the contract checksum for accepted P7 repairs.
 - `tools/run_cycle_report.py` writes a trained proof-carrying certificate smoke by default; `--skip-certificates` disables it.
 
 Remaining:
@@ -181,7 +182,7 @@ Current executable coverage:
 - Executed layers re-log sign+mask compression decisions and activation quantization into a per-inference `CompressionTraceLedger`.
 - `TernaryKernelDispatcher` records packed sign+mask dispatch metadata with active weights, packed bytes and CPU/CUDA dispatch mode.
 - `SelfSpeculativeDecoder` drafts MTP/FSP contracts, caps accepted horizon to the selected route and records MTP/FSP trace events.
-- `UltraFastInferenceEngine` integrates the verifier OS, cognitive memory reconstruction and memory-augmented answer recovery, latent KV traces, specialist expert traces, proof certificates, future contracts and oracle-audited verified capability per effective cost.
+- `UltraFastInferenceEngine` integrates the verifier OS, cognitive memory reconstruction and memory-augmented answer recovery, latent KV traces, specialist expert traces, proof certificates, future contracts, output-goal contracts and oracle-audited verified capability per effective cost.
 - Fast-path tasks can skip runtime level-0 verification cost, but their reported verified-capability score is still audited by the oracle; confident wrong fast answers receive zero verified capability.
 - `write_cycle_run` can persist inference results into `summary.json`.
 - Tests cover route selection, cost ordering, early exit/depth differences, fast-path false-confidence rejection, normal-path light certificates, latent KV anchor fidelity, self-speculative horizon caps, careful-path strong verification, certificate validation, expert traces, ternary kernel dispatch records and JSON persistence.
@@ -287,7 +288,7 @@ Current executable coverage:
 - Frontier registries persist to `frontier_registry.json` plus per-circuit micro-model checkpoints and reload through `CheckpointManager`, so a compiled skill can survive process boundaries.
 - `UltraFastInferenceEngine` accepts a `compiled_frontier_registry` and uses a selected compiled frontier circuit as the answer source before fast/normal/careful route execution.
 - `FrontierSkillDiscovery` distills both source regressions slow-solved by the reference solver and their frontier variants, so a compiled circuit can repair the original failing task rather than only nearby adversarial variants.
-- `CortexTrainingPhaseController` now runs a bounded Frontier Skill Discovery pass during phase audit, persists the registry under the run directory, routes a covered P8 task through the compiled FastSolve circuit, evaluates the same registry as a P7 repair candidate before parameter regrowth, feeds accepted compiled repairs into P10 as prioritized `compiled_frontier` proposals, and reports `frontier_compiled_*`, `frontier_repair_*` and `recursive_frontier_proposal_events` fields in `cortex_phase_report.json`.
+- `CortexTrainingPhaseController` now runs a bounded Frontier Skill Discovery pass during phase audit, persists the registry under the run directory, routes a covered P8 task through the compiled FastSolve circuit, evaluates the same registry as a P7 repair candidate before parameter regrowth, requires the Frontier output-goal contract and compiled-circuit certificate before accepting that repair, feeds accepted compiled repairs into P10 as prioritized `compiled_frontier` proposals, and reports `frontier_compiled_*`, `frontier_output_goal_*`, `frontier_repair_*` and `recursive_frontier_proposal_events` fields in `cortex_phase_report.json`.
 - P10 resume hardening: after checkpoint restore, the LLM controller searches a small archive-aware proposal budget so recursive improvement does not fail only because the first restored-context proposal is rejected by strict gates.
 - `write_cycle_run` persists frontier discovery reports under `summary.json["frontier_discovery"]`.
 - `tools/run_cycle_report.py` writes Frontier Skill Discovery by default unless `--skip-frontier` is passed.
@@ -395,7 +396,7 @@ Current executable coverage:
 - `MemmapCausalDataset` samples causal next-token targets and multi-horizon future targets directly from the memmap with vectorized batch window reads.
 - `CortexTransformerLM` is a complete causal Transformer with tied embeddings, causal self-attention, MLP blocks, optional Cortex multi-horizon heads, an optional differentiable Variable-In compressor, an optional learned exact/latent/drop memory policy, an optional packed int2 `BitLinear` ternary core for the Cortex model with native CUDA kernel audit, a trainable skill-aware MoE path whose expert activations are recorded in the compression trace ledger and an optional latent certificate head.
 - `CortexObjective` optimizes next-token loss plus Cortex MTP, temporal-consistency, confidence, Variable-In compression-cost, learned-memory policy and certificate-head terms when the Cortex heads are enabled.
-- `CortexTrainingPhaseController` integrates P1-P10 into full LLM training when horizons are `[1, 2, 4, 8]`, Variable-In, learned memory policy, skill-aware experts and the certificate head are enabled: verifier cycle, packed ternary forward traces, Variable-In KV/compression traces, exact-anchor observations decoded from real LLM input batches, learned exact/latent/drop memory decisions, skill-expert activation traces, MTP/FSP contract ledger, cumulative Bit/Skill/Causal/Uncertainty ledgers, cognitive memory reconstruction, certificate verification, causal attribution, minimal regrowth planning, fast/normal/careful inference, sleep replay batches and recursive-improvement gates.
+- `CortexTrainingPhaseController` integrates P1-P10 into full LLM training when horizons are `[1, 2, 4, 8]`, Variable-In, learned memory policy, skill-aware experts and the certificate head are enabled: verifier cycle, packed ternary forward traces, Variable-In KV/compression traces, exact-anchor observations decoded from real LLM input batches, learned exact/latent/drop memory decisions, skill-expert activation traces, MTP/FSP contract ledger, output-goal contract ledger, cumulative Bit/Skill/Causal/Uncertainty ledgers, cognitive memory reconstruction, certificate verification, causal attribution, minimal regrowth planning, fast/normal/careful inference, sleep replay batches and recursive-improvement gates.
 - The full Cortex trainer adds confidence/contract regularization to the loss, tokenizes accepted sleep/phase examples into causal replay batches, tracks replay examples by originating phase including P9 sleep, scales Cortex trainable losses with bounded cross-phase objective feedback and writes `cortex_phase_report.json` with per-phase event counts.
 - Cortex checkpoints persist and restore the phase controller's replay state, objective feedback state, future-contract ledger, retained ternary compression trace ledger, exact-input-anchor counters, Bit/Skill/Causal/Uncertainty ledgers, cognitive memory, sleep pools and recursive-improvement archive summaries, so interrupted full-architecture training keeps the same P2-P4/P9/P10 and ledger audit context instead of resetting those modules while keeping trace memory bounded.
 - `build_training_plan` writes `run_plan.json` before training starts, with real token-count, split-window, parameter-count, planned-token, checkpoint and optimizer-memory estimates for the baseline and Cortex models.

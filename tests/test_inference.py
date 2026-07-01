@@ -68,6 +68,9 @@ class UltraFastInferenceTest(unittest.TestCase):
         self.assertFalse(result.verification.passed)
         self.assertFalse(result.passed)
         self.assertEqual(result.verified_capability_per_cost, 0.0)
+        self.assertFalse(result.answer.certificate["output_goal_contract_passed"])
+        self.assertFalse(result.future_contract["output_goal_contract"]["accepted"])
+        self.assertIn("oracle_verification_failed", result.future_contract["output_goal_contract"]["violations"])
 
     def test_normal_path_uses_light_certificate_and_moderate_budget(self):
         verifier = _verifier()
@@ -90,6 +93,8 @@ class UltraFastInferenceTest(unittest.TestCase):
         self.assertTrue(normal.verification and normal.verification.passed)
         self.assertTrue(normal.certificate_verified)
         self.assertLessEqual(normal.future_contract["horizon"], normal.route.mtp_horizon)
+        self.assertTrue(normal.future_contract["output_goal_contract"]["accepted"])
+        self.assertTrue(normal.answer.certificate["output_goal_contract_passed"])
         self.assertLess(fast.cost.effective_cost(), normal.cost.effective_cost())
         self.assertLess(normal.cost.effective_cost(), careful.cost.effective_cost())
 

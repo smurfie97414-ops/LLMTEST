@@ -2,7 +2,7 @@ import unittest
 
 import torch
 
-from cortex3 import CostTrace, DynamicSkillVerifier, ReferenceRuleAgent, default_skill_specs
+from cortex3 import Anchor, CandidateAnswer, CostTrace, DynamicSkillVerifier, ReferenceRuleAgent, Task, default_skill_specs
 from cortex3_autoregressive import TokenVocabulary
 from cortex3_future import (
     DEFAULT_MTP_HORIZONS,
@@ -86,6 +86,29 @@ class FutureContractsTest(unittest.TestCase):
         self.assertEqual(engine.ledger.rejected, 1)
         self.assertEqual(len(trace.mtp_fsp_events), 2)
         self.assertFalse(trace.mtp_fsp_events[-1].accepted)
+
+    def test_output_goal_contract_accepts_exact_result_and_rejects_extra_text_or_missing_anchor(self):
+        engine = FutureContractEngine(MTPFSPConfig(hidden_size=4, vocab_size=7), heads=_confident_heads())
+        exact_task = Task("goal-exact", "instruction_following", "Output OK exactly.", "OK")
+        accepted = engine.gate_output_goal(exact_task, CandidateAnswer("OK", confidence=0.99), output_verified=True)
+        extra = engine.gate_output_goal(exact_task, CandidateAnswer("OK extra", confidence=0.99), output_verified=True)
+        anchor = Anchor("identifier", "C3-4242-A", "goal-anchor")
+        anchor_task = Task(
+            "goal-anchor",
+            "long_context_anchor",
+            "Return only the exact identifier.",
+            "C3-4242-A",
+            anchors=(anchor,),
+        )
+        missing_anchor = engine.gate_output_goal(anchor_task, CandidateAnswer("C3-0000-X", confidence=0.99), output_verified=False)
+
+        self.assertTrue(accepted.accepted)
+        self.assertFalse(extra.accepted)
+        self.assertIn("exact_output_mismatch", extra.violations)
+        self.assertFalse(missing_anchor.accepted)
+        self.assertIn("required_anchor_missing", missing_anchor.violations)
+        self.assertIn("oracle_verification_failed", missing_anchor.violations)
+        self.assertEqual(len(engine.ledger.output_goal_decisions), 3)
 
     def test_risky_domain_shortens_and_requires_gate_before_acceptance(self):
         trace = CompressionTraceLedger()

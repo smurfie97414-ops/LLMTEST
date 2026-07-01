@@ -161,6 +161,10 @@ class ProposalGenerator:
                     "repair_score_delta": float(payload.get("repair_score_delta", 0.0)),
                     "protected_checked": int(payload.get("protected_checked", 0)),
                     "frontier_compiled_verified": bool(payload.get("frontier_compiled_verified")),
+                    "frontier_output_goal_contract_passed": bool(payload.get("frontier_output_goal_contract_passed")),
+                    "frontier_output_goal_contract": dict(payload.get("frontier_output_goal_contract") or {}),
+                    "frontier_compiled_contract_verified": bool(payload.get("frontier_compiled_contract_verified")),
+                    "frontier_compiled_contract_checksum": str(payload.get("frontier_compiled_contract_checksum", "")),
                 },
             ))
             if len(proposals) >= max_proposals:

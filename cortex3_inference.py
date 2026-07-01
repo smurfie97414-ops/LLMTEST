@@ -494,9 +494,28 @@ class UltraFastInferenceEngine:
             raw=base_answer.raw,
         )
         verification = self.verifier.oracle_registry.verify(task.skill, task, answer)
-        cert_ok = self._certificate_verified(hidden, task, answer, route)
+        output_goal = self.speculative.engine.gate_output_goal(
+            task,
+            answer,
+            risk=signal.risk,
+            contract_id=f"{task.task_id}-{route.path.value}-output-goal",
+            output_verified=verification.passed,
+        )
+        answer = CandidateAnswer(
+            text=answer.text,
+            confidence=answer.confidence if output_goal.accepted else 0.0,
+            certificate={
+                **dict(answer.certificate),
+                "output_goal_contract": output_goal.to_dict(),
+                "output_goal_contract_passed": output_goal.accepted,
+            },
+            cost=answer.cost,
+            raw={**dict(answer.raw), "output_goal_contract": output_goal.to_dict()},
+        )
+        cert_ok = self._certificate_verified(hidden, task, answer, route) and output_goal.accepted
         future_cost = CostTrace(**dict(future.get("cost", {}))) if future else CostTrace()
-        total_cost = prediction.predicted_cost.merge(answer.cost).merge(self.trace.cost_trace).merge(future_cost)
+        future_payload = {**dict(future), "output_goal_contract": output_goal.to_dict()}
+        total_cost = prediction.predicted_cost.merge(answer.cost).merge(self.trace.cost_trace).merge(future_cost).merge(output_goal.cost)
         if reconstruction is not None:
             total_cost = total_cost.merge(reconstruction.cost)
         if route.verifier_level > 0:
@@ -515,7 +534,7 @@ class UltraFastInferenceEngine:
             early_exit=exit_decision,
             layers_ran=layers_ran,
             memory_reconstruction=reconstruction,
-            future_contract=future,
+            future_contract=future_payload,
             kernel_dispatches=kernel_dispatches,
             certificate_verified=cert_ok,
             verified_capability_per_cost=vc_per_cost,

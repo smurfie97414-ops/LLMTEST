@@ -65,7 +65,7 @@ Latent Memory / KV        Causal + Skill Ledgers
   ▼                              ▼
 Ternary Core  W ∈ {-1,0,+1}  +  Skill-aware Experts
   │
-  ├── Future Contract / FSP
+  ├── Future Contract / FSP + Output-Goal Contracts
   ├── Adaptive Multi-Token Decoding
   ├── Latent Reasoning Workspace
   └── Certificate Generator
@@ -88,7 +88,7 @@ Cette base contient maintenant :
 - Phase 1 du Verifier OS est maintenant élargie avec registre d'oracles, anti-métamorphiques, coûts vérificateur par cas, audit faux positifs/faux négatifs d'oracle, harnais de défauts injectés et familles de compétences `arithmetic`, `algebra`, `long_context_anchor`, `entity_tracking`, `instruction_following`, `code_unit_tests`, `calibration` ;
 - `cortex3_reporting.py` : persistance des cycles dans `runs/` avec JSON structuré, rapport markdown et matrice de défauts injectés ;
 - `cortex3_ternary.py` : instrumentation Phase 2 avec quantization d'activations 8→4 bit, residual synapse buffer, compression logs, `BitLinear` sign+mask, buffers ternaires packes int2 et kernels CUDA natifs extension/RawKernel tuilé/warp/WMMA avec gradient STE ;
-- `cortex3_future.py` : Phase 3 MTP/FSP sous contrat avec têtes PyTorch horizons 1/2/4/8, calibration autonome, confidence head, temporal consistency loss, Future Contract, révision et accept/reject gates ;
+- `cortex3_future.py` : Phase 3 MTP/FSP sous contrat avec têtes PyTorch horizons 1/2/4/8, calibration autonome, confidence head, temporal consistency loss, Future Contract, contrats output-goal au-delà des token ids, révision et accept/reject gates ;
 - `cortex3_memory.py` : Phase 4 mémoire cognitive avec KV récent exact, KV ancien latent compact, Exact Anchor Ledger, reconstruction conditionnée par requête, récupération de réponse augmentée par mémoire et vérificateur de fidélité aux ancres ;
 - `cortex3_certificates.py` : Phase 5 raisonnement latent avec `latent proof state`, tête PyTorch de certificat calibrée, génération proof-carrying, certificats courts vérifiables dont contrats `compiled_circuit`, dé-latentisation aléatoire et vérification par outils ;
 - `cortex3_attribution.py` : Phase 6 attribution causale avec ablations par blocs, experts, KV mode, horizon MTP, précision d'activation, contrat FSP, routage counterfactual et clustering de régressions ;
@@ -98,7 +98,7 @@ Cette base contient maintenant :
 - `cortex3_improvement.py` : Phase 10 Recursive Improvement Engine avec génération de propositions, propositions prioritaires issues des réparations Frontier compilées, sandbox en mémoire, évaluateur dynamique, gate Pareto/protection/diversité, archive évolutive et rollback ;
 - `cortex3_objective.py` : loss finale du plan avec 17 termes pondérés et les 15 métriques absolues, dont `Verified Capability per Effective Joule` ;
 - `cortex3_experiments.py` : expériences A-E du plan, de la détection de défauts injectés à la sandbox d'auto-amélioration ;
-- `cortex3_frontier.py` : découverte de compétences frontières avec slow-solve vérifié des régressions sources et variantes, compilation en micro-circuit `BitLinear`, registre runtime de circuits DSV-passing, certificats P5 de contrat compilé, sélection par skill/invariants via `CompiledFrontierAgent`, persistance `frontier_registry.json` + checkpoints, branchement P8 via `UltraFastInferenceEngine` et preuve d'usage FastSolve/réparation P7/proposition P10 compilée dans l'audit LLM ;
+- `cortex3_frontier.py` : découverte de compétences frontières avec slow-solve vérifié des régressions sources et variantes, compilation en micro-circuit `BitLinear`, registre runtime de circuits DSV-passing, contrats output-goal P3, certificats P5 de contrat compilé, sélection par skill/invariants via `CompiledFrontierAgent`, persistance `frontier_registry.json` + checkpoints, branchement P8 via `UltraFastInferenceEngine` et preuve d'usage FastSolve/réparation P7/proposition P10 compilée dans l'audit LLM ;
 - `cortex3_microtrain.py` : micro-modèle PyTorch entraînable avec cœur `BitLinear`, agent DSV, exemples issus du verifier/sleep phase et checkpoints `.pt` ;
 - `cortex3_autoregressive.py` : décodeur micro-autoregressif PyTorch avec vocabulaire caractère, génération greedy ou blockwise sous Future Contract, pertes comportement/MTP multi-horizons/contrat futur, agent DSV et checkpoints `.pt` ;
 - `cortex3_llm.py` : harness de pré-entraînement LLM réel avec export Hugging Face `datasets`, tokenizer BPE `tokenizers`, corpus texte streamé vers memmap avec identité SHA-256, dataset causal, Transformer complet, baseline next-token, objectif Cortex multi-horizon, compresseur Variable-In différentiable, politique mémoire apprise exact/latent/drop, observation d'ancres exactes depuis les batchs LLM, coeur ternaire `BitLinear` packe int2 avec audit du kernel CUDA natif, MoE skill-aware entraînable, certificate head latent, ledgers Bit/Skill/Causal/Uncertainty persistants, AMP/DDP, checkpoints strictement liés au corpus, courbes et rapport comparatif ;
@@ -245,7 +245,7 @@ Ce smoke construit un corpus texte déterministe, entraîne un tokenizer BPE, é
 - `baseline_ntp/checkpoint_final.pt`
 - `cortex3/checkpoint_final.pt`
 
-Quand les horizons sont complets `[1, 2, 4, 8]`, le modèle Cortex active aussi le core ternaire `BitLinear`, la politique mémoire apprise exact/latent/drop et le contrôleur de phases P1-P10 pendant l'entraînement. Ce contrôleur exécute le Verifier OS, les contrats MTP/FSP, la mémoire cognitive, les certificats, l'attribution, le regrowth, le routage fast/normal/careful, la sleep phase et le gate d'amélioration récursive. Il ajoute une régularisation Cortex au loss, transforme les exemples sleep acceptés en replay causal tokenisé, applique les réparations P7 acceptées directement au Transformer via un patch borné et non-régressif des paramètres ciblés, convertit les propositions P10 acceptées en patchs signés avec rollback token, exige des dispatchs ternaires packés, écrit `cortex_phase_report.json`, et la preuve comparative exige `cortex_phase_integration_passed=true` dès qu'un run annonce l'architecture Cortex complète.
+Quand les horizons sont complets `[1, 2, 4, 8]`, le modèle Cortex active aussi le core ternaire `BitLinear`, la politique mémoire apprise exact/latent/drop et le contrôleur de phases P1-P10 pendant l'entraînement. Ce contrôleur exécute le Verifier OS, les contrats MTP/FSP token-level, les contrats output-goal, la mémoire cognitive, les certificats, l'attribution, le regrowth, le routage fast/normal/careful, la sleep phase et le gate d'amélioration récursive. Il ajoute une régularisation Cortex au loss, transforme les exemples sleep acceptés en replay causal tokenisé, applique les réparations P7 acceptées directement au Transformer via un patch borné et non-régressif des paramètres ciblés, convertit les propositions P10 acceptées en patchs signés avec rollback token, exige des dispatchs ternaires packés, écrit `cortex_phase_report.json`, et la preuve comparative exige `cortex_phase_integration_passed=true` dès qu'un run annonce l'architecture Cortex complète.
 
 Pour un corpus plus large :
 
@@ -372,7 +372,7 @@ python -m pytest tests/test_llm_pretraining.py -q
 
 1. Durcir Phase 1 jusqu'au statut Verifier OS complet : coût par cas réel, familles génératives plus larges, tests de faux positifs/faux négatifs d'oracle.
 2. Durcir Phase 2 au-delà de l'auto-sizing court déjà mesuré, diversifié, adaptatif, raffiné et confirmé : élargir les candidats, les batchs LLM, la durée des profils et les seuils GPU/throughput, en conservant la sélection multi-seed sous budget VRAM observé.
-3. Étendre Phase 3 vers des suites held-out plus larges, benchmarks MTP vs NTP et contrats FSP orientés objectifs de sortie.
+3. Étendre Phase 3 vers des suites held-out plus larges et benchmarks MTP/output-goal vs NTP sur coût vérifié.
 4. Étendre Phase 4 au-delà de l'ablation courte actuelle avec benchmarks coût/qualité de la politique mémoire apprise exact/latent/drop sur long contexte et held-out anchors.
 5. Étendre Phase 5 avec vérification algébrique multi-étapes, tests code plus riches et mesure held-out des économies de tokens de certificat.
 6. Étendre la boucle générative autoregressive vers held-out suites, benchmarks coût/qualité plus larges et calibration de confiance.
