@@ -322,10 +322,15 @@ class UltraFastInferenceEngine:
         self.verifier = verifier
         self.agent = agent
         self.config = config or InferenceConfig()
+        self._compiled_frontier_requires_memory = memory is not None
         self.memory = memory or CognitiveMemory()
         self.compiled_frontier_registry = compiled_frontier_registry
         self.compiled_frontier_agent = (
-            CompiledFrontierAgent(compiled_frontier_registry, verifier=verifier)
+            CompiledFrontierAgent(
+                compiled_frontier_registry,
+                verifier=verifier,
+                memory=self.memory if self._compiled_frontier_requires_memory else None,
+            )
             if compiled_frontier_registry is not None
             else None
         )
@@ -341,7 +346,11 @@ class UltraFastInferenceEngine:
     def set_compiled_frontier_registry(self, registry: FrontierCircuitRegistry | None) -> None:
         self.compiled_frontier_registry = registry
         self.compiled_frontier_agent = (
-            CompiledFrontierAgent(registry, verifier=self.verifier)
+            CompiledFrontierAgent(
+                registry,
+                verifier=self.verifier,
+                memory=self.memory if self._compiled_frontier_requires_memory else None,
+            )
             if registry is not None
             else None
         )

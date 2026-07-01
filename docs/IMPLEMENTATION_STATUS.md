@@ -87,7 +87,7 @@ Current executable coverage:
 - Long-context and entity-tracking skill families.
 - `CognitiveMemory` stores recent segments in exact KV and evicts older segments into compact latent KV.
 - `LatentKVStore` keeps Torch embeddings, compact summaries and exact anchors instead of old full text.
-- `Query-conditioned memory reconstruction` retrieves exact recent and latent old segments by embedding similarity, token overlap and anchor intent.
+- `Query-conditioned memory reconstruction` retrieves exact recent and latent old segments by embedding similarity, token overlap and anchor intent, then force-includes any segment carrying explicitly required anchors.
 - `AnchorFidelityVerifier` proves required exact anchors are preserved in reconstructed context.
 - `compression_report` records recent/latent counts, latent token compression ratio and ledger anchors.
 - `write_cycle_run` can persist cognitive memory reports into `summary.json`.
@@ -95,11 +95,13 @@ Current executable coverage:
 - Memory-augmented answers carry certificate fields, selected segment ids, anchor fidelity and the displaced base answer in `raw`; inference JSON persists this audit trail.
 - `LearnedMemoryPolicy` is part of the Transformer forward, mixes exact/latent/drop states differentiably, receives the `learned_memory` loss and is audited by the full Cortex phase controller.
 - `tools/benchmark_learned_memory_policy.py` runs a short shared-weight ablation against disabled learned memory, freezes non-memory parameters, trains only `learned_memory.*`, and reports before/after losses, policy gradients, exact/latent/drop decisions and storage ratio.
+- `CompiledCircuitMemoryBinding` turns Frontier circuits into retained P4 memory objects with circuit id, source/frontier/held-out lineage, obligations, metadata keys, anchors, fidelity and selected segment ids.
+- `CompiledFrontierAgent`, P8 inference, P9 sleep-frontier FastSolve and P7 Frontier repair candidates require a reconstructible P4 memory binding whenever the full LLM controller supplies shared memory; the P5 compiled-circuit certificate carries memory-binding claims.
 
 Remaining:
 
 - Run large long-context ablations proving the learned exact/latent/drop memory policy improves cost/quality over deterministic memory alone on held-out anchors.
-- Promote anchor fidelity to a required cycle gate for long-context tasks.
+- Scale compiled-skill memory retention across larger registries and multi-cycle restarts.
 - Measure memory cost/quality tradeoffs across exact KV vs latent KV in run reports.
 
 ## Phase 5 - Latent reasoning with certificates
@@ -184,6 +186,7 @@ Current executable coverage:
 - `TernaryKernelDispatcher` records packed sign+mask dispatch metadata with active weights, packed bytes and CPU/CUDA dispatch mode.
 - `SelfSpeculativeDecoder` drafts MTP/FSP contracts, caps accepted horizon to the selected route and records MTP/FSP trace events.
 - `UltraFastInferenceEngine` integrates the verifier OS, cognitive memory reconstruction and memory-augmented answer recovery, latent KV traces, specialist expert traces, proof certificates, future contracts, output-goal contracts and oracle-audited verified capability per effective cost.
+- When a compiled Frontier circuit is available and shared P4 memory is supplied, `UltraFastInferenceEngine` only uses the compiled FastSolve answer after the circuit memory binding is established and reconstructed.
 - Fast-path tasks can skip runtime level-0 verification cost, but their reported verified-capability score is still audited by the oracle; confident wrong fast answers receive zero verified capability.
 - `write_cycle_run` can persist inference results into `summary.json`.
 - Tests cover route selection, cost ordering, early exit/depth differences, fast-path false-confidence rejection, normal-path light certificates, latent KV anchor fidelity, self-speculative horizon caps, careful-path strong verification, certificate validation, expert traces, ternary kernel dispatch records and JSON persistence.
@@ -225,8 +228,8 @@ Current executable coverage:
 - `tools/run_cycle_report.py` writes Phase 9 sleep traces by default unless `--skip-sleep` is passed.
 - The full LLM trainer tokenizes accepted sleep examples with the active BPE tokenizer and replays them as causal batches in the Cortex loss.
 - `FrontierSkillDiscovery.compile_sleep_consolidation` now promotes accepted sleep examples by coherent consolidation family into held-out gated `BitLinear` micro-circuits with `training.source_kind="sleep_consolidation"`.
-- The full LLM phase controller saves those sleep-promoted circuits into the persistent Frontier registry, immediately verifies a `CompiledFrontierAgent` FastSolve on the exact promoted circuit, adds verified P9 replay from the compiled answer, and feeds the circuit into P10 as a `compiled_frontier` proposal.
-- Architecture and deliverable audits now reject P9 if sleep consolidation only creates replay; they require nonzero `sleep_frontier_compiled_circuit_count`, held-out pass equality and `sleep_frontier_fastsolve_events`.
+- The full LLM phase controller saves those sleep-promoted circuits into the persistent Frontier registry, binds them into P4 cognitive memory, immediately verifies a `CompiledFrontierAgent` FastSolve on the exact promoted circuit, adds verified P9 replay from the compiled answer, and feeds the circuit into P10 as a `compiled_frontier` proposal.
+- Architecture and deliverable audits now reject P9 if sleep consolidation only creates replay; they require nonzero `sleep_frontier_compiled_circuit_count`, held-out pass equality, P4 memory binding and `sleep_frontier_fastsolve_events`.
 - Cortex phase replay batches, including Phase 9 sleep/consolidation examples, future-contract ledger decisions, bounded ternary compression trace histories, cognitive-memory segments, sleep pools and recursive-improvement archive summaries are now saved in checkpoints and restored on resume, so long runs do not lose P4/P9/P10 context, P2 instrumentation or P3 contract state after interruption.
 - `CompressionTraceLedger` keeps total P2 event counters and aggregate effective-cost inputs separately from retained detailed events; the LLM harness limits retained detailed traces with `cortex_trace_retention_limit` to prevent long GPU runs from growing trace memory without bound.
 
@@ -292,10 +295,11 @@ Current executable coverage:
 - Reports include DSV score, held-out pass counts/rate/gate status, training deltas, active/total weights and packed compiled weight bits.
 - `FrontierCircuitRegistry` now keeps DSV-passing compiled circuits as runtime artifacts instead of dropping the trained model after report generation.
 - `CompiledFrontierAgent` selects a compiled circuit by covered task ids, group ids, numeric signatures, non-label metadata, anchors and invariants, not by skill name alone; if a circuit is selected, verifier failure is exposed on the answer rather than hidden behind a fallback.
+- `CompiledFrontierAgent` establishes and verifies a P4 `CompiledCircuitMemoryBinding` before using a selected circuit when shared memory is provided; if binding establishment or fidelity fails, FastSolve raises instead of silently falling back.
 - Frontier registries persist to `frontier_registry.json` plus per-circuit micro-model checkpoints and reload through `CheckpointManager`, so a compiled skill can survive process boundaries.
 - `UltraFastInferenceEngine` accepts a `compiled_frontier_registry` and uses a selected compiled frontier circuit as the answer source before fast/normal/careful route execution.
 - `FrontierSkillDiscovery` distills both source regressions slow-solved by the reference solver and their frontier variants, so a compiled circuit can repair the original failing task rather than only nearby adversarial variants.
-- P5 `compiled_circuit` certificates now require held-out task lineage and a passing held-out gate in addition to source/frontier lineage, DSV, output-goal and answer checksum.
+- P5 `compiled_circuit` certificates now require held-out task lineage and a passing held-out gate in addition to source/frontier lineage, DSV, output-goal, memory-binding claims and answer checksum.
 - `CortexTrainingPhaseController` now runs a bounded Frontier Skill Discovery pass during phase audit, persists the registry under the run directory, routes a covered P8 task through the compiled FastSolve circuit, evaluates the same registry as a P7 repair candidate before parameter regrowth, requires held-out gate pass, Frontier output-goal contract and compiled-circuit certificate before accepting that repair, feeds accepted compiled repairs into P10 as prioritized `compiled_frontier` proposals, and reports `frontier_compiled_*`, `frontier_heldout_*`, `frontier_output_goal_*`, `frontier_repair_*` and `recursive_frontier_proposal_events` fields in `cortex_phase_report.json`.
 - P10 resume hardening: after checkpoint restore, the LLM controller searches a small archive-aware proposal budget so recursive improvement does not fail only because the first restored-context proposal is rejected by strict gates.
 - `write_cycle_run` persists frontier discovery reports under `summary.json["frontier_discovery"]`.

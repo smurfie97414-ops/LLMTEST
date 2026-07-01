@@ -388,6 +388,11 @@ def json_dumps(payload: Mapping[str, Any]) -> str:
     return json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False)
 
 
+def compiled_circuit_id(report: FrontierCompiledCircuit | Mapping[str, Any]) -> str:
+    payload = report.to_dict() if isinstance(report, FrontierCompiledCircuit) else dict(report)
+    return hashlib.blake2b(json_dumps(payload).encode("utf-8"), digest_size=16).hexdigest()
+
+
 class CompiledFrontierAgent:
     def __init__(
         self,
@@ -396,11 +401,15 @@ class CompiledFrontierAgent:
         fallback: Any | None = None,
         verifier: DynamicSkillVerifier | None = None,
         verify_outputs: bool = True,
+        memory: Any | None = None,
+        require_memory_binding: bool | None = None,
     ):
         self.registry = registry
         self.fallback = fallback
         self.verifier = verifier
         self.verify_outputs = verify_outputs
+        self.memory = memory
+        self.require_memory_binding = bool(memory is not None) if require_memory_binding is None else bool(require_memory_binding)
         self.certificate_verifier = CertificateVerifier()
         self.output_goal_engine = FutureContractEngine(MTPFSPConfig(hidden_size=8, vocab_size=8))
 
@@ -412,9 +421,11 @@ class CompiledFrontierAgent:
         *,
         output_verified: bool,
         output_goal: OutputGoalDecision,
+        memory_binding: Any | None = None,
+        memory_reconstruction: Any | None = None,
     ) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
         report_payload = circuit.report.to_dict()
-        circuit_id = hashlib.blake2b(json_dumps(report_payload).encode("utf-8"), digest_size=16).hexdigest()
+        circuit_id = compiled_circuit_id(report_payload)
         invariant_checksum = hashlib.blake2b(
             json_dumps(circuit.report.invariants.to_dict()).encode("utf-8"),
             digest_size=16,
@@ -445,6 +456,18 @@ class CompiledFrontierAgent:
             "output_goal_contract_passed": bool(output_goal.accepted),
             "output_goal_obligations": tuple(output_goal.contract.obligations),
             "output_goal_violations": tuple(output_goal.violations),
+            "memory_binding_id": getattr(memory_binding, "binding_id", ""),
+            "memory_binding_passed": bool(
+                memory_binding is not None
+                and memory_reconstruction is not None
+                and getattr(memory_reconstruction.fidelity, "passed", False)
+                and getattr(memory_binding, "segment_id", "") in tuple(getattr(memory_reconstruction, "selected_segment_ids", ()))
+            ),
+            "memory_binding_fidelity": (
+                float(memory_reconstruction.fidelity.score)
+                if memory_reconstruction is not None
+                else 0.0
+            ),
         }
         latent_state = LatentProofState(
             state_id=f"compiled-frontier-{circuit_id}-{task.task_id}",
@@ -491,6 +514,48 @@ class CompiledFrontierAgent:
                 cost=answer.cost,
                 raw={**dict(answer.raw), "frontier_compiled_selected": False},
             )
+        circuit_id = compiled_circuit_id(circuit.report)
+        memory_binding = None
+        memory_reconstruction = None
+        if self.memory is not None:
+            try:
+                self.memory.bind_compiled_circuit(
+                    circuit_id=circuit_id,
+                    skill=circuit.skill,
+                    source_kind=str(circuit.report.training.get("source_kind", "frontier_discovery")),
+                    source_failure_ids=tuple(circuit.report.source_failure_ids),
+                    frontier_task_ids=tuple(circuit.report.frontier_task_ids),
+                    heldout_task_ids=tuple(circuit.report.heldout_task_ids),
+                    prompt_obligations=tuple(circuit.report.invariants.prompt_obligations),
+                    metadata_keys=tuple(circuit.report.invariants.metadata_keys),
+                    anchors=tuple(
+                        anchor
+                        for covered in tuple(circuit.verified_tasks) + tuple(circuit.heldout_tasks)
+                        for anchor in covered.anchors
+                    ),
+                )
+            except Exception as exc:
+                if self.require_memory_binding:
+                    raise ValueError(f"compiled Frontier circuit {circuit_id} could not establish a P4 memory binding") from exc
+            try:
+                memory_binding, memory_reconstruction = self.memory.reconstruct_compiled_circuit_binding(
+                    circuit_id,
+                    query=f"{task.prompt} compiled circuit {circuit_id} skill {circuit.skill}",
+                )
+            except KeyError as exc:
+                if self.require_memory_binding:
+                    raise ValueError(f"compiled Frontier circuit {circuit_id} has no P4 memory binding") from exc
+            if memory_reconstruction is not None:
+                if (
+                    not memory_reconstruction.fidelity.passed
+                    or memory_binding is None
+                    or memory_binding.segment_id not in memory_reconstruction.selected_segment_ids
+                ):
+                    if self.require_memory_binding:
+                        missing = ", ".join(anchor.value for anchor in memory_reconstruction.fidelity.missing)
+                        raise ValueError(
+                            f"compiled Frontier circuit {circuit_id} failed P4 memory binding fidelity: missing {missing}"
+                        )
         answer = circuit.agent(task)
         certificate = {
             **dict(answer.certificate),
@@ -513,7 +578,21 @@ class CompiledFrontierAgent:
             "frontier_heldout_task_ids": circuit.report.heldout_task_ids,
             "frontier_heldout": dict(circuit.report.heldout),
         }
+        if memory_binding is not None and memory_reconstruction is not None:
+            certificate.update({
+                "frontier_memory_binding_id": memory_binding.binding_id,
+                "frontier_memory_binding_passed": bool(memory_reconstruction.fidelity.passed),
+                "frontier_memory_binding_fidelity": memory_reconstruction.fidelity.score,
+                "frontier_memory_selected_segments": memory_reconstruction.selected_segment_ids,
+            })
+            raw["frontier_memory_binding"] = {
+                **memory_binding.to_dict(),
+                "runtime_fidelity": asdict(memory_reconstruction.fidelity),
+                "runtime_selected_segment_ids": memory_reconstruction.selected_segment_ids,
+            }
         cost = answer.cost.merge(CostTrace(verifier_steps=1 if self.verifier is not None and self.verify_outputs else 0))
+        if memory_reconstruction is not None:
+            cost = cost.merge(memory_reconstruction.cost)
         confidence = answer.confidence
         output_verified = True
         if self.verifier is not None and self.verify_outputs:
@@ -542,6 +621,8 @@ class CompiledFrontierAgent:
             answer,
             output_verified=output_verified and output_goal.accepted,
             output_goal=output_goal,
+            memory_binding=memory_binding,
+            memory_reconstruction=memory_reconstruction,
         )
         certificate["frontier_compiled_contract"] = contract_certificate
         certificate["frontier_compiled_contract_checksum"] = contract_certificate["checksum"]

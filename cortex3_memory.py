@@ -116,6 +116,106 @@ class MemoryReconstruction:
         return "\n".join(section for section in sections if section)
 
 
+@dataclass(frozen=True)
+class CompiledCircuitMemoryBinding:
+    binding_id: str
+    circuit_id: str
+    skill: str
+    source_kind: str
+    segment_id: str
+    source_failure_ids: tuple[str, ...]
+    frontier_task_ids: tuple[str, ...]
+    heldout_task_ids: tuple[str, ...]
+    prompt_obligations: tuple[str, ...]
+    metadata_keys: tuple[str, ...]
+    anchor_values: tuple[str, ...]
+    fidelity: AnchorFidelityResult
+    selected_segment_ids: tuple[str, ...]
+    cost: CostTrace
+
+    @property
+    def passed(self) -> bool:
+        return self.fidelity.passed and self.segment_id in self.selected_segment_ids
+
+    @property
+    def required_anchors(self) -> tuple[Anchor, ...]:
+        source = self.segment_id
+        anchors = [
+            Anchor("circuit", self.circuit_id, source, 1.0),
+            Anchor("skill", self.skill, source, 1.0),
+        ]
+        if self.source_kind:
+            anchors.append(Anchor("source_kind", self.source_kind, source, 1.0))
+        return tuple(anchors)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "binding_id": self.binding_id,
+            "circuit_id": self.circuit_id,
+            "skill": self.skill,
+            "source_kind": self.source_kind,
+            "segment_id": self.segment_id,
+            "source_failure_ids": list(self.source_failure_ids),
+            "frontier_task_ids": list(self.frontier_task_ids),
+            "heldout_task_ids": list(self.heldout_task_ids),
+            "prompt_obligations": list(self.prompt_obligations),
+            "metadata_keys": list(self.metadata_keys),
+            "anchor_values": list(self.anchor_values),
+            "fidelity": {
+                "required": self.fidelity.required,
+                "preserved": self.fidelity.preserved,
+                "missing": [asdict(anchor) for anchor in self.fidelity.missing],
+                "score": self.fidelity.score,
+            },
+            "selected_segment_ids": list(self.selected_segment_ids),
+            "cost": asdict(self.cost),
+            "passed": self.passed,
+        }
+
+    @staticmethod
+    def from_dict(payload: Mapping[str, Any]) -> "CompiledCircuitMemoryBinding":
+        fidelity_payload = dict(payload.get("fidelity") or {})
+        cost_payload = dict(payload.get("cost") or {})
+        return CompiledCircuitMemoryBinding(
+            binding_id=str(payload.get("binding_id", "")),
+            circuit_id=str(payload.get("circuit_id", "")),
+            skill=str(payload.get("skill", "")),
+            source_kind=str(payload.get("source_kind", "")),
+            segment_id=str(payload.get("segment_id", "")),
+            source_failure_ids=tuple(str(item) for item in payload.get("source_failure_ids", ())),
+            frontier_task_ids=tuple(str(item) for item in payload.get("frontier_task_ids", ())),
+            heldout_task_ids=tuple(str(item) for item in payload.get("heldout_task_ids", ())),
+            prompt_obligations=tuple(str(item) for item in payload.get("prompt_obligations", ())),
+            metadata_keys=tuple(str(item) for item in payload.get("metadata_keys", ())),
+            anchor_values=tuple(str(item) for item in payload.get("anchor_values", ())),
+            fidelity=AnchorFidelityResult(
+                required=int(fidelity_payload.get("required", 0)),
+                preserved=int(fidelity_payload.get("preserved", 0)),
+                missing=tuple(
+                    Anchor(
+                        kind=str(anchor.get("kind", "")),
+                        value=str(anchor.get("value", "")),
+                        source_id=str(anchor.get("source_id", "")),
+                        importance=float(anchor.get("importance", 1.0)),
+                    )
+                    for anchor in fidelity_payload.get("missing", ())
+                ),
+                score=float(fidelity_payload.get("score", 0.0)),
+            ),
+            selected_segment_ids=tuple(str(item) for item in payload.get("selected_segment_ids", ())),
+            cost=CostTrace(
+                weight_bits_read=float(cost_payload.get("weight_bits_read", 0.0)),
+                activation_bits=float(cost_payload.get("activation_bits", 0.0)),
+                kv_bytes=float(cost_payload.get("kv_bytes", 0.0)),
+                generated_tokens=int(cost_payload.get("generated_tokens", 0)),
+                latent_steps=int(cost_payload.get("latent_steps", 0)),
+                experts_activated=int(cost_payload.get("experts_activated", 0)),
+                verifier_steps=int(cost_payload.get("verifier_steps", 0)),
+                wall_time_ms=float(cost_payload.get("wall_time_ms", 0.0)),
+            ),
+        )
+
+
 def tokenize(text: str) -> tuple[str, ...]:
     return tuple(token.lower() for token in _TOKEN_RE.findall(text))
 
@@ -219,6 +319,7 @@ class CognitiveMemory:
         self.recent = RecentExactKV(self.config.recent_exact_limit)
         self.latent = LatentKVStore(self.config)
         self.fidelity = AnchorFidelityVerifier()
+        self.compiled_circuit_bindings: dict[str, CompiledCircuitMemoryBinding] = {}
 
     def _make_exact_segment(self, segment_id: str, text: str, metadata: Mapping[str, Any] | None = None, extra_anchors: Iterable[Anchor] = ()) -> MemorySegment:
         extracted = self.anchor_ledger.ingest(text, segment_id)
@@ -295,6 +396,22 @@ class CognitiveMemory:
             if score > 0.0
         ]
         latent_segments = self.latent.retrieve(query_embedding, query_tokens, anchor_kinds, self.config.top_k_latent)
+        if required_anchors is not None:
+            required_keys = {(anchor.kind, anchor.value) for anchor in required_anchors}
+
+            def has_required_anchor(segment: MemorySegment) -> bool:
+                return any((anchor.kind, anchor.value) in required_keys for anchor in segment.anchors)
+
+            exact_ids = {segment.segment_id for segment in exact_segments}
+            for segment in self.recent.segments:
+                if segment.segment_id not in exact_ids and has_required_anchor(segment):
+                    exact_segments.append(segment)
+                    exact_ids.add(segment.segment_id)
+            latent_ids = {segment.segment_id for segment in latent_segments}
+            for segment in self.latent.segments:
+                if segment.segment_id not in latent_ids and has_required_anchor(segment):
+                    latent_segments.append(segment)
+                    latent_ids.add(segment.segment_id)
         selected = exact_segments + [segment for segment in latent_segments if segment.segment_id not in {exact.segment_id for exact in exact_segments}]
         required = self._required_anchors(selected, query_tokens, anchor_kinds, required_anchors)
 
@@ -328,6 +445,111 @@ class CognitiveMemory:
             cost=cost,
         )
 
+    def bind_compiled_circuit(
+        self,
+        *,
+        circuit_id: str,
+        skill: str,
+        source_kind: str,
+        source_failure_ids: Sequence[str] = (),
+        frontier_task_ids: Sequence[str] = (),
+        heldout_task_ids: Sequence[str] = (),
+        prompt_obligations: Sequence[str] = (),
+        metadata_keys: Sequence[str] = (),
+        anchors: Iterable[Anchor] = (),
+    ) -> CompiledCircuitMemoryBinding:
+        if not circuit_id:
+            raise ValueError("compiled circuit memory binding requires a circuit_id")
+        if not skill:
+            raise ValueError("compiled circuit memory binding requires a skill")
+        existing = self.compiled_circuit_bindings.get(circuit_id)
+        if existing is not None:
+            try:
+                _, reconstruction = self.reconstruct_compiled_circuit_binding(circuit_id)
+                if reconstruction.fidelity.passed and existing.segment_id in reconstruction.selected_segment_ids:
+                    return existing
+            except KeyError:
+                pass
+
+        segment_id = f"compiled-circuit-{circuit_id[:16]}"
+        required = (
+            Anchor("circuit", circuit_id, segment_id, 1.0),
+            Anchor("skill", skill, segment_id, 1.0),
+            Anchor("source_kind", source_kind or "frontier_discovery", segment_id, 1.0),
+        )
+        source_failure_ids = tuple(str(item) for item in source_failure_ids)
+        frontier_task_ids = tuple(str(item) for item in frontier_task_ids)
+        heldout_task_ids = tuple(str(item) for item in heldout_task_ids)
+        prompt_obligations = tuple(str(item) for item in prompt_obligations)
+        metadata_keys = tuple(str(item) for item in metadata_keys)
+        extra_anchor_tuple = tuple(anchors)
+        text = "\n".join(
+            (
+                f"Compiled circuit id: {circuit_id}",
+                f"Skill: {skill}",
+                f"Source kind: {source_kind or 'frontier_discovery'}",
+                "Source failures: " + " ".join(source_failure_ids),
+                "Frontier tasks: " + " ".join(frontier_task_ids),
+                "Held-out tasks: " + " ".join(heldout_task_ids),
+                "Prompt obligations: " + " ".join(prompt_obligations),
+                "Metadata keys: " + " ".join(metadata_keys),
+                "Anchors: " + " ".join(anchor.value for anchor in extra_anchor_tuple),
+            )
+        )
+        segment = self.ingest(
+            segment_id,
+            text,
+            metadata={
+                "source": "compiled_circuit_memory_binding",
+                "circuit_id": circuit_id,
+                "skill": skill,
+                "source_kind": source_kind or "frontier_discovery",
+                "frontier_task_ids": frontier_task_ids,
+                "heldout_task_ids": heldout_task_ids,
+            },
+            extra_anchors=tuple(required) + extra_anchor_tuple,
+        )
+        reconstruction = self.reconstruct(
+            f"compiled circuit {circuit_id} skill {skill} {source_kind}",
+            required_anchors=required,
+        )
+        binding = CompiledCircuitMemoryBinding(
+            binding_id=f"memory-binding-{circuit_id}",
+            circuit_id=circuit_id,
+            skill=skill,
+            source_kind=source_kind or "frontier_discovery",
+            segment_id=segment.segment_id,
+            source_failure_ids=source_failure_ids,
+            frontier_task_ids=frontier_task_ids,
+            heldout_task_ids=heldout_task_ids,
+            prompt_obligations=prompt_obligations,
+            metadata_keys=metadata_keys,
+            anchor_values=tuple(anchor.value for anchor in tuple(required) + extra_anchor_tuple),
+            fidelity=reconstruction.fidelity,
+            selected_segment_ids=reconstruction.selected_segment_ids,
+            cost=reconstruction.cost,
+        )
+        if not binding.passed:
+            missing = ", ".join(anchor.value for anchor in reconstruction.fidelity.missing)
+            raise ValueError(f"compiled circuit memory binding failed fidelity for {circuit_id}: missing {missing}")
+        self.compiled_circuit_bindings[circuit_id] = binding
+        return binding
+
+    def reconstruct_compiled_circuit_binding(
+        self,
+        circuit_id: str,
+        *,
+        query: str = "",
+    ) -> tuple[CompiledCircuitMemoryBinding, MemoryReconstruction]:
+        binding = self.compiled_circuit_bindings.get(circuit_id)
+        if binding is None:
+            raise KeyError(f"compiled circuit memory binding not found for {circuit_id}")
+        reconstruction = self.reconstruct(
+            query or f"compiled circuit {binding.circuit_id} skill {binding.skill} {binding.source_kind}",
+            required_anchors=binding.required_anchors,
+        )
+        return binding, reconstruction
+
     def compression_report(self) -> dict[str, Any]:
         latent = self.latent.segments
         original = sum(segment.original_token_count for segment in latent)
@@ -339,4 +561,9 @@ class CognitiveMemory:
             "latent_stored_tokens": stored,
             "latent_compression_ratio": stored / max(original, 1),
             "anchors": [asdict(anchor) for anchor in self.anchor_ledger.anchors],
+            "compiled_circuit_memory_bindings": [
+                binding.to_dict()
+                for binding in self.compiled_circuit_bindings.values()
+            ],
+            "compiled_circuit_memory_binding_count": len(self.compiled_circuit_bindings),
         }

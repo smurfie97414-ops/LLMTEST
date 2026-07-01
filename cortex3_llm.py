@@ -44,7 +44,7 @@ from cortex3 import (
 from cortex3_attribution import CausalAttributionEngine
 from cortex3_certificates import CertificateHead, CertificateHeadOutput, CertificateType, CertificateVerifier, LatentProofState, RandomDelatentizer, build_certificate, certificate_contract_for_task, evaluate_certificate_efficiency
 from cortex3_cycle import CortexCycle
-from cortex3_frontier import CompiledFrontierAgent, FrontierCircuitRegistry, FrontierSkillDiscovery
+from cortex3_frontier import CompiledFrontierAgent, FrontierCircuitRegistry, FrontierSkillDiscovery, compiled_circuit_id
 from cortex3_future import (
     ContractDecision,
     FutureContract,
@@ -57,7 +57,7 @@ from cortex3_future import (
 from cortex3_improvement import AcceptanceDecision, ProposalKind, RecursiveImprovementEngine, RollbackEvent
 from cortex3_inference import InferenceConfig, InferencePath, UltraFastInferenceEngine
 from cortex3_ledgers import BitLedger, CausalLedger, CausalTrace, SkillLedger, SkillState, UncertaintyLedger
-from cortex3_memory import CognitiveMemory, CognitiveMemoryConfig, MemoryMode, MemorySegment
+from cortex3_memory import CognitiveMemory, CognitiveMemoryConfig, CompiledCircuitMemoryBinding, MemoryMode, MemorySegment
 from cortex3_objective import FINAL_LOSS_TERMS, build_objective_report
 from cortex3_phases import CORTEX3_PHASES
 from cortex3_regrowth import MinimalRegrowthEngine, RegrowthActionKind, RegrowthPlan
@@ -694,6 +694,10 @@ def _memory_state(memory: CognitiveMemory) -> dict[str, Any]:
         "recent": [_memory_segment_payload(segment) for segment in memory.recent.segments],
         "latent": [_memory_segment_payload(segment) for segment in memory.latent.segments],
         "anchors": [_anchor_payload(anchor) for anchor in memory.anchor_ledger.anchors],
+        "compiled_circuit_bindings": [
+            binding.to_dict()
+            for binding in memory.compiled_circuit_bindings.values()
+        ],
         "compression_report": memory.compression_report(),
     }
 
@@ -704,6 +708,13 @@ def _restore_memory_state(memory: CognitiveMemory, payload: Mapping[str, Any] | 
     memory.recent.segments = [_memory_segment_from_payload(item) for item in payload.get("recent", ())]
     memory.latent.segments = [_memory_segment_from_payload(item) for item in payload.get("latent", ())]
     memory.anchor_ledger.anchors = [_anchor_from_payload(item) for item in payload.get("anchors", ())]
+    memory.compiled_circuit_bindings = {
+        binding.circuit_id: binding
+        for binding in (
+            CompiledCircuitMemoryBinding.from_dict(dict(item))
+            for item in payload.get("compiled_circuit_bindings", ())
+        )
+    }
 
 
 def _sleep_state(sleep: SleepPhaseConsolidator) -> dict[str, Any]:
@@ -3246,6 +3257,18 @@ def _cortex_architecture_audit_from_summary(summary: Mapping[str, Any]) -> dict[
         "cognitive memory must learn exact/latent/drop retention decisions during LLM training, not only replay audited segments",
     )
     add(
+        "compiled_circuit_memory_retention",
+        integer("compiled_circuit_memory_binding_count") > 0
+        and integer("compiled_circuit_memory_binding_events") > 0
+        and integer("compiled_circuit_memory_fidelity_failures") == 0,
+        {
+            "compiled_circuit_memory_binding_count": integer("compiled_circuit_memory_binding_count"),
+            "compiled_circuit_memory_binding_events": integer("compiled_circuit_memory_binding_events"),
+            "compiled_circuit_memory_fidelity_failures": integer("compiled_circuit_memory_fidelity_failures"),
+        },
+        "P4 memory must retain and reconstruct compiled Frontier circuits before FastSolve/P7/P9/P10 reuse",
+    )
+    add(
         "ternary_core",
         trace_count("layer_forward_events") > 0
         and trace_count("activation_quantizations") > 0
@@ -3446,7 +3469,8 @@ def _cortex_architecture_audit_from_summary(summary: Mapping[str, Any]) -> dict[
         and integer("sleep_frontier_heldout_total") > 0
         and integer("sleep_frontier_heldout_passed") == integer("sleep_frontier_heldout_total")
         and integer("sleep_frontier_heldout_gate_passed_circuit_count") == integer("sleep_frontier_compiled_circuit_count")
-        and integer("sleep_frontier_fastsolve_events") > 0,
+        and integer("sleep_frontier_fastsolve_events") > 0
+        and integer("sleep_frontier_memory_binding_events") > 0,
         {
             "P9": phase_count("P9"),
             "sleep_replay_examples": integer("sleep_replay_examples"),
@@ -3457,6 +3481,7 @@ def _cortex_architecture_audit_from_summary(summary: Mapping[str, Any]) -> dict[
             "sleep_frontier_heldout_total": integer("sleep_frontier_heldout_total"),
             "sleep_frontier_heldout_gate_passed_circuit_count": integer("sleep_frontier_heldout_gate_passed_circuit_count"),
             "sleep_frontier_fastsolve_events": integer("sleep_frontier_fastsolve_events"),
+            "sleep_frontier_memory_binding_events": integer("sleep_frontier_memory_binding_events"),
         },
         "sleep/consolidation must emit verified replay, then compile accepted experience into held-out gated executable Frontier circuits used by FastSolve",
     )
@@ -3681,7 +3706,10 @@ def _cortex_phase_deliverable_audit_from_summary(summary: Mapping[str, Any]) -> 
         and int(summary.get("input_anchor_count", 0) or 0) > 0
         and int(summary.get("input_anchor_fidelity_failures", 0) or 0) == 0
         and int(summary.get("learned_memory_policy_events", 0) or 0) > 0
-        and int(summary.get("learned_memory_anchor_supervision_events", 0) or 0) > 0,
+        and int(summary.get("learned_memory_anchor_supervision_events", 0) or 0) > 0
+        and int(summary.get("compiled_circuit_memory_binding_count", 0) or 0) > 0
+        and int(summary.get("compiled_circuit_memory_binding_events", 0) or 0) > 0
+        and int(summary.get("compiled_circuit_memory_fidelity_failures", 0) or 0) == 0,
         {
             "memory_recent_segments": int(summary.get("memory_recent_segments", 0) or 0),
             "memory_latent_segments": int(summary.get("memory_latent_segments", 0) or 0),
@@ -3689,8 +3717,11 @@ def _cortex_phase_deliverable_audit_from_summary(summary: Mapping[str, Any]) -> 
             "input_anchor_fidelity_failures": int(summary.get("input_anchor_fidelity_failures", 0) or 0),
             "learned_memory_policy_events": int(summary.get("learned_memory_policy_events", 0) or 0),
             "learned_memory_anchor_supervision_events": int(summary.get("learned_memory_anchor_supervision_events", 0) or 0),
+            "compiled_circuit_memory_binding_count": int(summary.get("compiled_circuit_memory_binding_count", 0) or 0),
+            "compiled_circuit_memory_binding_events": int(summary.get("compiled_circuit_memory_binding_events", 0) or 0),
+            "compiled_circuit_memory_fidelity_failures": int(summary.get("compiled_circuit_memory_fidelity_failures", 0) or 0),
         },
-        "Cognitive memory must preserve exact anchors while learning exact/latent/drop retention decisions",
+        "Cognitive memory must preserve exact anchors, learn exact/latent/drop retention decisions, and retain compiled Frontier circuits for reuse",
     )
     add(
         "P5",
@@ -3775,7 +3806,8 @@ def _cortex_phase_deliverable_audit_from_summary(summary: Mapping[str, Any]) -> 
         and int(summary.get("sleep_frontier_heldout_total", 0) or 0) > 0
         and int(summary.get("sleep_frontier_heldout_passed", 0) or 0)
         == int(summary.get("sleep_frontier_heldout_total", 0) or 0)
-        and count("sleep_frontier_fastsolve_events") > 0,
+        and count("sleep_frontier_fastsolve_events") > 0
+        and int(summary.get("sleep_frontier_memory_binding_events", 0) or 0) > 0,
         {
             "sleep_replay_examples": int(summary.get("sleep_replay_examples", 0) or 0),
             "sleep_synthetic_examples": int(summary.get("sleep_synthetic_examples", 0) or 0),
@@ -3787,8 +3819,9 @@ def _cortex_phase_deliverable_audit_from_summary(summary: Mapping[str, Any]) -> 
             "sleep_frontier_heldout_passed": int(summary.get("sleep_frontier_heldout_passed", 0) or 0),
             "sleep_frontier_heldout_total": int(summary.get("sleep_frontier_heldout_total", 0) or 0),
             "sleep_frontier_fastsolve_events": count("sleep_frontier_fastsolve_events"),
+            "sleep_frontier_memory_binding_events": int(summary.get("sleep_frontier_memory_binding_events", 0) or 0),
         },
-        "sleep phase must combine replay, verified synthetic/metamorphic, real reservoir, anti-collapse scheduling and held-out gated Frontier compilation",
+        "sleep phase must combine replay, verified synthetic/metamorphic, real reservoir, anti-collapse scheduling, memory-retained held-out Frontier compilation and FastSolve",
     )
     add(
         "P10",
@@ -4393,6 +4426,58 @@ class CortexTrainingPhaseController:
             tuple(str(item) for item in report.get("heldout_task_ids", ())),
         )
 
+    def _bind_frontier_circuit_memory(
+        self,
+        runtime_circuit: Any,
+        *,
+        step: int,
+        source_phase: str,
+    ) -> dict[str, Any]:
+        report = runtime_circuit.report
+        circuit_id = compiled_circuit_id(report)
+        training = dict(report.training)
+        task_anchors = tuple(
+            anchor
+            for task in tuple(runtime_circuit.verified_tasks) + tuple(runtime_circuit.heldout_tasks)
+            for anchor in task.anchors
+        )
+        binding = self.memory.bind_compiled_circuit(
+            circuit_id=circuit_id,
+            skill=runtime_circuit.skill,
+            source_kind=str(training.get("source_kind", "frontier_discovery")),
+            source_failure_ids=tuple(report.source_failure_ids),
+            frontier_task_ids=tuple(report.frontier_task_ids),
+            heldout_task_ids=tuple(report.heldout_task_ids),
+            prompt_obligations=tuple(report.invariants.prompt_obligations),
+            metadata_keys=tuple(report.invariants.metadata_keys),
+            anchors=task_anchors,
+        )
+        _, reconstruction = self.memory.reconstruct_compiled_circuit_binding(
+            circuit_id,
+            query=f"{source_phase} compiled circuit {circuit_id} skill {runtime_circuit.skill}",
+        )
+        if not reconstruction.fidelity.passed or binding.segment_id not in reconstruction.selected_segment_ids:
+            self._count("compiled_circuit_memory_fidelity_failures")
+            missing = ", ".join(anchor.value for anchor in reconstruction.fidelity.missing)
+            raise ValueError(f"{source_phase} circuit {circuit_id} failed P4 memory retention gate: missing {missing}")
+        self._count("compiled_circuit_memory_binding_events")
+        if source_phase == "P9":
+            self._count("sleep_frontier_memory_binding_events")
+        self.bit_ledger.ingest_cost(reconstruction.cost, note=f"{source_phase}:compiled-circuit-memory:{runtime_circuit.skill}")
+        self._record_causal_trace(
+            trace_id=f"{source_phase}-compiled-memory-{step}-{circuit_id}",
+            skill=runtime_circuit.skill,
+            confidence=0.99,
+            anchors=len(binding.anchor_values),
+            certificate_fields=("compiled_circuit_memory_binding", "exact_anchor_ledger"),
+            verifier_level=2,
+        )
+        return {
+            "binding": binding.to_dict(),
+            "runtime_fidelity": asdict(reconstruction.fidelity),
+            "runtime_selected_segment_ids": reconstruction.selected_segment_ids,
+        }
+
     def _compile_sleep_frontier(
         self,
         sleep_report: Any,
@@ -4437,6 +4522,7 @@ class CortexTrainingPhaseController:
         for runtime_circuit in runtime_circuits:
             if not runtime_circuit.verified_tasks:
                 continue
+            memory_binding_report = self._bind_frontier_circuit_memory(runtime_circuit, step=step, source_phase="P9")
             local_registry = FrontierCircuitRegistry()
             local_registry.register(
                 runtime_circuit.report,
@@ -4446,7 +4532,7 @@ class CortexTrainingPhaseController:
                 checkpoint_path=runtime_circuit.checkpoint_path,
             )
             task = runtime_circuit.verified_tasks[0]
-            answer = CompiledFrontierAgent(local_registry, verifier=self.verifier)(task)
+            answer = CompiledFrontierAgent(local_registry, verifier=self.verifier, memory=self.memory)(task)
             verification = self.verifier.oracle_registry.verify(task.skill, task, answer)
             if not verification.passed:
                 raise ValueError(f"P9 compiled sleep Frontier fastsolve failed oracle for {task.task_id}: {verification.reason}")
@@ -4474,6 +4560,8 @@ class CortexTrainingPhaseController:
                     "frontier_heldout_task_ids": runtime_circuit.report.heldout_task_ids,
                     "frontier_heldout_gate_passed": bool(runtime_circuit.report.heldout.get("gate_passed", False)),
                     "frontier_compiled_contract_verified": bool(answer.certificate.get("frontier_compiled_contract_verified", False)),
+                    "frontier_memory_binding_id": answer.certificate.get("frontier_memory_binding_id"),
+                    "frontier_memory_binding_passed": bool(answer.certificate.get("frontier_memory_binding_passed", False)),
                 },
             )
             fastsolve_reports.append(
@@ -4488,6 +4576,8 @@ class CortexTrainingPhaseController:
                     "heldout_gate_passed": bool(runtime_circuit.report.heldout.get("gate_passed", False)),
                     "heldout_passed": int(runtime_circuit.report.heldout.get("passed", 0)),
                     "heldout_total": int(runtime_circuit.report.heldout.get("total", 0)),
+                    "memory_binding": memory_binding_report,
+                    "frontier_memory_binding_passed": bool(answer.certificate.get("frontier_memory_binding_passed", False)),
                 }
             )
         if not fastsolve_reports:
@@ -4589,7 +4679,7 @@ class CortexTrainingPhaseController:
         circuit = self.frontier_registry.select(failure.task)
         if circuit is None:
             return None
-        compiled_agent = CompiledFrontierAgent(self.frontier_registry, verifier=self.verifier)
+        compiled_agent = CompiledFrontierAgent(self.frontier_registry, verifier=self.verifier, memory=self.memory)
         answer = compiled_agent(failure.task)
         repaired = self.verifier.oracle_registry.verify(failure.task.skill, failure.task, answer)
 
@@ -4607,6 +4697,7 @@ class CortexTrainingPhaseController:
         output_goal_passed = bool(answer.certificate.get("frontier_output_goal_contract_passed"))
         compiled_contract_verified = bool(answer.certificate.get("frontier_compiled_contract_verified"))
         heldout_gate_passed = bool(answer.certificate.get("frontier_heldout_gate_passed"))
+        memory_binding_passed = bool(answer.certificate.get("frontier_memory_binding_passed"))
         accepted = bool(
             repaired.passed
             and repaired.score > failure.score
@@ -4614,6 +4705,7 @@ class CortexTrainingPhaseController:
             and output_goal_passed
             and compiled_contract_verified
             and heldout_gate_passed
+            and memory_binding_passed
         )
         report = {
             "task_id": failure.task.task_id,
@@ -4640,6 +4732,9 @@ class CortexTrainingPhaseController:
             "frontier_output_goal_contract": dict(answer.certificate.get("frontier_output_goal_contract") or {}),
             "frontier_compiled_contract_verified": compiled_contract_verified,
             "frontier_compiled_contract_checksum": str(answer.certificate.get("frontier_compiled_contract_checksum", "")),
+            "frontier_memory_binding_id": str(answer.certificate.get("frontier_memory_binding_id", "")),
+            "frontier_memory_binding_passed": memory_binding_passed,
+            "frontier_memory_binding_fidelity": float(answer.certificate.get("frontier_memory_binding_fidelity", 0.0) or 0.0),
             "certificate_fields": tuple(sorted(str(key) for key in answer.certificate)),
             "cost": asdict(total_cost),
         }
@@ -5197,6 +5292,7 @@ class CortexTrainingPhaseController:
         output_goal_summary = self._output_goal_contract_summary()
         frontier_registry_summary = self.frontier_registry.to_dict()
         frontier_heldout_summary = _frontier_heldout_summary(frontier_registry_summary)
+        memory_report = self.memory.compression_report()
         summary = {
             "schema_version": 1,
             "phase_event_counts": phase_counts,
@@ -5258,6 +5354,11 @@ class CortexTrainingPhaseController:
             "uncertainty_ledger_ece": self.uncertainty_ledger.expected_calibration_error(),
             "memory_recent_segments": len(self.memory.recent.segments),
             "memory_latent_segments": len(self.memory.latent.segments),
+            "compiled_circuit_memory_binding_count": int(memory_report.get("compiled_circuit_memory_binding_count", 0) or 0),
+            "compiled_circuit_memory_binding_events": int(self.integration_counts.get("compiled_circuit_memory_binding_events", 0)),
+            "compiled_circuit_memory_fidelity_failures": int(self.integration_counts.get("compiled_circuit_memory_fidelity_failures", 0)),
+            "sleep_frontier_memory_binding_events": int(self.integration_counts.get("sleep_frontier_memory_binding_events", 0)),
+            "compiled_circuit_memory_bindings": _last_items(memory_report.get("compiled_circuit_memory_bindings", ()), 5),
             "sleep_replay_examples": len(self.sleep.replay.examples),
             "sleep_synthetic_examples": len(self.sleep.synthetic.examples),
             "sleep_reservoir_examples": len(self.sleep.reservoir.examples),
@@ -5351,9 +5452,19 @@ class CortexTrainingPhaseController:
                     registry_dir = self.run_dir / "frontier_registry"
                     registry_path = self.frontier_registry.save(registry_dir)
                     self.integration_counts["frontier_registry_saves"] = self.integration_counts.get("frontier_registry_saves", 0) + 1
+                    all_runtime_circuits = tuple(
+                        circuit
+                        for skill in self.frontier_registry.compiled_skills()
+                        for circuit in self.frontier_registry.circuits_for_skill(skill)
+                    )
+                    memory_bindings = tuple(
+                        self._bind_frontier_circuit_memory(circuit, step=step, source_phase="frontier")
+                        for circuit in all_runtime_circuits
+                    )
                     audit["frontier_discovery"] = {
                         **frontier_payload,
                         "registry_path": str(registry_path),
+                        "memory_bindings": memory_bindings,
                     }
                     first_skill = frontier_report.circuits[0].skill
                     runtime_circuits = self.frontier_registry.circuits_for_skill(first_skill)
@@ -5654,6 +5765,8 @@ class CortexTrainingPhaseController:
                 if bool(inferred.answer.raw.get("frontier_compiled_selected")):
                     self._count("frontier_compiled_fastsolve_events")
                     self.frontier_compiled_fastsolve_events += 1
+                    if bool(inferred.answer.certificate.get("frontier_memory_binding_passed")):
+                        self._count("compiled_circuit_memory_binding_events")
             self._touch("P8")
             audit["inference"] = route_reports[0] if route_reports else {}
             audit["inference_routes"] = route_reports
@@ -5922,6 +6035,7 @@ class CortexTrainingPhaseController:
         output_goal_summary = self._output_goal_contract_summary()
         frontier_registry_summary = self.frontier_registry.to_dict()
         frontier_heldout_summary = _frontier_heldout_summary(frontier_registry_summary)
+        memory_report = self.memory.compression_report()
         return {
             "schema_version": 1,
             "enabled": True,
@@ -5992,6 +6106,11 @@ class CortexTrainingPhaseController:
                 "phase_replay_examples_by_phase": dict(self.phase_replay_examples),
                 "memory_recent_segments": len(self.memory.recent.segments),
                 "memory_latent_segments": len(self.memory.latent.segments),
+                "compiled_circuit_memory_binding_count": int(memory_report.get("compiled_circuit_memory_binding_count", 0) or 0),
+                "compiled_circuit_memory_binding_events": int(self.integration_counts.get("compiled_circuit_memory_binding_events", 0)),
+                "compiled_circuit_memory_fidelity_failures": int(self.integration_counts.get("compiled_circuit_memory_fidelity_failures", 0)),
+                "sleep_frontier_memory_binding_events": int(self.integration_counts.get("sleep_frontier_memory_binding_events", 0)),
+                "compiled_circuit_memory_bindings": _last_items(memory_report.get("compiled_circuit_memory_bindings", ()), 5),
                 "sleep_replay_examples": len(self.sleep.replay.examples),
                 "sleep_synthetic_examples": len(self.sleep.synthetic.examples),
                 "sleep_reservoir_examples": len(self.sleep.reservoir.examples),
@@ -6080,6 +6199,10 @@ class CortexTrainingPhaseController:
                     "uncertainty_ledger_observations": sum(len(pairs) for pairs in self.uncertainty_ledger.bins.values()),
                     "memory_recent_segments": len(self.memory.recent.segments),
                     "memory_latent_segments": len(self.memory.latent.segments),
+                    "compiled_circuit_memory_binding_count": int(memory_report.get("compiled_circuit_memory_binding_count", 0) or 0),
+                    "compiled_circuit_memory_binding_events": int(self.integration_counts.get("compiled_circuit_memory_binding_events", 0)),
+                    "compiled_circuit_memory_fidelity_failures": int(self.integration_counts.get("compiled_circuit_memory_fidelity_failures", 0)),
+                    "sleep_frontier_memory_binding_events": int(self.integration_counts.get("sleep_frontier_memory_binding_events", 0)),
                     "sleep_replay_examples": len(self.sleep.replay.examples),
                     "sleep_synthetic_examples": len(self.sleep.synthetic.examples),
                     "sleep_reservoir_examples": len(self.sleep.reservoir.examples),
@@ -6155,6 +6278,10 @@ class CortexTrainingPhaseController:
                     "uncertainty_ledger_observations": sum(len(pairs) for pairs in self.uncertainty_ledger.bins.values()),
                     "memory_recent_segments": len(self.memory.recent.segments),
                     "memory_latent_segments": len(self.memory.latent.segments),
+                    "compiled_circuit_memory_binding_count": int(memory_report.get("compiled_circuit_memory_binding_count", 0) or 0),
+                    "compiled_circuit_memory_binding_events": int(self.integration_counts.get("compiled_circuit_memory_binding_events", 0)),
+                    "compiled_circuit_memory_fidelity_failures": int(self.integration_counts.get("compiled_circuit_memory_fidelity_failures", 0)),
+                    "sleep_frontier_memory_binding_events": int(self.integration_counts.get("sleep_frontier_memory_binding_events", 0)),
                     "sleep_replay_examples": len(self.sleep.replay.examples),
                     "sleep_synthetic_examples": len(self.sleep.synthetic.examples),
                     "sleep_reservoir_examples": len(self.sleep.reservoir.examples),

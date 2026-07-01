@@ -4,8 +4,9 @@ import unittest
 
 from cortex3 import CorruptedCompressedAgent, DynamicSkillVerifier, ReferenceRuleAgent, default_skill_specs
 from cortex3_cycle import CortexCycle
-from cortex3_frontier import CompiledFrontierAgent, FrontierCircuitRegistry, FrontierSkillDiscovery
+from cortex3_frontier import CompiledFrontierAgent, FrontierCircuitRegistry, FrontierSkillDiscovery, compiled_circuit_id
 from cortex3_inference import InferencePath, UltraFastInferenceEngine
+from cortex3_memory import CognitiveMemory, CognitiveMemoryConfig
 from cortex3_reporting import write_cycle_run
 
 
@@ -39,9 +40,25 @@ class FrontierSkillDiscoveryTest(unittest.TestCase):
         selected = registry.select(task)
         self.assertIsNotNone(selected)
         self.assertEqual(selected.report.skill, task.skill)
-        answer = CompiledFrontierAgent(registry, verifier=verifier)(task)
+        circuit_id = compiled_circuit_id(runtime_circuit.report)
+
+        class BrokenMemory:
+            def bind_compiled_circuit(self, **kwargs):
+                raise RuntimeError("binding blocked")
+
+        with self.assertRaisesRegex(ValueError, "could not establish a P4 memory binding"):
+            CompiledFrontierAgent(registry, verifier=verifier, memory=BrokenMemory())(task)
+
+        strict_memory = CognitiveMemory(CognitiveMemoryConfig(recent_exact_limit=1, embedding_dim=64, top_k_latent=2))
+        answer = CompiledFrontierAgent(registry, verifier=verifier, memory=strict_memory)(task)
+        binding = strict_memory.compiled_circuit_bindings[circuit_id]
+        strict_memory.ingest("recent-frontier-noise", "Segment recent pour verifier que le circuit compile reste reconstructible en latent KV.")
+        answer = CompiledFrontierAgent(registry, verifier=verifier, memory=strict_memory)(task)
         self.assertTrue(answer.raw["frontier_compiled_selected"])
         self.assertTrue(answer.certificate["frontier_compiled_circuit"])
+        self.assertEqual(answer.certificate["frontier_memory_binding_id"], binding.binding_id)
+        self.assertTrue(answer.certificate["frontier_memory_binding_passed"])
+        self.assertGreater(answer.certificate["frontier_memory_binding_fidelity"], 0.0)
         self.assertTrue(answer.certificate["frontier_verification_passed"])
         self.assertTrue(answer.certificate["frontier_heldout_gate_passed"])
         self.assertEqual(answer.certificate["frontier_heldout_passed"], answer.certificate["frontier_heldout_total"])
@@ -51,16 +68,19 @@ class FrontierSkillDiscoveryTest(unittest.TestCase):
         self.assertEqual(answer.certificate["frontier_compiled_contract"]["certificate_type"], "compiled_circuit")
         compiled_contract = answer.certificate["frontier_compiled_contract"]["claims"]["compiled_circuit_contract"]
         self.assertTrue(compiled_contract["output_goal_contract_passed"])
+        self.assertEqual(compiled_contract["memory_binding_id"], binding.binding_id)
+        self.assertTrue(compiled_contract["memory_binding_passed"])
         self.assertTrue(compiled_contract["heldout_gate_passed"])
         self.assertEqual(compiled_contract["heldout_passed"], compiled_contract["heldout_total"])
         self.assertTrue(compiled_contract["heldout_task_ids"])
         self.assertEqual(compiled_contract["output_goal_contract_id"], answer.certificate["frontier_output_goal_contract"]["contract"]["contract_id"])
         self.assertTrue(answer.certificate["frontier_compiled_contract_checksum"])
         self.assertTrue(verifier.oracle_registry.verify(task.skill, task, answer).passed)
-        engine = UltraFastInferenceEngine(verifier, CorruptedCompressedAgent(), compiled_frontier_registry=registry)
+        engine = UltraFastInferenceEngine(verifier, CorruptedCompressedAgent(), memory=strict_memory, compiled_frontier_registry=registry)
         inferred = engine.infer(task, forced_path=InferencePath.FAST)
         self.assertTrue(inferred.answer.raw["frontier_compiled_selected"])
         self.assertTrue(inferred.answer.certificate["frontier_compiled_circuit"])
+        self.assertTrue(inferred.answer.certificate["frontier_memory_binding_passed"])
         self.assertTrue(inferred.answer.certificate["output_goal_contract_passed"])
         self.assertTrue(inferred.future_contract["output_goal_contract"]["accepted"])
         self.assertTrue(inferred.passed)

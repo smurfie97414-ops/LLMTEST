@@ -3214,6 +3214,7 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 "p1_to_p10_phase_activity",
                 "variable_in_compressor",
                 "learned_cognitive_memory_policy",
+                "compiled_circuit_memory_retention",
                 "exact_anchor_ledger",
                 "latent_memory_kv",
                 "ternary_core",
@@ -3304,6 +3305,10 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 influence["last_objective_loss_total"],
             )
             self.assertGreater(influence["memory_recent_segments"], 0)
+            self.assertGreater(influence["compiled_circuit_memory_binding_count"], 0)
+            self.assertGreater(influence["compiled_circuit_memory_binding_events"], 0)
+            self.assertEqual(influence["compiled_circuit_memory_fidelity_failures"], 0)
+            self.assertTrue(influence["compiled_circuit_memory_bindings"])
             self.assertGreater(influence["sleep_replay_examples"], 0)
             self.assertGreater(influence["sleep_synthetic_examples"], 0)
             self.assertGreater(influence["frontier_compiled_circuit_count"], 0)
@@ -3326,6 +3331,7 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             )
             self.assertGreater(influence["frontier_compiled_fastsolve_events"], 0)
             self.assertGreater(influence["sleep_frontier_fastsolve_events"], 0)
+            self.assertGreater(influence["sleep_frontier_memory_binding_events"], 0)
             self.assertGreater(influence["frontier_repair_candidate_count"], 0)
             self.assertGreater(influence["frontier_repair_accepted_events"], 0)
             self.assertGreater(influence["recursive_frontier_proposal_events"], 0)
@@ -3349,6 +3355,8 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             self.assertTrue(latest_frontier_repair["frontier_output_goal_contract"]["accepted"], latest_frontier_repair)
             self.assertTrue(latest_frontier_repair["frontier_compiled_contract_verified"], latest_frontier_repair)
             self.assertTrue(latest_frontier_repair["frontier_compiled_contract_checksum"], latest_frontier_repair)
+            self.assertTrue(latest_frontier_repair["frontier_memory_binding_passed"], latest_frontier_repair)
+            self.assertGreater(latest_frontier_repair["frontier_memory_binding_fidelity"], 0.0)
             self.assertTrue(latest_frontier_repair["repair_passed"], latest_frontier_repair)
             self.assertTrue(latest_frontier_repair["non_regression_passed"], latest_frontier_repair)
             self.assertGreater(latest_frontier_repair["repair_score_delta"], 0.0)

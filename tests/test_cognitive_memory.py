@@ -65,6 +65,31 @@ class CognitiveMemoryTest(unittest.TestCase):
         self.assertEqual(tuple(first.shape), (32,))
         self.assertTrue(bool(first.equal(second)))
 
+    def test_compiled_circuit_memory_binding_survives_latent_eviction(self):
+        memory = CognitiveMemory(CognitiveMemoryConfig(recent_exact_limit=1, embedding_dim=64, top_k_latent=2))
+        binding = memory.bind_compiled_circuit(
+            circuit_id="circuit-alpha-123",
+            skill="algebra",
+            source_kind="sleep_consolidation",
+            source_failure_ids=("sleep-example-1",),
+            frontier_task_ids=("frontier-train-1", "frontier-train-2"),
+            heldout_task_ids=("frontier-heldout-1",),
+            prompt_obligations=("exact_output", "no_extra_text"),
+            metadata_keys=("a", "b", "c"),
+            anchors=(Anchor("variable", "x", "frontier-train-1"),),
+        )
+        memory.ingest("recent", "Nouveau segment qui force le circuit compile en latent KV.")
+
+        restored_binding, reconstruction = memory.reconstruct_compiled_circuit_binding("circuit-alpha-123")
+
+        self.assertEqual(restored_binding.binding_id, binding.binding_id)
+        self.assertTrue(reconstruction.fidelity.passed)
+        self.assertIn(binding.segment_id, reconstruction.selected_segment_ids)
+        self.assertIn("circuit-alpha-123", reconstruction.rendered_context)
+        report = memory.compression_report()
+        self.assertEqual(report["compiled_circuit_memory_binding_count"], 1)
+        self.assertTrue(report["compiled_circuit_memory_bindings"][0]["passed"])
+
     def test_cycle_run_artifacts_can_include_cognitive_memory_report(self):
         verifier = DynamicSkillVerifier(default_skill_specs())
         report = CortexCycle(verifier).run(ReferenceRuleAgent(), CorruptedCompressedAgent(), seed=5, n_per_skill=1)
