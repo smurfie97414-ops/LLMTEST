@@ -27,6 +27,7 @@ from cortex3_certificates import (
     default_tool_registry,
     evaluate_certificate_efficiency,
     model_token_certificate_tool,
+    sympy_symbolic_tool,
 )
 from cortex3_cycle import CortexCycle
 from cortex3_reporting import write_cycle_run
@@ -252,6 +253,65 @@ class CertificatesTest(unittest.TestCase):
         self.assertFalse(algebra_linear_tool(bad).passed)
         self.assertFalse(algebra_linear_tool(extra_text).passed)
 
+    def test_symbolic_algebra_certificate_uses_sympy_solver_for_quadratic_roots(self):
+        state = _latent_state()
+        task = Task(
+            "task-symbolic",
+            "algebra",
+            "Solve exactly for x: x^2 - x - 6 = 0. Return the exact roots as a comma-separated set.",
+            "-2, 3",
+            {"variable": "x", "a": 1, "b": -1, "c": -6, "kind": "quadratic"},
+        )
+        claims, tool, tool_args, anchors = certificate_contract_for_task(task, "-2, 3")
+        cert = build_certificate(
+            certificate_id="cert-symbolic",
+            task_id=task.task_id,
+            skill=task.skill,
+            certificate_type=CertificateType.ALGEBRA,
+            answer="-2, 3",
+            claims=claims,
+            uncertainty=0.03,
+            latent_state=state,
+            anchors=anchors,
+            tool=tool,
+            tool_args=tool_args,
+        )
+
+        self.assertEqual(tool, "sympy_symbolic")
+        self.assertEqual(tuple(tool_args["expected_roots"]), ("-2", "3"))
+        self.assertEqual(claims["symbolic_solver"], "sympy")
+        self.assertTrue(CertificateVerifier().verify(cert, state).passed)
+        self.assertTrue(sympy_symbolic_tool(cert).passed)
+
+        wrong_roots = ShortCertificate(
+            certificate_id=cert.certificate_id,
+            task_id=cert.task_id,
+            skill=cert.skill,
+            certificate_type=cert.certificate_type,
+            answer="-2, 4",
+            claims=cert.claims,
+            uncertainty=cert.uncertainty,
+            latent_state_checksum=cert.latent_state_checksum,
+            anchors=cert.anchors,
+            tool=cert.tool,
+            tool_args=cert.tool_args,
+        )
+        tampered_claims = ShortCertificate(
+            certificate_id=cert.certificate_id,
+            task_id=cert.task_id,
+            skill=cert.skill,
+            certificate_type=cert.certificate_type,
+            answer=cert.answer,
+            claims={**dict(cert.claims), "symbolic_solver": "claimed-local-solver"},
+            uncertainty=cert.uncertainty,
+            latent_state_checksum=cert.latent_state_checksum,
+            anchors=cert.anchors,
+            tool=cert.tool,
+            tool_args=cert.tool_args,
+        )
+        self.assertFalse(sympy_symbolic_tool(wrong_roots).passed)
+        self.assertFalse(sympy_symbolic_tool(tampered_claims).passed)
+
     def test_code_certificate_requires_hidden_tests_and_properties_when_declared(self):
         state = _latent_state()
         cert = build_certificate(
@@ -445,7 +505,7 @@ class CertificatesTest(unittest.TestCase):
 
     def test_default_registry_contains_required_tools(self):
         registry = default_tool_registry()
-        self.assertEqual(set(registry.names), {"algebra_linear", "anchor_fidelity", "arithmetic", "code_tests", "compiled_circuit", "exact_match", "model_token_certificate"})
+        self.assertEqual(set(registry.names), {"algebra_linear", "anchor_fidelity", "arithmetic", "code_tests", "compiled_circuit", "exact_match", "model_token_certificate", "sympy_symbolic"})
 
     def test_cycle_run_artifacts_can_include_short_certificates(self):
         state = _latent_state()

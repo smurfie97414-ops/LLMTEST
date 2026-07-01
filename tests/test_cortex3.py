@@ -43,6 +43,21 @@ class Cortex3Test(unittest.TestCase):
             self.assertFalse(skill.verify(task, CandidateAnswer(str(int(task.expected) + 1))).passed)
             self.assertFalse(skill.verify(task, CandidateAnswer(f"the answer is {task.expected}")).passed)
 
+    def test_algebra_oracle_accepts_exact_symbolic_quadratic_root_sets(self):
+        skill = AlgebraSkill()
+        task = Task(
+            "quadratic-oracle",
+            "algebra",
+            "Solve exactly for x: x^2 - x - 6 = 0. Return the exact roots as a comma-separated set.",
+            "-2, 3",
+            {"variable": "x", "a": 1, "b": -1, "c": -6, "kind": "quadratic"},
+        )
+
+        self.assertTrue(skill.verify(task, CandidateAnswer("-2, 3")).passed)
+        self.assertTrue(skill.verify(task, CandidateAnswer("3, -2")).passed)
+        self.assertFalse(skill.verify(task, CandidateAnswer("-2, 4")).passed)
+        self.assertFalse(skill.verify(task, CandidateAnswer("x = -2, 3")).passed)
+
     def test_reference_beats_corrupted_candidate(self):
         verifier = DynamicSkillVerifier([ArithmeticSkill(), LongContextAnchorSkill(), InstructionSkill()])
         ref = verifier.evaluate(ReferenceRuleAgent(), n_per_skill=3, seed=0)

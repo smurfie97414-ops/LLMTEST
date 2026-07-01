@@ -160,7 +160,7 @@ Dans le checkpoint inspecte :
 - P1 replay : 3
 - P3 replay : 3
 - P4 replay : 3
-- P5 replay : 3
+- P5 replay : 3+ avec replay symbolique verifie lorsque P5 tourne
 - P6 replay : 3
 - P7 replay : 3
 - P8 replay : 7
@@ -227,7 +227,7 @@ Correspondance runtime :
 | Future Contract / FSP | `FutureContractEngine` + observed tokens | P3 replay + contract decisions |
 | Adaptive Multi-Token Decoding | MTP horizons + inference route + model-backed adaptive block gate | audit `adaptive_multi_token_decoding`, `inference_model_backed_adaptive_mtp_*` |
 | Latent Reasoning Workspace | `LatentReasoningWorkspace` multi-step + binding cert head | audits `latent_reasoning_workspace`, P5 et checkpoint |
-| Certificate Generator | `CertificateHead` + verifier | P5 certificate verification |
+| Certificate Generator | `CertificateHead` + verifier + `sympy_symbolic` | P5 certificate verification, symbolic solver replay |
 | Frontier FastSolve persistant | `FrontierCircuitRegistry` + `CompiledFrontierAgent` | registre restaure, binding P4 restaure, output-goal et certificat compile |
 | Hierarchical Dynamic Verifier | `DynamicSkillVerifier` | P1 + no phase errors |
 | Attribute Regression | `CausalAttributionEngine` | P6 |
@@ -415,6 +415,9 @@ La phase cree :
 - un certificat issu de la vraie `CertificateHead` du Transformer quand un forward LLM est disponible ;
 - un certificat court ;
 - une verification par outil ;
+- une verification algebrique lineaire multi-step ;
+- une verification symbolique SymPy de racines quadratiques exactes ;
+- une verification code visible/cachee/proprietes ;
 - une random de-latentization probe ;
 - une mesure d'efficacite certificat vs raisonnement visible.
 
@@ -424,12 +427,12 @@ P5 alimente :
 
 - `BitLedger` via cout de certificat ;
 - `CausalLedger` via preuve/certificat ;
-- replay P5 ;
+- replay P5 lineaire et symbolique verifie ;
 - `L_latent_certificate`.
 
 ### Impact Apprentissage
 
-Le modele possede un `LatentReasoningWorkspace` et une `CertificateHead` dans le forward. Le workspace execute plusieurs pas latents, renvoie un feedback dans les hidden states avant logits/MTP/certificat, puis `latent_workspace_loss` lie son resume a l'etat latent de certificat. Le loss de certificat pousse la tete a produire une reponse finale et une incertitude coherente. P5 materialise maintenant cette sortie en `ShortCertificate` verifie par checksum latent, coherence token (`model_token_certificate`) et claims de binding workspace, puis persiste l'artefact dans le rapport et les checkpoints. Les certificats algebre/code restent des preuves outil plus fortes; le certificat model-head prouve que la tete du modele participe vraiment au chemin P5 au lieu de rester un simple module appele en forward.
+Le modele possede un `LatentReasoningWorkspace` et une `CertificateHead` dans le forward. Le workspace execute plusieurs pas latents, renvoie un feedback dans les hidden states avant logits/MTP/certificat, puis `latent_workspace_loss` lie son resume a l'etat latent de certificat. Le loss de certificat pousse la tete a produire une reponse finale et une incertitude coherente. P5 materialise maintenant cette sortie en `ShortCertificate` verifie par checksum latent, coherence token (`model_token_certificate`) et claims de binding workspace, puis persiste l'artefact dans le rapport et les checkpoints. Les certificats algebre/code sont des preuves outil plus fortes: lineaire multi-step, solveur symbolique SymPy pour quadratiques exactes, tests code visibles/caches/proprietes. Le certificat symbolique cree aussi un replay P5 verifie, donc le solveur specialise agit sur le corpus de replay au lieu de rester un audit separe.
 
 ## Phase 6 - Causal Attribution
 
@@ -850,6 +853,14 @@ Les tests courts pertinents sont :
   - verifie ledgers, replay, objectifs ;
   - verifie P7/P10 patches dans le checkpoint ;
   - reprend l'entrainement et verifie que l'influence continue.
+
+- `test_symbolic_algebra_certificate_uses_sympy_solver_for_quadratic_roots`
+  - exige le routage `sympy_symbolic` ;
+  - verifie racines exactes, claim de solveur et rejets de racines/claims faux.
+
+- `test_algebra_oracle_accepts_exact_symbolic_quadratic_root_sets`
+  - prouve que le Verifier OS accepte le replay algebrique symbolique ;
+  - rejette les racines fausses et les reponses avec texte extra.
 
 - `test_training_config_rejects_strict_and_auto_resume_together`
   - verifie les configs dangereuses ;

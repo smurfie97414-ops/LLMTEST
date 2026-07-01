@@ -10,6 +10,8 @@ from enum import Enum
 from math import fsum
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
+import sympy as sp
+
 
 @dataclass(frozen=True)
 class CostTrace:
@@ -243,6 +245,21 @@ def _last_int(text: str) -> int | None:
 def _exact_int(text: str) -> int | None:
     normalized = text.strip().replace("−", "-")
     return int(normalized) if _EXACT_INT_RE.fullmatch(normalized) else None
+
+
+def _exact_int_tuple(text: str) -> tuple[int, ...] | None:
+    normalized = text.strip().replace("−", "-")
+    if len(normalized) >= 2 and normalized[0] in "([{" and normalized[-1] in ")]}":
+        normalized = normalized[1:-1].strip()
+    if not normalized:
+        return None
+    values: list[int] = []
+    for token in normalized.split(","):
+        token = token.strip()
+        if not _EXACT_INT_RE.fullmatch(token):
+            return None
+        values.append(int(token))
+    return tuple(sorted(values)) if values else None
 
 
 @dataclass(frozen=True)
@@ -491,6 +508,36 @@ class AlgebraSkill(SkillSpec):
         )]
 
     def verify(self, task: Task, answer: CandidateAnswer) -> VerificationCaseResult:
+        meta = dict(task.metadata)
+        kind = str(meta.get("kind", "linear"))
+        if kind in {"quadratic", "symbolic", "symbolic_quadratic"}:
+            parsed_roots = _exact_int_tuple(answer.text)
+            if parsed_roots is None:
+                return _result(task, answer, False, 0.0, "answer is not an exact integer root set")
+            try:
+                a = int(meta["a"])
+                b = int(meta["b"])
+                c = int(meta["c"])
+                variable = str(meta.get("variable", "x"))
+                if a == 0:
+                    return _result(task, answer, False, 0.0, "quadratic coefficient cannot be zero")
+                x = sp.Symbol(variable)
+                solved_roots = tuple(sp.solve(sp.Eq(a * x**2 + b * x + c, 0), x))
+                if any(root.is_integer is not True for root in solved_roots):
+                    return _result(task, answer, False, 0.0, "quadratic equation does not have an all-integer solution set")
+                roots = tuple(sorted(int(root) for root in solved_roots))
+            except Exception as exc:
+                return _result(task, answer, False, 0.0, f"invalid symbolic algebra task: {exc!r}")
+            if len(roots) == 0:
+                return _result(task, answer, False, 0.0, "quadratic equation has no exact integer roots")
+            passed = parsed_roots == roots
+            return _result(
+                task,
+                answer,
+                passed,
+                1.0 if passed else 0.0,
+                "quadratic equation solved symbolically" if passed else f"expected roots {roots}, got {parsed_roots}",
+            )
         parsed = _exact_int(answer.text)
         if parsed is None:
             return _result(task, answer, False, 0.0, "answer is not exactly one algebraic integer")

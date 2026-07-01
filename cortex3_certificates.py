@@ -12,6 +12,7 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import sympy as sp
 
 from cortex3 import Anchor, CandidateAnswer, CostTrace, ReferenceRuleAgent, Task
 from cortex3_memory import embed_text
@@ -328,6 +329,78 @@ def _linear_algebra_steps(a: int, b: int, c: int, variable: str, solution: int) 
     )
 
 
+_SYMBOLIC_VARIABLE_RE = re.compile(r"[A-Za-z]\w{0,15}\Z")
+
+
+def _canonical_symbolic_values(values: Iterable[Any]) -> tuple[sp.Expr, ...]:
+    return tuple(sorted((sp.simplify(value) for value in values), key=sp.default_sort_key))
+
+
+def _symbolic_value_strings(values: Iterable[Any]) -> tuple[str, ...]:
+    return tuple(str(value) for value in _canonical_symbolic_values(values))
+
+
+def _parse_exact_symbolic_answer(text: str) -> tuple[sp.Expr, ...] | None:
+    normalized = text.strip().replace("−", "-")
+    if len(normalized) >= 2 and normalized[0] in "([{" and normalized[-1] in ")]}":
+        normalized = normalized[1:-1].strip()
+    if not normalized:
+        return None
+    values: list[sp.Expr] = []
+    for token in normalized.split(","):
+        token = token.strip()
+        if not re.fullmatch(r"[-+]?\d+(?:/\d+)?", token):
+            return None
+        value = sp.Rational(token)
+        values.append(sp.simplify(value))
+    return _canonical_symbolic_values(values) if values else None
+
+
+def _quadratic_symbolic_roots(a: int, b: int, c: int, variable: str) -> tuple[sp.Expr, ...]:
+    if not _SYMBOLIC_VARIABLE_RE.fullmatch(variable):
+        raise ValueError(f"invalid symbolic variable {variable!r}")
+    if a == 0:
+        raise ValueError("quadratic coefficient cannot be zero")
+    x = sp.Symbol(variable)
+    polynomial = sp.Poly(a * x**2 + b * x + c, x, domain=sp.QQ)
+    roots = _canonical_symbolic_values(sp.solve(sp.Eq(polynomial.as_expr(), 0), x))
+    if len(roots) == 0:
+        raise ValueError("quadratic equation has no exact roots")
+    if any(root.is_rational is not True for root in roots):
+        raise ValueError("symbolic certificate requires exact rational roots")
+    return roots
+
+
+def _symbolic_quadratic_claims(a: int, b: int, c: int, variable: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    roots = _quadratic_symbolic_roots(a, b, c, variable)
+    solution_set = _symbolic_value_strings(roots)
+    substitution_checks = tuple(
+        {
+            "root": str(root),
+            "substitution": f"{a}*({root})**2 + {b}*({root}) + {c}",
+            "result": "0",
+        }
+        for root in roots
+    )
+    claims = {
+        "variable": variable,
+        "equation": f"{a}*{variable}**2 + {b}*{variable} + {c} = 0",
+        "constraint": "exact symbolic quadratic equation",
+        "symbolic_solver": "sympy",
+        "solution_set": solution_set,
+        "substitution_checks": substitution_checks,
+        "verification": "SymPy solves the polynomial and checks every reported root by substitution",
+    }
+    tool_args = {
+        "degree": 2,
+        "coefficients": (a, b, c),
+        "variable": variable,
+        "expected_roots": solution_set,
+        "require_substitution_checks": True,
+    }
+    return claims, tool_args
+
+
 def algebra_linear_tool(certificate: ShortCertificate) -> ToolVerification:
     if certificate.certificate_type != CertificateType.ALGEBRA:
         return ToolVerification("algebra_linear", False, 0.0, "certificate type is not algebra")
@@ -365,6 +438,59 @@ def algebra_linear_tool(certificate: ShortCertificate) -> ToolVerification:
         if provided_result != int(expected_step["result"]):
             return ToolVerification("algebra_linear", False, 0.0, f"step {expected_step['step']!r} has wrong result")
     return ToolVerification("algebra_linear", True, 1.0, "multi-step algebra certificate verified")
+
+
+def sympy_symbolic_tool(certificate: ShortCertificate) -> ToolVerification:
+    tool_name = "sympy_symbolic"
+    if certificate.certificate_type != CertificateType.ALGEBRA:
+        return ToolVerification(tool_name, False, 0.0, "certificate type is not algebra")
+    args = dict(certificate.tool_args)
+    try:
+        degree = int(args.get("degree", 0))
+        coefficients = tuple(int(value) for value in args.get("coefficients", ()))
+        variable = str(args.get("variable", "x"))
+        if degree != 2 or len(coefficients) != 3:
+            return ToolVerification(tool_name, False, 0.0, "symbolic verifier expects a quadratic coefficient contract")
+        roots = _quadratic_symbolic_roots(coefficients[0], coefficients[1], coefficients[2], variable)
+    except Exception as exc:
+        return ToolVerification(tool_name, False, 0.0, f"invalid symbolic tool args: {exc!r}")
+
+    expected_roots = tuple(str(value) for value in args.get("expected_roots", ()))
+    root_strings = _symbolic_value_strings(roots)
+    if expected_roots != root_strings:
+        return ToolVerification(tool_name, False, 0.0, "expected roots do not match SymPy solution")
+    answer_roots = _parse_exact_symbolic_answer(certificate.answer)
+    if answer_roots is None:
+        return ToolVerification(tool_name, False, 0.0, "answer is not an exact symbolic solution set")
+    answer_root_strings = _symbolic_value_strings(answer_roots)
+    if answer_root_strings != root_strings:
+        return ToolVerification(tool_name, False, 0.0, f"expected roots {root_strings}, got {answer_root_strings}")
+
+    claims = dict(certificate.claims)
+    if str(claims.get("symbolic_solver")) != "sympy":
+        return ToolVerification(tool_name, False, 0.0, "missing SymPy solver claim")
+    if tuple(str(value) for value in claims.get("solution_set", ())) != root_strings:
+        return ToolVerification(tool_name, False, 0.0, "claimed solution set does not match SymPy solution")
+    checks = tuple(dict(item) for item in claims.get("substitution_checks", ()))
+    if bool(args.get("require_substitution_checks", False)) and len(checks) != len(root_strings):
+        return ToolVerification(tool_name, False, 0.0, "missing symbolic substitution checks")
+
+    x = sp.Symbol(variable)
+    polynomial = coefficients[0] * x**2 + coefficients[1] * x + coefficients[2]
+    checked_roots: list[str] = []
+    for check in checks:
+        root_text = str(check.get("root", ""))
+        parsed = _parse_exact_symbolic_answer(root_text)
+        if parsed is None or len(parsed) != 1:
+            return ToolVerification(tool_name, False, 0.0, "substitution check root is not exact")
+        root = parsed[0]
+        residual = sp.simplify(polynomial.subs(x, root))
+        if residual != 0 or str(check.get("result")) != "0":
+            return ToolVerification(tool_name, False, 0.0, f"root {root_text!r} does not satisfy polynomial")
+        checked_roots.append(str(root))
+    if _symbolic_value_strings(sp.Rational(root) for root in checked_roots) != root_strings:
+        return ToolVerification(tool_name, False, 0.0, "substitution checks do not cover the SymPy solution set")
+    return ToolVerification(tool_name, True, 1.0, "SymPy symbolic certificate verified")
 
 
 def _safe_eval_arithmetic(expression: str) -> int:
@@ -511,6 +637,7 @@ def default_tool_registry() -> ToolVerifierRegistry:
     registry.register("compiled_circuit", compiled_circuit_tool)
     registry.register("exact_match", exact_match_tool)
     registry.register("model_token_certificate", model_token_certificate_tool)
+    registry.register("sympy_symbolic", sympy_symbolic_tool)
     registry.register("code_tests", code_unit_test_tool)
     return registry
 
@@ -799,6 +926,19 @@ def certificate_contract_for_task(task: Task, answer: str, certificate_type: Cer
         )
     if cert_type == CertificateType.ALGEBRA:
         meta = dict(task.metadata)
+        kind = str(meta.get("kind", "linear"))
+        if kind in {"quadratic", "symbolic", "symbolic_quadratic"}:
+            a = int(meta["a"])
+            b = int(meta["b"])
+            c = int(meta["c"])
+            variable = str(meta.get("variable", "x"))
+            claims, tool_args = _symbolic_quadratic_claims(a, b, c, variable)
+            return (
+                claims,
+                "sympy_symbolic",
+                tool_args,
+                tuple(task.anchors),
+            )
         a = int(meta["a"])
         b = int(meta["b"])
         c = int(meta["c"])

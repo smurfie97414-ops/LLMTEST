@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 authors = [{name = "LLMTEST contributors"}]
 license = {text = "MIT"}
-dependencies = ["torch>=2.0", "numpy>=1.26", "tokenizers>=0.23", "matplotlib>=3.8", "datasets>=5.0", "psutil>=7.0"]
+dependencies = ["torch>=2.0", "numpy>=1.26", "tokenizers>=0.23", "matplotlib>=3.8", "datasets>=5.0", "psutil>=7.0", "sympy>=1.13"]
 
 [project.optional-dependencies]
 test = ["pytest>=9.0"]
