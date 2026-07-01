@@ -14,6 +14,7 @@ dependencies = ["torch>=2.0", "numpy>=1.26", "tokenizers>=0.23", "matplotlib>=3.
 
 [project.optional-dependencies]
 test = ["pytest>=9.0"]
+cuda = ["cupy-cuda12x>=14.1", "ml_dtypes>=0.5"]
 
 [project.scripts]
 cortex3 = "cortex3:main"

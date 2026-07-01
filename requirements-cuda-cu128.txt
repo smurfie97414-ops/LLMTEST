@@ -1,2 +1,5 @@
 --index-url https://download.pytorch.org/whl/cu128
+--extra-index-url https://pypi.org/simple
 torch==2.11.0+cu128
+cupy-cuda12x>=14.1
+ml_dtypes>=0.5

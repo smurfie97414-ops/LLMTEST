@@ -959,6 +959,7 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 "latent_memory_kv",
                 "ternary_core",
                 "packed_ternary_hardware_runtime",
+                "native_ternary_cuda_kernel",
                 "skill_aware_experts",
                 "bit_ledger",
                 "skill_ledger",
@@ -997,6 +998,8 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             influence = phase_report["training_influence"]
             self.assertGreater(influence["ternary_core_forward_events"], 0)
             self.assertGreater(influence["packed_ternary_dispatches"], 0)
+            if phase_report["native_ternary_kernel_required"]:
+                self.assertGreater(influence["native_ternary_kernel_dispatches"], 0)
             self.assertGreater(influence["variable_input_compression_events"], 0)
             self.assertGreater(influence["learned_memory_policy_events"], 0)
             self.assertGreater(influence["learned_memory_anchor_supervision_events"], 0)

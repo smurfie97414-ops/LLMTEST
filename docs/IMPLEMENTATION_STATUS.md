@@ -41,19 +41,19 @@ Remaining Phase 1 hardening:
 Current executable coverage:
 
 - `TernaryBlock`, `ternarize_values`, zero states and estimated bit accounting.
-- `cortex3_ternary.BitLinear` provides a sign+mask layer with shared scales, activation quantization, optional residual runtime and packed int2 ternary weight buffers; PyTorch is a required dependency.
+- `cortex3_ternary.BitLinear` provides a sign+mask layer with shared scales, activation quantization, optional residual runtime, packed int2 ternary weight buffers and a native CuPy RawKernel CUDA path (`native_int2_cupy_cuda`) for CUDA tensors; PyTorch is a required dependency and CuPy is required for the native CUDA path.
 - `ResidualSynapseBuffer` stores reconstruction residuals for compressed blocks.
-- `CompressionTraceLedger` records compression decisions, activation quantization, expert activations, KV mode events, MTP/FSP events and packed ternary dispatches.
+- `CompressionTraceLedger` records compression decisions, activation quantization, expert activations, KV mode events, MTP/FSP events, packed ternary dispatches and native CUDA kernel dispatch counts.
 - Compression decisions include active count, provisional/certified zeros, estimated bits, threshold and residual L1.
 - `LayerForwardEvent` records real `BitLinear` forward passes with layer id, input/output shapes, active weights, estimated packed weight bits and activation bits.
 - `BitLinear` uses a straight-through runtime weight path so gradients reach `float_weight` while the forward value is read from packed int2 ternary weights by default.
-- Tests cover exact parity with `nn.Linear` only when residual runtime is explicitly enabled, gradient survival to inputs and weights, packed int2 CPU dispatch, packed int2 CUDA dispatch and micro-model layer-forward traces.
+- Tests cover exact parity with `nn.Linear` only when residual runtime is explicitly enabled, gradient survival to inputs and weights, packed int2 CPU dispatch, native packed int2 CUDA dispatch, fp32/fp16/bf16 native-kernel value parity and micro-model layer-forward traces.
 
 Remaining:
 
 - Feed layer-forward traces into persisted cycle reports outside inference-specific trace summaries.
 - Use layer-forward traces as first-class evidence in causal attribution block probes.
-- Replace the PyTorch unpack/matmul packed dispatch with a fused custom CUDA kernel and benchmark latency/energy.
+- Extend the current CuPy RawKernel into more aggressively tiled/fused CUDA kernels and benchmark latency/VRAM/energy across larger LLM-shaped batches.
 
 ## Phase 3 - MTP/FSP under contract
 
@@ -377,7 +377,7 @@ Current executable coverage:
 - `TextShardReader` streams text shards without loading the whole corpus into memory.
 - `TokenizedCorpusBuilder` streams encoded chunks once into a `uint32` token file and writes a coherent `manifest.json`.
 - `MemmapCausalDataset` samples causal next-token targets and multi-horizon future targets directly from the memmap with vectorized batch window reads.
-- `CortexTransformerLM` is a complete causal Transformer with tied embeddings, causal self-attention, MLP blocks, optional Cortex multi-horizon heads, an optional differentiable Variable-In compressor, an optional learned exact/latent/drop memory policy, an optional packed int2 `BitLinear` ternary core for the Cortex model, a trainable skill-aware MoE path whose expert activations are recorded in the compression trace ledger and an optional latent certificate head.
+- `CortexTransformerLM` is a complete causal Transformer with tied embeddings, causal self-attention, MLP blocks, optional Cortex multi-horizon heads, an optional differentiable Variable-In compressor, an optional learned exact/latent/drop memory policy, an optional packed int2 `BitLinear` ternary core for the Cortex model with native CUDA kernel audit, a trainable skill-aware MoE path whose expert activations are recorded in the compression trace ledger and an optional latent certificate head.
 - `CortexObjective` optimizes next-token loss plus Cortex MTP, temporal-consistency, confidence, Variable-In compression-cost, learned-memory policy and certificate-head terms when the Cortex heads are enabled.
 - `CortexTrainingPhaseController` integrates P1-P10 into full LLM training when horizons are `[1, 2, 4, 8]`, Variable-In, learned memory policy, skill-aware experts and the certificate head are enabled: verifier cycle, packed ternary forward traces, Variable-In KV/compression traces, exact-anchor observations decoded from real LLM input batches, learned exact/latent/drop memory decisions, skill-expert activation traces, MTP/FSP contract ledger, cumulative Bit/Skill/Causal/Uncertainty ledgers, cognitive memory reconstruction, certificate verification, causal attribution, minimal regrowth planning, fast/normal/careful inference, sleep replay batches and recursive-improvement gates.
 - The full Cortex trainer adds confidence/contract regularization to the loss, tokenizes accepted sleep/phase examples into causal replay batches, tracks replay examples by originating phase including P9 sleep, scales Cortex trainable losses with bounded cross-phase objective feedback and writes `cortex_phase_report.json` with per-phase event counts.
@@ -413,7 +413,8 @@ Current executable coverage:
 Evidence:
 
 - Local GPU environment after dependency correction: NVIDIA GeForce RTX 5070, driver CUDA `13.2`, `torch==2.11.0+cu128`, `torch.version.cuda==12.8`, `cuda_available=True`, `cuda_device_count=1`, `distributed_available=True`, `gloo_available=True`, `nccl_available=False` on Windows.
-- CUDA dependency correction: the previous environment had `torch==2.12.1+cpu` despite a visible RTX 5070. Installed the official CUDA wheel with `pip install --force-reinstall torch==2.11.0+cu128 --index-url https://download.pytorch.org/whl/cu128`; `requirements-cuda-cu128.txt` records the reproducible install command.
+- CUDA dependency correction: the previous environment had `torch==2.12.1+cpu` despite a visible RTX 5070. Installed the official CUDA wheel with `pip install --force-reinstall torch==2.11.0+cu128 --index-url https://download.pytorch.org/whl/cu128`; `requirements-cuda-cu128.txt` records the reproducible install command and now includes `cupy-cuda12x`/`ml_dtypes` for the native ternary CUDA kernel.
+- Native ternary kernel validation: `tools\benchmark_ternary_kernel.py --batch 128 --in-features 256 --out-features 256 --dtype fp16 --warmup 5 --repeat 20` passed on RTX 5070 with backend `native_int2_cupy_cuda`, max error `0.001953`, packed weight compression `8x`, native `0.1008 ms`, PyTorch unpack+linear `0.3065 ms`, speedup `3.04x`.
 - Doctor validation: `tools\train_llm.py doctor --out-dir runs\llm-doctor-cuda-validation --require-cuda --precision bf16 --device cuda` passed with CUDA visible and bf16 resolving on `cuda`.
 - `.\.venv\Scripts\python.exe tools\train_llm.py smoke --out-dir runs\llm-smoke-dev-48 --steps 48 --require-win`
 - Smoke proof: baseline score `0.022321`, Cortex score `0.145833`, Cortex/baseline `6.533x`, next-token-loss regression ratio `1.020`, proof passed.

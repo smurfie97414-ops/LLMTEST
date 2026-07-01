@@ -87,7 +87,7 @@ Cette base contient maintenant :
 - `cortex3.py` : noyau de tâches, skills, vérificateur dynamique, adversarial checks, ternaire sign+mask, ancrage exact, horizon MTP adaptatif, regrowth minimal et CLI de démonstration ;
 - Phase 1 du Verifier OS est maintenant élargie avec registre d'oracles, anti-métamorphiques, coûts vérificateur par cas, audit faux positifs/faux négatifs d'oracle, harnais de défauts injectés et familles de compétences `arithmetic`, `algebra`, `long_context_anchor`, `entity_tracking`, `instruction_following`, `code_unit_tests`, `calibration` ;
 - `cortex3_reporting.py` : persistance des cycles dans `runs/` avec JSON structuré, rapport markdown et matrice de défauts injectés ;
-- `cortex3_ternary.py` : instrumentation Phase 2 avec quantization d'activations 8→4 bit, residual synapse buffer, compression logs, `BitLinear` sign+mask et dispatch ternaire packe int2 CPU/CUDA avec gradient STE ;
+- `cortex3_ternary.py` : instrumentation Phase 2 avec quantization d'activations 8→4 bit, residual synapse buffer, compression logs, `BitLinear` sign+mask, buffers ternaires packes int2 et kernel CUDA natif CuPy RawKernel avec gradient STE ;
 - `cortex3_future.py` : Phase 3 MTP/FSP sous contrat avec têtes PyTorch horizons 1/2/4/8, calibration autonome, confidence head, temporal consistency loss, Future Contract, révision et accept/reject gates ;
 - `cortex3_memory.py` : Phase 4 mémoire cognitive avec KV récent exact, KV ancien latent compact, Exact Anchor Ledger, reconstruction conditionnée par requête, récupération de réponse augmentée par mémoire et vérificateur de fidélité aux ancres ;
 - `cortex3_certificates.py` : Phase 5 raisonnement latent avec `latent proof state`, tête PyTorch de certificat calibrée, génération proof-carrying, certificats courts vérifiables, dé-latentisation aléatoire et vérification par outils ;
@@ -100,7 +100,7 @@ Cette base contient maintenant :
 - `cortex3_experiments.py` : expériences A-E du plan, de la détection de défauts injectés à la sandbox d'auto-amélioration ;
 - `cortex3_microtrain.py` : micro-modèle PyTorch entraînable avec cœur `BitLinear`, agent DSV, exemples issus du verifier/sleep phase et checkpoints `.pt` ;
 - `cortex3_autoregressive.py` : décodeur micro-autoregressif PyTorch avec vocabulaire caractère, génération greedy ou blockwise sous Future Contract, pertes comportement/MTP multi-horizons/contrat futur, agent DSV et checkpoints `.pt` ;
-- `cortex3_llm.py` : harness de pré-entraînement LLM réel avec export Hugging Face `datasets`, tokenizer BPE `tokenizers`, corpus texte streamé vers memmap avec identité SHA-256, dataset causal, Transformer complet, baseline next-token, objectif Cortex multi-horizon, compresseur Variable-In différentiable, politique mémoire apprise exact/latent/drop, observation d'ancres exactes depuis les batchs LLM, coeur ternaire `BitLinear` packe int2, MoE skill-aware entraînable, certificate head latent, ledgers Bit/Skill/Causal/Uncertainty persistants, AMP/DDP, checkpoints strictement liés au corpus, courbes et rapport comparatif ;
+- `cortex3_llm.py` : harness de pré-entraînement LLM réel avec export Hugging Face `datasets`, tokenizer BPE `tokenizers`, corpus texte streamé vers memmap avec identité SHA-256, dataset causal, Transformer complet, baseline next-token, objectif Cortex multi-horizon, compresseur Variable-In différentiable, politique mémoire apprise exact/latent/drop, observation d'ancres exactes depuis les batchs LLM, coeur ternaire `BitLinear` packe int2 avec audit du kernel CUDA natif, MoE skill-aware entraînable, certificate head latent, ledgers Bit/Skill/Causal/Uncertainty persistants, AMP/DDP, checkpoints strictement liés au corpus, courbes et rapport comparatif ;
 - `cortex3_phases.py` : registre exécutable des 10 phases Cortex-3 ;
 - `cortex3_ledgers.py` : Bit Ledger, Skill Ledger, Causal Ledger et Uncertainty Ledger ;
 - `cortex3_analysis.py` : analyse des causes probables d'une régression ;
@@ -145,7 +145,10 @@ Pour remplacer un build PyTorch CPU par le build CUDA validé localement :
 ```bash
 pip install -r requirements-cuda-cu128.txt
 python tools/train_llm.py doctor --require-cuda --precision bf16 --device cuda
+python tools/benchmark_ternary_kernel.py --dtype fp16
 ```
+
+`requirements-cuda-cu128.txt` installe aussi `cupy-cuda12x` et `ml_dtypes`, nécessaires au kernel CUDA natif `native_int2_cupy_cuda`. Sur RTX 5070, le smoke benchmark local `batch=128, in=256, out=256, fp16` mesure `0.1008 ms` pour le kernel natif contre `0.3065 ms` pour unpack+`F.linear`, soit `3.04x`, avec erreur max `0.001953`.
 
 ## Démo noyau
 
@@ -320,7 +323,7 @@ python -m pytest tests/test_llm_pretraining.py -q
 ## Roadmap immédiate
 
 1. Durcir Phase 1 jusqu'au statut Verifier OS complet : coût par cas réel, familles génératives plus larges, tests de faux positifs/faux négatifs d'oracle.
-2. Durcir Phase 2 au-delà du dispatch packé int2 avec un kernel CUDA fusionné et des benchmarks latence/VRAM/énergie.
+2. Durcir Phase 2 au-delà du RawKernel natif actuel avec kernels CUDA plus tuilés/fusionnés, benchmarks latence/VRAM/énergie plus larges et mesure sous vrais batchs LLM.
 3. Étendre Phase 3 vers des suites held-out plus larges, benchmarks MTP vs NTP et contrats FSP orientés objectifs de sortie.
 4. Étendre Phase 4 avec benchmarks coût/qualité de la politique mémoire apprise exact/latent/drop sur long contexte et ablation sans mémoire apprise.
 5. Étendre Phase 5 avec vérification algébrique multi-étapes, tests code plus riches et mesure held-out des économies de tokens de certificat.

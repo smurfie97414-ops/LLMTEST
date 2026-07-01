@@ -29,10 +29,11 @@ Observation ressource separee du meme run long :
 Preuve post-integration des deux nouvelles briques :
 
 - `test_learned_memory_policy_is_trainable_and_affects_cortex_loss` : loss `learned_memory` non nul, gradient non nul dans la politique memoire, dispatch ternaire packe present ;
-- `test_bitlinear_packed_ternary_cuda_dispatch_runs_on_gpu` : backend `packed_int2_cuda` execute sur le GPU local avec gradient STE non nul ;
-- `test_full_cortex_phase_controller_uses_all_modules_during_training` : mini training LLM complet avec audits exigeant `learned_cognitive_memory_policy` et `packed_ternary_hardware_runtime`.
+- `test_bitlinear_native_packed_ternary_cuda_dispatch_runs_on_gpu` : backend `native_int2_cupy_cuda` execute sur le GPU local avec gradient STE non nul ;
+- `test_native_ternary_cuda_kernel_matches_packed_runtime_for_training_dtypes` : le kernel natif correspond au runtime packe en fp32, fp16 et bf16 ;
+- `test_full_cortex_phase_controller_uses_all_modules_during_training` : mini training LLM complet avec audits exigeant `learned_cognitive_memory_policy`, `packed_ternary_hardware_runtime` et `native_ternary_cuda_kernel` quand CUDA est disponible.
 
-Le long run devra produire un nouveau sidecar sous le commit de cette integration pour remplacer l'ancien audit `22/22` par l'audit courant plus strict.
+Le long run devra produire un nouveau sidecar sous le commit de cette integration pour remplacer l'ancien audit `22/22` par l'audit courant plus strict incluant `native_ternary_cuda_kernel`.
 
 Evenements phase observes dans le checkpoint :
 
@@ -281,7 +282,7 @@ Quand `use_ternary_core=True`, les lineaires principaux deviennent des `BitLinea
 - codes ternaires packes int2 dans `packed_codes` ;
 - quantization d'activation ;
 - layer forward events ;
-- `PackedTernaryDispatch` avec backend `packed_int2_torch` ou `packed_int2_cuda`.
+- `PackedTernaryDispatch` avec backend `packed_int2_torch`, `packed_int2_cuda` ou `native_int2_cupy_cuda`.
 
 ### Interaction Avec Les Autres Phases
 
@@ -297,7 +298,7 @@ Le forward lit la valeur runtime depuis les codes ternaires packes, puis utilise
 
 ### Preuve Runtime
 
-Le checkpoint inspecte montre `P2=238652` evenements. Les tests ajoutes verifient en plus que `BitLinear` execute un dispatch `packed_int2_cuda` sur GPU local et que le gradient reste non nul vers les poids entrainables.
+Le checkpoint inspecte montre `P2=238652` evenements. Les tests ajoutes verifient en plus que `BitLinear` execute un dispatch CUDA natif `native_int2_cupy_cuda` sur GPU local, que les valeurs fp32/fp16/bf16 correspondent au runtime packe, et que le gradient STE reste non nul vers les poids entrainables.
 
 ## Phase 3 - Future Contract / FSP / MTP
 
@@ -713,19 +714,21 @@ Critere de fermeture :
 Etat actuel :
 
 - `BitLinear` tourne dans le forward avec valeur runtime issue de buffers `packed_codes` int2 ;
+- sur CUDA, le forward peut lancer le kernel natif CuPy RawKernel `native_int2_cupy_cuda` via DLPack zero-copy ;
 - le coeur est requantifie apres optimizer step et apres patchs P7/P10 ;
 - les traces P2 prouvent une execution ternaire-compatible pendant le run ;
-- un smoke test CUDA verifie `packed_int2_cuda` sur GPU local avec gradient STE non nul.
+- un smoke test CUDA verifie `native_int2_cupy_cuda` sur GPU local avec gradient STE non nul ;
+- `tools/benchmark_ternary_kernel.py` fournit un benchmark reproductible du kernel natif contre unpack+`F.linear`.
 
 Limite restante :
 
-- le dispatch packe est reel et GPU, mais il s'appuie encore sur les operations PyTorch pour unpack/matmul ;
-- il n'y a pas encore de kernel CUDA fusionne/custom prouvant le gain final attendu d'un coeur ternaire optimise.
+- le kernel natif actuel est simple, un thread par sortie, et doit encore etre remplace ou complete par des kernels tuiles/fusionnes plus optimises pour grands batchs LLM ;
+- les benchmarks doivent etre elargis a VRAM, energie estimee, tailles LLM reelles et qualite de convergence.
 
 Critere de fermeture :
 
-- fournir kernels ternaires optimises ou backend compile fusionne ;
-- benchmarker latence, VRAM, energie estimee, throughput et qualite face a une baseline dense.
+- fournir kernels ternaires optimises tuiles/fusionnes au-dela du RawKernel actuel ;
+- benchmarker latence, VRAM, energie estimee, throughput et qualite face a une baseline dense sur runs LLM larges.
 
 ### Verifier Dynamique A Grande Echelle
 

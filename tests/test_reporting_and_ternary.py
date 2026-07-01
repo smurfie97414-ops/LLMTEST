@@ -14,6 +14,7 @@ from cortex3_ternary import (
     CompressionTraceLedger,
     ResidualSynapseBuffer,
     make_compression_decision,
+    native_ternary_cuda_available,
     quantize_activation_values,
     torch_available,
 )
@@ -160,12 +161,21 @@ class ReportingAndTernaryTest(unittest.TestCase):
         self.assertTrue(torch.allclose(actual, expected, atol=1e-6))
         self.assertGreater(layer.ledger.total_packed_ternary_dispatches, 0)
 
-    @unittest.skipUnless(__import__("torch").cuda.is_available(), "CUDA is required for packed ternary CUDA dispatch")
-    def test_bitlinear_packed_ternary_cuda_dispatch_runs_on_gpu(self):
+    @unittest.skipUnless(
+        __import__("torch").cuda.is_available() and native_ternary_cuda_available(),
+        "CUDA plus CuPy native ternary kernel is required",
+    )
+    def test_bitlinear_native_packed_ternary_cuda_dispatch_runs_on_gpu(self):
         import torch
 
         torch.manual_seed(7)
-        layer = BitLinear(BitLinearConfig(8, 4, activation_bits=4, log_prefix="cuda-packed")).cuda()
+        layer = BitLinear(BitLinearConfig(
+            8,
+            4,
+            activation_bits=4,
+            log_prefix="cuda-packed",
+            require_native_cuda_kernel=True,
+        )).cuda()
         x = torch.randn(5, 8, device="cuda", requires_grad=True)
 
         output = layer(x)
@@ -177,7 +187,39 @@ class ReportingAndTernaryTest(unittest.TestCase):
         self.assertIsNotNone(layer.float_weight.grad)
         self.assertGreater(float(layer.float_weight.grad.abs().sum().detach().cpu()), 0.0)
         self.assertGreater(layer.ledger.total_packed_ternary_dispatches, 0)
-        self.assertEqual(layer.ledger.packed_ternary_dispatches[-1].backend, "packed_int2_cuda")
+        self.assertGreater(layer.ledger.total_native_ternary_kernel_dispatches, 0)
+        self.assertEqual(layer.ledger.packed_ternary_dispatches[-1].backend, "native_int2_cupy_cuda")
+        self.assertTrue(layer.ledger.packed_ternary_dispatches[-1].native_kernel)
+
+    @unittest.skipUnless(
+        __import__("torch").cuda.is_available() and native_ternary_cuda_available(),
+        "CUDA plus CuPy native ternary kernel is required",
+    )
+    def test_native_ternary_cuda_kernel_matches_packed_runtime_for_training_dtypes(self):
+        import torch
+        import torch.nn.functional as F
+
+        torch.manual_seed(23)
+        for dtype, atol in ((torch.float32, 1e-5), (torch.float16, 2e-2), (torch.bfloat16, 3e-2)):
+            with self.subTest(dtype=str(dtype)):
+                layer = BitLinear(BitLinearConfig(
+                    17,
+                    11,
+                    activation_bits=0,
+                    residual_runtime=False,
+                    require_native_cuda_kernel=True,
+                    log_prefix=f"native-{dtype}",
+                )).cuda()
+                x = torch.randn(5, 17, device="cuda", dtype=dtype)
+                actual = layer._native_cuda_packed_output(x)
+                expected = F.linear(
+                    x.float(),
+                    layer._packed_runtime_weight(dtype=torch.float32, device=x.device),
+                    layer.bias.float(),
+                )
+                torch.cuda.synchronize()
+
+                self.assertTrue(torch.allclose(actual.float(), expected, atol=atol, rtol=atol))
 
     def test_bitlinear_matches_float_linear_when_activation_quantization_is_disabled(self):
         import torch

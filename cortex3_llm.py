@@ -163,6 +163,8 @@ def _restore_compression_trace_ledger(ledger: CompressionTraceLedger | None, pay
     ledger.total_mtp_fsp_events = 0
     ledger.total_layer_forward_events = 0
     ledger.total_packed_ternary_dispatches = 0
+    ledger.total_native_ternary_kernel_dispatches = 0
+    ledger.total_torch_packed_ternary_dispatches = 0
     ledger.total_weight_bits_read = 0.0
     ledger.total_activation_bits = 0.0
     ledger.total_kv_bytes = 0.0
@@ -272,6 +274,7 @@ def _restore_compression_trace_ledger(ledger: CompressionTraceLedger | None, pay
                 max_abs_error_vs_ste=float(data.get("max_abs_error_vs_ste", 0.0)),
                 used_residual=bool(data.get("used_residual", False)),
                 note=str(data.get("note", "")),
+                native_kernel=bool(data.get("native_kernel", False)),
             )
         )
     ledger._trim(ledger.packed_ternary_dispatches)
@@ -283,6 +286,18 @@ def _restore_compression_trace_ledger(ledger: CompressionTraceLedger | None, pay
     ledger.total_mtp_fsp_events = int(total_counts.get("mtp_fsp_events", len(ledger.mtp_fsp_events)))
     ledger.total_layer_forward_events = int(total_counts.get("layer_forward_events", len(ledger.layer_forward_events)))
     ledger.total_packed_ternary_dispatches = int(total_counts.get("packed_ternary_dispatches", len(ledger.packed_ternary_dispatches)))
+    ledger.total_native_ternary_kernel_dispatches = int(
+        total_counts.get(
+            "native_ternary_kernel_dispatches",
+            sum(1 for item in ledger.packed_ternary_dispatches if item.native_kernel or item.backend.startswith("native_")),
+        )
+    )
+    ledger.total_torch_packed_ternary_dispatches = int(
+        total_counts.get(
+            "torch_packed_ternary_dispatches",
+            max(0, ledger.total_packed_ternary_dispatches - ledger.total_native_ternary_kernel_dispatches),
+        )
+    )
     cost_trace = dict(payload.get("cost_trace") or {})
     ledger.total_weight_bits_read = float(
         cost_trace.get("weight_bits_read", sum(item.estimated_bits for item in ledger.compression_decisions))
@@ -1497,6 +1512,8 @@ class TransformerConfig:
     use_cortex_heads: bool = False
     use_ternary_core: bool = False
     ternary_activation_bits: int = 4
+    use_native_ternary_kernel: bool = True
+    require_native_ternary_kernel: bool = False
     use_skill_aware_experts: bool = False
     skill_expert_count: int = 4
     skill_expert_top_k: int = 2
@@ -1552,6 +1569,8 @@ def _make_transformer_linear(
             bias=bias,
             activation_bits=config.ternary_activation_bits,
             log_prefix=log_prefix,
+            use_native_cuda_kernel=config.use_native_ternary_kernel,
+            require_native_cuda_kernel=config.require_native_ternary_kernel,
         ),
         ledger=ledger,
     )
@@ -2643,6 +2662,7 @@ def _last_items(items: Sequence[Any], limit: int = 3) -> list[Any]:
 def _cortex_architecture_audit_from_summary(summary: Mapping[str, Any]) -> dict[str, Any]:
     phase_counts = {str(key): int(value) for key, value in dict(summary.get("phase_event_counts") or {}).items()}
     trace_counts = {str(key): int(value) for key, value in dict(summary.get("compression_trace_counts") or {}).items()}
+    native_ternary_required = bool(summary.get("native_ternary_kernel_required", False))
     replay_by_phase = {
         str(key): int(value)
         for key, value in dict(summary.get("phase_replay_examples_by_phase") or {}).items()
@@ -2785,6 +2805,16 @@ def _cortex_architecture_audit_from_summary(summary: Mapping[str, Any]) -> dict[
         trace_count("packed_ternary_dispatches") > 0,
         {"packed_ternary_dispatches": trace_count("packed_ternary_dispatches")},
         "ternary core must dispatch from packed 2-bit ternary weight buffers, not only trace PyTorch float-linear compatibility",
+    )
+    add(
+        "native_ternary_cuda_kernel",
+        (not native_ternary_required) or trace_count("native_ternary_kernel_dispatches") > 0,
+        {
+            "native_ternary_kernel_required": native_ternary_required,
+            "native_ternary_kernel_dispatches": trace_count("native_ternary_kernel_dispatches"),
+            "torch_packed_ternary_dispatches": trace_count("torch_packed_ternary_dispatches"),
+        },
+        "CUDA full-architecture runs must launch a native packed int2 ternary kernel, not only a PyTorch matmul over unpacked weights",
     )
     add(
         "skill_aware_experts",
@@ -2982,6 +3012,7 @@ def _cortex_phase_deliverable_audit_from_summary(summary: Mapping[str, Any]) -> 
     counts = {str(key): int(value) for key, value in dict(summary.get("integration_counts") or {}).items()}
     phase_counts = {str(key): int(value) for key, value in dict(summary.get("phase_event_counts") or {}).items()}
     trace_counts = {str(key): int(value) for key, value in dict(summary.get("compression_trace_counts") or {}).items()}
+    native_ternary_required = bool(summary.get("native_ternary_kernel_required", False))
     replay_by_phase = {
         str(key): int(value)
         for key, value in dict(summary.get("phase_replay_examples_by_phase") or {}).items()
@@ -3056,14 +3087,17 @@ def _cortex_phase_deliverable_audit_from_summary(summary: Mapping[str, Any]) -> 
         trace("layer_forward_events") > 0
         and trace("activation_quantizations") > 0
         and trace("compression_decisions") > 0
-        and trace("packed_ternary_dispatches") > 0,
+        and trace("packed_ternary_dispatches") > 0
+        and ((not native_ternary_required) or trace("native_ternary_kernel_dispatches") > 0),
         {
             "layer_forward_events": trace("layer_forward_events"),
             "activation_quantizations": trace("activation_quantizations"),
             "compression_decisions": trace("compression_decisions"),
             "packed_ternary_dispatches": trace("packed_ternary_dispatches"),
+            "native_ternary_kernel_required": native_ternary_required,
+            "native_ternary_kernel_dispatches": trace("native_ternary_kernel_dispatches"),
         },
-        "BitLinear sign+mask, activation quantization, compression decisions and packed ternary dispatch must all run",
+        "BitLinear sign+mask, activation quantization, compression decisions, packed dispatch, and required native CUDA kernel must all run",
     )
     add(
         "P3",
@@ -4253,7 +4287,18 @@ class CortexTrainingPhaseController:
                     "kv_events": len(compression_trace.get("kv_events", ())),
                     "mtp_fsp_events": len(compression_trace.get("mtp_fsp_events", ())),
                     "layer_forward_events": len(compression_trace.get("layer_forward_events", ())),
+                    "packed_ternary_dispatches": len(compression_trace.get("packed_ternary_dispatches", ())),
+                    "native_ternary_kernel_dispatches": sum(
+                        1
+                        for item in compression_trace.get("packed_ternary_dispatches", ())
+                        if bool(dict(item).get("native_kernel", False)) or str(dict(item).get("backend", "")).startswith("native_")
+                    ),
                 }
+                compression_trace_counts["torch_packed_ternary_dispatches"] = max(
+                    0,
+                    compression_trace_counts["packed_ternary_dispatches"]
+                    - compression_trace_counts["native_ternary_kernel_dispatches"],
+                )
         phase_counts = dict(self.phase_counts)
         if compression_trace_counts.get("layer_forward_events", 0) > 0:
             phase_counts["P2"] = max(phase_counts.get("P2", 0), compression_trace_counts["layer_forward_events"])
@@ -4281,6 +4326,11 @@ class CortexTrainingPhaseController:
             "objective_feedback_history": _last_items(self.objective_feedback_history, 5),
             "future_contract_decisions": len(self.future_ledger.decisions),
             "compression_trace_counts": compression_trace_counts,
+            "native_ternary_kernel_required": bool(
+                torch.cuda.is_available()
+                and self.model.config.use_ternary_core
+                and self.model.config.use_native_ternary_kernel
+            ),
             "variable_input_compression_events": compression_trace_counts.get("kv_events", 0),
             "certificate_head_forward_events": int(self.model.certificate_forward_events),
             "input_anchor_observations": int(self.input_anchor_observations),
@@ -4724,7 +4774,17 @@ class CortexTrainingPhaseController:
                     "kv_events": len(compression_trace.get("kv_events", ())),
                     "mtp_fsp_events": len(compression_trace.get("mtp_fsp_events", ())),
                     "layer_forward_events": len(compression_trace.get("layer_forward_events", ())),
+                    "packed_ternary_dispatches": len(compression_trace.get("packed_ternary_dispatches", ())),
+                    "native_ternary_kernel_dispatches": sum(
+                        1
+                        for item in compression_trace.get("packed_ternary_dispatches", ())
+                        if bool(dict(item).get("native_kernel", False)) or str(dict(item).get("backend", "")).startswith("native_")
+                    ),
                 }
+                trace_counts["torch_packed_ternary_dispatches"] = max(
+                    0,
+                    trace_counts["packed_ternary_dispatches"] - trace_counts["native_ternary_kernel_dispatches"],
+                )
             if trace_counts["layer_forward_events"] > 0:
                 self.phase_counts["P2"] = max(self.phase_counts.get("P2", 0), trace_counts["layer_forward_events"])
         phases = []
@@ -4742,9 +4802,16 @@ class CortexTrainingPhaseController:
             "all_phases_active": all(item["active_in_llm_training"] for item in phases),
             "phases": phases,
             "phase_event_counts": dict(self.phase_counts),
+            "native_ternary_kernel_required": bool(
+                torch.cuda.is_available()
+                and self.model.config.use_ternary_core
+                and self.model.config.use_native_ternary_kernel
+            ),
             "training_influence": {
                 "ternary_core_forward_events": trace_counts.get("layer_forward_events", 0),
                 "packed_ternary_dispatches": trace_counts.get("packed_ternary_dispatches", 0),
+                "native_ternary_kernel_dispatches": trace_counts.get("native_ternary_kernel_dispatches", 0),
+                "torch_packed_ternary_dispatches": trace_counts.get("torch_packed_ternary_dispatches", 0),
                 "variable_input_compression_events": trace_counts.get("kv_events", 0),
                 "skill_expert_activations": trace_counts.get("expert_activations", 0),
                 "certificate_head_forward_events": int(self.model.certificate_forward_events),
@@ -4819,6 +4886,11 @@ class CortexTrainingPhaseController:
                     "objective_feedback_term_count": len(self.last_objective_loss_terms),
                     "future_contract_decisions": len(self.future_ledger.decisions),
                     "compression_trace_counts": trace_counts,
+                    "native_ternary_kernel_required": bool(
+                        torch.cuda.is_available()
+                        and self.model.config.use_ternary_core
+                        and self.model.config.use_native_ternary_kernel
+                    ),
                     "variable_input_compression_events": trace_counts.get("kv_events", 0),
                     "certificate_head_forward_events": int(self.model.certificate_forward_events),
                     "input_anchor_observations": int(self.input_anchor_observations),
@@ -5370,6 +5442,8 @@ class LLMTrainer:
         checkpoint_model_config.setdefault("variable_compression_wide_kernel", 8)
         checkpoint_model_config.setdefault("use_learned_memory_policy", False)
         checkpoint_model_config.setdefault("learned_memory_temperature", 1.0)
+        checkpoint_model_config.setdefault("use_native_ternary_kernel", True)
+        checkpoint_model_config.setdefault("require_native_ternary_kernel", False)
         checkpoint_model_config.setdefault("use_certificate_head", False)
         checkpoint_model_config.setdefault("certificate_latent_size", 64)
         if checkpoint_model_config != asdict(self.model.config):
@@ -5986,6 +6060,8 @@ def _estimate_transformer_training_memory(config: TransformerConfig, training: T
         "skill_expert_top_k": int(config.skill_expert_top_k) if config.use_skill_aware_experts else 0,
         "variable_in_compressor": bool(config.use_variable_in_compressor),
         "learned_memory_policy": bool(config.use_learned_memory_policy),
+        "native_ternary_kernel": bool(config.use_ternary_core and config.use_native_ternary_kernel),
+        "native_ternary_kernel_required": bool(config.use_ternary_core and config.require_native_ternary_kernel),
         "certificate_head": bool(config.use_certificate_head),
         "certificate_latent_size": int(config.certificate_latent_size) if config.use_certificate_head else 0,
         "training_state_bytes": int(training_state_bytes),
@@ -6013,6 +6089,8 @@ def _experiment_model_memory_estimates(config: ComparisonConfig) -> dict[str, An
         **asdict(baseline_config),
         "use_cortex_heads": True,
         "use_ternary_core": True,
+        "use_native_ternary_kernel": True,
+        "require_native_ternary_kernel": bool(config.training.require_cuda or str(config.training.device).startswith("cuda")),
         "use_skill_aware_experts": True,
         "use_variable_in_compressor": True,
         "use_learned_memory_policy": True,
@@ -6068,6 +6146,8 @@ def build_training_plan(
         **asdict(baseline_config),
         "use_cortex_heads": True,
         "use_ternary_core": True,
+        "use_native_ternary_kernel": True,
+        "require_native_ternary_kernel": bool(config.training.require_cuda or str(config.training.device).startswith("cuda")),
         "use_skill_aware_experts": True,
         "use_variable_in_compressor": True,
         "use_learned_memory_policy": True,
@@ -6360,6 +6440,8 @@ class LLMComparisonRunner:
                 **asdict(model_config),
                 "use_cortex_heads": True,
                 "use_ternary_core": True,
+                "use_native_ternary_kernel": True,
+                "require_native_ternary_kernel": bool(self.config.training.require_cuda or str(self.config.training.device).startswith("cuda")),
                 "use_skill_aware_experts": True,
                 "use_variable_in_compressor": True,
                 "use_learned_memory_policy": True,

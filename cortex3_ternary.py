@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import warnings
 from dataclasses import asdict, dataclass, field
 from math import fsum
 from typing import Any, Iterable, Mapping, Sequence
@@ -10,6 +11,150 @@ from cortex3 import CostTrace, TernaryBlock, ZeroState, ternarize_values
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+_CUPY_TERNARY_KERNEL_SOURCE = r"""
+#include <cuda_fp16.h>
+#include <cuda_bf16.h>
+
+extern "C" __global__ void ternary_matmul_fp32(
+    const float* x,
+    const unsigned char* packed,
+    const float* scales,
+    const float* residual,
+    const float* bias,
+    float* out,
+    int m_rows,
+    int n_cols,
+    int k_cols,
+    int packed_stride,
+    int use_residual,
+    int has_bias) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  int total = m_rows * n_cols;
+  if (idx >= total) return;
+  int m = idx / n_cols;
+  int n = idx - m * n_cols;
+  float acc = has_bias ? bias[n] : 0.0f;
+  float scale = scales[n];
+  const unsigned char* packed_row = packed + n * packed_stride;
+  for (int k = 0; k < k_cols; ++k) {
+    unsigned char byte = packed_row[k >> 2];
+    unsigned int code = (byte >> ((k & 3) << 1)) & 3;
+    float sign = code == 1 ? -1.0f : (code == 2 ? 1.0f : 0.0f);
+    float w = sign * scale;
+    if (use_residual) w += residual[n * k_cols + k];
+    acc += x[m * k_cols + k] * w;
+  }
+  out[idx] = acc;
+}
+
+extern "C" __global__ void ternary_matmul_fp16(
+    const __half* x,
+    const unsigned char* packed,
+    const float* scales,
+    const float* residual,
+    const float* bias,
+    __half* out,
+    int m_rows,
+    int n_cols,
+    int k_cols,
+    int packed_stride,
+    int use_residual,
+    int has_bias) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  int total = m_rows * n_cols;
+  if (idx >= total) return;
+  int m = idx / n_cols;
+  int n = idx - m * n_cols;
+  float acc = has_bias ? bias[n] : 0.0f;
+  float scale = scales[n];
+  const unsigned char* packed_row = packed + n * packed_stride;
+  for (int k = 0; k < k_cols; ++k) {
+    unsigned char byte = packed_row[k >> 2];
+    unsigned int code = (byte >> ((k & 3) << 1)) & 3;
+    float sign = code == 1 ? -1.0f : (code == 2 ? 1.0f : 0.0f);
+    float w = sign * scale;
+    if (use_residual) w += residual[n * k_cols + k];
+    acc += __half2float(x[m * k_cols + k]) * w;
+  }
+  out[idx] = __float2half(acc);
+}
+
+extern "C" __global__ void ternary_matmul_bf16(
+    const __nv_bfloat16* x,
+    const unsigned char* packed,
+    const float* scales,
+    const float* residual,
+    const float* bias,
+    __nv_bfloat16* out,
+    int m_rows,
+    int n_cols,
+    int k_cols,
+    int packed_stride,
+    int use_residual,
+    int has_bias) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  int total = m_rows * n_cols;
+  if (idx >= total) return;
+  int m = idx / n_cols;
+  int n = idx - m * n_cols;
+  float acc = has_bias ? bias[n] : 0.0f;
+  float scale = scales[n];
+  const unsigned char* packed_row = packed + n * packed_stride;
+  for (int k = 0; k < k_cols; ++k) {
+    unsigned char byte = packed_row[k >> 2];
+    unsigned int code = (byte >> ((k & 3) << 1)) & 3;
+    float sign = code == 1 ? -1.0f : (code == 2 ? 1.0f : 0.0f);
+    float w = sign * scale;
+    if (use_residual) w += residual[n * k_cols + k];
+    acc += __bfloat162float(x[m * k_cols + k]) * w;
+  }
+  out[idx] = __float2bfloat16(acc);
+}
+"""
+
+_CUPY_TERNARY_KERNEL_NAMES = {
+    torch.float32: "ternary_matmul_fp32",
+    torch.float16: "ternary_matmul_fp16",
+    torch.bfloat16: "ternary_matmul_bf16",
+}
+_CUPY_TERNARY_KERNEL_CACHE: dict[Any, Any] = {}
+_CUPY_IMPORT_ERROR: Exception | None = None
+
+
+def _load_cupy() -> Any:
+    global _CUPY_IMPORT_ERROR
+    try:
+        import cupy as cp
+    except Exception as exc:  # pragma: no cover - depends on optional CUDA runtime
+        _CUPY_IMPORT_ERROR = exc
+        raise RuntimeError("cupy-cuda12x is required for native ternary CUDA kernels") from exc
+    _CUPY_IMPORT_ERROR = None
+    return cp
+
+
+def _cupy_ternary_kernel(dtype: Any) -> tuple[Any, Any]:
+    if dtype not in _CUPY_TERNARY_KERNEL_NAMES:
+        raise RuntimeError(f"native ternary CUDA kernel does not support dtype {dtype}")
+    cp = _load_cupy()
+    if dtype not in _CUPY_TERNARY_KERNEL_CACHE:
+        _CUPY_TERNARY_KERNEL_CACHE[dtype] = cp.RawKernel(
+            _CUPY_TERNARY_KERNEL_SOURCE,
+            _CUPY_TERNARY_KERNEL_NAMES[dtype],
+            options=("--std=c++17",),
+        )
+    return cp, _CUPY_TERNARY_KERNEL_CACHE[dtype]
+
+
+def native_ternary_cuda_available() -> bool:
+    if not torch.cuda.is_available():
+        return False
+    try:
+        _cupy_ternary_kernel(torch.float32)
+    except Exception:
+        return False
+    return True
 
 
 @dataclass(frozen=True)
@@ -95,6 +240,7 @@ class PackedTernaryDispatch:
     max_abs_error_vs_ste: float
     used_residual: bool
     note: str = ""
+    native_kernel: bool = False
 
 
 @dataclass
@@ -114,6 +260,8 @@ class CompressionTraceLedger:
     total_mtp_fsp_events: int = 0
     total_layer_forward_events: int = 0
     total_packed_ternary_dispatches: int = 0
+    total_native_ternary_kernel_dispatches: int = 0
+    total_torch_packed_ternary_dispatches: int = 0
     total_weight_bits_read: float = 0.0
     total_activation_bits: float = 0.0
     total_kv_bytes: float = 0.0
@@ -161,6 +309,10 @@ class CompressionTraceLedger:
 
     def record_packed_ternary_dispatch(self, event: PackedTernaryDispatch) -> None:
         self.total_packed_ternary_dispatches += 1
+        if event.native_kernel or event.backend.startswith("native_"):
+            self.total_native_ternary_kernel_dispatches += 1
+        else:
+            self.total_torch_packed_ternary_dispatches += 1
         self.total_packed_weight_bytes += float(event.packed_weight_bytes)
         self.packed_ternary_dispatches.append(event)
         self._trim(self.packed_ternary_dispatches)
@@ -218,6 +370,8 @@ class CompressionTraceLedger:
                 "mtp_fsp_events": self.total_mtp_fsp_events,
                 "layer_forward_events": self.total_layer_forward_events,
                 "packed_ternary_dispatches": self.total_packed_ternary_dispatches,
+                "native_ternary_kernel_dispatches": self.total_native_ternary_kernel_dispatches,
+                "torch_packed_ternary_dispatches": self.total_torch_packed_ternary_dispatches,
             },
             "cost_trace": asdict(self.cost_trace),
             "packed_weight_bytes_read": self.total_packed_weight_bytes,
@@ -325,6 +479,8 @@ class BitLinearConfig:
     shared_scale: bool = True
     log_prefix: str = "bitlinear"
     use_packed_ternary_runtime: bool = True
+    use_native_cuda_kernel: bool = True
+    require_native_cuda_kernel: bool = False
 
 
 class BitLinear(nn.Module):
@@ -483,6 +639,60 @@ class BitLinear(nn.Module):
             weight = weight + self.residual_weight.to(device=device, dtype=dtype)
         return weight
 
+    def _native_cuda_packed_output(self, x: Any) -> Any:
+        if not x.is_cuda:
+            raise RuntimeError("native ternary kernel requires CUDA input")
+        if x.dtype not in _CUPY_TERNARY_KERNEL_NAMES:
+            raise RuntimeError(f"native ternary kernel does not support dtype {x.dtype}")
+        if not self.config.shared_scale:
+            raise RuntimeError("native ternary kernel currently requires per-output shared scales")
+        cp, kernel = _cupy_ternary_kernel(x.dtype)
+        x_flat = x.detach().contiguous().view(-1, self.config.in_features)
+        output = torch.empty(
+            (*x.shape[:-1], self.config.out_features),
+            device=x.device,
+            dtype=x.dtype,
+        )
+        output_flat = output.view(-1, self.config.out_features)
+        packed = self.packed_codes.contiguous()
+        scales = self.scales.detach().to(device=x.device, dtype=torch.float32).contiguous().view(-1)
+        residual = (
+            self.residual_weight.detach().to(device=x.device, dtype=torch.float32).contiguous()
+            if self.config.residual_runtime
+            else torch.empty((0,), device=x.device, dtype=torch.float32)
+        )
+        bias = (
+            self.bias.detach().to(device=x.device, dtype=torch.float32).contiguous()
+            if self.bias is not None
+            else torch.empty((0,), device=x.device, dtype=torch.float32)
+        )
+        total = int(output_flat.numel())
+        threads = 256
+        blocks = ((total + threads - 1) // threads,)
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=DeprecationWarning, message="ExternalStream is deprecated.*")
+            stream = cp.cuda.ExternalStream(torch.cuda.current_stream(x.device).cuda_stream)
+        with stream:
+            kernel(
+                blocks,
+                (threads,),
+                (
+                    cp.from_dlpack(x_flat),
+                    cp.from_dlpack(packed),
+                    cp.from_dlpack(scales),
+                    cp.from_dlpack(residual),
+                    cp.from_dlpack(bias),
+                    cp.from_dlpack(output_flat),
+                    int(x_flat.shape[0]),
+                    int(self.config.out_features),
+                    int(self.config.in_features),
+                    int(packed.shape[1]),
+                    int(bool(self.config.residual_runtime)),
+                    int(self.bias is not None),
+                ),
+            )
+        return output
+
     def _quantize_input(self, x: Any) -> Any:
         if self.config.activation_bits <= 0:
             return x
@@ -510,12 +720,32 @@ class BitLinear(nn.Module):
         output_note = "BitLinear packed int2 ternary forward"
         if self.config.use_packed_ternary_runtime:
             self._sync_quantized_buffers_from_weight(record_decision=False)
-            packed_weight = self._packed_runtime_weight(dtype=xq.dtype, device=xq.device)
-            packed_output = F.linear(xq, packed_weight, self.bias)
-            ste_output = F.linear(xq, ste_weight, self.bias)
+            native_kernel = False
+            backend = "packed_int2_cuda" if xq.is_cuda else "packed_int2_torch"
+            native_note = ""
+            if xq.is_cuda and self.config.use_native_cuda_kernel:
+                try:
+                    packed_output = self._native_cuda_packed_output(xq)
+                    native_kernel = True
+                    backend = "native_int2_cupy_cuda"
+                    native_note = "native CuPy RawKernel"
+                except Exception as exc:
+                    if self.config.require_native_cuda_kernel:
+                        raise
+                    packed_weight = self._packed_runtime_weight(dtype=xq.dtype, device=xq.device)
+                    packed_output = F.linear(xq, packed_weight, self.bias.to(xq.dtype) if self.bias is not None and self.bias.dtype != xq.dtype else self.bias)
+                    native_note = f"native kernel unavailable: {type(exc).__name__}: {exc}"
+            else:
+                packed_weight = self._packed_runtime_weight(dtype=xq.dtype, device=xq.device)
+                packed_output = F.linear(xq, packed_weight, self.bias.to(xq.dtype) if self.bias is not None and self.bias.dtype != xq.dtype else self.bias)
+            ste_linear_weight = ste_weight
+            ste_linear_bias = self.bias
+            if xq.is_cuda and xq.dtype in {torch.float16, torch.bfloat16}:
+                ste_linear_weight = ste_weight.to(xq.dtype)
+                ste_linear_bias = self.bias.to(xq.dtype) if self.bias is not None else None
+            ste_output = F.linear(xq, ste_linear_weight, ste_linear_bias)
             output = ste_output + (packed_output - ste_output).detach()
             max_abs_error = float((packed_output.detach() - ste_output.detach()).abs().max().cpu()) if packed_output.numel() else 0.0
-            backend = "packed_int2_cuda" if xq.is_cuda else "packed_int2_torch"
             self.ledger.record_packed_ternary_dispatch(PackedTernaryDispatch(
                 layer_id=self.config.log_prefix,
                 backend=backend,
@@ -525,7 +755,11 @@ class BitLinear(nn.Module):
                 total_weights=self._last_total_weights,
                 max_abs_error_vs_ste=max_abs_error,
                 used_residual=bool(self.config.residual_runtime),
-                note="forward value read from packed 2-bit ternary weight buffer; gradient uses STE",
+                note=(
+                    "forward value read from packed 2-bit ternary weight buffer; gradient uses STE"
+                    + (f"; {native_note}" if native_note else "")
+                ),
+                native_kernel=native_kernel,
             ))
         else:
             output = F.linear(xq, ste_weight, self.bias)
