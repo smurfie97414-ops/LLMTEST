@@ -1778,15 +1778,23 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
         measured_by_key = {item["shape_key"]: item for item in report["measured_candidates"]}
         refinement_round = report["measurement"]["refinement_rounds"][0]
         budget_action = report["measurement"]["refinement_budget_actions"][0]
+        candidate_actions = report["measurement"]["refinement_budget_candidate_actions"]
         detail = refinement_round["details"][0]
         self.assertTrue(report["passed"], report["failed_checks"])
         self.assertEqual(report["selection"]["selected_shape_keys"], (cheap_key,))
         self.assertEqual(report["measurement"]["refinement_budget_strategy"], "expected_gain_per_cost")
         self.assertEqual(report["measurement"]["refinement_budget_action_count"], 1)
+        self.assertEqual(report["measurement"]["refinement_budget_candidate_action_count"], 2)
         self.assertEqual(refinement_round["refinement_budget_strategy"], "expected_gain_per_cost")
         self.assertEqual(refinement_round["shape_keys"], (cheap_key,))
+        self.assertEqual(refinement_round["refinement_budget_candidate_action_count"], 2)
         self.assertEqual(budget_action["shape_key"], cheap_key)
         self.assertGreater(budget_action["gain_per_cost"], 0.0)
+        self.assertEqual(tuple(action["shape_key"] for action in candidate_actions), (cheap_key, expensive_key))
+        self.assertTrue(candidate_actions[0]["selected_for_refinement"])
+        self.assertFalse(candidate_actions[1]["selected_for_refinement"])
+        self.assertGreater(candidate_actions[1]["expected_gain"], candidate_actions[0]["expected_gain"])
+        self.assertGreater(candidate_actions[0]["gain_per_cost"], candidate_actions[1]["gain_per_cost"])
         self.assertLess(
             budget_action["measurement_cost_tokens"],
             measured_by_key[expensive_key]["tokens_per_optimizer_step"]

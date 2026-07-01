@@ -9883,17 +9883,14 @@ def _profile_autosize_measurement_seeds(
     return tuple(selected)
 
 
-def _profile_autosize_uncertainty_refinement_inputs(
+def _profile_autosize_uncertainty_refinement_actions(
     measured_candidates: Sequence[Mapping[str, Any]],
     *,
-    requested_count: int,
     selected_shape_count: int = 1,
     refinement_steps: int = 1,
     refinement_repeat_count: int = 1,
     refinement_extra_seed_count: int = 1,
 ) -> tuple[Mapping[str, Any], ...]:
-    if requested_count <= 0:
-        return ()
     passed = tuple(
         sorted(
             (
@@ -9971,7 +9968,27 @@ def _profile_autosize_uncertainty_refinement_inputs(
         ),
         reverse=True,
     )
-    return tuple(ranked[: int(requested_count)])
+    return tuple(ranked)
+
+
+def _profile_autosize_uncertainty_refinement_inputs(
+    measured_candidates: Sequence[Mapping[str, Any]],
+    *,
+    requested_count: int,
+    selected_shape_count: int = 1,
+    refinement_steps: int = 1,
+    refinement_repeat_count: int = 1,
+    refinement_extra_seed_count: int = 1,
+) -> tuple[Mapping[str, Any], ...]:
+    if requested_count <= 0:
+        return ()
+    return _profile_autosize_uncertainty_refinement_actions(
+        measured_candidates,
+        selected_shape_count=selected_shape_count,
+        refinement_steps=refinement_steps,
+        refinement_repeat_count=refinement_repeat_count,
+        refinement_extra_seed_count=refinement_extra_seed_count,
+    )[: int(requested_count)]
 
 
 def run_llm_batch_profile_matrix(
@@ -10463,6 +10480,7 @@ def run_llm_batch_profile_autosize(
     measurement_rounds: list[Mapping[str, Any]] = []
     refinement_rounds: list[Mapping[str, Any]] = []
     refinement_budget_actions: list[Mapping[str, Any]] = []
+    refinement_budget_candidate_actions: list[Mapping[str, Any]] = []
     confirmation_rounds: list[Mapping[str, Any]] = []
     refinement_seeds: tuple[int, ...] = ()
     confirmation_seeds: tuple[int, ...] = ()
@@ -10694,14 +10712,14 @@ def run_llm_batch_profile_autosize(
             if not extra_seeds:
                 return
             refinement_profile_steps = max(1, int(steps) * requested_refine_uncertain_step_multiplier)
-            refinement_inputs = _profile_autosize_uncertainty_refinement_inputs(
+            refinement_action_frontier = _profile_autosize_uncertainty_refinement_actions(
                 aggregated_measurement_rows,
-                requested_count=requested_refine_uncertain_candidate_count,
                 selected_shape_count=selected_shape_count,
                 refinement_steps=refinement_profile_steps,
                 refinement_repeat_count=requested_refine_uncertain_repeat_count,
                 refinement_extra_seed_count=len(extra_seeds),
             )
+            refinement_inputs = tuple(refinement_action_frontier[:requested_refine_uncertain_candidate_count])
             if not refinement_inputs:
                 return
 
@@ -10778,6 +10796,10 @@ def run_llm_batch_profile_autosize(
                 measurement_inputs = tuple(aggregated_measurement_rows)
                 refinement_seeds = extra_seeds
                 synthesized_refinement_seed_count = sum(1 for seed in refinement_seeds if seed not in provided_seed_set)
+                selected_refinement_keys = {
+                    str(candidate.get("shape_key", ""))
+                    for candidate in refinement_inputs
+                }
                 round_budget_actions = tuple(
                     {
                         "shape_key": str(candidate.get("shape_key", "")),
@@ -10795,7 +10817,26 @@ def run_llm_batch_profile_autosize(
                     }
                     for candidate in refinement_inputs
                 )
+                round_budget_candidate_actions = tuple(
+                    {
+                        "shape_key": str(candidate.get("shape_key", "")),
+                        "estimated_rank": int(candidate.get("estimated_rank", 0)),
+                        "strategy": str(candidate.get("refinement_budget_strategy", "")),
+                        "expected_gain": float(candidate.get("refinement_expected_gain", 0.0)),
+                        "uncertainty_width": float(candidate.get("refinement_uncertainty_width", 0.0)),
+                        "posterior_utility": float(candidate.get("refinement_posterior_utility", 0.0)),
+                        "measurement_cost_tokens": int(candidate.get("refinement_measurement_cost_tokens", 0)),
+                        "gain_per_cost": float(candidate.get("refinement_gain_per_cost", 0.0)),
+                        "is_selected_finalist": bool(candidate.get("refinement_is_selected_finalist")),
+                        "selected_for_refinement": str(candidate.get("shape_key", "")) in selected_refinement_keys,
+                        "planned_steps": int(candidate.get("refinement_planned_steps", refinement_profile_steps)),
+                        "planned_repeat_count": int(candidate.get("refinement_planned_repeat_count", requested_refine_uncertain_repeat_count)),
+                        "planned_extra_seed_count": int(candidate.get("refinement_planned_extra_seed_count", len(extra_seeds))),
+                    }
+                    for candidate in refinement_action_frontier
+                )
                 refinement_budget_actions.extend(round_budget_actions)
+                refinement_budget_candidate_actions.extend(round_budget_candidate_actions)
                 refinement_rounds.append(
                     {
                         "round_index": int(round_index),
@@ -10809,6 +10850,8 @@ def run_llm_batch_profile_autosize(
                         "refinement_repeat_count": requested_refine_uncertain_repeat_count,
                         "refinement_budget_strategy": "expected_gain_per_cost",
                         "refinement_budget_actions": round_budget_actions,
+                        "refinement_budget_candidate_action_count": len(round_budget_candidate_actions),
+                        "refinement_budget_candidate_actions": round_budget_candidate_actions,
                         "details": tuple(refinement_details),
                     }
                 )
@@ -11479,6 +11522,8 @@ def run_llm_batch_profile_autosize(
             "refinement_budget_strategy": "expected_gain_per_cost",
             "refinement_budget_action_count": len(refinement_budget_actions),
             "refinement_budget_actions": tuple(refinement_budget_actions),
+            "refinement_budget_candidate_action_count": len(refinement_budget_candidate_actions),
+            "refinement_budget_candidate_actions": tuple(refinement_budget_candidate_actions),
             "confirmation_enabled": (
                 effective_measure_candidate_count > 0
                 and requested_confirm_selected_candidate_count > 0
