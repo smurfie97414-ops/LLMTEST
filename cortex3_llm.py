@@ -9197,6 +9197,7 @@ def _profile_autosize_candidate(
 
 
 PROFILE_AUTOSIZE_MEASURED_SELECTION_METRICS = ("throughput", "gpu", "throughput_gpu")
+PROFILE_AUTOSIZE_MEASUREMENT_STRATEGIES = ("diverse", "top")
 
 
 def _profile_autosize_measured_score(
@@ -9215,6 +9216,141 @@ def _profile_autosize_measured_score(
     if metric == "gpu":
         return float(gpu_utilization_percent)
     return float(train_tokens_per_second) * max(1.0, float(gpu_utilization_percent))
+
+
+def _profile_autosize_diversity_features(
+    candidate: Mapping[str, Any],
+    *,
+    ranges: Mapping[str, tuple[float, float]],
+) -> tuple[float, ...]:
+    shape = dict(candidate["shape"])
+    raw = {
+        "seq_len": float(shape["seq_len"]),
+        "d_model": float(shape["d_model"]),
+        "n_layers": float(shape["n_layers"]),
+        "batch_size": float(shape["batch_size"]),
+        "gradient_accumulation_steps": float(candidate.get("gradient_accumulation_steps", shape.get("gradient_accumulation_steps", 1))),
+        "budget_fraction_used": float(candidate.get("budget_fraction_used", 0.0)),
+        "tokens_per_optimizer_step": float(candidate.get("tokens_per_optimizer_step", 0.0)),
+    }
+    values: list[float] = []
+    for name in (
+        "seq_len",
+        "d_model",
+        "n_layers",
+        "batch_size",
+        "gradient_accumulation_steps",
+        "budget_fraction_used",
+        "tokens_per_optimizer_step",
+    ):
+        low, high = ranges[name]
+        span = max(1e-9, high - low)
+        values.append((raw[name] - low) / span)
+    return tuple(values)
+
+
+def _profile_autosize_measurement_inputs(
+    ranked_candidates: Sequence[Mapping[str, Any]],
+    *,
+    requested_count: int,
+    strategy: str,
+) -> tuple[Mapping[str, Any], ...]:
+    if requested_count <= 0:
+        return ()
+    if strategy not in PROFILE_AUTOSIZE_MEASUREMENT_STRATEGIES:
+        raise ValueError(
+            f"unknown autosize measurement strategy {strategy!r}; "
+            f"expected one of {PROFILE_AUTOSIZE_MEASUREMENT_STRATEGIES}"
+        )
+    candidates = tuple(ranked_candidates)
+    if not candidates:
+        return ()
+    count = min(int(requested_count), len(candidates))
+
+    def annotate(candidate: Mapping[str, Any], *, reason: str, index: int, distance: float = 0.0) -> Mapping[str, Any]:
+        return {
+            **candidate,
+            "measurement_candidate_index": int(index),
+            "measurement_selection_reason": reason,
+            "measurement_selection_distance": float(distance),
+        }
+
+    if strategy == "top":
+        return tuple(
+            annotate(candidate, reason="top_estimated_score", index=index)
+            for index, candidate in enumerate(candidates[:count])
+        )
+
+    ranges: dict[str, tuple[float, float]] = {}
+    feature_names = (
+        "seq_len",
+        "d_model",
+        "n_layers",
+        "batch_size",
+        "gradient_accumulation_steps",
+        "budget_fraction_used",
+        "tokens_per_optimizer_step",
+    )
+    raw_by_name: dict[str, list[float]] = {name: [] for name in feature_names}
+    for candidate in candidates:
+        shape = dict(candidate["shape"])
+        raw_by_name["seq_len"].append(float(shape["seq_len"]))
+        raw_by_name["d_model"].append(float(shape["d_model"]))
+        raw_by_name["n_layers"].append(float(shape["n_layers"]))
+        raw_by_name["batch_size"].append(float(shape["batch_size"]))
+        raw_by_name["gradient_accumulation_steps"].append(
+            float(candidate.get("gradient_accumulation_steps", shape.get("gradient_accumulation_steps", 1)))
+        )
+        raw_by_name["budget_fraction_used"].append(float(candidate.get("budget_fraction_used", 0.0)))
+        raw_by_name["tokens_per_optimizer_step"].append(float(candidate.get("tokens_per_optimizer_step", 0.0)))
+    for name, values in raw_by_name.items():
+        ranges[name] = (min(values), max(values))
+    features = {
+        str(candidate["shape_key"]): _profile_autosize_diversity_features(candidate, ranges=ranges)
+        for candidate in candidates
+    }
+    scores = [float(candidate.get("score", 0.0)) for candidate in candidates]
+    score_low, score_high = min(scores), max(scores)
+    score_span = max(1e-9, score_high - score_low)
+    token_values = [float(candidate.get("tokens_per_optimizer_step", 0.0)) for candidate in candidates]
+    token_low, token_high = min(token_values), max(token_values)
+    token_span = max(1e-9, token_high - token_low)
+
+    selected: list[Mapping[str, Any]] = [annotate(candidates[0], reason="top_estimated_score", index=0)]
+    selected_keys = {str(candidates[0]["shape_key"])}
+    while len(selected) < count:
+        best: tuple[float, float, float, int, Mapping[str, Any]] | None = None
+        selected_features = [features[str(item["shape_key"])] for item in selected]
+        for candidate in candidates:
+            shape_key = str(candidate["shape_key"])
+            if shape_key in selected_keys:
+                continue
+            feature = features[shape_key]
+            min_distance = min(
+                math.sqrt(sum((left - right) ** 2 for left, right in zip(feature, selected_feature)))
+                for selected_feature in selected_features
+            )
+            estimated_score_norm = (float(candidate.get("score", 0.0)) - score_low) / score_span
+            token_norm = (float(candidate.get("tokens_per_optimizer_step", 0.0)) - token_low) / token_span
+            budget_norm = float(candidate.get("budget_fraction_used", 0.0))
+            secondary = (0.50 * min_distance) + (0.25 * estimated_score_norm) + (0.15 * token_norm) + (0.10 * budget_norm)
+            rank = int(candidate.get("estimated_rank", 0))
+            key = (secondary, min_distance, float(candidate.get("score", 0.0)), -rank, candidate)
+            if best is None or key[:4] > best[:4]:
+                best = key
+        if best is None:
+            break
+        _, distance, _, _, candidate = best
+        selected.append(
+            annotate(
+                candidate,
+                reason="diverse_shape_frontier",
+                index=len(selected),
+                distance=distance,
+            )
+        )
+        selected_keys.add(str(candidate["shape_key"]))
+    return tuple(selected)
 
 
 def _profile_autosize_measurement_summary(
@@ -9237,6 +9373,10 @@ def _profile_autosize_measurement_summary(
         "budget_fraction_used": float(candidate["budget_fraction_used"]),
         "tokens_per_optimizer_step": int(candidate["tokens_per_optimizer_step"]),
         "estimated_score": float(candidate["score"]),
+        "estimated_rank": int(candidate.get("estimated_rank", 0)),
+        "measurement_candidate_index": int(candidate.get("measurement_candidate_index", 0)),
+        "measurement_selection_reason": str(candidate.get("measurement_selection_reason", "")),
+        "measurement_selection_distance": float(candidate.get("measurement_selection_distance", 0.0)),
         "fits_budget": bool(candidate["fits_budget"]),
         "measurement_metric": metric,
     }
@@ -9389,6 +9529,10 @@ def _profile_autosize_aggregate_measurements(
         "tokens_per_optimizer_step": int(candidate["tokens_per_optimizer_step"]),
         "estimated_score": float(candidate["score"]),
         "score": float(candidate["score"]),
+        "estimated_rank": int(candidate.get("estimated_rank", 0)),
+        "measurement_candidate_index": int(candidate.get("measurement_candidate_index", 0)),
+        "measurement_selection_reason": str(candidate.get("measurement_selection_reason", "")),
+        "measurement_selection_distance": float(candidate.get("measurement_selection_distance", 0.0)),
         "fits_budget": bool(candidate["fits_budget"]),
         "measurement_metric": metric,
         "measurement_profile_passed": measurement_profile_passed,
@@ -9667,6 +9811,7 @@ def run_llm_batch_profile_autosize(
     memory_budget_fraction: float = 0.35,
     measure_candidate_count: int = 4,
     measure_candidate_seed_count: int | None = None,
+    measure_candidate_strategy: str = "diverse",
     measured_selection_metric: str = "throughput_gpu",
     min_cases: int = 1,
     require_multi_shape: bool = False,
@@ -9690,6 +9835,11 @@ def run_llm_batch_profile_autosize(
     requested_measure_candidate_count = int(measure_candidate_count)
     if requested_measure_candidate_count < 0:
         raise ValueError("measure_candidate_count must be >= 0")
+    if measure_candidate_strategy not in PROFILE_AUTOSIZE_MEASUREMENT_STRATEGIES:
+        raise ValueError(
+            f"unknown measure_candidate_strategy {measure_candidate_strategy!r}; "
+            f"expected one of {PROFILE_AUTOSIZE_MEASUREMENT_STRATEGIES}"
+        )
     if measured_selection_metric not in PROFILE_AUTOSIZE_MEASURED_SELECTION_METRICS:
         raise ValueError(
             f"unknown measured_selection_metric {measured_selection_metric!r}; "
@@ -9779,15 +9929,23 @@ def run_llm_batch_profile_autosize(
                             candidates.append(candidate)
                         else:
                             rejected.append({**candidate, "reason": "estimated_peak_exceeds_budget"})
-    ranked_candidates = sorted(
-        candidates,
-        key=lambda item: (
-            float(item["score"]),
-            int(item["estimated_peak_training_bytes"]),
-            int(item["tokens_per_optimizer_step"]),
-            str(item["shape_key"]),
-        ),
-        reverse=True,
+    ranked_candidates = tuple(
+        {
+            **candidate,
+            "estimated_rank": index + 1,
+        }
+        for index, candidate in enumerate(
+            sorted(
+                candidates,
+                key=lambda item: (
+                    float(item["score"]),
+                    int(item["estimated_peak_training_bytes"]),
+                    int(item["tokens_per_optimizer_step"]),
+                    str(item["shape_key"]),
+                ),
+                reverse=True,
+            )
+        )
     )
     measured_candidates: tuple[Mapping[str, Any], ...] = ()
     measured_passed_candidates: tuple[Mapping[str, Any], ...] = ()
@@ -9798,13 +9956,18 @@ def run_llm_batch_profile_autosize(
     measurement_seed = int(measurement_seeds[0])
     selection_source = "estimated"
     selection_pool: Sequence[Mapping[str, Any]] = ranked_candidates
+    measurement_inputs: tuple[Mapping[str, Any], ...] = ()
     effective_measure_candidate_count = (
         max(requested_measure_candidate_count, int(selected_shape_count))
         if requested_measure_candidate_count > 0
         else 0
     )
     if effective_measure_candidate_count > 0:
-        measurement_inputs = tuple(ranked_candidates[:effective_measure_candidate_count])
+        measurement_inputs = _profile_autosize_measurement_inputs(
+            ranked_candidates,
+            requested_count=effective_measure_candidate_count,
+            strategy=measure_candidate_strategy,
+        )
         aggregated_measurement_rows: list[Mapping[str, Any]] = []
         for candidate_index, candidate in enumerate(measurement_inputs):
             shape = dict(candidate["shape"])
@@ -9979,6 +10142,9 @@ def run_llm_batch_profile_autosize(
             "requested_seed_count": requested_measure_candidate_seed_count,
             "measurement_seed_count": len(measurement_seeds),
             "measurement_seeds": measurement_seeds,
+            "candidate_selection_strategy": measure_candidate_strategy,
+            "measurement_input_shape_keys": tuple(str(item["shape_key"]) for item in measurement_inputs),
+            "measurement_input_estimated_ranks": tuple(int(item.get("estimated_rank", 0)) for item in measurement_inputs),
             "measured_selection_metric": measured_selection_metric,
             "selected_from_measurements": selection_source == "measured",
         },
@@ -10223,6 +10389,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     profile_autosize.add_argument("--memory-budget-fraction", type=float, default=0.35)
     profile_autosize.add_argument("--measure-candidate-count", type=int, default=4)
     profile_autosize.add_argument("--measure-candidate-seed-count", type=int, default=None, help="number of provided seeds used while measuring each candidate; default uses all provided seeds")
+    profile_autosize.add_argument("--measure-candidate-strategy", choices=PROFILE_AUTOSIZE_MEASUREMENT_STRATEGIES, default="diverse", help="candidate subset measured before final matrix; diverse samples shape frontiers instead of only the top estimated ranks")
     profile_autosize.add_argument("--measured-selection-metric", choices=PROFILE_AUTOSIZE_MEASURED_SELECTION_METRICS, default="throughput_gpu")
     profile_autosize.add_argument("--min-cases", type=int, default=1)
     profile_autosize.add_argument("--require-multi-shape", action="store_true")
@@ -10609,6 +10776,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             memory_budget_fraction=args.memory_budget_fraction,
             measure_candidate_count=args.measure_candidate_count,
             measure_candidate_seed_count=args.measure_candidate_seed_count,
+            measure_candidate_strategy=args.measure_candidate_strategy,
             measured_selection_metric=args.measured_selection_metric,
             min_cases=args.min_cases,
             require_multi_shape=args.require_multi_shape,

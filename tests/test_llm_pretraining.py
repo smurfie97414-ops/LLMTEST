@@ -267,6 +267,90 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             self.assertTrue(report["matrix"]["passed"], report["matrix"]["failed_checks"])
             self.assertEqual(report["matrix"]["summary"]["case_count"], 1)
 
+    def test_llm_batch_profile_autosize_diverse_measurement_can_escape_top_estimate(self):
+        profile_calls = []
+
+        def fake_profile(**kwargs):
+            profile_calls.append(dict(kwargs))
+            is_fast_shape = int(kwargs["seq_len"]) == 32 and int(kwargs["d_model"]) == 32
+            train_tokens_per_second = 900.0 if is_fast_shape else 10.0
+            gpu_utilization = 40.0 if is_fast_shape else 5.0
+            planned = (
+                int(kwargs["steps"])
+                * int(kwargs["batch_size"])
+                * int(kwargs["gradient_accumulation_steps"])
+                * int(kwargs["seq_len"])
+            )
+            return {
+                "passed": True,
+                "failed_checks": (),
+                "throughput": {
+                    "train_tokens_per_second_wall": train_tokens_per_second,
+                    "planned_train_tokens": planned,
+                },
+                "resource_usage": {
+                    "sample_count": 1,
+                    "metrics": {
+                        "gpu_utilization_percent": {"avg": gpu_utilization, "min": gpu_utilization, "max": gpu_utilization},
+                        "gpu_memory_used_mb": {"avg": 128.0, "min": 128.0, "max": 128.0},
+                        "gpu_power_draw_watts": {"avg": 45.0, "min": 45.0, "max": 45.0},
+                        "process_cpu_percent_of_total": {"avg": 1.0, "min": 1.0, "max": 1.0},
+                    },
+                },
+                "torch_cuda_memory": {
+                    "after": {
+                        "max_memory_allocated_bytes": 8 * 1024 * 1024,
+                    }
+                },
+                "kernel_evidence": {
+                    "native_ternary_kernel_required": False,
+                    "strict_extension_only": True,
+                },
+                "architecture": {"all_phases_active": True},
+            }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch("cortex3_llm.run_llm_batch_profile", side_effect=fake_profile):
+                report = run_llm_batch_profile_autosize(
+                    out_dir=root / "autosize-diverse",
+                    candidate_seq_lens=(32, 64),
+                    candidate_d_models=(32, 64),
+                    candidate_n_layers=(1,),
+                    candidate_batch_sizes=(2,),
+                    candidate_gradient_accumulation_steps=(1,),
+                    n_heads=4,
+                    selected_shape_count=1,
+                    min_selected_shapes=1,
+                    seeds=(11,),
+                    steps=1,
+                    gradient_accumulation_steps=1,
+                    vocab_size=128,
+                    precision="fp32",
+                    device="cpu",
+                    require_cuda=False,
+                    memory_budget_mb=512,
+                    measure_candidate_count=2,
+                    min_cases=1,
+                    min_resource_samples=1,
+                )
+
+        self.assertTrue(report["passed"], report["failed_checks"])
+        self.assertEqual(report["measurement"]["candidate_selection_strategy"], "diverse")
+        self.assertEqual(report["measurement"]["measured_candidate_count"], 2)
+        self.assertTrue(
+            any(rank > report["measurement"]["effective_candidate_count"] for rank in report["measurement"]["measurement_input_estimated_ranks"]),
+            report["measurement"]["measurement_input_estimated_ranks"],
+        )
+        measured_by_key = {item["shape_key"]: item for item in report["measured_candidates"]}
+        fast_shape_key = "seq32_d32_h4_l1_b2_g1"
+        self.assertIn(fast_shape_key, measured_by_key)
+        self.assertEqual(measured_by_key[fast_shape_key]["measurement_selection_reason"], "diverse_shape_frontier")
+        self.assertGreater(measured_by_key[fast_shape_key]["estimated_rank"], 2)
+        self.assertEqual(report["selection"]["selected_shape_keys"], (fast_shape_key,))
+        self.assertEqual(profile_calls[-1]["seq_len"], 32)
+        self.assertEqual(profile_calls[-1]["d_model"], 32)
+
     def test_llm_batch_profile_autosize_matrix_uses_selected_gradient_accumulation(self):
         profile_calls = []
 
