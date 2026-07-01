@@ -2384,13 +2384,18 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
         y = torch.randint(4, 96, (2, 16))
         future = torch.stack((y, y, y, y), dim=-1)
 
+        model.set_skill_expert_context((0.70, 0.10, 0.10, 0.10), source="unit-skill-ledger")
         output = model(x)
         loss, breakdown = CortexObjective().compute(output, y, future, use_cortex_terms=True)
         loss.backward()
 
         self.assertIsNotNone(output.learned_memory_policy)
+        self.assertIsNotNone(output.skill_expert_routing)
+        self.assertIsNotNone(output.skill_expert_routing.target_distribution)
         self.assertGreater(breakdown.learned_memory, 0.0)
+        self.assertGreater(breakdown.skill_expert, 0.0)
         self.assertGreater(float(model.learned_memory.policy[-1].weight.grad.abs().sum()), 0.0)
+        self.assertGreater(float(model.skill_experts.router.weight.grad.abs().sum()), 0.0)
         self.assertGreater(model.compression_ledger.total_packed_ternary_dispatches, 0)
 
     def test_learned_memory_ablation_shows_policy_can_reduce_loss(self):
@@ -3279,6 +3284,11 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 + influence["learned_memory_retention_applied_drop"],
             )
             self.assertGreater(influence["skill_expert_activations"], 0)
+            self.assertGreater(influence["skill_expert_context_events"], 0)
+            self.assertGreater(influence["skill_expert_replay_context_events"], 0)
+            self.assertGreater(influence["skill_expert_context_updates"], 0)
+            self.assertTrue(influence["skill_expert_last_context"], influence)
+            self.assertTrue(influence["skill_expert_context_skills"], influence)
             self.assertGreater(influence["certificate_head_forward_events"], 0)
             self.assertGreater(influence["model_certificate_head_verified_events"], 0)
             self.assertGreater(influence["model_certificate_head_latent_checksum_events"], 0)
@@ -3476,6 +3486,14 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 influence["inference_model_backed_replay_events"],
             )
             self.assertEqual(
+                persisted["training_influence"]["skill_expert_context_events"],
+                influence["skill_expert_context_events"],
+            )
+            self.assertEqual(
+                persisted["training_influence"]["skill_expert_replay_context_events"],
+                influence["skill_expert_replay_context_events"],
+            )
+            self.assertEqual(
                 persisted["training_influence"]["frontier_repair_accepted_events"],
                 influence["frontier_repair_accepted_events"],
             )
@@ -3593,6 +3611,8 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 self.assertGreater(first_influence["output_goal_contract_decisions"], 0)
                 self.assertGreater(first_influence["output_goal_contract_accepted"], 0)
                 self.assertGreater(first_influence["ternary_core_forward_events"], 0)
+                self.assertGreater(first_influence["skill_expert_context_events"], 0)
+                self.assertGreater(first_influence["skill_expert_replay_context_events"], 0)
                 self.assertGreater(first_influence["inference_model_backed_events"], 0)
                 self.assertGreater(first_influence["inference_model_backed_generated_tokens"], 0)
                 self.assertGreater(first_influence["inference_model_backed_replay_events"], 0)
@@ -3628,6 +3648,10 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 self.assertGreater(checkpoint["cortex_phase_state"]["input_anchor_observations"], 0)
                 self.assertGreater(checkpoint["cortex_phase_state"]["input_anchor_count"], 0)
                 self.assertEqual(checkpoint["cortex_phase_state"]["input_anchor_fidelity_failures"], 0)
+                self.assertGreater(checkpoint["cortex_phase_state"]["skill_expert_context_events"], 0)
+                self.assertGreater(checkpoint["cortex_phase_state"]["skill_expert_replay_context_events"], 0)
+                self.assertTrue(checkpoint["cortex_phase_state"]["skill_expert_last_context"])
+                self.assertTrue(checkpoint["cortex_phase_state"]["skill_expert_context_skills"])
                 self.assertGreater(checkpoint["cortex_phase_state"]["ledgers"]["bit_ledger"]["total_effective_bits"], 0.0)
                 self.assertTrue(checkpoint["cortex_phase_state"]["ledgers"]["skill_ledger"]["states"])
                 self.assertGreater(checkpoint["cortex_phase_state"]["ledgers"]["causal_ledger"]["trace_count"], 0)
@@ -3786,6 +3810,10 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                     sidecar["cortex_phase_state_summary"]["compression_trace_counts"]["expert_activations"],
                     0,
                 )
+                self.assertGreater(sidecar["cortex_phase_state_summary"]["skill_expert_context_events"], 0)
+                self.assertGreater(sidecar["cortex_phase_state_summary"]["skill_expert_replay_context_events"], 0)
+                self.assertTrue(sidecar["cortex_phase_state_summary"]["skill_expert_last_context"])
+                self.assertTrue(sidecar["cortex_phase_state_summary"]["skill_expert_context_skills"])
                 self.assertGreater(sidecar["cortex_phase_state_summary"]["variable_input_compression_events"], 0)
                 self.assertGreater(sidecar["cortex_phase_state_summary"]["certificate_head_forward_events"], 0)
                 self.assertGreater(sidecar["cortex_phase_state_summary"]["model_certificate_head_verified_events"], 0)
@@ -3927,6 +3955,14 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             self.assertGreaterEqual(
                 resumed_influence["skill_expert_activations"],
                 first_influence["skill_expert_activations"],
+            )
+            self.assertGreaterEqual(
+                resumed_influence["skill_expert_context_events"],
+                first_influence["skill_expert_context_events"],
+            )
+            self.assertGreater(
+                resumed_influence["skill_expert_replay_context_events"],
+                first_influence["skill_expert_replay_context_events"],
             )
             self.assertGreaterEqual(
                 resumed_influence["variable_input_compression_events"],

@@ -1,6 +1,6 @@
 # Cortex-3 Architecture Self-Critique
 
-Etat: boucle d'audit 72 apres relecture P1-P10 hors profiling/observabilite. La critique repart des 10 phases et vise les briques structurantes: SlowSolve -> verification -> attribution -> regrowth -> compilation -> selection runtime -> reutilisation persistante -> evolution recursive. Le dernier correctif structurel transforme maintenant les sorties P8 model-backed du vrai `CortexTransformerLM` en replay verifie ou correctif, afin qu'elles influencent `replay_loss` au lieu de rester une generation observee.
+Etat: boucle d'audit 73 apres relecture P1-P10 hors profiling/observabilite. La critique repart des 10 phases et vise les briques structurantes: SlowSolve -> verification -> attribution -> regrowth -> compilation -> selection runtime -> reutilisation persistante -> evolution recursive. Le dernier correctif structurel relie maintenant le Skill Ledger et les replays verifies au routeur MoE `SkillAwareExpertMoE`, avec contexte expert persistant, loss d'alignement et gate d'audit obligatoire.
 
 Ce document sert de registre de critique et de correction. Il ne remplace pas les tests longs interdits pour cette iteration; il se limite aux preuves courtes disponibles, aux rapports du code et aux tests courts.
 
@@ -19,6 +19,7 @@ Mise a jour C69: P5 ne se contente plus d'une `CertificateHead` appelee en forwa
 Mise a jour C70: P9 ne peut plus valider son reservoir reel/exogene avec une tache Cortex artificielle. `observe_input_batch` cree des exemples `REAL_EXOGENOUS` a partir des tokens reels du dataloader, les verifie par oracle exact, conserve la provenance `from_llm_input_batch`, et P9 echoue si ces exemples sont absents avant consolidation.
 Mise a jour C71: P8 ne prend plus `ReferenceRuleAgent` comme source de reponse par defaut dans le harness LLM. `CortexTransformerInferenceAgent` decode greedy depuis les logits du Transformer, transporte la sortie de `CertificateHead`, et l'audit P8 exige des evenements `inference_model_backed_*`.
 Mise a jour C72: P8 ne se contente plus d'appeler le Transformer. Chaque inference model-backed forcee sur un span reel est transformee en replay P8 verifie: la reponse modele si elle passe, sinon la correction oracle, avec compteurs `inference_model_backed_replay_events` obligatoires dans les audits.
+Mise a jour C73: les experts ne sont plus seulement actives par un routeur dense generique. Le Skill Ledger produit un contexte expert derive des competences fragiles, chaque replay verifie porte une cible d'expert issue de son skill, et `CortexObjective` ajoute une loss differenciable d'alignement de routage.
 
 ## Audit transversal haut enjeu apres C55
 
@@ -27,11 +28,21 @@ Mise a jour C72: P8 ne se contente plus d'appeler le Transformer. Chaque inferen
 - P3 MTP/FSP: les contrats token-horizon sont branches dans le training, et les nouveaux contrats output-goal protegent maintenant les objectifs de sortie/skill au-dela du prochain token.
 - P4 Cognitive Memory: la memoire apprise existe dans le Transformer LLM, ses decisions exact/latent/drop pilotent maintenant le stockage autonome P4, la memoire conserve les ancres par override dur, et les competences compilees Frontier sont retenues comme objets memoire avec gate de reconstruction avant FastSolve, y compris apres restauration checkpoint. Le manque suivant est de prouver cette retention sur de plus grands registres et plusieurs cycles longs.
 - P5 Certificates: les certificats prouvent des sorties et des traces latentes. La tete de certificat du Transformer produit maintenant un artefact verifie par checksum/coherence token, les certificats certifient aussi l'origine compilee d'une competence reutilisee via un contrat `compiled_circuit` a checksum, incluant le passage du contrat output-goal, et couvrent une premiere preuve algebrique multi-step plus des tests code visibles/caches/proprietes.
-- P6 Attribution: les ablations savent localiser des causes. Le point fort enjeu est de transformer ces causes en selection de circuit compile ou regrowth cible, pas seulement en estimation.
+- P6 Attribution: les ablations savent localiser des causes. Le point fort enjeu est de transformer ces causes en selection de circuit compile ou regrowth cible, pas seulement en estimation. C73 relie aussi les competences fragiles du Skill Ledger au routage des experts pendant le training, ce qui transforme une fragilite detectee en pression de calcul specialisee.
 - P7 Minimal Regrowth: le LLM sait appliquer un patch borne aux vrais parametres. Le pont ajoute ici teste maintenant une competence compilee comme candidat de reparation verifie avant d'acheter du regrowth parametrique, puis conserve le regrowth existant sous gate stricte.
 - P8 Fast/Normal/Careful Inference: les routes existent, le chemin FastSolve consomme maintenant un registre frontier seulement quand un circuit couvre vraiment la tache, selectionne le circuit le plus specialise avant les scores globaux, chaque reponse inferee porte un contrat output-goal, et la reprise checkpoint execute une FastSolve restauree avant de continuer. Hors circuit compile couvert, le harness LLM utilise maintenant le vrai Transformer comme source de reponse P8, avec logits greedy, cout de generation et certificat latent modele. Les echecs ou succes model-backed deviennent maintenant des replays P8 verifies, donc ils agissent sur le gradient via `replay_loss`.
 - P9 Sleep Anti-Collapse: le replay et les exemples verifies alimentent le training, puis certaines familles coherentes acceptees par le sommeil sont maintenant promues en circuits Frontier persistants avec held-out gate, FastSolve immediat, FastSolve restauree apres checkpoint et proposition P10. Le reservoir reel/exogene est maintenant strictement alimente par le vrai flux LLM decode pendant `observe_input_batch`, avec provenance persistante et audit obligatoire.
 - P10 Recursive Improvement: les propositions peuvent appliquer des patchs signes et ne restent plus isolees du corpus d'entrainement. Le controleur LLM explore un budget borne de propositions tout en conservant les gates Pareto/protection/calibration/diversite/reward-hacking; les reparations Frontier acceptees par P7 sont promues en propositions `compiled_frontier` prioritaires, l'archive complete peut survivre a un run independant, les propositions acceptees peuvent engendrer une generation suivante sous pression de diversite, puis chaque proposition acceptee devient aussi un artefact P10 verifie, replayable et persistant.
+
+### C73. Les experts etaient actives mais pas vraiment pilotes par le Skill Ledger
+
+- Critique: avant C73, `SkillAwareExpertMoE` routait les tokens depuis les hidden states et enregistrait des activations d'experts, mais le routeur ne consommait pas explicitement les competences fragiles detectees par P1/P6/P7 ni les skills des replays verifies. Le nom "skill-aware" etait donc trop faible: les experts etaient trainables, mais pas suffisamment lies au Skill Ledger, ce qui cassait une brique du schema cible `Causal + Skill Ledgers -> Ternary Core + Skill-aware Experts`.
+- Correction: `CortexTrainingPhaseController` convertit maintenant les etats du Skill Ledger en distribution cible d'experts stable par skill, ponderee par fragilite, echecs, pass rate et statut protege. Ce contexte est injecte dans le `CortexTransformerLM` apres P1 et persiste dans le checkpoint.
+- Correction replay: chaque exemple de replay P1/P3/P4/P5/P6/P7/P8/P9/P10 porte une distribution expert derivee de son `targeted_skill`. Pendant `replay_loss`, le modele remplace temporairement son contexte global par ce contexte de skill, puis restaure le contexte precedent.
+- Correction apprentissage: `SkillAwareExpertMoE` renvoie maintenant `SkillExpertRoutingState` avec logits, probabilites, top-k et cible. `CortexObjective` ajoute `skill_expert_loss`, une KL d'alignement routeur->cible plus une petite penalite de balance, donc le routage expert recoit du gradient et n'est plus seulement un compteur.
+- Correction audit: l'audit architecture `skill_aware_experts` exige maintenant des activations d'experts, des evenements de contexte Skill Ledger, des evenements de contexte replay et une liste de skills ayant pilote le contexte.
+- Verification courte: `py_compile`, `test_learned_memory_policy_is_trainable_and_affects_cortex_loss`, `test_full_cortex_phase_controller_uses_all_modules_during_training` et `test_cortex_phase_state_survives_checkpoint_resume` passent. Les tests verifient gradient non nul dans le routeur expert, contexte Skill Ledger, contexte replay, persistance checkpoint et reprise.
+- Statut: corrige pour le pont Skill Ledger -> Skill-aware MoE -> loss -> replay/checkpoint. La prochaine cible haut enjeu doit continuer a privilegier les liens causaux entre phases, pas les profils longs ou les compteurs seuls.
 
 ### C70. Le reservoir P9 disait reel/exogene sans recevoir le corpus LLM reel
 
@@ -790,9 +801,9 @@ Mise a jour C72: P8 ne se contente plus d'appeler le Transformer. Chaque inferen
 
 ### Skill-aware Experts
 
-- Statut: MoE trainable et events experts.
-- Faiblesse: routing encore peu supervise par skill ledger.
-- Correction restante: ajouter regularisation skill-ledger/routing.
+- Statut: MoE trainable, events experts, contexte derive du Skill Ledger, contexte par replay verifie et loss d'alignement de routage.
+- Faiblesse: le routage est maintenant branche aux skills fragiles, mais pas encore calibre sur grands historiques multi-corpus et competences concurrentes.
+- Correction restante: scaler la supervision Skill Ledger/expert sur plusieurs cycles et verifier la specialisation d'experts sur suites held-out.
 
 ### Future Contract / FSP
 

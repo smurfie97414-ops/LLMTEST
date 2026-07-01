@@ -1643,6 +1643,7 @@ class TransformerConfig:
     use_skill_aware_experts: bool = False
     skill_expert_count: int = 4
     skill_expert_top_k: int = 2
+    skill_expert_context_strength: float = 1.25
     use_variable_in_compressor: bool = False
     variable_compression_wide_kernel: int = 8
     use_learned_memory_policy: bool = False
@@ -1671,6 +1672,8 @@ class TransformerConfig:
             raise ValueError("skill_expert_count must be positive")
         if not 1 <= self.skill_expert_top_k <= self.skill_expert_count:
             raise ValueError("skill_expert_top_k must be between 1 and skill_expert_count")
+        if self.skill_expert_context_strength < 0:
+            raise ValueError("skill_expert_context_strength must be non-negative")
         if self.variable_compression_wide_kernel < 2:
             raise ValueError("variable_compression_wide_kernel must be >= 2")
         if self.use_learned_memory_policy and self.learned_memory_temperature <= 0:
@@ -1946,6 +1949,30 @@ class LearnedMemoryPolicy(nn.Module):
         return mixed, state
 
 
+@dataclass(frozen=True)
+class SkillExpertRoutingState:
+    route_logits: torch.Tensor
+    route_probs: torch.Tensor
+    top_indices: torch.Tensor
+    target_distribution: torch.Tensor | None = None
+    context_source: str = ""
+
+    def to_summary(self) -> dict[str, Any]:
+        route_mean = self.route_probs.detach().mean(dim=(0, 1)).cpu()
+        payload: dict[str, Any] = {
+            "route_distribution": tuple(float(item) for item in route_mean.tolist()),
+            "selected_experts": tuple(
+                sorted(set(int(index) for index in self.top_indices.detach().cpu().reshape(-1).tolist()))
+            ),
+            "context_source": self.context_source,
+        }
+        if self.target_distribution is not None:
+            payload["target_distribution"] = tuple(
+                float(item) for item in self.target_distribution.detach().cpu().tolist()
+            )
+        return payload
+
+
 class SkillAwareExpertMoE(nn.Module):
     def __init__(self, config: TransformerConfig, *, ledger: CompressionTraceLedger | None = None):
         super().__init__()
@@ -1973,8 +2000,25 @@ class SkillAwareExpertMoE(nn.Module):
             for index in range(config.skill_expert_count)
         ])
 
-    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        hidden: torch.Tensor,
+        *,
+        skill_context: torch.Tensor | None = None,
+        context_source: str = "",
+    ) -> tuple[torch.Tensor, SkillExpertRoutingState]:
         route_logits = self.router(hidden)
+        target_distribution = None
+        if skill_context is not None and skill_context.numel() == self.config.skill_expert_count:
+            target_distribution = skill_context.to(device=hidden.device, dtype=route_logits.dtype).clamp_min(0.0)
+            total = target_distribution.sum()
+            if bool((total <= 0).detach().cpu()):
+                target_distribution = None
+            else:
+                target_distribution = target_distribution / total
+                bias = target_distribution.clamp_min(1e-6).log().view(1, 1, -1)
+                route_logits = route_logits + float(self.config.skill_expert_context_strength) * bias
+        route_probs = F.softmax(route_logits, dim=-1)
         top_values, top_indices = torch.topk(
             route_logits,
             k=self.config.skill_expert_top_k,
@@ -1993,10 +2037,19 @@ class SkillAwareExpertMoE(nn.Module):
             for expert_index in sorted(selected):
                 self.ledger.record_expert(
                     f"llm-skill-expert-{expert_index}",
-                    "skill-aware MoE route in Cortex Transformer forward",
+                    (
+                        "skill-aware MoE route in Cortex Transformer forward"
+                        + (f" from {context_source}" if context_source else "")
+                    ),
                     cost=float(top_indices.eq(expert_index).sum().item()) / max(1.0, float(top_indices.numel())),
                 )
-        return hidden + combined
+        return hidden + combined, SkillExpertRoutingState(
+            route_logits=route_logits,
+            route_probs=route_probs,
+            top_indices=top_indices,
+            target_distribution=target_distribution,
+            context_source=context_source,
+        )
 
 
 @dataclass(frozen=True)
@@ -2008,6 +2061,7 @@ class LLMForwardOutput:
     certificate: CertificateHeadOutput | None = None
     variable_compression: VariableCompressionState | None = None
     learned_memory_policy: LearnedMemoryPolicyState | None = None
+    skill_expert_routing: SkillExpertRoutingState | None = None
 
 
 class CortexTransformerLM(nn.Module):
@@ -2039,6 +2093,14 @@ class CortexTransformerLM(nn.Module):
             if config.use_skill_aware_experts
             else None
         )
+        self.register_buffer(
+            "_skill_expert_context",
+            torch.zeros(config.skill_expert_count, dtype=torch.float32),
+            persistent=False,
+        )
+        self.skill_expert_context_active = False
+        self.skill_expert_context_source = ""
+        self.skill_expert_context_updates = 0
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
         self.mtp_heads = nn.ModuleDict({
             str(horizon): _make_transformer_linear(
@@ -2064,6 +2126,42 @@ class CortexTransformerLM(nn.Module):
         )
         self.lm_head.weight = self.token_embedding.weight
 
+    def skill_expert_context_distribution(self) -> tuple[float, ...] | None:
+        if not self.skill_expert_context_active:
+            return None
+        return tuple(float(item) for item in self._skill_expert_context.detach().cpu().tolist())
+
+    def set_skill_expert_context(
+        self,
+        distribution: Sequence[float] | torch.Tensor | None,
+        *,
+        source: str = "",
+    ) -> None:
+        if self.skill_experts is None:
+            return
+        if distribution is None:
+            self._skill_expert_context.zero_()
+            self.skill_expert_context_active = False
+            self.skill_expert_context_source = ""
+            self.skill_expert_context_updates += 1
+            return
+        tensor = torch.as_tensor(distribution, dtype=torch.float32, device=self._skill_expert_context.device).flatten()
+        if int(tensor.numel()) != int(self.config.skill_expert_count):
+            raise ValueError(
+                f"skill expert context must contain {self.config.skill_expert_count} weights, got {int(tensor.numel())}"
+            )
+        tensor = tensor.clamp_min(0.0)
+        total = tensor.sum()
+        if float(total.detach().cpu()) <= 0.0:
+            self._skill_expert_context.zero_()
+            self.skill_expert_context_active = False
+            self.skill_expert_context_source = ""
+        else:
+            self._skill_expert_context.copy_(tensor / total)
+            self.skill_expert_context_active = True
+            self.skill_expert_context_source = source
+        self.skill_expert_context_updates += 1
+
     def forward(self, input_ids: torch.Tensor) -> LLMForwardOutput:
         if input_ids.ndim != 2:
             raise ValueError("input_ids must have shape [batch, seq_len]")
@@ -2082,8 +2180,14 @@ class CortexTransformerLM(nn.Module):
         for block in self.blocks:
             hidden = block(hidden)
         hidden = self.ln_f(hidden)
+        skill_expert_routing = None
         if self.skill_experts is not None:
-            hidden = self.skill_experts(hidden)
+            context = self._skill_expert_context if self.skill_expert_context_active else None
+            hidden, skill_expert_routing = self.skill_experts(
+                hidden,
+                skill_context=context,
+                context_source=self.skill_expert_context_source,
+            )
         logits = self.lm_head(hidden)
         mtp_logits = {
             int(horizon): head(hidden)
@@ -2101,6 +2205,7 @@ class CortexTransformerLM(nn.Module):
             certificate=certificate,
             variable_compression=variable_compression,
             learned_memory_policy=learned_memory_policy,
+            skill_expert_routing=skill_expert_routing,
         )
 
     def requantize_ternary_core(self, *, certify_zeros: bool = False) -> None:
@@ -2213,6 +2318,7 @@ class LossWeights:
     confidence: float = 0.05
     variable_input: float = 0.01
     learned_memory: float = 0.03
+    skill_expert: float = 0.025
     certificate: float = 0.04
 
 
@@ -2225,6 +2331,7 @@ class LossBreakdown:
     confidence: float = 0.0
     variable_input: float = 0.0
     learned_memory: float = 0.0
+    skill_expert: float = 0.0
     certificate: float = 0.0
 
     def to_dict(self) -> dict[str, float]:
@@ -2256,6 +2363,7 @@ class CortexObjective:
         confidence_loss = output.logits.new_tensor(0.0)
         variable_loss = output.logits.new_tensor(0.0)
         learned_memory_loss = output.logits.new_tensor(0.0)
+        skill_expert_loss = output.logits.new_tensor(0.0)
         certificate_loss = output.logits.new_tensor(0.0)
         if use_cortex_terms:
             if not output.mtp_logits:
@@ -2309,6 +2417,22 @@ class CortexObjective:
                 collapse_loss = (policy.probs.mean(dim=(0, 1)) - target_distribution).square().sum()
                 learned_memory_loss = mode_loss + 0.50 * anchor_loss + 0.05 * storage_loss + 0.10 * collapse_loss
                 total = total + self.weights.learned_memory * learned_memory_loss
+            if (
+                output.skill_expert_routing is not None
+                and output.skill_expert_routing.target_distribution is not None
+            ):
+                route_mean = output.skill_expert_routing.route_probs.mean(dim=(0, 1)).clamp_min(1e-8)
+                route_mean = route_mean / route_mean.sum().clamp_min(1e-8)
+                target = output.skill_expert_routing.target_distribution.to(
+                    device=route_mean.device,
+                    dtype=route_mean.dtype,
+                )
+                target = target.clamp_min(1e-8)
+                target = target / target.sum().clamp_min(1e-8)
+                alignment_loss = F.kl_div(route_mean.log(), target, reduction="sum")
+                load_balance_loss = route_mean.square().mean()
+                skill_expert_loss = alignment_loss + 0.05 * load_balance_loss
+                total = total + self.weights.skill_expert * skill_expert_loss
             if output.certificate is not None:
                 final_targets = next_targets[:, -1]
                 cert_answer_loss = F.cross_entropy(output.certificate.answer_logits, final_targets)
@@ -2327,6 +2451,7 @@ class CortexObjective:
             confidence=float(confidence_loss.detach().cpu()),
             variable_input=float(variable_loss.detach().cpu()),
             learned_memory=float(learned_memory_loss.detach().cpu()),
+            skill_expert=float(skill_expert_loss.detach().cpu()),
             certificate=float(certificate_loss.detach().cpu()),
         )
 
@@ -3445,9 +3570,18 @@ def _cortex_architecture_audit_from_summary(summary: Mapping[str, Any]) -> dict[
     )
     add(
         "skill_aware_experts",
-        trace_count("expert_activations") > 0,
-        {"expert_activations": trace_count("expert_activations")},
-        "skill-aware expert routing must activate experts during training",
+        trace_count("expert_activations") > 0
+        and integer("skill_expert_context_events") > 0
+        and integer("skill_expert_replay_context_events") > 0
+        and len(tuple(summary.get("skill_expert_context_skills", ()) or ())) > 0,
+        {
+            "expert_activations": trace_count("expert_activations"),
+            "skill_expert_context_events": integer("skill_expert_context_events"),
+            "skill_expert_replay_context_events": integer("skill_expert_replay_context_events"),
+            "skill_expert_context_updates": integer("skill_expert_context_updates"),
+            "skill_expert_context_skills": tuple(summary.get("skill_expert_context_skills", ()) or ()),
+        },
+        "skill-aware expert routing must be conditioned by Skill Ledger/replay skill context, not only activate generic experts",
     )
     add(
         "bit_ledger",
@@ -4183,6 +4317,7 @@ class CortexTrainingPhaseController:
         self.frontier_repair_candidates: list[dict[str, Any]] = []
         self.frontier_repair_accepted_events = 0
         self.replay_batches: list[torch.Tensor] = []
+        self.replay_skill_contexts: list[tuple[float, ...]] = []
         self.replay_cursor = 0
         self.regularization_steps = 0
         self.replay_updates = 0
@@ -4209,6 +4344,10 @@ class CortexTrainingPhaseController:
         self.learned_memory_latent_decisions = 0
         self.learned_memory_drop_decisions = 0
         self.learned_memory_storage_ratio_total = 0.0
+        self.skill_expert_context_events = 0
+        self.skill_expert_replay_context_events = 0
+        self.skill_expert_last_context: tuple[float, ...] = ()
+        self.skill_expert_context_skills: tuple[str, ...] = ()
         self.model_certificate_head_artifacts: list[dict[str, Any]] = []
         self.regrowth_model_applications: list[dict[str, Any]] = []
         self.regrowth_model_parameter_delta_l1 = 0.0
@@ -4336,6 +4475,62 @@ class CortexTrainingPhaseController:
             certificate_fields=example.answer.certificate.keys(),
             verifier_level=example.verification_level,
         )
+
+    def _skill_to_expert_index(self, skill: str) -> int:
+        digest = hashlib.sha256(str(skill).encode("utf-8")).digest()
+        return int.from_bytes(digest[:4], "big") % int(self.model.config.skill_expert_count)
+
+    def _skill_expert_distribution(
+        self,
+        skill_weights: Mapping[str, float],
+        *,
+        focus: float = 0.86,
+    ) -> tuple[float, ...]:
+        count = int(self.model.config.skill_expert_count)
+        if count <= 0:
+            return ()
+        base = max(0.0, 1.0 - float(focus)) / float(count)
+        weights = [base for _ in range(count)]
+        total_skill_weight = sum(max(0.0, float(value)) for value in skill_weights.values())
+        if total_skill_weight <= 0:
+            return tuple(1.0 / float(count) for _ in range(count))
+        for skill, raw_weight in skill_weights.items():
+            weight = max(0.0, float(raw_weight)) / total_skill_weight
+            expert_index = self._skill_to_expert_index(skill)
+            weights[expert_index] += float(focus) * weight
+        total = sum(weights)
+        return tuple(float(value / total) for value in weights)
+
+    def _skill_context_for_task(self, task: Task | TrainingExample | str) -> tuple[float, ...]:
+        if isinstance(task, TrainingExample):
+            skill = task.targeted_skill
+        elif isinstance(task, Task):
+            skill = task.skill
+        else:
+            skill = str(task)
+        return self._skill_expert_distribution({skill: 1.0}, focus=0.90)
+
+    def refresh_skill_expert_context_from_ledger(self, *, source: str) -> None:
+        states = tuple(self.skill_ledger.states.values())
+        if not states:
+            self.model.set_skill_expert_context(None)
+            return
+        skill_weights: dict[str, float] = {}
+        for state in states:
+            rarity_pressure = 1.0 + float(state.failures)
+            fragility_pressure = 1.0 + 3.0 * float(state.fragility)
+            protection_pressure = 1.75 if state.protected else 1.0
+            low_pass_pressure = 1.0 + max(0.0, 1.0 - float(state.pass_rate))
+            skill_weights[state.skill] = rarity_pressure * fragility_pressure * protection_pressure * low_pass_pressure
+        distribution = self._skill_expert_distribution(skill_weights, focus=0.82)
+        self.model.set_skill_expert_context(distribution, source=source)
+        self.skill_expert_context_events += 1
+        self.skill_expert_last_context = distribution
+        self.skill_expert_context_skills = tuple(
+            skill for skill, _ in sorted(skill_weights.items(), key=lambda item: item[1], reverse=True)
+        )
+        self._count("skill_expert_ledger_context_events")
+        self._count("skill_expert_ledger_context_skills", len(self.skill_expert_context_skills))
 
     def _learned_memory_retention_decision(
         self,
@@ -4826,14 +5021,29 @@ class CortexTrainingPhaseController:
     ) -> torch.Tensor | None:
         if not self.replay_batches or self.config.cortex_phase_replay_weight <= 0:
             return None
-        batch = self.replay_batches[self.replay_cursor % len(self.replay_batches)].to(device)
+        replay_index = self.replay_cursor % len(self.replay_batches)
+        batch = self.replay_batches[replay_index].to(device)
+        replay_context = (
+            self.replay_skill_contexts[replay_index]
+            if replay_index < len(self.replay_skill_contexts)
+            else ()
+        )
         self.replay_cursor += 1
         x = batch[:, :-1]
         y = batch[:, 1:]
         future = self._future_targets_from_next_tokens(y)
-        with precision.autocast(device.type):
-            output = model_forward(x)
-            loss, _ = objective.compute(output, y, future, use_cortex_terms=self.model.config.use_cortex_heads)
+        previous_context = self.model.skill_expert_context_distribution()
+        previous_source = self.model.skill_expert_context_source
+        if replay_context:
+            self.model.set_skill_expert_context(replay_context, source="phase-replay")
+            self.skill_expert_replay_context_events += 1
+            self._count("skill_expert_replay_context_events")
+        try:
+            with precision.autocast(device.type):
+                output = model_forward(x)
+                loss, _ = objective.compute(output, y, future, use_cortex_terms=self.model.config.use_cortex_heads)
+        finally:
+            self.model.set_skill_expert_context(previous_context, source=previous_source)
         self.replay_updates += 1
         return loss * float(self.config.cortex_phase_replay_weight) * self.objective_feedback_scale()
 
@@ -4934,6 +5144,7 @@ class CortexTrainingPhaseController:
             metadata={"source_phase": phase_id, **dict(metadata or {})},
         )
         self.replay_batches.append(self._batch_from_example(example))
+        self.replay_skill_contexts.append(self._skill_context_for_task(example))
         self.phase_replay_examples[phase_id] = self.phase_replay_examples.get(phase_id, 0) + 1
         self.phase_replay_example_ids.append(example.example_id)
         self._record_training_example_ledgers(example, phase_id=phase_id)
@@ -4942,6 +5153,7 @@ class CortexTrainingPhaseController:
     def _add_sleep_replay(self, examples: Sequence[TrainingExample]) -> None:
         for example in examples[:8]:
             self.replay_batches.append(self._batch_from_example(example))
+            self.replay_skill_contexts.append(self._skill_context_for_task(example))
             self.phase_replay_examples["P9"] = self.phase_replay_examples.get("P9", 0) + 1
             self.phase_replay_example_ids.append(f"llm-p9-{self.phase_replay_examples['P9']}-{example.example_id}")
             self._record_training_example_ledgers(example, phase_id="P9")
@@ -5754,6 +5966,7 @@ class CortexTrainingPhaseController:
             "frontier_registry_path": str(self.run_dir / "frontier_registry"),
             "frontier_registry_summary": self.frontier_registry.to_dict(),
             "replay_batches": [batch.detach().cpu() for batch in self.replay_batches],
+            "replay_skill_contexts": [tuple(float(value) for value in context) for context in self.replay_skill_contexts],
             "replay_cursor": int(self.replay_cursor),
             "regularization_steps": int(self.regularization_steps),
             "replay_updates": int(self.replay_updates),
@@ -5789,6 +6002,10 @@ class CortexTrainingPhaseController:
             "learned_memory_latent_decisions": int(self.learned_memory_latent_decisions),
             "learned_memory_drop_decisions": int(self.learned_memory_drop_decisions),
             "learned_memory_storage_ratio_total": float(self.learned_memory_storage_ratio_total),
+            "skill_expert_context_events": int(self.skill_expert_context_events),
+            "skill_expert_replay_context_events": int(self.skill_expert_replay_context_events),
+            "skill_expert_last_context": tuple(float(value) for value in self.skill_expert_last_context),
+            "skill_expert_context_skills": tuple(self.skill_expert_context_skills),
             "last_ingested_compression_cost": _cost_trace_payload(self._last_ingested_compression_cost),
             "future_ledger": self.future_ledger.to_dict(),
             "compression_trace_ledger": (
@@ -5834,6 +6051,12 @@ class CortexTrainingPhaseController:
             else torch.as_tensor(batch, dtype=torch.long)
             for batch in payload.get("replay_batches", ())
         ]
+        self.replay_skill_contexts = [
+            tuple(float(value) for value in context)
+            for context in payload.get("replay_skill_contexts", ())
+        ]
+        while len(self.replay_skill_contexts) < len(self.replay_batches):
+            self.replay_skill_contexts.append(())
         self.replay_cursor = int(payload.get("replay_cursor", 0))
         self.regularization_steps = int(payload.get("regularization_steps", 0))
         self.replay_updates = int(payload.get("replay_updates", 0))
@@ -5922,6 +6145,12 @@ class CortexTrainingPhaseController:
         self.learned_memory_latent_decisions = int(payload.get("learned_memory_latent_decisions", 0))
         self.learned_memory_drop_decisions = int(payload.get("learned_memory_drop_decisions", 0))
         self.learned_memory_storage_ratio_total = float(payload.get("learned_memory_storage_ratio_total", 0.0))
+        self.skill_expert_context_events = int(payload.get("skill_expert_context_events", 0))
+        self.skill_expert_replay_context_events = int(payload.get("skill_expert_replay_context_events", 0))
+        self.skill_expert_last_context = tuple(float(value) for value in payload.get("skill_expert_last_context", ()))
+        self.skill_expert_context_skills = tuple(str(value) for value in payload.get("skill_expert_context_skills", ()))
+        if self.skill_expert_last_context:
+            self.model.set_skill_expert_context(self.skill_expert_last_context, source="checkpoint-restored-skill-ledger")
         self._last_ingested_compression_cost = _cost_trace_from_payload(payload.get("last_ingested_compression_cost"))
         _restore_future_contract_ledger(self.future_ledger, payload.get("future_ledger"))
         _restore_compression_trace_ledger(self.model.compression_ledger, payload.get("compression_trace_ledger"))
@@ -6102,6 +6331,12 @@ class CortexTrainingPhaseController:
             "learned_memory_retention_applied_latent": int(memory_report.get("learned_retention_applied_latent", 0) or 0),
             "learned_memory_retention_applied_drop": int(memory_report.get("learned_retention_applied_drop", 0) or 0),
             "learned_memory_retention_anchor_overrides": int(memory_report.get("learned_retention_anchor_overrides", 0) or 0),
+            "skill_expert_context_events": int(self.skill_expert_context_events),
+            "skill_expert_replay_context_events": int(self.skill_expert_replay_context_events),
+            "skill_expert_context_updates": int(self.model.skill_expert_context_updates),
+            "skill_expert_context_source": self.model.skill_expert_context_source,
+            "skill_expert_last_context": tuple(float(value) for value in self.skill_expert_last_context),
+            "skill_expert_context_skills": tuple(self.skill_expert_context_skills),
             "bit_ledger_total_effective_bits": self.bit_ledger.total_effective_bits,
             "skill_ledger_states": len(self.skill_ledger.states),
             "causal_ledger_traces": len(self.causal_ledger.traces),
@@ -6198,6 +6433,12 @@ class CortexTrainingPhaseController:
                 "aggregate_score": cycle_report.trial.aggregate_score,
             }
             audit["ledgers"] = self._ingest_cycle_ledgers(cycle_report, step=step)
+            self.refresh_skill_expert_context_from_ledger(source=f"P1-skill-ledger-step-{step}")
+            audit["skill_expert_context"] = {
+                "source": self.model.skill_expert_context_source,
+                "distribution": self.model.skill_expert_context_distribution(),
+                "skills": self.skill_expert_context_skills,
+            }
             first_failure = cycle_report.regressions[0] if cycle_report.regressions else None
             verifier_task = first_failure.task if first_failure is not None else Task(
                 f"phase-p1-{step}",
@@ -6966,6 +7207,11 @@ class CortexTrainingPhaseController:
                 "native_ternary_autotune_cache_hits": trace_counts.get("native_ternary_autotune_cache_hits", 0),
                 "variable_input_compression_events": trace_counts.get("kv_events", 0),
                 "skill_expert_activations": trace_counts.get("expert_activations", 0),
+                "skill_expert_context_events": int(self.skill_expert_context_events),
+                "skill_expert_replay_context_events": int(self.skill_expert_replay_context_events),
+                "skill_expert_context_updates": int(self.model.skill_expert_context_updates),
+                "skill_expert_last_context": tuple(float(value) for value in self.skill_expert_last_context),
+                "skill_expert_context_skills": tuple(self.skill_expert_context_skills),
                 "certificate_head_forward_events": int(self.model.certificate_forward_events),
                 "certificate_algebra_tool_events": int(self.integration_counts.get("certificate_algebra_tool_events", 0)),
                 "certificate_code_hidden_property_events": int(self.integration_counts.get("certificate_code_hidden_property_events", 0)),
@@ -7142,6 +7388,11 @@ class CortexTrainingPhaseController:
                     "learned_memory_retention_applied_latent": int(memory_report.get("learned_retention_applied_latent", 0) or 0),
                     "learned_memory_retention_applied_drop": int(memory_report.get("learned_retention_applied_drop", 0) or 0),
                     "learned_memory_retention_anchor_overrides": int(memory_report.get("learned_retention_anchor_overrides", 0) or 0),
+                    "skill_expert_context_events": int(self.skill_expert_context_events),
+                    "skill_expert_replay_context_events": int(self.skill_expert_replay_context_events),
+                    "skill_expert_context_updates": int(self.model.skill_expert_context_updates),
+                    "skill_expert_last_context": tuple(float(value) for value in self.skill_expert_last_context),
+                    "skill_expert_context_skills": tuple(self.skill_expert_context_skills),
                     "bit_ledger_total_effective_bits": self.bit_ledger.total_effective_bits,
                     "skill_ledger_states": len(self.skill_ledger.states),
                     "causal_ledger_traces": len(self.causal_ledger.traces),
@@ -7266,6 +7517,11 @@ class CortexTrainingPhaseController:
                     "learned_memory_retention_applied_latent": int(memory_report.get("learned_retention_applied_latent", 0) or 0),
                     "learned_memory_retention_applied_drop": int(memory_report.get("learned_retention_applied_drop", 0) or 0),
                     "learned_memory_retention_anchor_overrides": int(memory_report.get("learned_retention_anchor_overrides", 0) or 0),
+                    "skill_expert_context_events": int(self.skill_expert_context_events),
+                    "skill_expert_replay_context_events": int(self.skill_expert_replay_context_events),
+                    "skill_expert_context_updates": int(self.model.skill_expert_context_updates),
+                    "skill_expert_last_context": tuple(float(value) for value in self.skill_expert_last_context),
+                    "skill_expert_context_skills": tuple(self.skill_expert_context_skills),
                     "bit_ledger_total_effective_bits": self.bit_ledger.total_effective_bits,
                     "skill_ledger_states": len(self.skill_ledger.states),
                     "causal_ledger_traces": len(self.causal_ledger.traces),
@@ -7815,6 +8071,7 @@ class LLMTrainer:
         checkpoint_model_config.setdefault("use_skill_aware_experts", False)
         checkpoint_model_config.setdefault("skill_expert_count", 4)
         checkpoint_model_config.setdefault("skill_expert_top_k", 2)
+        checkpoint_model_config.setdefault("skill_expert_context_strength", 1.25)
         checkpoint_model_config.setdefault("use_variable_in_compressor", False)
         checkpoint_model_config.setdefault("variable_compression_wide_kernel", 8)
         checkpoint_model_config.setdefault("use_learned_memory_policy", False)

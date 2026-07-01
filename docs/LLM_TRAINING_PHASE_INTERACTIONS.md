@@ -123,7 +123,7 @@ Le modele n'est pas un Transformer standard habille par un rapport. Son forward 
 - `BitLinear` pour le coeur ternaire ;
 - `VariableInCompressor` pour compression adaptative ;
 - `LearnedMemoryPolicy` pour decider quoi garder exact, latent ou drop ;
-- `SkillAwareExpertMoE` pour experts skill-aware ;
+- `SkillAwareExpertMoE` pour experts skill-aware, maintenant conditionne par le Skill Ledger et les skills de replay verifies ;
 - tetes MTP multi-horizon ;
 - tete de confiance ;
 - `CertificateHead`.
@@ -141,8 +141,10 @@ Le loss total contient :
 - penalite de compression Variable-In ;
 - supervision de politique memoire apprise exact/latent/drop basee sur l'utilite token-level ;
 - certificate loss.
+- skill-expert routing loss, qui aligne la distribution du routeur MoE sur les competences fragiles ou les skills de replay.
 
 Donc le modele n'apprend pas seulement a predire le prochain token. Il apprend aussi a predire des horizons futurs, calibrer sa confiance, produire des preuves latentes, compresser differemment selon l'importance des tokens et choisir une politique memoire exact/latent/drop.
+Depuis C73, il apprend aussi a router son calcul vers des experts lies aux competences que le Verifier OS et le Skill Ledger jugent fragiles, au lieu de seulement activer des experts generiques.
 
 ### 3. Replay Causal Verifie
 
@@ -216,7 +218,7 @@ Correspondance runtime :
 | Causal Ledger | `CausalLedger` + traces P1/P3/P4/P8/replay | audit `causal_ledger` |
 | Skill Ledger | `SkillLedger.update_from_report` | audit `skill_ledger` |
 | Ternary Core | `BitLinear`, quantization, requantization, packed int2 dispatch | P2 `238652` events + audit `packed_ternary_hardware_runtime` |
-| Skill-aware Experts | `SkillAwareExpertMoE` | audit `skill_aware_experts` |
+| Skill-aware Experts | `SkillAwareExpertMoE` conditionne par Skill Ledger/replay | audit `skill_aware_experts`, `skill_expert_context_events`, `skill_expert_replay_context_events` |
 | Future Contract / FSP | `FutureContractEngine` + observed tokens | P3 replay + contract decisions |
 | Adaptive Multi-Token Decoding | MTP horizons + inference route | audit `adaptive_multi_token_decoding` |
 | Latent Reasoning Workspace | `LatentProofState` + cert head | P5 audit |
