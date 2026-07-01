@@ -9749,6 +9749,39 @@ def _profile_autosize_aggregate_measurements(
     }
 
 
+def _profile_autosize_measurement_seeds(
+    normalized_seeds: Sequence[int],
+    *,
+    requested_count: int,
+) -> tuple[int, ...]:
+    if requested_count < 1:
+        raise ValueError("requested measurement seed count must be positive")
+    if not normalized_seeds:
+        raise ValueError("at least one seed is required")
+    selected: list[int] = []
+    seen: set[int] = set()
+    for raw_seed in normalized_seeds:
+        seed = int(raw_seed)
+        if seed in seen:
+            continue
+        selected.append(seed)
+        seen.add(seed)
+        if len(selected) >= requested_count:
+            return tuple(selected)
+    step = 104729
+    candidate = int(selected[-1] if selected else normalized_seeds[-1])
+    while len(selected) < requested_count:
+        candidate = (candidate + step) % 2147483647
+        if candidate == 0:
+            candidate = step
+        if candidate in seen:
+            candidate += 1
+            continue
+        selected.append(candidate)
+        seen.add(candidate)
+    return tuple(selected)
+
+
 def run_llm_batch_profile_matrix(
     *,
     out_dir: str | Path,
@@ -9999,6 +10032,7 @@ def run_llm_batch_profile_autosize(
     memory_budget_fraction: float = 0.35,
     measure_candidate_count: int = 4,
     measure_candidate_seed_count: int | None = None,
+    min_measure_candidate_seed_count: int = 2,
     measure_candidate_strategy: str = "diverse",
     measure_candidate_adaptive_rounds: int = 2,
     measured_selection_metric: str = "throughput_gpu",
@@ -10040,14 +10074,22 @@ def run_llm_batch_profile_autosize(
     normalized_seeds = tuple(int(seed) for seed in seeds)
     if not normalized_seeds:
         raise ValueError("at least one autosize seed is required")
+    requested_min_measure_candidate_seed_count = int(min_measure_candidate_seed_count)
+    if requested_min_measure_candidate_seed_count < 1:
+        raise ValueError("min_measure_candidate_seed_count must be positive")
     requested_measure_candidate_seed_count = (
-        len(normalized_seeds)
+        max(len(tuple(dict.fromkeys(normalized_seeds))), requested_min_measure_candidate_seed_count)
         if measure_candidate_seed_count is None
         else int(measure_candidate_seed_count)
     )
     if requested_measure_candidate_seed_count < 1:
         raise ValueError("measure_candidate_seed_count must be positive")
-    measurement_seeds = normalized_seeds[: min(len(normalized_seeds), requested_measure_candidate_seed_count)]
+    measurement_seeds = _profile_autosize_measurement_seeds(
+        normalized_seeds,
+        requested_count=requested_measure_candidate_seed_count,
+    )
+    provided_seed_set = set(normalized_seeds)
+    synthesized_measurement_seed_count = sum(1 for seed in measurement_seeds if seed not in provided_seed_set)
     if candidate_gradient_accumulation_steps is None:
         base_gradient_accumulation_steps = int(gradient_accumulation_steps)
         normalized_candidate_gradient_accumulation_steps = tuple(
@@ -10406,8 +10448,11 @@ def run_llm_batch_profile_autosize(
             "measured_passed_candidate_count": len(measured_passed_candidates),
             "measured_passed_profile_count": measured_passed_profile_count,
             "measurement_seed": measurement_seed,
+            "provided_seed_count": len(tuple(dict.fromkeys(normalized_seeds))),
+            "min_measurement_seed_count": requested_min_measure_candidate_seed_count,
             "requested_seed_count": requested_measure_candidate_seed_count,
             "measurement_seed_count": len(measurement_seeds),
+            "synthesized_measurement_seed_count": synthesized_measurement_seed_count,
             "measurement_seeds": measurement_seeds,
             "candidate_selection_strategy": measure_candidate_strategy,
             "adaptive_rounds_requested": requested_measure_candidate_adaptive_rounds,
@@ -10658,7 +10703,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     profile_autosize.add_argument("--memory-budget-mb", type=float, default=0.0)
     profile_autosize.add_argument("--memory-budget-fraction", type=float, default=0.35)
     profile_autosize.add_argument("--measure-candidate-count", type=int, default=4)
-    profile_autosize.add_argument("--measure-candidate-seed-count", type=int, default=None, help="number of provided seeds used while measuring each candidate; default uses all provided seeds")
+    profile_autosize.add_argument("--measure-candidate-seed-count", type=int, default=None, help="candidate measurement seed count; default uses all provided seeds and at least the minimum, synthesizing deterministic extras when needed")
+    profile_autosize.add_argument("--min-measure-candidate-seed-count", type=int, default=2, help="minimum candidate measurement seeds; deterministic extra seeds are synthesized when fewer seeds are provided")
     profile_autosize.add_argument("--measure-candidate-strategy", choices=PROFILE_AUTOSIZE_MEASUREMENT_STRATEGIES, default="diverse", help="candidate subset measured before final matrix; diverse samples shape frontiers instead of only the top estimated ranks")
     profile_autosize.add_argument("--measure-candidate-adaptive-rounds", type=int, default=2, help="bounded measurement waves; with diverse strategy, later rounds refine around measured winners without increasing measure-candidate-count")
     profile_autosize.add_argument("--measured-selection-metric", choices=PROFILE_AUTOSIZE_MEASURED_SELECTION_METRICS, default="throughput_gpu")
@@ -11047,6 +11093,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             memory_budget_fraction=args.memory_budget_fraction,
             measure_candidate_count=args.measure_candidate_count,
             measure_candidate_seed_count=args.measure_candidate_seed_count,
+            min_measure_candidate_seed_count=args.min_measure_candidate_seed_count,
             measure_candidate_strategy=args.measure_candidate_strategy,
             measure_candidate_adaptive_rounds=args.measure_candidate_adaptive_rounds,
             measured_selection_metric=args.measured_selection_metric,
