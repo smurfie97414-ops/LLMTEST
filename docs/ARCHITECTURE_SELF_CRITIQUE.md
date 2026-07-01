@@ -1,6 +1,6 @@
 # Cortex-3 Architecture Self-Critique
 
-Etat: boucle d'audit 73 apres relecture P1-P10 hors profiling/observabilite. La critique repart des 10 phases et vise les briques structurantes: SlowSolve -> verification -> attribution -> regrowth -> compilation -> selection runtime -> reutilisation persistante -> evolution recursive. Le dernier correctif structurel relie maintenant le Skill Ledger et les replays verifies au routeur MoE `SkillAwareExpertMoE`, avec contexte expert persistant, loss d'alignement et gate d'audit obligatoire.
+Etat: boucle d'audit 74 apres relecture P1-P10 hors profiling/observabilite. La critique repart des 10 phases et vise les briques structurantes: SlowSolve -> verification -> attribution -> regrowth -> compilation -> selection runtime -> reutilisation persistante -> evolution recursive. Le dernier correctif structurel rend le Latent Reasoning Workspace explicite, trainable, lie aux certificats modele et obligatoire dans les audits P5/full Cortex.
 
 Ce document sert de registre de critique et de correction. Il ne remplace pas les tests longs interdits pour cette iteration; il se limite aux preuves courtes disponibles, aux rapports du code et aux tests courts.
 
@@ -20,6 +20,7 @@ Mise a jour C70: P9 ne peut plus valider son reservoir reel/exogene avec une tac
 Mise a jour C71: P8 ne prend plus `ReferenceRuleAgent` comme source de reponse par defaut dans le harness LLM. `CortexTransformerInferenceAgent` decode greedy depuis les logits du Transformer, transporte la sortie de `CertificateHead`, et l'audit P8 exige des evenements `inference_model_backed_*`.
 Mise a jour C72: P8 ne se contente plus d'appeler le Transformer. Chaque inference model-backed forcee sur un span reel est transformee en replay P8 verifie: la reponse modele si elle passe, sinon la correction oracle, avec compteurs `inference_model_backed_replay_events` obligatoires dans les audits.
 Mise a jour C73: les experts ne sont plus seulement actives par un routeur dense generique. Le Skill Ledger produit un contexte expert derive des competences fragiles, chaque replay verifie porte une cible d'expert issue de son skill, et `CortexObjective` ajoute une loss differenciable d'alignement de routage.
+Mise a jour C74: P5 ne reduit plus le `Latent Reasoning Workspace` a un alias de `LatentProofState`. `CortexTransformerLM` contient maintenant un module `LatentReasoningWorkspace` multi-step, son resume feedback les hidden states avant logits/MTP/certificat, `CortexObjective` ajoute une loss `latent_workspace`, les certificats modele portent checksum/steps/binding workspace, les checkpoints persistent ces preuves et les audits P5/full Cortex exigent forward, pas latents et binding certificat.
 
 ## Audit transversal haut enjeu apres C55
 
@@ -43,6 +44,16 @@ Mise a jour C73: les experts ne sont plus seulement actives par un routeur dense
 - Correction audit: l'audit architecture `skill_aware_experts` exige maintenant des activations d'experts, des evenements de contexte Skill Ledger, des evenements de contexte replay et une liste de skills ayant pilote le contexte.
 - Verification courte: `py_compile`, `test_learned_memory_policy_is_trainable_and_affects_cortex_loss`, `test_full_cortex_phase_controller_uses_all_modules_during_training` et `test_cortex_phase_state_survives_checkpoint_resume` passent. Les tests verifient gradient non nul dans le routeur expert, contexte Skill Ledger, contexte replay, persistance checkpoint et reprise.
 - Statut: corrige pour le pont Skill Ledger -> Skill-aware MoE -> loss -> replay/checkpoint. La prochaine cible haut enjeu doit continuer a privilegier les liens causaux entre phases, pas les profils longs ou les compteurs seuls.
+
+### C74. Le Latent Reasoning Workspace etait encore implicite dans la tete de certificat
+
+- Critique: avant C74, la table architecture cible mappait `Latent Reasoning Workspace` vers `LatentProofState + CertificateHead`. Cela prouvait l'existence d'une preuve latente et d'un certificat, mais pas un espace de raisonnement latent multi-step general qui modifie le hidden state, recoit du gradient et sert de source au certificat. C'etait une faille structurante de P5: le certificat pouvait exister sans workspace interne reel.
+- Correction forward: ajout de `LatentReasoningWorkspace` dans `CortexTransformerLM`. Le module calcule une attention de contexte, execute plusieurs transitions latentes trainables, garde les gates de pas, projette un feedback vers les hidden states, puis les logits next-token, MTP/FSP et `CertificateHead` consomment ce hidden enrichi.
+- Correction apprentissage: `CortexObjective` ajoute `latent_workspace_loss`, qui lie le resume du workspace a l'etat latent de certificat et penalise instabilite/gates/attention trop concentree. Le test unitaire verifie un gradient non nul dans les parametres du workspace.
+- Correction certificat/audit: le controleur P5 materialise les certificats modele avec checksum, nombre de pas et flag `latent_workspace_bound_to_certificate`. Les audits `latent_reasoning_workspace` et `P5:latent_certificate_delatentization_tool_verification` exigent maintenant forwards workspace, pas latents et binding certificat.
+- Correction checkpoint/runtime: les compteurs `latent_workspace_forward_events`, `latent_workspace_step_events`, `latent_workspace_certificate_binding_events` et `latent_workspace_last_summary` sont persistes dans `cortex_phase_state`, les sidecars et `training_influence`. `CortexTrainingPhaseController` refuse un full Cortex sans `use_latent_reasoning_workspace=True`.
+- Verification courte: `py_compile`, `test_learned_memory_policy_is_trainable_and_affects_cortex_loss`, `test_training_plan_matches_transformer_parameter_counts`, `test_full_cortex_phase_controller_uses_all_modules_during_training`, `test_future_contract_observed_tokens_use_real_horizon_not_horizon_columns` et `test_cortex_phase_state_survives_checkpoint_resume` passent.
+- Statut: corrige pour le pont P5 `workspace latent multi-step -> hidden/logits/MTP/certificat -> loss -> audit/checkpoint/P8 metadata`. La prochaine cible haut enjeu doit rester transversale entre phases, pas revenir a l'observabilite P2.
 
 ### C70. Le reservoir P9 disait reel/exogene sans recevoir le corpus LLM reel
 
@@ -819,9 +830,9 @@ Mise a jour C73: les experts ne sont plus seulement actives par un routeur dense
 
 ### Latent Reasoning Workspace
 
-- Statut: latent proof/certificate and P8 latent loops.
-- Faiblesse: workspace encore implicite, pas un buffer raisonnement multi-step general.
-- Correction restante: rendre workspace explicite dans reports et loss.
+- Statut: module `LatentReasoningWorkspace` explicite dans le forward LLM, attention de contexte, pas latents trainables, feedback hidden, loss `latent_workspace`, checksum et binding vers `CertificateHead`.
+- Faiblesse: la preuve courte etablit l'integration et le gradient, pas encore la qualite de raisonnement latent sur grands benchmarks multi-domaines.
+- Correction restante: entrainer plus longtemps et comparer la generalisation workspace-on/off sur suites held-out quand les tests longs seront autorises.
 
 ### Certificate Generator
 

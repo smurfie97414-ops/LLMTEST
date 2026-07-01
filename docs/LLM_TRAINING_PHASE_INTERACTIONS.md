@@ -28,7 +28,7 @@ Observation ressource separee du meme run long :
 
 Preuve post-integration des deux nouvelles briques :
 
-- `test_learned_memory_policy_is_trainable_and_affects_cortex_loss` : loss `learned_memory` non nul, gradient non nul dans la politique memoire, dispatch ternaire packe present ;
+- `test_learned_memory_policy_is_trainable_and_affects_cortex_loss` : loss `learned_memory`, `skill_expert` et `latent_workspace` non nulles, gradients non nuls dans la politique memoire, le routeur expert et le workspace latent, dispatch ternaire packe present ;
 - `test_learned_memory_ablation_shows_policy_can_reduce_loss` : ablation courte a poids partages, memoire apprise active vs desactivee, puis entrainement de la seule politique exact/latent/drop avec delta `before - after` positif sur total et next-token loss ;
 - `test_bitlinear_native_packed_ternary_cuda_dispatch_runs_on_gpu` : backend natif `native_int2_*_cuda_*` execute sur le GPU local avec gradient STE non nul ;
 - `test_bitlinear_native_extension_cuda_dispatch_runs_on_gpu` : backend extension strict, forward CUDA, backward `grad_input`, backward `grad_weight` + `grad_bias`, et requantize extension prouves par compteurs ;
@@ -36,6 +36,7 @@ Preuve post-integration des deux nouvelles briques :
 - `test_native_ternary_cuda_fast_ste_backward_matches_dense_ste` : le backward fast STE CUDA correspond au dense STE en fp32, fp16 et bf16, avec `grad_input` calcule depuis les poids int2 packes et `grad_weight` + `grad_bias` calcules par extension ;
 - `test_native_ternary_cuda_requantize_pack_matches_torch_sync` : la requantization/packing CUDA fusionnee reproduit signs, mask, scales, residuals, packed codes et compte d'actifs du chemin PyTorch en fp32, fp16 et bf16 ;
 - `test_full_cortex_phase_controller_uses_all_modules_during_training` : mini training LLM complet avec audits exigeant `learned_cognitive_memory_policy`, `packed_ternary_hardware_runtime`, `native_ternary_cuda_kernel` quand CUDA est disponible et le nouveau composant `future_output_goal_contracts`.
+- `test_full_cortex_phase_controller_uses_all_modules_during_training` verifie aussi `latent_workspace_forward_events`, `latent_workspace_step_events` et `latent_workspace_certificate_binding_events`.
 - `test_full_cortex_phase_controller_uses_all_modules_during_training` verifie aussi que P5 execute les nouveaux certificats `algebra_linear` et code visible/cache/proprietes pendant le controleur P1-P10.
 - `test_cortex_phase_state_survives_checkpoint_resume` : reprise checkpoint avec restauration des decisions output-goal dans la ledger P3, maintien des evenements P5 algebra/code et maintien des audits architecture/livrables.
 
@@ -124,6 +125,7 @@ Le modele n'est pas un Transformer standard habille par un rapport. Son forward 
 - `VariableInCompressor` pour compression adaptative ;
 - `LearnedMemoryPolicy` pour decider quoi garder exact, latent ou drop ;
 - `SkillAwareExpertMoE` pour experts skill-aware, maintenant conditionne par le Skill Ledger et les skills de replay verifies ;
+- `LatentReasoningWorkspace` pour pas latents trainables avec feedback dans le hidden ;
 - tetes MTP multi-horizon ;
 - tete de confiance ;
 - `CertificateHead`.
@@ -221,7 +223,7 @@ Correspondance runtime :
 | Skill-aware Experts | `SkillAwareExpertMoE` conditionne par Skill Ledger/replay | audit `skill_aware_experts`, `skill_expert_context_events`, `skill_expert_replay_context_events` |
 | Future Contract / FSP | `FutureContractEngine` + observed tokens | P3 replay + contract decisions |
 | Adaptive Multi-Token Decoding | MTP horizons + inference route | audit `adaptive_multi_token_decoding` |
-| Latent Reasoning Workspace | `LatentProofState` + cert head | P5 audit |
+| Latent Reasoning Workspace | `LatentReasoningWorkspace` multi-step + binding cert head | audits `latent_reasoning_workspace`, P5 et checkpoint |
 | Certificate Generator | `CertificateHead` + verifier | P5 certificate verification |
 | Frontier FastSolve persistant | `FrontierCircuitRegistry` + `CompiledFrontierAgent` | registre restaure, binding P4 restaure, output-goal et certificat compile |
 | Hierarchical Dynamic Verifier | `DynamicSkillVerifier` | P1 + no phase errors |
@@ -400,6 +402,7 @@ P5 part d'une tache issue du cycle ou d'une tache controlee.
 
 La phase cree :
 
+- un workspace latent explicite depuis le vrai forward Transformer ;
 - un `LatentProofState` ;
 - un certificat issu de la vraie `CertificateHead` du Transformer quand un forward LLM est disponible ;
 - un certificat court ;
@@ -418,7 +421,7 @@ P5 alimente :
 
 ### Impact Apprentissage
 
-Le modele possede une `CertificateHead` dans le forward. Le loss de certificat pousse la tete a produire une reponse finale et une incertitude coherente. P5 materialise maintenant cette sortie en `ShortCertificate` verifie par checksum latent et coherence token (`model_token_certificate`), puis persiste l'artefact dans le rapport et les checkpoints. Les certificats algebre/code restent des preuves outil plus fortes; le certificat model-head prouve que la tete du modele participe vraiment au chemin P5 au lieu de rester un simple module appele en forward.
+Le modele possede un `LatentReasoningWorkspace` et une `CertificateHead` dans le forward. Le workspace execute plusieurs pas latents, renvoie un feedback dans les hidden states avant logits/MTP/certificat, puis `latent_workspace_loss` lie son resume a l'etat latent de certificat. Le loss de certificat pousse la tete a produire une reponse finale et une incertitude coherente. P5 materialise maintenant cette sortie en `ShortCertificate` verifie par checksum latent, coherence token (`model_token_certificate`) et claims de binding workspace, puis persiste l'artefact dans le rapport et les checkpoints. Les certificats algebre/code restent des preuves outil plus fortes; le certificat model-head prouve que la tete du modele participe vraiment au chemin P5 au lieu de rester un simple module appele en forward.
 
 ## Phase 6 - Causal Attribution
 

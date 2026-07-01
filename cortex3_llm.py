@@ -1650,6 +1650,9 @@ class TransformerConfig:
     learned_memory_temperature: float = 1.0
     use_certificate_head: bool = False
     certificate_latent_size: int = 64
+    use_latent_reasoning_workspace: bool = False
+    latent_workspace_steps: int = 3
+    latent_workspace_feedback_strength: float = 0.20
 
     def __post_init__(self) -> None:
         if self.vocab_size <= len(SPECIAL_TOKENS):
@@ -1680,6 +1683,10 @@ class TransformerConfig:
             raise ValueError("learned_memory_temperature must be positive")
         if self.certificate_latent_size < 1:
             raise ValueError("certificate_latent_size must be positive")
+        if self.latent_workspace_steps < 1:
+            raise ValueError("latent_workspace_steps must be positive")
+        if self.latent_workspace_feedback_strength < 0:
+            raise ValueError("latent_workspace_feedback_strength must be non-negative")
 
 
 def _make_transformer_linear(
@@ -2053,6 +2060,113 @@ class SkillAwareExpertMoE(nn.Module):
 
 
 @dataclass(frozen=True)
+class LatentReasoningWorkspaceState:
+    step_states: torch.Tensor
+    summary: torch.Tensor
+    step_gates: torch.Tensor
+    token_attention: torch.Tensor
+    feedback: torch.Tensor
+
+    @property
+    def step_count(self) -> int:
+        return int(self.step_states.shape[1])
+
+    def checksum(self, row_index: int = 0) -> str:
+        row = self.summary[row_index].detach().cpu().flatten()
+        values = [round(float(value), 6) for value in row.tolist()]
+        payload = {"step_count": self.step_count, "values": values}
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        return hashlib.blake2b(encoded, digest_size=16).hexdigest()
+
+    def to_summary(self) -> dict[str, Any]:
+        return {
+            "step_count": self.step_count,
+            "summary_norm_mean": float(self.summary.detach().norm(dim=-1).mean().cpu()),
+            "gate_mean": float(self.step_gates.detach().mean().cpu()),
+            "gate_min": float(self.step_gates.detach().amin().cpu()),
+            "gate_max": float(self.step_gates.detach().amax().cpu()),
+            "feedback_norm_mean": float(self.feedback.detach().norm(dim=-1).mean().cpu()),
+        }
+
+
+class LatentReasoningWorkspace(nn.Module):
+    def __init__(self, config: TransformerConfig, *, ledger: CompressionTraceLedger | None = None):
+        super().__init__()
+        self.config = config
+        self.ledger = ledger
+        latent_size = int(config.certificate_latent_size)
+        self.input_norm = nn.LayerNorm(config.d_model)
+        self.token_scorer = nn.Linear(config.d_model, 1)
+        self.context_projection = _make_transformer_linear(
+            config,
+            config.d_model,
+            latent_size,
+            ledger=ledger,
+            log_prefix="latent_workspace.context",
+        )
+        self.step_transition = _make_transformer_linear(
+            config,
+            latent_size,
+            latent_size,
+            ledger=ledger,
+            log_prefix="latent_workspace.transition",
+        )
+        self.step_gate = nn.Linear(latent_size, 1)
+        self.feedback_projection = _make_transformer_linear(
+            config,
+            latent_size,
+            config.d_model,
+            ledger=ledger,
+            log_prefix="latent_workspace.feedback",
+        )
+
+    def forward(self, hidden: torch.Tensor) -> tuple[torch.Tensor, LatentReasoningWorkspaceState]:
+        if hidden.ndim != 3:
+            raise ValueError("latent workspace expects hidden with shape [batch, time, channels]")
+        normalized = self.input_norm(hidden)
+        attention_logits = self.token_scorer(normalized).squeeze(-1)
+        token_attention = F.softmax(attention_logits, dim=-1)
+        context = torch.einsum("bt,btd->bd", token_attention, normalized)
+        context_latent = torch.tanh(self.context_projection(context))
+        latent = context_latent
+        step_states: list[torch.Tensor] = []
+        step_gates: list[torch.Tensor] = []
+        for _ in range(int(self.config.latent_workspace_steps)):
+            candidate_input = latent + context_latent
+            candidate = torch.tanh(self.step_transition(candidate_input))
+            gate = torch.sigmoid(self.step_gate(candidate_input)).squeeze(-1)
+            latent = gate.unsqueeze(-1) * candidate + (1.0 - gate).unsqueeze(-1) * latent
+            step_states.append(latent)
+            step_gates.append(gate)
+        stacked_steps = torch.stack(step_states, dim=1)
+        gates = torch.stack(step_gates, dim=1)
+        summary = stacked_steps[:, -1, :]
+        feedback = self.feedback_projection(summary)
+        state = LatentReasoningWorkspaceState(
+            step_states=stacked_steps,
+            summary=summary,
+            step_gates=gates,
+            token_attention=token_attention,
+            feedback=feedback,
+        )
+        if self.ledger is not None:
+            batch = int(hidden.shape[0])
+            bytes_used = float(batch * state.step_count * int(self.config.certificate_latent_size) * 2)
+            self.ledger.record_kv(
+                "llm-latent-reasoning-workspace",
+                "latent_workspace",
+                bytes_used=bytes_used,
+                exact_anchors=0,
+                note=(
+                    "explicit latent reasoning workspace "
+                    f"steps={state.step_count} gate_mean={float(gates.detach().mean().cpu()):.4f}"
+                ),
+            )
+        mixed = hidden + float(self.config.latent_workspace_feedback_strength) * feedback.unsqueeze(1)
+        return mixed, state
+
+
+@dataclass(frozen=True)
 class LLMForwardOutput:
     logits: torch.Tensor
     hidden: torch.Tensor
@@ -2062,6 +2176,7 @@ class LLMForwardOutput:
     variable_compression: VariableCompressionState | None = None
     learned_memory_policy: LearnedMemoryPolicyState | None = None
     skill_expert_routing: SkillExpertRoutingState | None = None
+    latent_workspace: LatentReasoningWorkspaceState | None = None
 
 
 class CortexTransformerLM(nn.Module):
@@ -2101,6 +2216,11 @@ class CortexTransformerLM(nn.Module):
         self.skill_expert_context_active = False
         self.skill_expert_context_source = ""
         self.skill_expert_context_updates = 0
+        self.latent_workspace = (
+            LatentReasoningWorkspace(config, ledger=self.compression_ledger)
+            if config.use_latent_reasoning_workspace
+            else None
+        )
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
         self.mtp_heads = nn.ModuleDict({
             str(horizon): _make_transformer_linear(
@@ -2188,6 +2308,9 @@ class CortexTransformerLM(nn.Module):
                 skill_context=context,
                 context_source=self.skill_expert_context_source,
             )
+        latent_workspace = None
+        if self.latent_workspace is not None:
+            hidden, latent_workspace = self.latent_workspace(hidden)
         logits = self.lm_head(hidden)
         mtp_logits = {
             int(horizon): head(hidden)
@@ -2206,6 +2329,7 @@ class CortexTransformerLM(nn.Module):
             variable_compression=variable_compression,
             learned_memory_policy=learned_memory_policy,
             skill_expert_routing=skill_expert_routing,
+            latent_workspace=latent_workspace,
         )
 
     def requantize_ternary_core(self, *, certify_zeros: bool = False) -> None:
@@ -2277,6 +2401,16 @@ class CortexTransformerInferenceAgent:
                             "model_certificate_type_index": int(cert.certificate_type_logits[0].detach().argmax(dim=-1).cpu()),
                             "model_certificate_uncertainty": float(cert.uncertainty[0].detach().cpu()),
                         }
+                    if output.latent_workspace is not None:
+                        workspace = output.latent_workspace
+                        certificate_payload.update(
+                            {
+                                "model_latent_workspace_checksum": workspace.checksum(0),
+                                "model_latent_workspace_steps": int(workspace.step_count),
+                                "model_latent_workspace_gate_mean": float(workspace.step_gates[0].detach().mean().cpu()),
+                                "model_latent_workspace_feedback_norm": float(workspace.feedback[0].detach().norm().cpu()),
+                            }
+                        )
                     if token_id == self.tokenizer.eos_id:
                         break
         finally:
@@ -2319,6 +2453,7 @@ class LossWeights:
     variable_input: float = 0.01
     learned_memory: float = 0.03
     skill_expert: float = 0.025
+    latent_workspace: float = 0.025
     certificate: float = 0.04
 
 
@@ -2332,6 +2467,7 @@ class LossBreakdown:
     variable_input: float = 0.0
     learned_memory: float = 0.0
     skill_expert: float = 0.0
+    latent_workspace: float = 0.0
     certificate: float = 0.0
 
     def to_dict(self) -> dict[str, float]:
@@ -2364,6 +2500,7 @@ class CortexObjective:
         variable_loss = output.logits.new_tensor(0.0)
         learned_memory_loss = output.logits.new_tensor(0.0)
         skill_expert_loss = output.logits.new_tensor(0.0)
+        latent_workspace_loss = output.logits.new_tensor(0.0)
         certificate_loss = output.logits.new_tensor(0.0)
         if use_cortex_terms:
             if not output.mtp_logits:
@@ -2433,6 +2570,24 @@ class CortexObjective:
                 load_balance_loss = route_mean.square().mean()
                 skill_expert_loss = alignment_loss + 0.05 * load_balance_loss
                 total = total + self.weights.skill_expert * skill_expert_loss
+            if output.latent_workspace is not None:
+                workspace = output.latent_workspace
+                transition_loss = output.logits.new_tensor(0.0)
+                if workspace.step_states.shape[1] > 1:
+                    transition_loss = (workspace.step_states[:, 1:, :] - workspace.step_states[:, :-1, :]).square().mean()
+                gate_entropy = -(
+                    workspace.step_gates.clamp_min(1e-8).log() * workspace.step_gates
+                    + (1.0 - workspace.step_gates).clamp_min(1e-8).log() * (1.0 - workspace.step_gates)
+                ).mean()
+                binding_loss = output.logits.new_tensor(0.0)
+                if output.certificate is not None and output.certificate.latent_state.shape == workspace.summary.shape:
+                    binding_loss = F.mse_loss(
+                        F.normalize(workspace.summary, dim=-1),
+                        F.normalize(output.certificate.latent_state, dim=-1),
+                    )
+                attention_spread_loss = workspace.token_attention.square().sum(dim=-1).mean()
+                latent_workspace_loss = binding_loss + 0.10 * transition_loss + 0.03 * gate_entropy + 0.02 * attention_spread_loss
+                total = total + self.weights.latent_workspace * latent_workspace_loss
             if output.certificate is not None:
                 final_targets = next_targets[:, -1]
                 cert_answer_loss = F.cross_entropy(output.certificate.answer_logits, final_targets)
@@ -2452,6 +2607,7 @@ class CortexObjective:
             variable_input=float(variable_loss.detach().cpu()),
             learned_memory=float(learned_memory_loss.detach().cpu()),
             skill_expert=float(skill_expert_loss.detach().cpu()),
+            latent_workspace=float(latent_workspace_loss.detach().cpu()),
             certificate=float(certificate_loss.detach().cpu()),
         )
 
@@ -3666,14 +3822,20 @@ def _cortex_architecture_audit_from_summary(summary: Mapping[str, Any]) -> dict[
         phase_count("P5") > 0
         and integer("certificate_head_forward_events") > 0
         and integer("model_certificate_head_verified_events") > 0
+        and integer("latent_workspace_forward_events") > 0
+        and integer("latent_workspace_step_events") > 0
+        and integer("latent_workspace_certificate_binding_events") > 0
         and replay_count("P5") > 0,
         {
             "P5": phase_count("P5"),
             "certificate_head_forward_events": integer("certificate_head_forward_events"),
             "model_certificate_head_verified_events": integer("model_certificate_head_verified_events"),
+            "latent_workspace_forward_events": integer("latent_workspace_forward_events"),
+            "latent_workspace_step_events": integer("latent_workspace_step_events"),
+            "latent_workspace_certificate_binding_events": integer("latent_workspace_certificate_binding_events"),
             "phase_replay_P5": replay_count("P5"),
         },
-        "latent proof workspace must feed model-head certificates and verified replay",
+        "explicit multi-step latent workspace must run, bind to model-head certificates and feed verified replay",
     )
     add(
         "certificate_generator",
@@ -4055,6 +4217,9 @@ def _cortex_phase_deliverable_audit_from_summary(summary: Mapping[str, Any]) -> 
         and count("delatentization_probe_failures") == 0
         and count("certificate_tool_verification_events") > 0
         and count("model_certificate_head_verified_events") > 0
+        and count("latent_workspace_forward_events") > 0
+        and count("latent_workspace_step_events") > 0
+        and count("latent_workspace_certificate_binding_events") > 0
         and count("certificate_algebra_tool_events") > 0
         and count("certificate_code_hidden_property_events") > 0,
         {
@@ -4064,10 +4229,13 @@ def _cortex_phase_deliverable_audit_from_summary(summary: Mapping[str, Any]) -> 
             "certificate_tool_verification_events": count("certificate_tool_verification_events"),
             "model_certificate_head_verified_events": count("model_certificate_head_verified_events"),
             "model_certificate_head_latent_checksum_events": count("model_certificate_head_latent_checksum_events"),
+            "latent_workspace_forward_events": count("latent_workspace_forward_events"),
+            "latent_workspace_step_events": count("latent_workspace_step_events"),
+            "latent_workspace_certificate_binding_events": count("latent_workspace_certificate_binding_events"),
             "certificate_algebra_tool_events": count("certificate_algebra_tool_events"),
             "certificate_code_hidden_property_events": count("certificate_code_hidden_property_events"),
         },
-        "latent proof state must include a verified model-head certificate plus random de-latentization, multi-step algebra and richer code tool verification",
+        "latent proof state must include an explicit multi-step workspace, verified model-head certificate, random de-latentization, multi-step algebra and richer code tool verification",
     )
     add(
         "P6",
@@ -4248,6 +4416,8 @@ class CortexTrainingPhaseController:
             raise ValueError("CortexTrainingPhaseController requires a learned cognitive memory policy for full Cortex training")
         if not model.config.use_certificate_head:
             raise ValueError("CortexTrainingPhaseController requires a certificate head for full Cortex training")
+        if not model.config.use_latent_reasoning_workspace:
+            raise ValueError("CortexTrainingPhaseController requires an explicit latent reasoning workspace for full Cortex training")
         self.model = model
         self.tokenizer = tokenizer
         self.config = config
@@ -4349,6 +4519,10 @@ class CortexTrainingPhaseController:
         self.skill_expert_last_context: tuple[float, ...] = ()
         self.skill_expert_context_skills: tuple[str, ...] = ()
         self.model_certificate_head_artifacts: list[dict[str, Any]] = []
+        self.latent_workspace_forward_events = 0
+        self.latent_workspace_step_events = 0
+        self.latent_workspace_certificate_binding_events = 0
+        self.latent_workspace_last_summary: dict[str, Any] = {}
         self.regrowth_model_applications: list[dict[str, Any]] = []
         self.regrowth_model_parameter_delta_l1 = 0.0
         self.regrowth_model_repair_loss_delta = 0.0
@@ -4683,6 +4857,26 @@ class CortexTrainingPhaseController:
         if future_targets is not None and future_targets.numel() > 0:
             target_token_id = int(future_targets[row_index, -1, 0].detach().cpu())
         answer_text = self._decode_model_token(answer_token_id)
+        workspace_summary: dict[str, Any] | None = None
+        workspace_checksum: str | None = None
+        workspace_steps = 0
+        workspace_bound_to_certificate = False
+        if output.latent_workspace is not None:
+            workspace = output.latent_workspace
+            workspace_summary = workspace.to_summary()
+            workspace_checksum = workspace.checksum(row_index)
+            workspace_steps = int(workspace.step_count)
+            workspace_bound_to_certificate = (
+                certificate_output.latent_state.shape == workspace.summary.shape
+            )
+            self.latent_workspace_forward_events += 1
+            self.latent_workspace_step_events += workspace_steps
+            self.latent_workspace_last_summary = dict(workspace_summary)
+            self._count("latent_workspace_forward_events")
+            self._count("latent_workspace_step_events", workspace_steps)
+            if workspace_bound_to_certificate:
+                self.latent_workspace_certificate_binding_events += 1
+                self._count("latent_workspace_certificate_binding_events")
         cert_types = tuple(CertificateType)
         cert_type_index = int(certificate_output.certificate_type_logits[row_index].detach().argmax(dim=-1).cpu())
         certificate_type = cert_types[cert_type_index % len(cert_types)]
@@ -4704,6 +4898,10 @@ class CortexTrainingPhaseController:
             answer=answer_text,
             claims={
                 "model_certificate_head": True,
+                "latent_reasoning_workspace": workspace_summary is not None,
+                "latent_workspace_checksum": workspace_checksum,
+                "latent_workspace_steps": workspace_steps,
+                "latent_workspace_bound_to_certificate": workspace_bound_to_certificate,
                 "predicted_certificate_type": certificate_type.value,
                 "answer_token_id": answer_token_id,
                 "lm_head_token_id": lm_head_token_id,
@@ -4736,6 +4934,9 @@ class CortexTrainingPhaseController:
             "target_match": target_match,
             "certificate_type": certificate_type.value,
             "uncertainty": uncertainty,
+            "latent_workspace": workspace_summary,
+            "latent_workspace_checksum": workspace_checksum,
+            "latent_workspace_bound_to_certificate": workspace_bound_to_certificate,
             "certificate": certificate.to_dict(),
             "latent_state": latent_state.to_dict(),
             "verification": verification.to_dict(),
@@ -5991,6 +6192,10 @@ class CortexTrainingPhaseController:
             "recursive_model_protected_loss_delta": float(self.recursive_model_protected_loss_delta),
             "certificate_head_forward_events": int(self.model.certificate_forward_events),
             "model_certificate_head_artifacts": list(self.model_certificate_head_artifacts),
+            "latent_workspace_forward_events": int(self.latent_workspace_forward_events),
+            "latent_workspace_step_events": int(self.latent_workspace_step_events),
+            "latent_workspace_certificate_binding_events": int(self.latent_workspace_certificate_binding_events),
+            "latent_workspace_last_summary": dict(self.latent_workspace_last_summary),
             "certificate_algebra_tool_events": int(self.integration_counts.get("certificate_algebra_tool_events", 0)),
             "certificate_code_hidden_property_events": int(self.integration_counts.get("certificate_code_hidden_property_events", 0)),
             "input_anchor_observations": int(self.input_anchor_observations),
@@ -6136,6 +6341,10 @@ class CortexTrainingPhaseController:
             dict(item)
             for item in payload.get("model_certificate_head_artifacts", ())
         ]
+        self.latent_workspace_forward_events = int(payload.get("latent_workspace_forward_events", 0))
+        self.latent_workspace_step_events = int(payload.get("latent_workspace_step_events", 0))
+        self.latent_workspace_certificate_binding_events = int(payload.get("latent_workspace_certificate_binding_events", 0))
+        self.latent_workspace_last_summary = dict(payload.get("latent_workspace_last_summary") or {})
         self.input_anchor_observations = int(payload.get("input_anchor_observations", 0))
         self.input_anchor_count = int(payload.get("input_anchor_count", 0))
         self.input_anchor_fidelity_failures = int(payload.get("input_anchor_fidelity_failures", 0))
@@ -6311,6 +6520,10 @@ class CortexTrainingPhaseController:
             "model_certificate_head_latent_checksum_events": int(self.integration_counts.get("model_certificate_head_latent_checksum_events", 0)),
             "model_certificate_head_target_match_events": int(self.integration_counts.get("model_certificate_head_target_match_events", 0)),
             "model_certificate_head_artifacts": _last_items(self.model_certificate_head_artifacts, 5),
+            "latent_workspace_forward_events": int(self.latent_workspace_forward_events),
+            "latent_workspace_step_events": int(self.latent_workspace_step_events),
+            "latent_workspace_certificate_binding_events": int(self.latent_workspace_certificate_binding_events),
+            "latent_workspace_last_summary": dict(self.latent_workspace_last_summary),
             "input_anchor_observations": int(self.input_anchor_observations),
             "input_anchor_count": int(self.input_anchor_count),
             "input_anchor_fidelity_failures": int(self.input_anchor_fidelity_failures),
@@ -7220,6 +7433,10 @@ class CortexTrainingPhaseController:
                 "model_certificate_head_latent_checksum_events": int(self.integration_counts.get("model_certificate_head_latent_checksum_events", 0)),
                 "model_certificate_head_target_match_events": int(self.integration_counts.get("model_certificate_head_target_match_events", 0)),
                 "model_certificate_head_artifacts": _last_items(self.model_certificate_head_artifacts, 5),
+                "latent_workspace_forward_events": int(self.latent_workspace_forward_events),
+                "latent_workspace_step_events": int(self.latent_workspace_step_events),
+                "latent_workspace_certificate_binding_events": int(self.latent_workspace_certificate_binding_events),
+                "latent_workspace_last_summary": dict(self.latent_workspace_last_summary),
                 "input_anchor_observations": int(self.input_anchor_observations),
                 "input_anchor_count": int(self.input_anchor_count),
                 "input_anchor_fidelity_failures": int(self.input_anchor_fidelity_failures),
@@ -7367,6 +7584,10 @@ class CortexTrainingPhaseController:
                     "model_certificate_head_latent_checksum_events": int(self.integration_counts.get("model_certificate_head_latent_checksum_events", 0)),
                     "model_certificate_head_target_match_events": int(self.integration_counts.get("model_certificate_head_target_match_events", 0)),
                     "model_certificate_head_artifacts": _last_items(self.model_certificate_head_artifacts, 5),
+                    "latent_workspace_forward_events": int(self.latent_workspace_forward_events),
+                    "latent_workspace_step_events": int(self.latent_workspace_step_events),
+                    "latent_workspace_certificate_binding_events": int(self.latent_workspace_certificate_binding_events),
+                    "latent_workspace_last_summary": dict(self.latent_workspace_last_summary),
                     **frontier_heldout_summary,
                     "input_anchor_observations": int(self.input_anchor_observations),
                     "input_anchor_count": int(self.input_anchor_count),
@@ -7497,6 +7718,10 @@ class CortexTrainingPhaseController:
                     "model_certificate_head_latent_checksum_events": int(self.integration_counts.get("model_certificate_head_latent_checksum_events", 0)),
                     "model_certificate_head_target_match_events": int(self.integration_counts.get("model_certificate_head_target_match_events", 0)),
                     "model_certificate_head_artifacts": _last_items(self.model_certificate_head_artifacts, 5),
+                    "latent_workspace_forward_events": int(self.latent_workspace_forward_events),
+                    "latent_workspace_step_events": int(self.latent_workspace_step_events),
+                    "latent_workspace_certificate_binding_events": int(self.latent_workspace_certificate_binding_events),
+                    "latent_workspace_last_summary": dict(self.latent_workspace_last_summary),
                     "input_anchor_observations": int(self.input_anchor_observations),
                     "input_anchor_count": int(self.input_anchor_count),
                     "input_anchor_fidelity_failures": int(self.input_anchor_fidelity_failures),
@@ -7794,6 +8019,7 @@ class LLMTrainer:
                 and self.model.config.use_variable_in_compressor
                 and self.model.config.use_learned_memory_policy
                 and self.model.config.use_certificate_head
+                and self.model.config.use_latent_reasoning_workspace
                 and self.model.config.horizons == (1, 2, 4, 8)
             )
             else None
@@ -8082,6 +8308,9 @@ class LLMTrainer:
         checkpoint_model_config.setdefault("native_ternary_autotune_cache_write", True)
         checkpoint_model_config.setdefault("use_certificate_head", False)
         checkpoint_model_config.setdefault("certificate_latent_size", 64)
+        checkpoint_model_config.setdefault("use_latent_reasoning_workspace", False)
+        checkpoint_model_config.setdefault("latent_workspace_steps", 3)
+        checkpoint_model_config.setdefault("latent_workspace_feedback_strength", 0.20)
         if checkpoint_model_config != asdict(self.model.config):
             raise ValueError("checkpoint model_config does not match the current model")
         checkpoint_corpus_identity = payload.get("corpus_identity")
@@ -8657,6 +8886,14 @@ def _transformer_parameter_count(config: TransformerConfig) -> int:
         total += latent * vocab_size + vocab_size
         total += latent * len(CertificateType) + len(CertificateType)
         total += latent + 1
+    if config.use_latent_reasoning_workspace:
+        latent = int(config.certificate_latent_size)
+        total += 2 * d_model
+        total += d_model + 1
+        total += d_model * latent + latent
+        total += latent * latent + latent
+        total += latent + 1
+        total += latent * d_model + d_model
     return int(total)
 
 
@@ -8704,6 +8941,8 @@ def _estimate_transformer_training_memory(config: TransformerConfig, training: T
         "native_ternary_backend": str(config.native_ternary_backend) if config.use_ternary_core else "",
         "certificate_head": bool(config.use_certificate_head),
         "certificate_latent_size": int(config.certificate_latent_size) if config.use_certificate_head else 0,
+        "latent_reasoning_workspace": bool(config.use_latent_reasoning_workspace),
+        "latent_workspace_steps": int(config.latent_workspace_steps) if config.use_latent_reasoning_workspace else 0,
         "training_state_bytes": int(training_state_bytes),
         "parameter_forward_bytes": int(parameter_forward_bytes),
         "hidden_activation_bytes": int(hidden_activation_bytes),
@@ -8736,6 +8975,7 @@ def _experiment_model_memory_estimates(config: ComparisonConfig) -> dict[str, An
         "use_variable_in_compressor": True,
         "use_learned_memory_policy": True,
         "use_certificate_head": True,
+        "use_latent_reasoning_workspace": True,
     })
     baseline = _estimate_transformer_training_memory(baseline_config, config.training)
     cortex = _estimate_transformer_training_memory(cortex_config, config.training)
@@ -8794,6 +9034,7 @@ def build_training_plan(
         "use_variable_in_compressor": True,
         "use_learned_memory_policy": True,
         "use_certificate_head": True,
+        "use_latent_reasoning_workspace": True,
     })
     baseline_parameters = _transformer_parameter_count(baseline_config)
     cortex_parameters = _transformer_parameter_count(cortex_config)
@@ -8854,6 +9095,8 @@ def build_training_plan(
             "cortex_variable_in_compressor": bool(cortex_config.use_variable_in_compressor),
             "cortex_learned_memory_policy": bool(cortex_config.use_learned_memory_policy),
             "cortex_certificate_head": bool(cortex_config.use_certificate_head),
+            "cortex_latent_reasoning_workspace": bool(cortex_config.use_latent_reasoning_workspace),
+            "cortex_latent_workspace_steps": int(cortex_config.latent_workspace_steps),
             "cortex_native_ternary_backend": str(cortex_config.native_ternary_backend),
         },
         "training": {
@@ -9090,6 +9333,7 @@ class LLMComparisonRunner:
                 "use_variable_in_compressor": True,
                 "use_learned_memory_policy": True,
                 "use_certificate_head": True,
+                "use_latent_reasoning_workspace": True,
             })
             cortex = LLMTrainer(
                 CortexTransformerLM(cortex_config),
@@ -11001,6 +11245,7 @@ def run_llm_batch_profile(
             use_variable_in_compressor=True,
             use_learned_memory_policy=True,
             use_certificate_head=True,
+            use_latent_reasoning_workspace=True,
         )
         trainer = LLMTrainer(
             CortexTransformerLM(model_config),
@@ -11171,6 +11416,7 @@ def _profile_shape_memory_estimate(
         use_variable_in_compressor=True,
         use_learned_memory_policy=True,
         use_certificate_head=True,
+        use_latent_reasoning_workspace=True,
     )
     return _estimate_transformer_training_memory(config, training)
 

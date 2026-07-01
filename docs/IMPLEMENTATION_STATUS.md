@@ -115,8 +115,11 @@ Current executable coverage:
 - `CandidateAnswer.certificate` field and certificate bit accounting.
 - `LatentProofState` stores a Torch latent proof vector, latent step count and checksum.
 - `LatentProofState.to_dict/from_dict` serializes proof vectors into JSON-safe rounded values for persisted audit trails.
+- `LatentReasoningWorkspace` is now an explicit trainable LLM module: it attends over hidden states, executes multiple latent transitions, feeds a projected latent summary back into the hidden stream before logits/MTP/certificates, and records latent workspace KV cost.
 - `CertificateHead` maps hidden states to latent proof state, answer logits, certificate type logits and uncertainty.
+- `CortexObjective` includes `latent_workspace` loss, binding the workspace summary to the certificate latent state while keeping latent steps stable and trainable.
 - The full LLM controller now materializes real `CertificateHead` outputs into verified `ShortCertificate` artifacts with model-token consistency, latent checksum verification, target-match metadata, checkpoint persistence and P5 audit gates.
+- Model-head certificates now carry latent-workspace checksum, step count and binding claims; full Cortex training requires `use_latent_reasoning_workspace=True`, persists workspace counters through checkpoints, and fails P5/full-architecture audits if workspace forward/steps/certificate binding are absent.
 - `CertificateHeadCalibrator` trains the certificate head on verifier micro-task answers, certificate types and uncertainty targets.
 - `ShortCertificate` carries answer, claims, uncertainty, latent checksum, anchors and optional tool contract.
 - `CertificateVerifier` checks uncertainty bounds, latent checksum and tool-backed verification.
@@ -136,6 +139,7 @@ Current executable coverage:
 Remaining:
 
 - Expand tool verification to external solver hooks and broader multi-step domains beyond current linear algebra/rich code cases.
+- Compare workspace-enabled vs workspace-disabled training on held-out reasoning traces once long tests are authorized.
 - Benchmark certificate-token savings and semantic reliability of model-head certificates over held-out reasoning traces.
 
 ## Phase 6 - Causal regression attribution

@@ -2378,6 +2378,7 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             use_variable_in_compressor=True,
             use_learned_memory_policy=True,
             use_certificate_head=True,
+            use_latent_reasoning_workspace=True,
         )
         model = CortexTransformerLM(config)
         x = torch.randint(4, 96, (2, 16))
@@ -2392,10 +2393,14 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
         self.assertIsNotNone(output.learned_memory_policy)
         self.assertIsNotNone(output.skill_expert_routing)
         self.assertIsNotNone(output.skill_expert_routing.target_distribution)
+        self.assertIsNotNone(output.latent_workspace)
+        self.assertEqual(output.latent_workspace.step_count, config.latent_workspace_steps)
         self.assertGreater(breakdown.learned_memory, 0.0)
         self.assertGreater(breakdown.skill_expert, 0.0)
+        self.assertGreater(breakdown.latent_workspace, 0.0)
         self.assertGreater(float(model.learned_memory.policy[-1].weight.grad.abs().sum()), 0.0)
         self.assertGreater(float(model.skill_experts.router.weight.grad.abs().sum()), 0.0)
+        self.assertGreater(float(model.latent_workspace.step_transition.float_weight.grad.abs().sum()), 0.0)
         self.assertGreater(model.compression_ledger.total_packed_ternary_dispatches, 0)
 
     def test_learned_memory_ablation_shows_policy_can_reduce_loss(self):
@@ -2502,6 +2507,7 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 "use_variable_in_compressor": True,
                 "use_learned_memory_policy": True,
                 "use_certificate_head": True,
+                "use_latent_reasoning_workspace": True,
             })
             baseline_parameters = sum(parameter.numel() for parameter in CortexTransformerLM(baseline_config).parameters())
             cortex_parameters = sum(parameter.numel() for parameter in CortexTransformerLM(cortex_config).parameters())
@@ -2512,6 +2518,8 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             self.assertTrue(plan["model"]["cortex_variable_in_compressor"])
             self.assertTrue(plan["model"]["cortex_learned_memory_policy"])
             self.assertTrue(plan["model"]["cortex_certificate_head"])
+            self.assertTrue(plan["model"]["cortex_latent_reasoning_workspace"])
+            self.assertEqual(plan["model"]["cortex_latent_workspace_steps"], 3)
             self.assertGreater(plan["model"]["cortex_parameters"], plan["model"]["baseline_parameters"])
             self.assertEqual(plan["training"]["tokens_per_optimizer_step"], 3 * 2 * 2 * 24)
             self.assertEqual(plan["training"]["planned_train_tokens"], 3 * 2 * 2 * 24 * 10)
@@ -2830,6 +2838,9 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                     "variable_compression_wide_kernel",
                     "use_certificate_head",
                     "certificate_latent_size",
+                    "use_latent_reasoning_workspace",
+                    "latent_workspace_steps",
+                    "latent_workspace_feedback_strength",
                 ):
                     legacy_checkpoint["model_config"].pop(key, None)
                 torch.save(legacy_checkpoint, run_dir / "checkpoint_final.pt")
@@ -3177,6 +3188,7 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 use_variable_in_compressor=True,
                 use_learned_memory_policy=True,
                 use_certificate_head=True,
+                use_latent_reasoning_workspace=True,
             )
             train = MemmapCausalDataset(manifest, split="train")
             val = MemmapCausalDataset(manifest, split="val")
@@ -3292,8 +3304,16 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             self.assertGreater(influence["certificate_head_forward_events"], 0)
             self.assertGreater(influence["model_certificate_head_verified_events"], 0)
             self.assertGreater(influence["model_certificate_head_latent_checksum_events"], 0)
+            self.assertGreater(influence["latent_workspace_forward_events"], 0)
+            self.assertGreater(influence["latent_workspace_step_events"], 0)
+            self.assertGreater(influence["latent_workspace_certificate_binding_events"], 0)
+            self.assertTrue(influence["latent_workspace_last_summary"], influence)
             self.assertTrue(influence["model_certificate_head_artifacts"], influence)
             self.assertTrue(influence["model_certificate_head_artifacts"][-1]["verification"]["passed"])
+            self.assertTrue(
+                influence["model_certificate_head_artifacts"][-1]["latent_workspace_bound_to_certificate"],
+                influence["model_certificate_head_artifacts"][-1],
+            )
             self.assertGreater(influence["certificate_algebra_tool_events"], 0)
             self.assertGreater(influence["certificate_code_hidden_property_events"], 0)
             self.assertGreater(influence["input_anchor_observations"], 0)
@@ -3494,6 +3514,18 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 influence["skill_expert_replay_context_events"],
             )
             self.assertEqual(
+                persisted["training_influence"]["latent_workspace_forward_events"],
+                influence["latent_workspace_forward_events"],
+            )
+            self.assertEqual(
+                persisted["training_influence"]["latent_workspace_step_events"],
+                influence["latent_workspace_step_events"],
+            )
+            self.assertEqual(
+                persisted["training_influence"]["latent_workspace_certificate_binding_events"],
+                influence["latent_workspace_certificate_binding_events"],
+            )
+            self.assertEqual(
                 persisted["training_influence"]["frontier_repair_accepted_events"],
                 influence["frontier_repair_accepted_events"],
             )
@@ -3539,6 +3571,7 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 use_variable_in_compressor=True,
                 use_learned_memory_policy=True,
                 use_certificate_head=True,
+                use_latent_reasoning_workspace=True,
             )
             controller = CortexTrainingPhaseController(
                 CortexTransformerLM(config),
@@ -3577,6 +3610,7 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 use_variable_in_compressor=True,
                 use_learned_memory_policy=True,
                 use_certificate_head=True,
+                use_latent_reasoning_workspace=True,
             )
             train = MemmapCausalDataset(manifest, split="train")
             val = MemmapCausalDataset(manifest, split="val")
@@ -3613,6 +3647,9 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 self.assertGreater(first_influence["ternary_core_forward_events"], 0)
                 self.assertGreater(first_influence["skill_expert_context_events"], 0)
                 self.assertGreater(first_influence["skill_expert_replay_context_events"], 0)
+                self.assertGreater(first_influence["latent_workspace_forward_events"], 0)
+                self.assertGreater(first_influence["latent_workspace_step_events"], 0)
+                self.assertGreater(first_influence["latent_workspace_certificate_binding_events"], 0)
                 self.assertGreater(first_influence["inference_model_backed_events"], 0)
                 self.assertGreater(first_influence["inference_model_backed_generated_tokens"], 0)
                 self.assertGreater(first_influence["inference_model_backed_replay_events"], 0)
@@ -3643,6 +3680,10 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 self.assertGreater(checkpoint["cortex_phase_state"]["certificate_head_forward_events"], 0)
                 self.assertGreater(len(checkpoint["cortex_phase_state"]["model_certificate_head_artifacts"]), 0)
                 self.assertTrue(checkpoint["cortex_phase_state"]["model_certificate_head_artifacts"][-1]["verification"]["passed"])
+                self.assertGreater(checkpoint["cortex_phase_state"]["latent_workspace_forward_events"], 0)
+                self.assertGreater(checkpoint["cortex_phase_state"]["latent_workspace_step_events"], 0)
+                self.assertGreater(checkpoint["cortex_phase_state"]["latent_workspace_certificate_binding_events"], 0)
+                self.assertTrue(checkpoint["cortex_phase_state"]["latent_workspace_last_summary"])
                 self.assertGreater(checkpoint["cortex_phase_state"]["certificate_algebra_tool_events"], 0)
                 self.assertGreater(checkpoint["cortex_phase_state"]["certificate_code_hidden_property_events"], 0)
                 self.assertGreater(checkpoint["cortex_phase_state"]["input_anchor_observations"], 0)
@@ -3783,6 +3824,9 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 self.assertGreater(sidecar["cortex_phase_state_summary"]["recursive_verified_artifact_count"], 0)
                 self.assertTrue(sidecar["cortex_phase_state_summary"]["recursive_verified_artifacts"])
                 self.assertGreater(sidecar["cortex_phase_state_summary"]["objective_feedback_events"], 0)
+                self.assertGreater(sidecar["cortex_phase_state_summary"]["latent_workspace_forward_events"], 0)
+                self.assertGreater(sidecar["cortex_phase_state_summary"]["latent_workspace_step_events"], 0)
+                self.assertGreater(sidecar["cortex_phase_state_summary"]["latent_workspace_certificate_binding_events"], 0)
                 self.assertEqual(
                     tuple(sidecar["cortex_phase_state_summary"]["objective_feedback_term_names"]),
                     FINAL_LOSS_TERMS,
