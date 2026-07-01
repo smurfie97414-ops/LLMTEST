@@ -338,6 +338,95 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             self.assertEqual(report["matrix"]["cases"][0]["shape"]["gradient_accumulation_steps"], 2)
             self.assertEqual(report["matrix"]["summary"]["total_planned_train_tokens"], 128)
 
+    def test_llm_batch_profile_autosize_measures_each_candidate_across_requested_seeds(self):
+        profile_calls = []
+
+        def fake_profile(**kwargs):
+            profile_calls.append(dict(kwargs))
+            planned = (
+                int(kwargs["steps"])
+                * int(kwargs["batch_size"])
+                * int(kwargs["gradient_accumulation_steps"])
+                * int(kwargs["seq_len"])
+            )
+            return {
+                "passed": True,
+                "failed_checks": (),
+                "throughput": {
+                    "train_tokens_per_second_wall": 100.0 + float(kwargs["seed"]),
+                    "planned_train_tokens": planned,
+                },
+                "resource_usage": {
+                    "sample_count": 1,
+                    "metrics": {
+                        "gpu_utilization_percent": {"avg": 10.0, "min": 10.0, "max": 10.0},
+                        "gpu_memory_used_mb": {"avg": 128.0, "min": 128.0, "max": 128.0},
+                        "gpu_power_draw_watts": {"avg": 45.0, "min": 45.0, "max": 45.0},
+                        "process_cpu_percent_of_total": {"avg": 1.0, "min": 1.0, "max": 1.0},
+                    },
+                },
+                "torch_cuda_memory": {
+                    "after": {
+                        "max_memory_allocated_bytes": 8 * 1024 * 1024,
+                    }
+                },
+                "kernel_evidence": {
+                    "native_ternary_kernel_required": False,
+                    "strict_extension_only": True,
+                },
+                "architecture": {"all_phases_active": True},
+            }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch("cortex3_llm.run_llm_batch_profile", side_effect=fake_profile):
+                report = run_llm_batch_profile_autosize(
+                    out_dir=root / "autosize-multiseed-measurement",
+                    candidate_seq_lens=(32,),
+                    candidate_d_models=(32,),
+                    candidate_n_layers=(1,),
+                    candidate_batch_sizes=(2,),
+                    candidate_gradient_accumulation_steps=(1, 2),
+                    n_heads=4,
+                    selected_shape_count=1,
+                    min_selected_shapes=1,
+                    seeds=(11, 13),
+                    steps=1,
+                    gradient_accumulation_steps=1,
+                    vocab_size=128,
+                    precision="fp32",
+                    device="cpu",
+                    require_cuda=False,
+                    memory_budget_mb=512,
+                    measure_candidate_count=1,
+                    min_cases=2,
+                    require_multi_seed=True,
+                    min_resource_samples=1,
+                )
+
+        self.assertTrue(report["passed"], report["failed_checks"])
+        self.assertEqual(len(profile_calls), 4)
+        self.assertEqual([call["seed"] for call in profile_calls[:2]], [11, 13])
+        self.assertTrue(all("candidate_measurements" in str(call["out_dir"]) for call in profile_calls[:2]))
+        self.assertTrue(str(profile_calls[0]["out_dir"]).endswith("seed_11"))
+        self.assertTrue(str(profile_calls[1]["out_dir"]).endswith("seed_13"))
+        self.assertEqual([call["seed"] for call in profile_calls[2:]], [11, 13])
+        self.assertTrue(all("matrix" in str(call["out_dir"]) for call in profile_calls[2:]))
+        self.assertEqual(report["measurement"]["requested_seed_count"], 2)
+        self.assertEqual(report["measurement"]["measurement_seed_count"], 2)
+        self.assertEqual(report["measurement"]["measurement_seeds"], (11, 13))
+        self.assertEqual(report["measurement"]["measured_candidate_count"], 1)
+        self.assertEqual(report["measurement"]["measured_candidate_profile_count"], 2)
+        self.assertEqual(report["measurement"]["measured_profile_passed_profile_count"], 2)
+        measured = report["measured_candidates"][0]
+        self.assertTrue(measured["measurement_passed"])
+        self.assertEqual(measured["measurement_seed_count"], 2)
+        self.assertEqual(measured["measurement_seeds"], (11, 13))
+        self.assertEqual(tuple(row["seed"] for row in measured["seed_measurements"]), (11, 13))
+        self.assertGreater(measured["measured_score"], 0.0)
+        self.assertEqual(report["matrix"]["summary"]["seed_count"], 2)
+        self.assertEqual(report["matrix"]["summary"]["case_count"], 2)
+
     def test_llm_batch_profile_autosize_blocks_measured_vram_over_budget(self):
         fake_profile = {
             "passed": True,

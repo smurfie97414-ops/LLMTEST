@@ -9247,9 +9247,11 @@ def _profile_autosize_measurement_summary(
             "measurement_passed": False,
             "measurement_error_type": type(error).__name__,
             "measurement_error": str(error),
+            "measurement_profile_failed_checks": ("measurement_error",),
             "measurement_failed_checks": ("measurement_error",),
             "measured_score": 0.0,
             "train_tokens_per_second_wall": 0.0,
+            "planned_train_tokens": 0,
             "gpu_utilization_percent_avg": 0.0,
             "gpu_memory_used_mb_max": 0.0,
             "gpu_memory_used_mb_avg": 0.0,
@@ -9259,6 +9261,7 @@ def _profile_autosize_measurement_summary(
             "measured_budget_enforced": False,
             "measured_budget_passed": False,
             "torch_cuda_peak_allocated_bytes": 0,
+            "torch_cuda_peak_to_estimate_ratio": 0.0,
             "strict_extension_only": False,
             "all_phases_active": False,
         }
@@ -9307,6 +9310,110 @@ def _profile_autosize_measurement_summary(
         ),
         "strict_extension_only": bool(profile.get("kernel_evidence", {}).get("strict_extension_only")),
         "all_phases_active": bool(profile.get("architecture", {}).get("all_phases_active")),
+    }
+
+
+def _profile_autosize_aggregate_measurements(
+    candidate: Mapping[str, Any],
+    *,
+    seed_measurements: Sequence[Mapping[str, Any]],
+    metric: str,
+) -> Mapping[str, Any]:
+    rows = tuple(seed_measurements)
+    if not rows:
+        raise ValueError("at least one candidate seed measurement is required")
+
+    def _mean_float(name: str) -> float:
+        values = [float(row.get(name, 0.0)) for row in rows]
+        return float(statistics.fmean(values)) if values else 0.0
+
+    def _max_float(name: str) -> float:
+        return float(max((float(row.get(name, 0.0)) for row in rows), default=0.0))
+
+    def _max_int(name: str) -> int:
+        return int(max((int(row.get(name, 0)) for row in rows), default=0))
+
+    measurement_seeds = tuple(int(row.get("seed", 0)) for row in rows)
+    profile_failed_checks = tuple(
+        dict.fromkeys(
+            str(check)
+            for row in rows
+            for check in tuple(row.get("measurement_profile_failed_checks", ()))
+        )
+    )
+    failed_checks = tuple(
+        dict.fromkeys(
+            str(check)
+            for row in rows
+            for check in tuple(row.get("measurement_failed_checks", ()))
+        )
+    )
+    failed_checks_by_seed = tuple(
+        {
+            "seed": int(row.get("seed", 0)),
+            "measurement_profile_failed_checks": tuple(str(item) for item in row.get("measurement_profile_failed_checks", ())),
+            "measurement_failed_checks": tuple(str(item) for item in row.get("measurement_failed_checks", ())),
+        }
+        for row in rows
+        if tuple(row.get("measurement_failed_checks", ())) or tuple(row.get("measurement_profile_failed_checks", ()))
+    )
+    measurement_errors = tuple(
+        {
+            "seed": int(row.get("seed", 0)),
+            "measurement_error_type": str(row.get("measurement_error_type", "")),
+            "measurement_error": str(row.get("measurement_error", "")),
+            "profile_path": str(row.get("profile_path", "")),
+        }
+        for row in rows
+        if "measurement_error" in row
+    )
+    measured_budget_enforced = any(bool(row.get("measured_budget_enforced")) for row in rows)
+    measured_budget_passed = all(bool(row.get("measured_budget_passed")) for row in rows)
+    measurement_profile_passed = all(bool(row.get("measurement_profile_passed")) for row in rows)
+    measurement_passed = all(bool(row.get("measurement_passed")) for row in rows)
+    strict_extension_only = all(bool(row.get("strict_extension_only")) for row in rows)
+    all_phases_active = all(bool(row.get("all_phases_active")) for row in rows)
+    estimated_peak_training_bytes = int(candidate["estimated_peak_training_bytes"])
+    torch_cuda_peak_allocated_bytes = _max_int("torch_cuda_peak_allocated_bytes")
+    return {
+        "shape": dict(candidate["shape"]),
+        "shape_key": str(candidate["shape_key"]),
+        "measurement_seed_count": len(measurement_seeds),
+        "measurement_seeds": measurement_seeds,
+        "profile_path": str(rows[0].get("profile_path", "")),
+        "profile_paths": tuple(str(row.get("profile_path", "")) for row in rows),
+        "seed_measurements": rows,
+        "estimated_peak_training_bytes": estimated_peak_training_bytes,
+        "budget_bytes": int(candidate["budget_bytes"]),
+        "budget_fraction_used": float(candidate["budget_fraction_used"]),
+        "tokens_per_optimizer_step": int(candidate["tokens_per_optimizer_step"]),
+        "estimated_score": float(candidate["score"]),
+        "score": float(candidate["score"]),
+        "fits_budget": bool(candidate["fits_budget"]),
+        "measurement_metric": metric,
+        "measurement_profile_passed": measurement_profile_passed,
+        "measurement_passed": measurement_passed,
+        "measurement_profile_failed_checks": profile_failed_checks,
+        "measurement_failed_checks": failed_checks,
+        "measurement_failed_checks_by_seed": failed_checks_by_seed,
+        "measurement_errors": measurement_errors,
+        "measured_score": _mean_float("measured_score"),
+        "train_tokens_per_second_wall": _mean_float("train_tokens_per_second_wall"),
+        "planned_train_tokens": sum(int(row.get("planned_train_tokens", 0)) for row in rows),
+        "gpu_utilization_percent_avg": _mean_float("gpu_utilization_percent_avg"),
+        "gpu_memory_used_mb_avg": _mean_float("gpu_memory_used_mb_avg"),
+        "gpu_memory_used_mb_max": _max_float("gpu_memory_used_mb_max"),
+        "gpu_power_draw_watts_avg": _mean_float("gpu_power_draw_watts_avg"),
+        "observed_gpu_memory_used_bytes": _max_int("observed_gpu_memory_used_bytes"),
+        "observed_gpu_memory_budget_fraction_used": _max_float("observed_gpu_memory_budget_fraction_used"),
+        "measured_budget_enforced": measured_budget_enforced,
+        "measured_budget_passed": measured_budget_passed,
+        "torch_cuda_peak_allocated_bytes": torch_cuda_peak_allocated_bytes,
+        "torch_cuda_peak_to_estimate_ratio": float(
+            torch_cuda_peak_allocated_bytes / max(1, estimated_peak_training_bytes)
+        ),
+        "strict_extension_only": strict_extension_only,
+        "all_phases_active": all_phases_active,
     }
 
 
@@ -9559,6 +9666,7 @@ def run_llm_batch_profile_autosize(
     memory_budget_mb: float = 0.0,
     memory_budget_fraction: float = 0.35,
     measure_candidate_count: int = 4,
+    measure_candidate_seed_count: int | None = None,
     measured_selection_metric: str = "throughput_gpu",
     min_cases: int = 1,
     require_multi_shape: bool = False,
@@ -9590,6 +9698,14 @@ def run_llm_batch_profile_autosize(
     normalized_seeds = tuple(int(seed) for seed in seeds)
     if not normalized_seeds:
         raise ValueError("at least one autosize seed is required")
+    requested_measure_candidate_seed_count = (
+        len(normalized_seeds)
+        if measure_candidate_seed_count is None
+        else int(measure_candidate_seed_count)
+    )
+    if requested_measure_candidate_seed_count < 1:
+        raise ValueError("measure_candidate_seed_count must be positive")
+    measurement_seeds = normalized_seeds[: min(len(normalized_seeds), requested_measure_candidate_seed_count)]
     if candidate_gradient_accumulation_steps is None:
         base_gradient_accumulation_steps = int(gradient_accumulation_steps)
         normalized_candidate_gradient_accumulation_steps = tuple(
@@ -9676,7 +9792,10 @@ def run_llm_batch_profile_autosize(
     measured_candidates: tuple[Mapping[str, Any], ...] = ()
     measured_passed_candidates: tuple[Mapping[str, Any], ...] = ()
     measured_profile_passed_count = 0
-    measurement_seed = int(normalized_seeds[0])
+    measured_candidate_profile_count = 0
+    measured_profile_passed_profile_count = 0
+    measured_passed_profile_count = 0
+    measurement_seed = int(measurement_seeds[0])
     selection_source = "estimated"
     selection_pool: Sequence[Mapping[str, Any]] = ranked_candidates
     effective_measure_candidate_count = (
@@ -9686,54 +9805,79 @@ def run_llm_batch_profile_autosize(
     )
     if effective_measure_candidate_count > 0:
         measurement_inputs = tuple(ranked_candidates[:effective_measure_candidate_count])
-        measurement_rows: list[Mapping[str, Any]] = []
+        aggregated_measurement_rows: list[Mapping[str, Any]] = []
         for candidate_index, candidate in enumerate(measurement_inputs):
             shape = dict(candidate["shape"])
-            measure_dir = (
-                output_dir
-                / "candidate_measurements"
-                / f"candidate_{candidate_index:03d}_{candidate['shape_key']}_seed{measurement_seed}"
-            )
-            profile: Mapping[str, Any] | None = None
-            error: BaseException | None = None
-            try:
-                profile = run_llm_batch_profile(
-                    out_dir=measure_dir,
-                    steps=steps,
-                    batch_size=int(shape["batch_size"]),
-                    gradient_accumulation_steps=int(shape.get("gradient_accumulation_steps", gradient_accumulation_steps)),
-                    seq_len=int(shape["seq_len"]),
-                    d_model=int(shape["d_model"]),
-                    n_heads=int(shape["n_heads"]),
-                    n_layers=int(shape["n_layers"]),
-                    vocab_size=vocab_size,
-                    precision=precision,
-                    device=device,
-                    require_cuda=require_cuda,
-                    native_ternary_backend=native_ternary_backend,
-                    resource_interval=resource_interval,
-                    min_resource_samples=min_resource_samples,
-                    seed=measurement_seed,
-                    corpus_repeats=corpus_repeats,
-                    max_corpus_tokens=max_corpus_tokens,
-                    overwrite=False,
+            seed_measurement_rows: list[Mapping[str, Any]] = []
+            for seed in measurement_seeds:
+                measure_dir = (
+                    output_dir
+                    / "candidate_measurements"
+                    / f"candidate_{candidate_index:03d}_{candidate['shape_key']}"
+                    / f"seed_{int(seed)}"
                 )
-            except Exception as exc:
-                error = exc
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-            measurement_rows.append(
-                _profile_autosize_measurement_summary(
+                profile: Mapping[str, Any] | None = None
+                error: BaseException | None = None
+                try:
+                    profile = run_llm_batch_profile(
+                        out_dir=measure_dir,
+                        steps=steps,
+                        batch_size=int(shape["batch_size"]),
+                        gradient_accumulation_steps=int(shape.get("gradient_accumulation_steps", gradient_accumulation_steps)),
+                        seq_len=int(shape["seq_len"]),
+                        d_model=int(shape["d_model"]),
+                        n_heads=int(shape["n_heads"]),
+                        n_layers=int(shape["n_layers"]),
+                        vocab_size=vocab_size,
+                        precision=precision,
+                        device=device,
+                        require_cuda=require_cuda,
+                        native_ternary_backend=native_ternary_backend,
+                        resource_interval=resource_interval,
+                        min_resource_samples=min_resource_samples,
+                        seed=int(seed),
+                        corpus_repeats=corpus_repeats,
+                        max_corpus_tokens=max_corpus_tokens,
+                        overwrite=False,
+                    )
+                except Exception as exc:
+                    error = exc
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                seed_measurement_rows.append(
+                    _profile_autosize_measurement_summary(
+                        candidate,
+                        profile=profile,
+                        profile_path=measure_dir / "llm_batch_profile.json",
+                        seed=int(seed),
+                        metric=measured_selection_metric,
+                        error=error,
+                    )
+                )
+            aggregated_measurement_rows.append(
+                _profile_autosize_aggregate_measurements(
                     candidate,
-                    profile=profile,
-                    profile_path=measure_dir / "llm_batch_profile.json",
-                    seed=measurement_seed,
+                    seed_measurements=seed_measurement_rows,
                     metric=measured_selection_metric,
-                    error=error,
                 )
             )
-        measured_candidates = tuple(measurement_rows)
+        measured_candidates = tuple(aggregated_measurement_rows)
+        measured_candidate_profile_count = sum(
+            len(tuple(item.get("seed_measurements", ()))) for item in measured_candidates
+        )
         measured_profile_passed_count = sum(1 for item in measured_candidates if bool(item.get("measurement_profile_passed")))
+        measured_profile_passed_profile_count = sum(
+            1
+            for item in measured_candidates
+            for row in tuple(item.get("seed_measurements", ()))
+            if bool(row.get("measurement_profile_passed"))
+        )
+        measured_passed_profile_count = sum(
+            1
+            for item in measured_candidates
+            for row in tuple(item.get("seed_measurements", ()))
+            if bool(row.get("measurement_passed"))
+        )
         measured_passed_candidates = tuple(
             sorted(
                 (item for item in measured_candidates if bool(item.get("measurement_passed"))),
@@ -9813,8 +9957,11 @@ def run_llm_batch_profile_autosize(
             "viable_candidate_count": len(candidates),
             "rejected_candidate_count": len(rejected),
             "measured_candidate_count": len(measured_candidates),
+            "measured_candidate_profile_count": measured_candidate_profile_count,
             "measured_profile_passed_candidate_count": measured_profile_passed_count,
+            "measured_profile_passed_profile_count": measured_profile_passed_profile_count,
             "measured_passed_candidate_count": len(measured_passed_candidates),
+            "measured_passed_profile_count": measured_passed_profile_count,
             "selected_shapes": tuple(dict(item["shape"]) for item in selected),
             "selected_shape_keys": tuple(str(item["shape_key"]) for item in selected),
         },
@@ -9823,9 +9970,15 @@ def run_llm_batch_profile_autosize(
             "requested_candidate_count": requested_measure_candidate_count,
             "effective_candidate_count": effective_measure_candidate_count,
             "measured_candidate_count": len(measured_candidates),
+            "measured_candidate_profile_count": measured_candidate_profile_count,
             "measured_profile_passed_candidate_count": measured_profile_passed_count,
+            "measured_profile_passed_profile_count": measured_profile_passed_profile_count,
             "measured_passed_candidate_count": len(measured_passed_candidates),
+            "measured_passed_profile_count": measured_passed_profile_count,
             "measurement_seed": measurement_seed,
+            "requested_seed_count": requested_measure_candidate_seed_count,
+            "measurement_seed_count": len(measurement_seeds),
+            "measurement_seeds": measurement_seeds,
             "measured_selection_metric": measured_selection_metric,
             "selected_from_measurements": selection_source == "measured",
         },
@@ -10069,6 +10222,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     profile_autosize.add_argument("--memory-budget-mb", type=float, default=0.0)
     profile_autosize.add_argument("--memory-budget-fraction", type=float, default=0.35)
     profile_autosize.add_argument("--measure-candidate-count", type=int, default=4)
+    profile_autosize.add_argument("--measure-candidate-seed-count", type=int, default=None, help="number of provided seeds used while measuring each candidate; default uses all provided seeds")
     profile_autosize.add_argument("--measured-selection-metric", choices=PROFILE_AUTOSIZE_MEASURED_SELECTION_METRICS, default="throughput_gpu")
     profile_autosize.add_argument("--min-cases", type=int, default=1)
     profile_autosize.add_argument("--require-multi-shape", action="store_true")
@@ -10454,6 +10608,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             memory_budget_mb=args.memory_budget_mb,
             memory_budget_fraction=args.memory_budget_fraction,
             measure_candidate_count=args.measure_candidate_count,
+            measure_candidate_seed_count=args.measure_candidate_seed_count,
             measured_selection_metric=args.measured_selection_metric,
             min_cases=args.min_cases,
             require_multi_shape=args.require_multi_shape,
