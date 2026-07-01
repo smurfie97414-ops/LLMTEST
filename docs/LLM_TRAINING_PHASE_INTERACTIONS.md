@@ -566,7 +566,7 @@ P8 fournit des exemples verifies par route et mesure la capacite par cout effect
 
 ### Entree
 
-P9 recoit le cycle P1, donc les echecs, reussites, fragilites et competences.
+P9 recoit le cycle P1, donc les echecs, reussites, fragilites et competences. Depuis C70, il recoit aussi les spans reels du corpus observes par `observe_input_batch`, decodes avec le tokenizer actif et verifies comme exemples exacts `REAL_EXOGENOUS`.
 
 ### Travail Execute
 
@@ -575,7 +575,7 @@ P9 construit :
 - replay de failures ;
 - exemples tool-solved ;
 - variantes metamorphiques ;
-- reservoir reel/exogene ;
+- reservoir reel/exogene issu des vrais batchs LLM, avec metadata `from_llm_input_batch` et hash de span ;
 - filtre anti-collapse ;
 - schedule de consolidation ;
 - promotion des familles coherentes acceptees en circuits Frontier `sleep_consolidation` ;
@@ -593,11 +593,11 @@ Le filtre rejette les exemples qui menacent :
 
 ### Interaction Avec Les Autres Phases
 
-P9 consolide les signaux de P1/P6/P7/P8/P10 en replay entrainable, puis compile certaines familles acceptees en circuits persistants utilisables par le registre Frontier.
+P9 consolide les signaux de P1/P6/P7/P8/P10 et les spans reels du dataloader en replay entrainable, puis compile certaines familles acceptees en circuits persistants utilisables par le registre Frontier.
 
 ### Impact Apprentissage
 
-P9 est une memoire d'entrainement verifiee et une source de compilation. Elle transforme les corrections lentes et verifiees en exemples causalement entrainables, puis transforme une famille coherente en competence FastSolve held-out gated. Dans le checkpoint, P9 conserve ses replays, ses pools sleep, ses rapports `sleep_frontier_reports`, les compteurs `sleep_frontier_*` et les circuits dans `frontier_registry`.
+P9 est une memoire d'entrainement verifiee et une source de compilation. Elle transforme les corrections lentes, les exemples tool/metamorphiques et les spans reels verifies du corpus en exemples causalement entrainables, puis transforme une famille coherente en competence FastSolve held-out gated. Dans le checkpoint, P9 conserve ses replays, ses pools sleep, les exemples reservoir `REAL_EXOGENOUS` marques `from_llm_input_batch`, ses rapports `sleep_frontier_reports`, les compteurs `sleep_frontier_*` et les circuits dans `frontier_registry`.
 
 ## Phase 10 - Recursive Improvement
 

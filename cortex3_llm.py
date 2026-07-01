@@ -3521,6 +3521,7 @@ def _cortex_architecture_audit_from_summary(summary: Mapping[str, Any]) -> dict[
         phase_count("P9") > 0
         and integer("sleep_replay_examples") > 0
         and integer("sleep_synthetic_examples") > 0
+        and integer("sleep_real_exogenous_llm_examples") > 0
         and integer("replay_batch_count") > 0
         and integer("sleep_frontier_compiled_circuit_count") > 0
         and integer("sleep_frontier_heldout_total") > 0
@@ -3532,6 +3533,7 @@ def _cortex_architecture_audit_from_summary(summary: Mapping[str, Any]) -> dict[
             "P9": phase_count("P9"),
             "sleep_replay_examples": integer("sleep_replay_examples"),
             "sleep_synthetic_examples": integer("sleep_synthetic_examples"),
+            "sleep_real_exogenous_llm_examples": integer("sleep_real_exogenous_llm_examples"),
             "replay_batch_count": integer("replay_batch_count"),
             "sleep_frontier_compiled_circuit_count": integer("sleep_frontier_compiled_circuit_count"),
             "sleep_frontier_heldout_passed": integer("sleep_frontier_heldout_passed"),
@@ -3905,6 +3907,8 @@ def _cortex_phase_deliverable_audit_from_summary(summary: Mapping[str, Any]) -> 
         int(summary.get("sleep_replay_examples", 0) or 0) > 0
         and int(summary.get("sleep_synthetic_examples", 0) or 0) > 0
         and int(summary.get("sleep_reservoir_examples", 0) or 0) > 0
+        and int(summary.get("sleep_real_exogenous_llm_examples", 0) or 0) > 0
+        and count("sleep_real_exogenous_llm_batch_events") > 0
         and count("sleep_metamorphic_examples") > 0
         and count("sleep_anti_collapse_decisions") > 0
         and count("sleep_consolidation_schedule_items") > 0
@@ -3918,6 +3922,8 @@ def _cortex_phase_deliverable_audit_from_summary(summary: Mapping[str, Any]) -> 
             "sleep_replay_examples": int(summary.get("sleep_replay_examples", 0) or 0),
             "sleep_synthetic_examples": int(summary.get("sleep_synthetic_examples", 0) or 0),
             "sleep_reservoir_examples": int(summary.get("sleep_reservoir_examples", 0) or 0),
+            "sleep_real_exogenous_llm_examples": int(summary.get("sleep_real_exogenous_llm_examples", 0) or 0),
+            "sleep_real_exogenous_llm_batch_events": count("sleep_real_exogenous_llm_batch_events"),
             "sleep_metamorphic_examples": count("sleep_metamorphic_examples"),
             "sleep_anti_collapse_decisions": count("sleep_anti_collapse_decisions"),
             "sleep_consolidation_schedule_items": count("sleep_consolidation_schedule_items"),
@@ -4271,6 +4277,89 @@ class CortexTrainingPhaseController:
         if decision.anchor_safety_override:
             self._count("learned_memory_retention_anchor_overrides")
 
+    def _real_exogenous_llm_examples(self) -> tuple[TrainingExample, ...]:
+        return tuple(
+            example
+            for example in self.sleep.reservoir.examples
+            if example.origin == ExampleOrigin.REAL_EXOGENOUS
+            and bool(dict(example.metadata).get("from_llm_input_batch"))
+        )
+
+    def _record_real_exogenous_llm_span(
+        self,
+        *,
+        step: int,
+        source: str,
+        row_index: int,
+        token_ids: Sequence[int],
+        text: str,
+        anchor_count: int,
+    ) -> TrainingExample | None:
+        span = text.strip()
+        if not span:
+            return None
+        span_hash = hashlib.sha256(span.encode("utf-8")).hexdigest()
+        task = Task(
+            f"llm-real-{source}-{step}-{row_index}-{span_hash[:12]}",
+            "instruction_following",
+            "Reproduce this observed LLM corpus span exactly:\n" + span,
+            span,
+            {
+                "source": source,
+                "step": int(step),
+                "row_index": int(row_index),
+                "token_count": int(len(token_ids)),
+                "text_sha256": span_hash,
+                "from_llm_input_batch": True,
+            },
+            group_id=f"llm-real-{span_hash[:16]}",
+        )
+        answer = CandidateAnswer(
+            span,
+            confidence=0.99,
+            certificate={
+                "real_exogenous_llm_span": True,
+                "from_llm_input_batch": True,
+                "text_sha256": span_hash,
+            },
+            cost=CostTrace(generated_tokens=max(1, len(token_ids)), verifier_steps=1),
+        )
+        verification = self.verifier.oracle_registry.verify(task.skill, task, answer)
+        if not verification.passed:
+            raise ValueError(f"real exogenous LLM span failed exact oracle: {verification.reason}")
+        example = self.sleep.reservoir.add(
+            task,
+            answer,
+            source_id=f"{source}-{step}-{row_index}",
+            oracle=task.skill,
+            verification_level=2,
+            difficulty=0.20 + min(0.45, len(token_ids) / max(1.0, float(self.model.config.seq_len)) * 0.45),
+            metadata={
+                "source": source,
+                "step": int(step),
+                "row_index": int(row_index),
+                "token_count": int(len(token_ids)),
+                "anchor_count": int(anchor_count),
+                "text_sha256": span_hash,
+                "from_llm_input_batch": True,
+                "verification_reason": verification.reason,
+                "verification_score": float(verification.score),
+            },
+        )
+        self._count("sleep_real_reservoir_events")
+        self._count("sleep_real_exogenous_llm_batch_events")
+        self._count("sleep_real_exogenous_llm_tokens", len(token_ids))
+        self.uncertainty_ledger.record("llm_real_exogenous_exact_span", answer.confidence, True)
+        self._record_causal_trace(
+            trace_id=f"real-exogenous-{source}-{step}-{row_index}",
+            skill="llm_real_exogenous_exact_span",
+            confidence=answer.confidence,
+            anchors=anchor_count,
+            certificate_fields=answer.certificate.keys(),
+            verifier_level=2,
+        )
+        return example
+
     def _decode_model_token(self, token_id: int) -> str:
         text = self.tokenizer.decode([int(token_id)]).strip()
         return text if text else f"<token:{int(token_id)}>"
@@ -4450,6 +4539,14 @@ class CortexTrainingPhaseController:
                     exact_anchors=anchor_count,
                     note="Exact Anchor Ledger observed decoded LLM input batch",
                 )
+            self._record_real_exogenous_llm_span(
+                step=step,
+                source=source,
+                row_index=row_index,
+                token_ids=token_ids,
+                text=text,
+                anchor_count=anchor_count,
+            )
             if anchor_count:
                 if segment is None:
                     self.input_anchor_fidelity_failures += 1
@@ -5833,6 +5930,7 @@ class CortexTrainingPhaseController:
         frontier_registry_summary = self.frontier_registry.to_dict()
         frontier_heldout_summary = _frontier_heldout_summary(frontier_registry_summary)
         memory_report = self.memory.compression_report()
+        real_exogenous_llm_examples = self._real_exogenous_llm_examples()
         summary = {
             "schema_version": 1,
             "phase_event_counts": phase_counts,
@@ -5918,6 +6016,9 @@ class CortexTrainingPhaseController:
             "sleep_replay_examples": len(self.sleep.replay.examples),
             "sleep_synthetic_examples": len(self.sleep.synthetic.examples),
             "sleep_reservoir_examples": len(self.sleep.reservoir.examples),
+            "sleep_real_exogenous_llm_examples": len(real_exogenous_llm_examples),
+            "sleep_real_exogenous_llm_batch_events": int(self.integration_counts.get("sleep_real_exogenous_llm_batch_events", 0)),
+            "sleep_real_exogenous_llm_tokens": int(self.integration_counts.get("sleep_real_exogenous_llm_tokens", 0)),
             "frontier_compiled_circuit_count": int(frontier_registry_summary["circuit_count"]),
             "frontier_compiled_skill_count": int(frontier_registry_summary["compiled_skill_count"]),
             **frontier_heldout_summary,
@@ -6397,20 +6498,14 @@ class CortexTrainingPhaseController:
         sleep_report = None
         try:
             if cycle_report is not None:
-                real_task = first_failure.task if first_failure is not None else Task(
-                    f"phase-real-{step}",
-                    "instruction_following",
-                    "Output real reservoir status exactly: VERIFIED",
-                    "VERIFIED",
-                )
-                self.sleep.reservoir.add(
-                    real_task,
-                    self._answer_from_task_expected(real_task),
-                    source_id=f"llm-training-{step}",
-                    oracle=real_task.skill,
-                    verification_level=2,
-                )
-                self._count("sleep_real_reservoir_events")
+                real_llm_examples = self._real_exogenous_llm_examples()
+                if not real_llm_examples:
+                    raise ValueError("P9 requires REAL_EXOGENOUS examples sourced from observed LLM input batches before sleep consolidation")
+                audit["sleep_real_exogenous_llm_examples"] = [
+                    example.example_id
+                    for example in real_llm_examples[-4:]
+                ]
+                self._count("sleep_real_exogenous_llm_consumed_events", len(real_llm_examples))
                 sleep_report = self.sleep.ingest_cycle(cycle_report, seed=self.config.seed + step)
                 self._add_sleep_replay(sleep_report.accepted_examples)
                 self._touch("P9")
@@ -6646,6 +6741,7 @@ class CortexTrainingPhaseController:
         frontier_registry_summary = self.frontier_registry.to_dict()
         frontier_heldout_summary = _frontier_heldout_summary(frontier_registry_summary)
         memory_report = self.memory.compression_report()
+        real_exogenous_llm_examples = self._real_exogenous_llm_examples()
         return {
             "schema_version": 1,
             "enabled": True,
@@ -6759,6 +6855,9 @@ class CortexTrainingPhaseController:
                 "sleep_replay_examples": len(self.sleep.replay.examples),
                 "sleep_synthetic_examples": len(self.sleep.synthetic.examples),
                 "sleep_reservoir_examples": len(self.sleep.reservoir.examples),
+                "sleep_real_exogenous_llm_examples": len(real_exogenous_llm_examples),
+                "sleep_real_exogenous_llm_batch_events": int(self.integration_counts.get("sleep_real_exogenous_llm_batch_events", 0)),
+                "sleep_real_exogenous_llm_tokens": int(self.integration_counts.get("sleep_real_exogenous_llm_tokens", 0)),
                 "frontier_compiled_circuit_count": int(frontier_registry_summary["circuit_count"]),
                 "frontier_compiled_skill_count": int(frontier_registry_summary["compiled_skill_count"]),
                 **frontier_heldout_summary,
@@ -6888,6 +6987,9 @@ class CortexTrainingPhaseController:
                     "sleep_replay_examples": len(self.sleep.replay.examples),
                     "sleep_synthetic_examples": len(self.sleep.synthetic.examples),
                     "sleep_reservoir_examples": len(self.sleep.reservoir.examples),
+                    "sleep_real_exogenous_llm_examples": len(real_exogenous_llm_examples),
+                    "sleep_real_exogenous_llm_batch_events": int(self.integration_counts.get("sleep_real_exogenous_llm_batch_events", 0)),
+                    "sleep_real_exogenous_llm_tokens": int(self.integration_counts.get("sleep_real_exogenous_llm_tokens", 0)),
                     "frontier_compiled_circuit_count": int(frontier_registry_summary["circuit_count"]),
                     "frontier_compiled_skill_count": int(frontier_registry_summary["compiled_skill_count"]),
                     **frontier_heldout_summary,
@@ -7002,6 +7104,9 @@ class CortexTrainingPhaseController:
                     "sleep_replay_examples": len(self.sleep.replay.examples),
                     "sleep_synthetic_examples": len(self.sleep.synthetic.examples),
                     "sleep_reservoir_examples": len(self.sleep.reservoir.examples),
+                    "sleep_real_exogenous_llm_examples": len(real_exogenous_llm_examples),
+                    "sleep_real_exogenous_llm_batch_events": int(self.integration_counts.get("sleep_real_exogenous_llm_batch_events", 0)),
+                    "sleep_real_exogenous_llm_tokens": int(self.integration_counts.get("sleep_real_exogenous_llm_tokens", 0)),
                     **frontier_heldout_summary,
                     "sleep_frontier_fastsolve_events": int(self.integration_counts.get("sleep_frontier_fastsolve_events", 0)),
                     "regrowth_model_application_count": len(self.regrowth_model_applications),

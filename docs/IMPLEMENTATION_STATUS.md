@@ -226,20 +226,21 @@ Current executable coverage:
 
 - `FailureReplayBuffer` converts verifier regressions into replay examples with corrected oracle labels.
 - `VerifiedSyntheticDataPool` refuses synthetic examples unless they carry origin, oracle, targeted skill, verification level, contamination risk, difficulty and confidence label.
-- `RealExogenousReservoir` stores non-synthetic external examples separately from synthetic training data.
+- `RealExogenousReservoir` stores non-synthetic external examples separately from synthetic training data and accepts provenance metadata for exact source tracking.
 - `ToolSolvedExampleFactory` creates tool/oracle-solved examples and rejects solver outputs that fail verification.
 - `MetamorphicFamilyBuilder` creates metamorphic and anti-metamorphic families from existing `SkillSpec` hooks, with oracle-verified labels.
 - `AntiCollapseFilter` rejects unlabeled synthetic data, high-contamination examples, duplicate prompts, calibration-gap increases and large-batch diversity collapse.
 - `DiversityMetrics` tracks skill counts, origin counts, unique prompt ratio, skill entropy, origin entropy, rare-skill fraction and average contamination risk.
 - `SkillConsolidationScheduler` prioritizes protected/fragile skills, applies an explicit rare-skill boost and schedules only examples accepted by the anti-collapse filter.
 - `SleepPhaseConsolidator` orchestrates failure replay, tool-solved examples, metamorphic families, real/exogenous examples, anti-collapse filtering and scheduling from a `CycleReport`.
+- The full LLM phase controller now populates the real/exogenous reservoir from decoded `observe_input_batch` token spans, verifies each span with the exact instruction-following oracle, persists `from_llm_input_batch` provenance, and rejects P9 consolidation if no real LLM span has reached the reservoir.
 - `SleepPhaseReport` now records baseline, accepted and scheduled rare-skill fractions plus rare-skill gain, diversity delta and calibration-gap delta, making the Phase 9 success criteria directly inspectable.
 - `write_cycle_run` can persist sleep phase reports into `summary.json`.
 - `tools/run_cycle_report.py` writes Phase 9 sleep traces by default unless `--skip-sleep` is passed.
 - The full LLM trainer tokenizes accepted sleep examples with the active BPE tokenizer and replays them as causal batches in the Cortex loss.
 - `FrontierSkillDiscovery.compile_sleep_consolidation` now promotes accepted sleep examples by coherent consolidation family into held-out gated `BitLinear` micro-circuits with `training.source_kind="sleep_consolidation"`.
 - The full LLM phase controller saves those sleep-promoted circuits into the persistent Frontier registry, binds them into P4 cognitive memory, immediately verifies a `CompiledFrontierAgent` FastSolve on the exact promoted circuit, adds verified P9 replay from the compiled answer, and feeds the circuit into P10 as a `compiled_frontier` proposal.
-- Architecture and deliverable audits now reject P9 if sleep consolidation only creates replay; they require nonzero `sleep_frontier_compiled_circuit_count`, held-out pass equality, P4 memory binding and `sleep_frontier_fastsolve_events`.
+- Architecture and deliverable audits now reject P9 if sleep consolidation only creates replay or only uses internally fabricated "real" tasks; they require nonzero `sleep_real_exogenous_llm_examples`, `sleep_real_exogenous_llm_batch_events`, `sleep_frontier_compiled_circuit_count`, held-out pass equality, P4 memory binding and `sleep_frontier_fastsolve_events`.
 - Cortex phase replay batches, including Phase 9 sleep/consolidation examples, future-contract ledger decisions, bounded ternary compression trace histories, cognitive-memory segments, compiled-circuit bindings, sleep pools and recursive-improvement archive summaries are now saved in checkpoints and restored on resume, so long runs do not lose P4/P9/P10 context, P2 instrumentation or P3 contract state after interruption.
 - Resume validation now proves sleep/frontier circuits are not only present in reports: a restored compiled circuit is executed through FastSolve with restored P4 memory before training continues.
 - `CompressionTraceLedger` keeps total P2 event counters and aggregate effective-cost inputs separately from retained detailed events; the LLM harness limits retained detailed traces with `cortex_trace_retention_limit` to prevent long GPU runs from growing trace memory without bound.

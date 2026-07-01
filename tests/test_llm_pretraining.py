@@ -3324,6 +3324,9 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             self.assertTrue(influence["compiled_circuit_memory_bindings"])
             self.assertGreater(influence["sleep_replay_examples"], 0)
             self.assertGreater(influence["sleep_synthetic_examples"], 0)
+            self.assertGreater(influence["sleep_real_exogenous_llm_examples"], 0)
+            self.assertGreater(influence["sleep_real_exogenous_llm_batch_events"], 0)
+            self.assertGreater(influence["sleep_real_exogenous_llm_tokens"], 0)
             self.assertGreater(influence["frontier_compiled_circuit_count"], 0)
             self.assertGreater(influence["frontier_compiled_skill_count"], 0)
             self.assertGreater(influence["frontier_heldout_total"], 0)
@@ -3652,6 +3655,17 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 )
                 self.assertGreater(len(checkpoint["cortex_phase_state"]["sleep_state"]["replay_examples"]), 0)
                 self.assertGreater(len(checkpoint["cortex_phase_state"]["sleep_state"]["synthetic_examples"]), 0)
+                reservoir_examples = checkpoint["cortex_phase_state"]["sleep_state"]["reservoir_examples"]
+                self.assertGreater(len(reservoir_examples), 0)
+                self.assertTrue(
+                    any(
+                        item["origin"] == "real_exogenous"
+                        and item["metadata"].get("from_llm_input_batch")
+                        and item["metadata"].get("text_sha256")
+                        for item in reservoir_examples
+                    ),
+                    reservoir_examples,
+                )
                 improvement_archive = checkpoint["cortex_phase_state"]["improvement_state"]["archive"]
                 self.assertGreater(
                     improvement_archive["accepted_count"] + improvement_archive["rejected_count"],

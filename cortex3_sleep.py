@@ -182,7 +182,11 @@ class RealExogenousReservoir:
         oracle: str = "external",
         verification_level: int = 1,
         difficulty: float | None = None,
+        metadata: Mapping[str, Any] | None = None,
     ) -> TrainingExample:
+        provenance = {"source_id": source_id}
+        if metadata:
+            provenance.update(dict(metadata))
         example = TrainingExample(
             example_id=f"real-{source_id}-{task.task_id}",
             task=task,
@@ -195,7 +199,7 @@ class RealExogenousReservoir:
             difficulty=_task_difficulty(task) if difficulty is None else max(0.0, min(1.0, difficulty)),
             confidence_label=None,
             synthetic=False,
-            metadata={"source_id": source_id},
+            metadata=provenance,
         )
         self.examples.append(example)
         if len(self.examples) > self.max_size:
