@@ -9071,6 +9071,10 @@ def run_llm_batch_profile_matrix(
     min_cases: int = 1,
     require_multi_shape: bool = False,
     require_multi_seed: bool = False,
+    min_train_tokens_per_second_mean: float = 0.0,
+    min_gpu_utilization_percent_mean: float = 0.0,
+    min_gpu_memory_used_mb_mean: float = 0.0,
+    min_gpu_power_draw_watts_mean: float = 0.0,
     default_batch_size: int = 8,
     overwrite: bool = False,
 ) -> Mapping[str, Any]:
@@ -9182,6 +9186,35 @@ def run_llm_batch_profile_matrix(
     gpu_avg_values = [float(row["gpu_utilization_percent_avg"]) for row in csv_rows if float(row["gpu_utilization_percent_avg"]) > 0.0]
     power_avg_values = [float(row["gpu_power_draw_watts_avg"]) for row in csv_rows if float(row["gpu_power_draw_watts_avg"]) > 0.0]
     vram_avg_values = [float(row["gpu_memory_used_mb_avg"]) for row in csv_rows if float(row["gpu_memory_used_mb_avg"]) > 0.0]
+    train_tokens_per_second_wall_mean = float(statistics.fmean(tokens_per_second_values)) if tokens_per_second_values else 0.0
+    gpu_utilization_percent_case_mean = float(statistics.fmean(gpu_avg_values)) if gpu_avg_values else 0.0
+    gpu_power_draw_watts_case_mean = float(statistics.fmean(power_avg_values)) if power_avg_values else 0.0
+    gpu_memory_used_mb_case_mean = float(statistics.fmean(vram_avg_values)) if vram_avg_values else 0.0
+    threshold_checks = {
+        "min_train_tokens_per_second_mean": {
+            "required": float(min_train_tokens_per_second_mean),
+            "observed": train_tokens_per_second_wall_mean,
+            "passed": train_tokens_per_second_wall_mean >= float(min_train_tokens_per_second_mean),
+        },
+        "min_gpu_utilization_percent_mean": {
+            "required": float(min_gpu_utilization_percent_mean),
+            "observed": gpu_utilization_percent_case_mean,
+            "passed": gpu_utilization_percent_case_mean >= float(min_gpu_utilization_percent_mean),
+        },
+        "min_gpu_memory_used_mb_mean": {
+            "required": float(min_gpu_memory_used_mb_mean),
+            "observed": gpu_memory_used_mb_case_mean,
+            "passed": gpu_memory_used_mb_case_mean >= float(min_gpu_memory_used_mb_mean),
+        },
+        "min_gpu_power_draw_watts_mean": {
+            "required": float(min_gpu_power_draw_watts_mean),
+            "observed": gpu_power_draw_watts_case_mean,
+            "passed": gpu_power_draw_watts_case_mean >= float(min_gpu_power_draw_watts_mean),
+        },
+    }
+    for check_name, check in threshold_checks.items():
+        if float(check["required"]) > 0.0 and not bool(check["passed"]):
+            failed_checks.append(check_name)
     summary = {
         "case_count": case_count,
         "passed_cases": passed_cases,
@@ -9189,12 +9222,13 @@ def run_llm_batch_profile_matrix(
         "seed_count": seed_count,
         "total_planned_train_tokens": total_planned_tokens,
         "wall_seconds": float(max(1e-9, time.time() - started)),
-        "train_tokens_per_second_wall_mean": float(statistics.fmean(tokens_per_second_values)) if tokens_per_second_values else 0.0,
-        "gpu_utilization_percent_case_mean": float(statistics.fmean(gpu_avg_values)) if gpu_avg_values else 0.0,
-        "gpu_power_draw_watts_case_mean": float(statistics.fmean(power_avg_values)) if power_avg_values else 0.0,
-        "gpu_memory_used_mb_case_mean": float(statistics.fmean(vram_avg_values)) if vram_avg_values else 0.0,
+        "train_tokens_per_second_wall_mean": train_tokens_per_second_wall_mean,
+        "gpu_utilization_percent_case_mean": gpu_utilization_percent_case_mean,
+        "gpu_power_draw_watts_case_mean": gpu_power_draw_watts_case_mean,
+        "gpu_memory_used_mb_case_mean": gpu_memory_used_mb_case_mean,
         "strict_extension_only_cases": sum(1 for case in cases if bool(case.get("kernel_evidence", {}).get("strict_extension_only"))),
         "all_phases_active_cases": sum(1 for case in cases if bool(case.get("architecture", {}).get("all_phases_active"))),
+        "threshold_checks": threshold_checks,
     }
     matrix = {
         "schema_version": 1,
@@ -9216,6 +9250,10 @@ def run_llm_batch_profile_matrix(
             "min_cases": int(min_cases),
             "require_multi_shape": bool(require_multi_shape),
             "require_multi_seed": bool(require_multi_seed),
+            "min_train_tokens_per_second_mean": float(min_train_tokens_per_second_mean),
+            "min_gpu_utilization_percent_mean": float(min_gpu_utilization_percent_mean),
+            "min_gpu_memory_used_mb_mean": float(min_gpu_memory_used_mb_mean),
+            "min_gpu_power_draw_watts_mean": float(min_gpu_power_draw_watts_mean),
         },
         "summary": summary,
         "cases": tuple(cases),
@@ -9409,6 +9447,10 @@ def main(argv: Sequence[str] | None = None) -> None:
     profile_matrix.add_argument("--min-cases", type=int, default=1)
     profile_matrix.add_argument("--require-multi-shape", action="store_true")
     profile_matrix.add_argument("--require-multi-seed", action="store_true")
+    profile_matrix.add_argument("--min-train-tokens-per-second-mean", type=float, default=0.0)
+    profile_matrix.add_argument("--min-gpu-utilization-percent-mean", type=float, default=0.0)
+    profile_matrix.add_argument("--min-gpu-memory-used-mb-mean", type=float, default=0.0)
+    profile_matrix.add_argument("--min-gpu-power-draw-watts-mean", type=float, default=0.0)
     profile_matrix.add_argument("--overwrite", action="store_true", help="delete and recreate the output directory instead of failing when it exists")
     profile_matrix.add_argument("--native-ternary-backend", choices=NATIVE_TERNARY_BACKEND_CHOICES, default=STRICT_NATIVE_TERNARY_BACKEND)
 
@@ -9744,6 +9786,10 @@ def main(argv: Sequence[str] | None = None) -> None:
             min_cases=args.min_cases,
             require_multi_shape=args.require_multi_shape,
             require_multi_seed=args.require_multi_seed,
+            min_train_tokens_per_second_mean=args.min_train_tokens_per_second_mean,
+            min_gpu_utilization_percent_mean=args.min_gpu_utilization_percent_mean,
+            min_gpu_memory_used_mb_mean=args.min_gpu_memory_used_mb_mean,
+            min_gpu_power_draw_watts_mean=args.min_gpu_power_draw_watts_mean,
             overwrite=args.overwrite,
         )
         print(json.dumps(report, indent=2, sort_keys=True, default=_json_default))

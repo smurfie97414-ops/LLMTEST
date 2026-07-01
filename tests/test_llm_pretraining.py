@@ -137,9 +137,40 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             self.assertEqual(payload["summary"]["seed_count"], 2)
             self.assertEqual(payload["summary"]["all_phases_active_cases"], 4)
             self.assertGreater(payload["summary"]["total_planned_train_tokens"], 0)
+            self.assertTrue(payload["summary"]["threshold_checks"]["min_train_tokens_per_second_mean"]["passed"])
             self.assertEqual(len(payload["cases"]), 4)
             self.assertTrue(all(case["architecture"]["all_phases_active"] for case in payload["cases"]))
             self.assertEqual(report["summary"]["case_count"], 4)
+
+    def test_llm_batch_profile_matrix_resource_thresholds_are_blocking(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            report = run_llm_batch_profile_matrix(
+                out_dir=root / "matrix",
+                shape_specs=(
+                    {"seq_len": 32, "d_model": 32, "n_heads": 4, "n_layers": 1, "batch_size": 4},
+                ),
+                seeds=(11,),
+                steps=1,
+                gradient_accumulation_steps=1,
+                vocab_size=128,
+                precision="fp32",
+                device="cpu",
+                require_cuda=False,
+                resource_interval=0.01,
+                min_resource_samples=1,
+                corpus_repeats=64,
+                max_corpus_tokens=2048,
+                min_cases=1,
+                min_train_tokens_per_second_mean=1e12,
+            )
+
+            self.assertFalse(report["passed"])
+            self.assertIn("min_train_tokens_per_second_mean", report["failed_checks"])
+            threshold = report["summary"]["threshold_checks"]["min_train_tokens_per_second_mean"]
+            self.assertFalse(threshold["passed"])
+            self.assertEqual(threshold["required"], 1e12)
+            self.assertGreater(threshold["observed"], 0.0)
 
     def test_cuda_ternary_training_contract_is_strict_extension(self):
         loose_config = TransformerConfig(

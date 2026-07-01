@@ -53,7 +53,7 @@ Remaining:
 
 - Feed layer-forward traces into persisted cycle reports outside inference-specific trace summaries.
 - Use layer-forward traces as first-class evidence in causal attribution block probes.
-- Broaden latency/VRAM/energy evidence from the strict real-batch multi-shape/multi-seed profile matrix to larger and longer LLM batches.
+- Add automatic batch/shape sizing under a VRAM budget, then broaden latency/VRAM/energy evidence from the strict real-batch multi-shape/multi-seed profile matrix to larger and longer LLM batches.
 
 ## Phase 3 - MTP/FSP under contract
 
