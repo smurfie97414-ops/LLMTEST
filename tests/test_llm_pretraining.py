@@ -45,6 +45,7 @@ from cortex3_llm import (
     inspect_llm_experiment,
     llm_doctor_report,
     main as llm_main,
+    run_llm_batch_profile,
 )
 from tools.benchmark_learned_memory_policy import run_learned_memory_ablation
 from tools.launch_llm_ddp import _manifest_requests_cuda, _train_args_request_cuda
@@ -54,6 +55,48 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
     def _corpus(self, root: Path, *, repeats: int = 80) -> TextCorpusConfig:
         files = build_seed_corpus(root / "text", repeats=repeats)
         return TextCorpusConfig.from_paths(files, min_chars_per_chunk=512)
+
+    def test_llm_batch_profile_writes_throughput_resource_and_architecture_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            report = run_llm_batch_profile(
+                out_dir=root / "profile",
+                steps=1,
+                batch_size=1,
+                gradient_accumulation_steps=1,
+                seq_len=16,
+                d_model=32,
+                n_heads=4,
+                n_layers=1,
+                vocab_size=128,
+                precision="fp32",
+                device="cpu",
+                require_cuda=False,
+                resource_interval=0.01,
+                min_resource_samples=1,
+                corpus_repeats=64,
+                max_corpus_tokens=1024,
+            )
+
+            profile_path = root / "profile" / "llm_batch_profile.json"
+            self.assertTrue(profile_path.exists())
+            payload = json.loads(profile_path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["schema_version"], 1)
+            self.assertGreater(payload["throughput"]["planned_train_tokens"], 0)
+            self.assertGreater(payload["throughput"]["train_tokens_per_second_wall"], 0.0)
+            self.assertIn("process_memory_rss_bytes", payload["resource_usage"]["metrics"])
+            self.assertIn("training_report", payload)
+            self.assertTrue(payload["architecture"]["all_phases_active"], payload["architecture"])
+            self.assertEqual(payload["torch_cuda_memory"]["after"]["enabled"], False)
+            self.assertEqual(report["run_dir"], str(root / "profile"))
+
+    def test_llm_batch_profile_refuses_existing_output_without_overwrite(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp) / "profile"
+            out_dir.mkdir()
+
+            with self.assertRaises(FileExistsError):
+                run_llm_batch_profile(out_dir=out_dir, steps=1, device="cpu")
 
     def test_cuda_ternary_training_contract_is_strict_extension(self):
         loose_config = TransformerConfig(

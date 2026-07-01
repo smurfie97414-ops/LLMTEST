@@ -737,16 +737,17 @@ Etat actuel :
 - les buffers packes sont resynchronises par version de poids, donc pas repackes a chaque forward inutilement, puis explicitement requantifies apres optimizer step et apres patchs P7/P10 ;
 - les traces P2 prouvent une execution ternaire-compatible pendant le run ;
 - un smoke test CUDA verifie les backends natifs sur GPU local avec gradient STE non nul ;
+- `tools/train_llm.py profile-batch` lance un vrai batch training Cortex strict avec optimizer, backward, requantize, P1-P10, monitoring CPU/GPU/power/VRAM et snapshot memoire CUDA torch ;
 - `tools/benchmark_ternary_kernel.py` fournit un benchmark reproductible du kernel natif contre unpack+`F.linear`.
 
 Limite restante :
 
-- les kernels natifs actuels couvrent deja une variante tuilée shared-memory, une variante warp-reduction, un forward WMMA fp16/bf16 decode-shared, un backend extension C++/CUDA strict, un autotune mesure/cache par shape, un profil JSON persistant, WMMA fp16/bf16 pour `grad_input` aligne/padde et WMMA fp16/bf16->fp32 pour `grad_weight` aligne/padde, mais doivent encore etre mesures en VRAM/energie sur grands batchs LLM ;
-- les benchmarks doivent etre elargis a VRAM, energie estimee, tailles LLM reelles et qualite de convergence.
+- les kernels natifs actuels couvrent deja une variante tuilée shared-memory, une variante warp-reduction, un forward WMMA fp16/bf16 decode-shared, un backend extension C++/CUDA strict, un autotune mesure/cache par shape, un profil JSON persistant, WMMA fp16/bf16 pour `grad_input` aligne/padde et WMMA fp16/bf16->fp32 pour `grad_weight` aligne/padde, et le profil court `runs/llm-batch-profile-v1/llm_batch_profile.json` mesure deja un vrai batch bf16 CUDA avec `passed=true`, `native_ternary_backend_counts={"extension":1417}`, all phases active, throughput `117.646` tokens/s, GPU moyen `10.344%`, puissance moyenne `37.702 W`, VRAM moyenne `971.812 MB` et pic CUDA torch `34,972,160` bytes ;
+- les benchmarks doivent etre elargis a plusieurs tailles LLM reelles, seeds, durees et qualite de convergence.
 
 Critere de fermeture :
 
-- profiler VRAM, energie, throughput et remplissage GPU sur shapes LLM plus grandes sans retirer de composants ;
+- profiler VRAM, energie, throughput et remplissage GPU sur shapes LLM plus grandes et plusieurs seeds sans retirer de composants ;
 - benchmarker latence, VRAM, energie estimee, throughput et qualite face a une baseline dense sur runs LLM larges.
 
 ### Verifier Dynamique A Grande Echelle

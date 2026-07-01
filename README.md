@@ -165,6 +165,14 @@ python tools/benchmark_learned_memory_policy.py --device cuda
 
 Le doctor distingue le backend RawKernel et le backend extension. Sur ce PC, `tools/train_llm.py doctor --require-cuda --require-cuda-extension --precision bf16 --device cuda` passe avec `native_rawkernel_available=true`, `native_extension_runtime_available=true`, `nvcc=12.8` depuis `C:\Users\hight\.codex\cuda-12.8\Library` et Visual Studio Build Tools 2022. Le smoke strict `tools/train_llm.py smoke --device cuda --require-cuda --steps 2` utilise l'extension par défaut, résout `precision=auto` en `fp16`, et produit un rapport avec `native_ternary_backend_counts={'extension': 2185}`, `native_ternary_requantize_backend_counts={'extension': 230}`, `native_ternary_grad_weight_backend_counts={'extension': 160}`, `native_ternary_grad_input_kernel_counts={'warp': 152, 'wmma_fp16': 8}`, `native_ternary_grad_weight_kernel_counts={'tiled': 152, 'wmma_fp16_float': 8}`, `torch_packed_ternary_dispatches=0`, `strict_extension_only=true`, et les audits P2/architecture passent avec exigence native explicite. Le smoke strict `tools/train_llm.py smoke --out-dir runs/llm-smoke-bf16-forward-wmma-v7 --device cuda --require-cuda --precision bf16 --steps 2` passe aussi avec `native_ternary_backend_counts={'extension': 2191}`, `native_ternary_kernel_variants=['tiled_shared_memory_int2','warp_reduction_int2','wmma_tensor_core_int2']`, `native_ternary_requantize_backend_counts={'extension': 230}`, `native_ternary_grad_weight_backend_counts={'extension': 162}`, `native_ternary_grad_input_kernel_counts={'warp': 154, 'wmma_bf16': 8}`, `native_ternary_grad_weight_kernel_counts={'tiled': 154, 'wmma_bf16_float': 8}` et audits architecture/deliverable passants. Ces smokes courts prouvent le branchement architecture; le proof gate comparatif reste volontairement `false` sur 2 steps si la baseline a un score nul, pour éviter une victoire artificielle.
 
+Pour mesurer un vrai batch LLM Cortex strict avec throughput, VRAM, puissance et usage CPU/GPU, sans lancer un test long :
+
+```bash
+python tools/train_llm.py profile-batch --out-dir runs/llm-batch-profile-v1 --overwrite --device cuda --require-cuda --precision bf16 --steps 2 --batch-size 8 --gradient-accumulation-steps 1 --seq-len 32 --d-model 64 --n-heads 4 --n-layers 2 --resource-interval 0.05 --min-resource-samples 2
+```
+
+Ce profil écrit `llm_batch_profile.json`, refuse d'écraser un dossier existant sans `--overwrite`, et échoue si une brique Cortex complète manque, si le backend CUDA strict ne reste pas `extension`, si les samples GPU/VRAM/puissance sont absents ou si le pic mémoire CUDA torch reste nul. Le run local court RTX 5070 passe avec `passed=true`, `native_ternary_backend_counts={"extension":1417}`, variants `tiled_shared_memory_int2/warp_reduction_int2/wmma_tensor_core_int2`, toutes les phases P1-P10 actives, `512` tokens entraînés planifiés, `117.646` tokens/s wall-clock, GPU moyen `10.344%`, GPU max `16%`, puissance moyenne `37.702 W`, VRAM moyenne `971.812 MB`, CPU process moyen `6.070%` du total et pic CUDA torch alloué `34,972,160` bytes.
+
 `tools/benchmark_learned_memory_policy.py` exécute une ablation courte contrôlée : mêmes poids partagés, mémoire apprise active contre mémoire désactivée, puis entraînement de la seule politique exact/latent/drop. Le rapport JSON expose les losses avant/après, le gradient mémoire, les décisions exact/latent/drop et le delta `before - after`.
 
 ## Démo noyau
@@ -340,7 +348,7 @@ python -m pytest tests/test_llm_pretraining.py -q
 ## Roadmap immédiate
 
 1. Durcir Phase 1 jusqu'au statut Verifier OS complet : coût par cas réel, familles génératives plus larges, tests de faux positifs/faux négatifs d'oracle.
-2. Durcir Phase 2 au-delà de la matrice WMMA courte : élargir les shapes forward/backward réelles, puis benchmarker latence/VRAM/énergie sous vrais batchs LLM.
+2. Durcir Phase 2 au-delà du profil batch LLM court : élargir les shapes forward/backward réelles, puis répéter latence/VRAM/énergie/throughput sur batchs LLM plus grands et multi-seed.
 3. Étendre Phase 3 vers des suites held-out plus larges, benchmarks MTP vs NTP et contrats FSP orientés objectifs de sortie.
 4. Étendre Phase 4 au-delà de l'ablation courte actuelle avec benchmarks coût/qualité de la politique mémoire apprise exact/latent/drop sur long contexte et held-out anchors.
 5. Étendre Phase 5 avec vérification algébrique multi-étapes, tests code plus riches et mesure held-out des économies de tokens de certificat.

@@ -1,6 +1,6 @@
 # Cortex-3 Architecture Self-Critique
 
-Etat: boucle d'audit 15 apres integration du backend PyTorch C++/CUDA extension strict par defaut dans le vrai training `BitLinear`, avec forward packe tuilé/warp/WMMA fp16-bf16 autotuné, backward `grad_input` WMMA fp16/bf16 aligne ou padde sur bords non multiples de 16, backward `grad_weight` + `grad_bias` WMMA fp16/bf16->fp32 aligne ou padde sur bords non multiples de 16, kernels warp/tiled hand-written pour les petites formes, requantization/packing post-update, compteurs backend/requantize/grad-input/grad-weight explicites, precision CLI `auto -> fp16` sur CUDA, precision `bf16` executable sur smoke LLM CUDA, doctor strict et smoke LLM CUDA sans fallback autorise.
+Etat: boucle d'audit 16 apres integration du backend PyTorch C++/CUDA extension strict par defaut dans le vrai training `BitLinear`, avec forward packe tuilé/warp/WMMA fp16-bf16 autotuné, backward `grad_input` WMMA fp16/bf16 aligne ou padde sur bords non multiples de 16, backward `grad_weight` + `grad_bias` WMMA fp16/bf16->fp32 aligne ou padde sur bords non multiples de 16, kernels warp/tiled hand-written pour les petites formes, requantization/packing post-update, compteurs backend/requantize/grad-input/grad-weight explicites, precision CLI `auto -> fp16` sur CUDA, precision `bf16` executable sur smoke LLM CUDA, doctor strict, smoke LLM CUDA sans fallback autorise, et profil batch LLM Cortex strict qui mesure throughput, CPU/GPU, puissance, VRAM `nvidia-smi` et memoire CUDA torch.
 
 Ce document sert de registre de critique et de correction. Il ne remplace pas les tests longs interdits pour cette iteration; il se limite aux preuves courtes disponibles, aux rapports du code et aux benchmarks GPU courts.
 
@@ -179,9 +179,19 @@ Ce document sert de registre de critique et de correction. Il ne remplace pas le
 - Benchmark strict BF16 RTX 5070: la matrice `256x768x768` + `255x769x771` passe avec variant forward `wmma_tensor_core_int2`, `native_ms=0.0973/0.1369`, `native_vs_unpack=7.57x/3.38x`, `full_forward_ms=0.0879/0.1372`, speedup forward/backward moyen `1.65x`, min `1.42x`, `strict_extension_only=true`.
 - Integration LLM: le smoke strict `tools\train_llm.py smoke --out-dir runs\llm-smoke-bf16-forward-wmma-v7 --device cuda --require-cuda --precision bf16 --steps 2` garde `native_ternary_backend_counts={'extension': 2191}`, `native_ternary_kernel_variants=['tiled_shared_memory_int2','warp_reduction_int2','wmma_tensor_core_int2']`, `native_ternary_requantize_backend_counts={'extension': 230}`, `native_ternary_grad_weight_backend_counts={'extension': 162}`, `native_ternary_grad_input_kernel_counts={'warp': 154, 'wmma_bf16': 8}`, `native_ternary_grad_weight_kernel_counts={'tiled': 154, 'wmma_bf16_float': 8}` et les audits architecture/deliverable passants.
 - Limite: le speedup forward/backward global peut varier avec la baseline dense courte et le bruit GPU; l'amelioration locale du forward est nette, mais les mesures VRAM/energie longues et la preuve Cortex > baseline sur corpus large restent hors tests courts autorises.
-- Statut: corrige pour le goulet forward packed grand format observe sans fallback dense. Restent a durcir: occupation GPU/VRAM/energie sur vrais batchs, multi-shape plus large, puis preuve comparative longue.
+- Statut: corrige pour le goulet forward packed grand format observe sans fallback dense. Le profil batch LLM court est traite par C22; restent a durcir: multi-shape plus large, multi-seed, durees plus longues et preuve comparative longue.
 
-## Critique phase par phase - boucle 15
+### C22. Profil batch LLM reel absent du gate court
+
+- Critique: apres C21, les benchmarks kernel et smokes prouvaient le backend strict, mais ils ne donnaient pas un artefact unique de training LLM Cortex reel avec optimizer/backward/requantize/P1-P10, throughput wall-clock, CPU/GPU moyen, puissance, VRAM `nvidia-smi` et pic memoire CUDA torch. On pouvait donc encore confondre "kernel rapide" et "batch LLM complet mesure".
+- Correction: ajout de `run_llm_batch_profile` et de la commande `tools/train_llm.py profile-batch`. Le profil prepare un corpus deterministe, tokenise, construit le manifeste, lance `LLMTrainer.train` avec Cortex complet, force `native_ternary_backend=extension` et `require_native_ternary_kernel=true` sur CUDA, puis ecrit `llm_batch_profile.json` avec `training_report`, `run_plan`, `throughput`, `resource_usage`, `torch_cuda_memory`, `kernel_evidence`, `architecture`, `hardware`, `failed_checks` et `passed`.
+- Gate: le profil echoue si les samples ressource manquent, si les tokens planifies sont nuls, si l'audit architecture/deliverable echoue, si CUDA strict n'observe pas seulement le backend extension, si GPU util/memoire/puissance manquent sur CUDA, ou si le pic memoire CUDA torch reste nul alors que CUDA est requis.
+- Verification courte CPU: `test_llm_batch_profile_writes_throughput_resource_and_architecture_report` verifie l'ecriture du JSON, le throughput positif, le monitor process, le rapport training, toutes les phases actives et le snapshot CUDA desactive en CPU.
+- Verification courte CUDA RTX 5070: `tools\train_llm.py profile-batch --out-dir runs\llm-batch-profile-v1 --overwrite --device cuda --require-cuda --precision bf16 --steps 2 --batch-size 8 --gradient-accumulation-steps 1 --seq-len 32 --d-model 64 --n-heads 4 --n-layers 2 --resource-interval 0.05 --min-resource-samples 2` passe avec `passed=true`, `failed_checks=[]`, `native_ternary_backend_counts={"extension":1417}`, variants `tiled_shared_memory_int2/warp_reduction_int2/wmma_tensor_core_int2`, all phases active, 512 tokens train planifies, `117.646` tokens/s wall-clock, GPU moyen `10.344%`, GPU max `16%`, puissance moyenne `37.702 W`, VRAM moyenne `971.812 MB`, CPU process moyen `6.070%` du total et pic CUDA torch alloue `34,972,160` bytes.
+- Limite: ce profil est volontairement court pour respecter l'interdiction de tests longs; il ne prouve pas encore saturation GPU, multi-seed, multi-shape large ni victoire Cortex > baseline sur corpus massif.
+- Statut: corrige pour le trou "vrai batch LLM profile court". Restent a durcir: profils batchs plus grands/multi-shapes/multi-seeds quand autorises, puis preuve comparative longue.
+
+## Critique phase par phase - boucle 16
 
 ### P1 - Verifier OS
 
@@ -194,10 +204,10 @@ Ce document sert de registre de critique et de correction. Il ne remplace pas le
 ### P2 - Ternary Core
 
 - Ce qui est solide: poids ternaires packes int2, quantization activations, STE, sync versionnee des buffers packes pendant training, kernels CUDA natifs tuiles/warp, forward WMMA fp16/bf16 decode-shared depuis int2 packe, autotune CUDA-event par shape avec candidats `tiled/warp/wmma`, profil JSON persistant, cache layer-local, fast STE autograd forward, backward CUDA `grad_input` depuis poids int2 packes, WMMA fp16/bf16 `grad_input` aligne ou padde, WMMA fp16/bf16->fp32 `grad_weight` + `grad_bias` aligne ou padde, requantization/packing post-update fusionnee CUDA, backend extension C++/CUDA strict par defaut, doctor CUDA distinguant RawKernel et extension runtime, audit LLM exigeant native forward/requantize/grad_weight exclusivement extension en training CUDA strict.
-- Preuve actuelle: tests CUDA courts, export/import profil, tests gradients fast-vs-dense STE en fp32/fp16/bf16, test de parite requantize/pack fp32/fp16/bf16, tests WMMA forward/grad-input/grad-weight fp16/bf16 alignes et edge, test extension forcee, doctor toolchain strict, benchmark RTX 5070 avec full forward/backward et requantize/pack profile, matrice strict extension 3 shapes avec monitoring soutenu GPU/CPU/power, matrice LLM-shape WMMA fp16 `256x768x768` + `512x1024x1024`, matrice edge WMMA fp16 paddee `255x769x771` + `511x1025x1027`, matrice BF16 WMMA `256x768x768` + `255x769x771`, matrices forward-WMMA v7 fp16/bf16, smoke LLM fp16/bf16 extension avec dispatches forward/requantize/grad_weight extension et compteurs WMMA `grad_input`/`grad_weight` positifs.
-- Faiblesse: pas de mesure energie/VRAM longue; GPU moyen encore faible sur petites et certaines BF16 shapes soutenues; le proof global court reste volontairement bloque par `baseline_score_passed` quand la baseline a un score nul.
+- Preuve actuelle: tests CUDA courts, export/import profil, tests gradients fast-vs-dense STE en fp32/fp16/bf16, test de parite requantize/pack fp32/fp16/bf16, tests WMMA forward/grad-input/grad-weight fp16/bf16 alignes et edge, test extension forcee, doctor toolchain strict, benchmark RTX 5070 avec full forward/backward et requantize/pack profile, matrice strict extension 3 shapes avec monitoring soutenu GPU/CPU/power, matrice LLM-shape WMMA fp16 `256x768x768` + `512x1024x1024`, matrice edge WMMA fp16 paddee `255x769x771` + `511x1025x1027`, matrice BF16 WMMA `256x768x768` + `255x769x771`, matrices forward-WMMA v7 fp16/bf16, smoke LLM fp16/bf16 extension avec dispatches forward/requantize/grad_weight extension et compteurs WMMA `grad_input`/`grad_weight` positifs, puis profil batch LLM Cortex bf16 strict avec optimizer/backward/P1-P10/monitoring et `passed=true`.
+- Faiblesse: pas encore de mesure energie/VRAM longue ni multi-shapes LLM batch; GPU moyen encore faible sur petites et certaines BF16 shapes soutenues; le proof global court reste volontairement bloque par `baseline_score_passed` quand la baseline a un score nul.
 - Risque architectural: le chemin training est maintenant completement branché en extension pour forward, `grad_input`, `grad_weight`, `grad_bias` et repack, mais une preuve de paradigme demandera que ce gain survive aux vrais batchs LLM et ne degrade pas la convergence.
-- Correction prioritaire restante: mesurer VRAM/energie/throughput sur vrais batchs LLM, puis run long seulement quand autorise.
+- Correction prioritaire restante: elargir le profil batch LLM a plusieurs tailles, graines et durees quand autorise, puis run long comparatif seulement quand autorise.
 
 ### P3 - Future Contract / FSP / MTP
 
@@ -298,8 +308,8 @@ Ce document sert de registre de critique et de correction. Il ne remplace pas le
 ### Ternary Core W in {-1,0,+1}
 
 - Statut: le forward lit les codes packes int2 et lance CUDA extension sur GPU avec autotune `tiled/warp/wmma`; le backward CUDA calcule `grad_input` depuis les codes int2 packes avec WMMA fp16/bf16 quand la shape est alignee ou paddee; `grad_weight` et `grad_bias` passent par WMMA fp16/bf16->fp32 quand la shape est alignee ou paddee; la resynchronisation post-update requantize et repack directement en CUDA extension.
-- Faiblesse: pas encore de profil energie/VRAM long; les mesures GPU courtes restent sensibles au bruit et ne prouvent pas encore l'efficacite sur tous vrais batchs LLM.
-- Correction restante: benchmarker les vrais batchs LLM avec VRAM/energie/throughput, puis elargir les matrices multi-shapes.
+- Faiblesse: un profil batch LLM court existe avec VRAM/puissance/throughput, mais pas encore de profil long ni multi-shape; les mesures GPU courtes restent sensibles au bruit et ne prouvent pas encore l'efficacite sur tous vrais batchs LLM.
+- Correction restante: elargir les vrais batchs LLM en VRAM/energie/throughput sur plusieurs shapes et seeds, puis lier ces profils aux preuves baseline/Cortex longues.
 
 ### Skill-aware Experts
 
@@ -337,9 +347,9 @@ Ce document sert de registre de critique et de correction. Il ne remplace pas le
 - Faiblesse: hierarchie encore surtout orchestrateur de modules; pas de policy apprise de profondeur verifier.
 - Correction restante: verifier-depth policy and cost calibration.
 
-## File de correction priorisee apres boucle 15
+## File de correction priorisee apres boucle 16
 
-1. P2: mesurer VRAM, energie, throughput et occupation GPU sur vrais batchs LLM des que les tests longs sont autorises.
+1. P2: elargir le profil batch LLM reel a plusieurs tailles de modeles, sequences, batchs et seeds, en gardant toutes les briques Cortex actives.
 2. P2: elargir la matrice forward/backward aux shapes de couches reelles du Transformer cible, en gardant `wmma` seulement quand l'autotune le gagne.
 3. P4: scaler l'ablation learned memory vs deterministic memory sur anchors long-context synthetiques puis held-out.
 4. P6/P7: afficher partout `repair_loss_before`, `repair_loss_after`, `protected_loss_before`, `protected_loss_after`, delta et convention.

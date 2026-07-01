@@ -8794,6 +8794,237 @@ def build_seed_corpus(path: str | Path, *, repeats: int = 256) -> tuple[str, ...
     return (str(shard),)
 
 
+def _torch_cuda_memory_snapshot(device: torch.device) -> Mapping[str, Any]:
+    if device.type != "cuda":
+        return {"enabled": False}
+    torch.cuda.synchronize(device)
+    return {
+        "enabled": True,
+        "device": str(device),
+        "memory_allocated_bytes": int(torch.cuda.memory_allocated(device)),
+        "memory_reserved_bytes": int(torch.cuda.memory_reserved(device)),
+        "max_memory_allocated_bytes": int(torch.cuda.max_memory_allocated(device)),
+        "max_memory_reserved_bytes": int(torch.cuda.max_memory_reserved(device)),
+    }
+
+
+def _strict_extension_only_from_influence(influence: Mapping[str, Any]) -> bool:
+    required_maps = (
+        "native_ternary_backend_counts",
+        "native_ternary_requantize_backend_counts",
+        "native_ternary_grad_weight_backend_counts",
+    )
+    for key in required_maps:
+        counts = dict(influence.get(key) or {})
+        if int(counts.get("extension", 0)) <= 0:
+            return False
+        if any(name != "extension" and int(value) > 0 for name, value in counts.items()):
+            return False
+    return int(influence.get("torch_packed_ternary_dispatches", 0)) == 0
+
+
+def run_llm_batch_profile(
+    *,
+    out_dir: str | Path,
+    steps: int = 3,
+    batch_size: int = 8,
+    gradient_accumulation_steps: int = 1,
+    seq_len: int = 32,
+    d_model: int = 64,
+    n_heads: int = 4,
+    n_layers: int = 2,
+    vocab_size: int = 256,
+    precision: str = "auto",
+    device: str = "auto",
+    require_cuda: bool = False,
+    native_ternary_backend: str = STRICT_NATIVE_TERNARY_BACKEND,
+    resource_interval: float = 0.05,
+    min_resource_samples: int = 2,
+    seed: int = 71,
+    corpus_repeats: int = 192,
+    max_corpus_tokens: int | None = 8192,
+    overwrite: bool = False,
+) -> Mapping[str, Any]:
+    output_dir = Path(out_dir)
+    if output_dir.exists():
+        if not overwrite:
+            raise FileExistsError(f"profile output directory already exists: {output_dir}")
+        shutil.rmtree(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    resolved_precision = _resolve_cli_precision(precision, device=device, require_cuda=require_cuda)
+    files = build_seed_corpus(output_dir / "seed_text", repeats=corpus_repeats)
+    corpus = TextCorpusConfig.from_paths(files, min_chars_per_chunk=512)
+    training = TrainingConfig(
+        steps=steps,
+        batch_size=batch_size,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        eval_interval=max(1, steps),
+        eval_batches=1,
+        seed=seed,
+        device=device,
+        precision=resolved_precision,
+        require_cuda=require_cuda,
+        checkpoint_interval=max(1, steps),
+        max_intermediate_checkpoints=0,
+        resource_monitor_interval=resource_interval,
+        cortex_phase_interval=1,
+        cortex_phase_probe_tasks=1,
+        cortex_phase_max_proposals=1,
+        num_threads=1,
+    )
+    config = ComparisonConfig(
+        vocab_size=vocab_size,
+        min_frequency=1,
+        seq_len=seq_len,
+        d_model=d_model,
+        n_heads=n_heads,
+        n_layers=n_layers,
+        dropout=0.0,
+        horizons=(1, 2, 4, 8),
+        training=training,
+        max_corpus_tokens=max_corpus_tokens,
+        native_ternary_backend=native_ternary_backend,
+    )
+    tokenizer = LLMTokenizer.train(corpus, vocab_size=vocab_size, min_frequency=1)
+    manifest = TokenizedCorpusBuilder(corpus, tokenizer).build(
+        output_dir / "corpus",
+        seq_len=seq_len,
+        max_horizon=max(config.horizons),
+        max_tokens=max_corpus_tokens,
+        preparation_config=_tokenized_preparation_config(
+            corpus,
+            vocab_size=vocab_size,
+            min_frequency=1,
+            seq_len=seq_len,
+            max_horizon=max(config.horizons),
+            max_tokens=max_corpus_tokens,
+        ),
+    )
+    corpus_identity = manifest.identity()
+    plan = build_training_plan(
+        manifest,
+        config,
+        world_size=1,
+        distributed=False,
+        corpus_identity=corpus_identity,
+    )
+    _write_json(output_dir / "run_plan.json", plan)
+    train_data = MemmapCausalDataset(manifest, split="train")
+    val_data = MemmapCausalDataset(manifest, split="val")
+    started = time.time()
+    report: TrainingRunReport | None = None
+    memory_before: Mapping[str, Any] = {"enabled": False}
+    memory_after: Mapping[str, Any] = {"enabled": False}
+    try:
+        model_config = TransformerConfig(
+            vocab_size=manifest.vocab_size,
+            seq_len=seq_len,
+            d_model=d_model,
+            n_heads=n_heads,
+            n_layers=n_layers,
+            dropout=0.0,
+            horizons=config.horizons,
+            use_cortex_heads=True,
+            use_ternary_core=True,
+            use_native_ternary_kernel=True,
+            require_native_ternary_kernel=_strict_native_ternary_required_for_training(training),
+            native_ternary_backend=native_ternary_backend,
+            use_skill_aware_experts=True,
+            use_variable_in_compressor=True,
+            use_learned_memory_policy=True,
+            use_certificate_head=True,
+        )
+        trainer = LLMTrainer(
+            CortexTransformerLM(model_config),
+            train_data,
+            val_data,
+            training,
+            run_dir=output_dir / "cortex3",
+            model_kind="cortex3_multi_horizon_profile",
+            corpus_identity=corpus_identity,
+        )
+        if trainer.device.type == "cuda":
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats(trainer.device)
+        memory_before = _torch_cuda_memory_snapshot(trainer.device)
+        report = trainer.train(name="cortex3_profile")
+        memory_after = _torch_cuda_memory_snapshot(trainer.device)
+    finally:
+        train_data.close()
+        val_data.close()
+    elapsed = max(1e-9, time.time() - started)
+    assert report is not None
+    phase_report = dict(report.cortex_phase_report)
+    influence = dict(phase_report.get("training_influence") or {})
+    resource_usage = dict(report.resource_usage or {})
+    resource_metrics = dict(resource_usage.get("metrics") or {})
+    planned_tokens = int(steps) * int(batch_size) * int(gradient_accumulation_steps) * int(seq_len)
+    cuda_profile = bool(memory_after.get("enabled"))
+    failed_checks: list[str] = []
+    if int(resource_usage.get("sample_count", 0)) < int(min_resource_samples):
+        failed_checks.append("resource_sample_count")
+    if planned_tokens <= 0:
+        failed_checks.append("planned_tokens")
+    if not bool(phase_report.get("architecture_audit", {}).get("passed")):
+        failed_checks.append("architecture_audit")
+    if not bool(phase_report.get("phase_deliverable_audit", {}).get("passed")):
+        failed_checks.append("phase_deliverable_audit")
+    native_kernel_required = bool(phase_report.get("native_ternary_kernel_required"))
+    strict_extension_only = _strict_extension_only_from_influence(influence)
+    if native_kernel_required and not strict_extension_only:
+        failed_checks.append("strict_extension_only")
+    if cuda_profile:
+        for key in ("gpu_utilization_percent", "gpu_memory_used_mb", "gpu_power_draw_watts"):
+            if key not in resource_metrics:
+                failed_checks.append(f"missing_{key}")
+        if int(memory_after.get("max_memory_allocated_bytes", 0)) <= 0:
+            failed_checks.append("torch_cuda_peak_memory")
+    elif require_cuda:
+        failed_checks.append("cuda_memory_profile")
+    throughput = {
+        "wall_seconds": float(elapsed),
+        "optimizer_steps": int(report.optimizer_steps),
+        "effective_batch_size": int(report.effective_batch_size),
+        "planned_train_tokens": int(planned_tokens),
+        "optimizer_steps_per_second_wall": float(report.optimizer_steps / elapsed),
+        "train_tokens_per_second_wall": float(planned_tokens / elapsed),
+        "tokens_per_optimizer_step": int(batch_size * gradient_accumulation_steps * seq_len),
+    }
+    profile = {
+        "schema_version": 1,
+        "run_dir": str(output_dir),
+        "training_report": report.to_dict(),
+        "plan": plan,
+        "throughput": throughput,
+        "torch_cuda_memory": {
+            "before": memory_before,
+            "after": memory_after,
+        },
+        "resource_usage": resource_usage,
+        "kernel_evidence": {
+            "native_ternary_kernel_required": native_kernel_required,
+            "strict_extension_only": strict_extension_only,
+            "native_ternary_backend_counts": influence.get("native_ternary_backend_counts", {}),
+            "native_ternary_kernel_variants": influence.get("native_ternary_kernel_variants", ()),
+            "native_ternary_requantize_backend_counts": influence.get("native_ternary_requantize_backend_counts", {}),
+            "native_ternary_grad_input_kernel_counts": influence.get("native_ternary_grad_input_kernel_counts", {}),
+            "native_ternary_grad_weight_backend_counts": influence.get("native_ternary_grad_weight_backend_counts", {}),
+            "native_ternary_grad_weight_kernel_counts": influence.get("native_ternary_grad_weight_kernel_counts", {}),
+        },
+        "architecture": {
+            "architecture_audit_passed": bool(phase_report.get("architecture_audit", {}).get("passed")),
+            "phase_deliverable_audit_passed": bool(phase_report.get("phase_deliverable_audit", {}).get("passed")),
+            "all_phases_active": bool(phase_report.get("all_phases_active")),
+            "phase_event_counts": phase_report.get("phase_event_counts", {}),
+        },
+        "hardware": report.hardware,
+        "failed_checks": tuple(failed_checks),
+        "passed": not failed_checks,
+    }
+    _write_json(output_dir / "llm_batch_profile.json", profile)
+    return profile
+
+
 def build_benchmark_corpus(path: str | Path, *, domain: str, repeats: int = 256) -> tuple[str, ...]:
     if repeats < 8:
         raise ValueError("benchmark repeats must be >= 8")
@@ -8903,6 +9134,27 @@ def main(argv: Sequence[str] | None = None) -> None:
     smoke.add_argument("--tokenizer-training-chars", type=int, default=None)
     smoke.add_argument("--min-planned-train-tokens", type=int, default=0)
     smoke.add_argument("--native-ternary-backend", choices=NATIVE_TERNARY_BACKEND_CHOICES, default=STRICT_NATIVE_TERNARY_BACKEND)
+
+    profile_batch = sub.add_parser("profile-batch", help="profile one strict Cortex LLM training run with throughput, VRAM and GPU resource metrics")
+    profile_batch.add_argument("--out-dir", default="runs/llm-batch-profile")
+    profile_batch.add_argument("--steps", type=int, default=3)
+    profile_batch.add_argument("--batch-size", type=int, default=8)
+    profile_batch.add_argument("--gradient-accumulation-steps", type=int, default=1)
+    profile_batch.add_argument("--seq-len", type=int, default=32)
+    profile_batch.add_argument("--d-model", type=int, default=64)
+    profile_batch.add_argument("--n-heads", type=int, default=4)
+    profile_batch.add_argument("--n-layers", type=int, default=2)
+    profile_batch.add_argument("--vocab-size", type=int, default=256)
+    profile_batch.add_argument("--precision", choices=("auto", "fp32", "bf16", "fp16"), default="auto")
+    profile_batch.add_argument("--device", default="auto")
+    profile_batch.add_argument("--require-cuda", action="store_true")
+    profile_batch.add_argument("--resource-interval", type=float, default=0.05)
+    profile_batch.add_argument("--min-resource-samples", type=int, default=2)
+    profile_batch.add_argument("--seed", type=int, default=71)
+    profile_batch.add_argument("--corpus-repeats", type=int, default=192)
+    profile_batch.add_argument("--max-corpus-tokens", type=int, default=8192)
+    profile_batch.add_argument("--overwrite", action="store_true", help="delete and recreate the output directory instead of failing when it exists")
+    profile_batch.add_argument("--native-ternary-backend", choices=NATIVE_TERNARY_BACKEND_CHOICES, default=STRICT_NATIVE_TERNARY_BACKEND)
 
     compare = sub.add_parser("compare", help="run baseline vs Cortex comparison on text files or directories")
     compare.add_argument("paths", nargs="+")
@@ -9187,6 +9439,34 @@ def main(argv: Sequence[str] | None = None) -> None:
         report = LLMComparisonRunner(corpus, config, run_dir=out_dir / "comparison").run(require_win=args.require_win)
         if _rank_zero():
             print(json.dumps(report.proof, indent=2, sort_keys=True))
+        return
+
+    if args.command == "profile-batch":
+        report = run_llm_batch_profile(
+            out_dir=args.out_dir,
+            steps=args.steps,
+            batch_size=args.batch_size,
+            gradient_accumulation_steps=args.gradient_accumulation_steps,
+            seq_len=args.seq_len,
+            d_model=args.d_model,
+            n_heads=args.n_heads,
+            n_layers=args.n_layers,
+            vocab_size=args.vocab_size,
+            precision=args.precision,
+            device=args.device,
+            require_cuda=args.require_cuda,
+            native_ternary_backend=args.native_ternary_backend,
+            resource_interval=args.resource_interval,
+            min_resource_samples=args.min_resource_samples,
+            seed=args.seed,
+            corpus_repeats=args.corpus_repeats,
+            max_corpus_tokens=args.max_corpus_tokens,
+            overwrite=args.overwrite,
+        )
+        print(json.dumps(report, indent=2, sort_keys=True, default=_json_default))
+        if not bool(report["passed"]):
+            failed = ", ".join(str(item) for item in report["failed_checks"])
+            raise RuntimeError(f"Cortex LLM batch profile failed required checks: {failed}")
         return
 
     if args.command == "prepare-hf":
