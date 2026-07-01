@@ -44,7 +44,7 @@ from cortex3 import (
 from cortex3_attribution import CausalAttributionEngine
 from cortex3_certificates import CertificateHead, CertificateHeadOutput, CertificateType, CertificateVerifier, LatentProofState, RandomDelatentizer, build_certificate, evaluate_certificate_efficiency
 from cortex3_cycle import CortexCycle
-from cortex3_frontier import FrontierCircuitRegistry, FrontierSkillDiscovery
+from cortex3_frontier import CompiledFrontierAgent, FrontierCircuitRegistry, FrontierSkillDiscovery
 from cortex3_future import ContractDecision, FutureContract, FutureContractEngine, FutureContractLedger, MTPFSPConfig
 from cortex3_improvement import AcceptanceDecision, ProposalKind, RecursiveImprovementEngine, RollbackEvent
 from cortex3_inference import InferenceConfig, InferencePath, UltraFastInferenceEngine
@@ -3755,6 +3755,8 @@ class CortexTrainingPhaseController:
         self.phase_audits: list[dict[str, Any]] = []
         self.frontier_reports: list[dict[str, Any]] = []
         self.frontier_compiled_fastsolve_events = 0
+        self.frontier_repair_candidates: list[dict[str, Any]] = []
+        self.frontier_repair_accepted_events = 0
         self.replay_batches: list[torch.Tensor] = []
         self.replay_cursor = 0
         self.regularization_steps = 0
@@ -4284,6 +4286,76 @@ class CortexTrainingPhaseController:
             raise ValueError(f"P7 model regrowth could not find trainable parameters for action {action.value}")
         return selected
 
+    def _cycle_protected_tasks(self, cycle_report: Any | None, failure_task: Task, *, limit: int = 4) -> tuple[Task, ...]:
+        protected: list[Task] = []
+        seen = {failure_task.task_id}
+        if cycle_report is None:
+            return ()
+        for skill_report in cycle_report.trial.skill_reports.values():
+            for case in skill_report.cases:
+                task = case.task
+                if task.task_id in seen:
+                    continue
+                protected.append(task)
+                seen.add(task.task_id)
+                if len(protected) >= limit:
+                    return tuple(protected)
+        return tuple(protected)
+
+    def _evaluate_frontier_repair_candidate(
+        self,
+        attribution_report: Any,
+        protected_tasks: Sequence[Task],
+    ) -> dict[str, Any] | None:
+        failure = attribution_report.failure
+        circuit = self.frontier_registry.select(failure.task)
+        if circuit is None:
+            return None
+        compiled_agent = CompiledFrontierAgent(self.frontier_registry, verifier=self.verifier)
+        answer = compiled_agent(failure.task)
+        repaired = self.verifier.oracle_registry.verify(failure.task.skill, failure.task, answer)
+
+        def repaired_agent(task: Task) -> CandidateAnswer:
+            if self.frontier_registry.select(task) is not None:
+                return compiled_agent(task)
+            return CandidateAnswer.coerce(self.trial_agent(task))
+
+        non_regression = self.regrowth.simulator.non_regression.check(
+            self.trial_agent,
+            repaired_agent,
+            tuple(protected_tasks),
+        )
+        total_cost = answer.cost.merge(repaired.verifier_cost)
+        accepted = bool(repaired.passed and repaired.score > failure.score and non_regression.passed)
+        report = {
+            "task_id": failure.task.task_id,
+            "skill": failure.task.skill,
+            "circuit_skill": circuit.skill,
+            "frontier_task_ids": tuple(circuit.report.frontier_task_ids),
+            "source_failure_ids": tuple(circuit.report.source_failure_ids),
+            "repair_score_before": float(failure.score),
+            "repair_score_after": float(repaired.score),
+            "repair_score_delta": float(repaired.score - failure.score),
+            "repair_passed": bool(repaired.passed),
+            "repair_reason": repaired.reason,
+            "non_regression_passed": bool(non_regression.passed),
+            "protected_checked": int(non_regression.checked),
+            "protected_regression_task_ids": tuple(case.task.task_id for case in non_regression.regressions),
+            "accepted": accepted,
+            "frontier_compiled_selected": bool(answer.raw.get("frontier_compiled_selected")),
+            "frontier_compiled_verified": bool(answer.raw.get("frontier_compiled_verified")),
+            "certificate_fields": tuple(sorted(str(key) for key in answer.certificate)),
+            "cost": asdict(total_cost),
+        }
+        if accepted:
+            self.frontier_repair_accepted_events += 1
+            self._count("frontier_repair_accepted_events")
+            self.bit_ledger.ingest_cost(
+                total_cost,
+                note=f"P7:frontier-repair:{failure.task.skill}:{failure.task.task_id}",
+            )
+        return report
+
     def _apply_model_regrowth(self, plan: RegrowthPlan, *, step: int) -> dict[str, Any]:
         if plan.selected is None:
             raise ValueError("P7 regrowth produced no recovered non-regressing selected action")
@@ -4565,6 +4637,8 @@ class CortexTrainingPhaseController:
             "phase_audits": list(self.phase_audits),
             "frontier_reports": list(self.frontier_reports),
             "frontier_compiled_fastsolve_events": int(self.frontier_compiled_fastsolve_events),
+            "frontier_repair_candidates": list(self.frontier_repair_candidates),
+            "frontier_repair_accepted_events": int(self.frontier_repair_accepted_events),
             "frontier_registry_path": str(self.run_dir / "frontier_registry"),
             "frontier_registry_summary": self.frontier_registry.to_dict(),
             "replay_batches": [batch.detach().cpu() for batch in self.replay_batches],
@@ -4627,6 +4701,8 @@ class CortexTrainingPhaseController:
         self.phase_audits = [dict(item) for item in payload.get("phase_audits", ())]
         self.frontier_reports = [dict(item) for item in payload.get("frontier_reports", ())]
         self.frontier_compiled_fastsolve_events = int(payload.get("frontier_compiled_fastsolve_events", 0))
+        self.frontier_repair_candidates = [dict(item) for item in payload.get("frontier_repair_candidates", ())]
+        self.frontier_repair_accepted_events = int(payload.get("frontier_repair_accepted_events", 0))
         frontier_path = Path(str(payload.get("frontier_registry_path") or (self.run_dir / "frontier_registry")))
         if frontier_path.exists() and (frontier_path / "frontier_registry.json").exists():
             self.frontier_registry = FrontierCircuitRegistry.load(frontier_path)
@@ -4859,8 +4935,11 @@ class CortexTrainingPhaseController:
             "frontier_compiled_circuit_count": int(self.frontier_registry.to_dict()["circuit_count"]),
             "frontier_compiled_skill_count": int(self.frontier_registry.to_dict()["compiled_skill_count"]),
             "frontier_compiled_fastsolve_events": int(self.frontier_compiled_fastsolve_events),
+            "frontier_repair_candidate_count": len(self.frontier_repair_candidates),
+            "frontier_repair_accepted_events": int(self.frontier_repair_accepted_events),
             "frontier_registry_path": str(self.run_dir / "frontier_registry"),
             "frontier_reports": _last_items(self.frontier_reports, 3),
+            "frontier_repair_candidates": _last_items(self.frontier_repair_candidates, 3),
             "improvement_archive_accepted": self.improvement.archive.accepted_count,
             "improvement_archive_rejected": self.improvement.archive.rejected_count,
             "regrowth_model_application_count": len(self.regrowth_model_applications),
@@ -5091,10 +5170,26 @@ class CortexTrainingPhaseController:
 
         try:
             if attribution_report is not None:
+                protected_regrowth_tasks = self._cycle_protected_tasks(cycle_report, attribution_report.failure.task)
+                frontier_repair = self._evaluate_frontier_repair_candidate(attribution_report, protected_regrowth_tasks)
+                if frontier_repair is not None:
+                    self.frontier_repair_candidates.append(frontier_repair)
+                    self._count("frontier_repair_candidate_events")
+                    audit["frontier_repair_candidate"] = frontier_repair
+                    if bool(frontier_repair["accepted"]):
+                        self._add_verified_phase_replay(
+                            "P7",
+                            attribution_report.failure.task,
+                            metadata={
+                                "frontier_repair_candidate": True,
+                                "repair_score_delta": frontier_repair["repair_score_delta"],
+                                "protected_checked": frontier_repair["protected_checked"],
+                            },
+                        )
                 regrowth_plan = self.regrowth.plan(
                     attribution_report,
                     self.trial_agent,
-                    (attribution_report.failure.task,),
+                    protected_regrowth_tasks or (attribution_report.failure.task,),
                     budget=float(self.config.cortex_phase_regrowth_budget),
                 )
                 self._touch("P7")
@@ -5457,6 +5552,8 @@ class CortexTrainingPhaseController:
                 "frontier_compiled_circuit_count": int(self.frontier_registry.to_dict()["circuit_count"]),
                 "frontier_compiled_skill_count": int(self.frontier_registry.to_dict()["compiled_skill_count"]),
                 "frontier_compiled_fastsolve_events": int(self.frontier_compiled_fastsolve_events),
+                "frontier_repair_candidate_count": len(self.frontier_repair_candidates),
+                "frontier_repair_accepted_events": int(self.frontier_repair_accepted_events),
                 "frontier_registry_path": str(self.run_dir / "frontier_registry"),
                 "regrowth_model_application_count": len(self.regrowth_model_applications),
                 "regrowth_model_parameter_delta_l1": float(self.regrowth_model_parameter_delta_l1),
@@ -5536,6 +5633,8 @@ class CortexTrainingPhaseController:
                     "frontier_compiled_circuit_count": int(self.frontier_registry.to_dict()["circuit_count"]),
                     "frontier_compiled_skill_count": int(self.frontier_registry.to_dict()["compiled_skill_count"]),
                     "frontier_compiled_fastsolve_events": int(self.frontier_compiled_fastsolve_events),
+                    "frontier_repair_candidate_count": len(self.frontier_repair_candidates),
+                    "frontier_repair_accepted_events": int(self.frontier_repair_accepted_events),
                     "regrowth_model_application_count": len(self.regrowth_model_applications),
                     "regrowth_model_parameter_delta_l1": float(self.regrowth_model_parameter_delta_l1),
                     "regrowth_model_repair_loss_delta": float(self.regrowth_model_repair_loss_delta),
@@ -5635,6 +5734,7 @@ class CortexTrainingPhaseController:
             },
             "frontier_registry_summary": self.frontier_registry.to_dict(),
             "frontier_reports": _last_items(self.frontier_reports, 3),
+            "frontier_repair_candidates": _last_items(self.frontier_repair_candidates, 3),
             "improvement_state_summary": _improvement_state(self.improvement),
             "regrowth_model_applications": _last_items(self.regrowth_model_applications, 5),
             "recursive_model_applications": _last_items(self.recursive_model_applications, 5),

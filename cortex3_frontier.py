@@ -404,7 +404,14 @@ class FrontierSkillDiscovery:
             frontier_tasks = tuple(self.adversary.expand_from_failures(failures, seed=seed + 1009 + index, per_failure=per_failure))
             if not frontier_tasks:
                 frontier_tasks = tuple(failure.task for failure in failures)
-            verified_tasks = self._verified_frontier_tasks(frontier_tasks)
+            candidate_tasks: list[Task] = []
+            seen_task_ids: set[str] = set()
+            for task in tuple(failure.task for failure in failures) + frontier_tasks:
+                if task.task_id in seen_task_ids:
+                    continue
+                candidate_tasks.append(task)
+                seen_task_ids.add(task.task_id)
+            verified_tasks = self._verified_frontier_tasks(candidate_tasks)
             if not verified_tasks:
                 continue
             examples = examples_from_tasks(verified_tasks, self.solver, source="frontier_slow_solve")

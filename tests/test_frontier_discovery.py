@@ -27,6 +27,7 @@ class FrontierSkillDiscoveryTest(unittest.TestCase):
         self.assertGreater(circuit.active_weights, 0)
         self.assertGreater(circuit.training["after_accuracy"], circuit.training["before_accuracy"])
         self.assertTrue(circuit.invariants.prompt_obligations)
+        self.assertTrue(set(circuit.source_failure_ids).issubset(set(circuit.frontier_task_ids)))
         self.assertEqual(registry.compiled_skills(), (circuit.skill,))
         runtime_circuit = registry.circuits_for_skill(circuit.skill)[0]
         task = runtime_circuit.verified_tasks[0]

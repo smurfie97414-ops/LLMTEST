@@ -281,7 +281,8 @@ Current executable coverage:
 - `CompiledFrontierAgent` selects a compiled circuit by skill/invariant overlap and executes it as the default path for covered tasks; if a circuit is selected, verifier failure is exposed on the answer rather than hidden behind a fallback.
 - Frontier registries persist to `frontier_registry.json` plus per-circuit micro-model checkpoints and reload through `CheckpointManager`, so a compiled skill can survive process boundaries.
 - `UltraFastInferenceEngine` accepts a `compiled_frontier_registry` and uses a selected compiled frontier circuit as the answer source before fast/normal/careful route execution.
-- `CortexTrainingPhaseController` now runs a bounded Frontier Skill Discovery pass during phase audit, persists the registry under the run directory, routes a covered P8 task through the compiled FastSolve circuit, and reports `frontier_compiled_*` fields in `cortex_phase_report.json`.
+- `FrontierSkillDiscovery` distills both source regressions slow-solved by the reference solver and their frontier variants, so a compiled circuit can repair the original failing task rather than only nearby adversarial variants.
+- `CortexTrainingPhaseController` now runs a bounded Frontier Skill Discovery pass during phase audit, persists the registry under the run directory, routes a covered P8 task through the compiled FastSolve circuit, evaluates the same registry as a P7 repair candidate before parameter regrowth, and reports `frontier_compiled_*` plus `frontier_repair_*` fields in `cortex_phase_report.json`.
 - P10 resume hardening: after checkpoint restore, the LLM controller searches a small archive-aware proposal budget so recursive improvement does not fail only because the first restored-context proposal is rejected by strict gates.
 - `write_cycle_run` persists frontier discovery reports under `summary.json["frontier_discovery"]`.
 - `tools/run_cycle_report.py` writes Frontier Skill Discovery by default unless `--skip-frontier` is passed.
@@ -291,12 +292,12 @@ Evidence:
 - `.\.venv\Scripts\python.exe -m unittest tests.test_frontier_discovery`
 - Smoke: fragile-skill frontier tasks are slow-solved, verified, distilled and compiled into a DSV-passing micro-circuit.
 - Short runtime proof: `python -m unittest tests.test_frontier_discovery` now asserts a compiled frontier circuit is registered, selected, used by `CompiledFrontierAgent`, oracle-verified, saved to `frontier_registry.json`, reloaded, used again, and consumed by `UltraFastInferenceEngine` on a forced fast path.
-- LLM controller proof: `tests.test_llm_pretraining.LLMPretrainingHarnessTest.test_full_cortex_phase_controller_uses_all_modules_during_training` asserts nonzero `frontier_compiled_circuit_count`, `frontier_compiled_skill_count`, `frontier_compiled_fastsolve_events` and an on-disk `frontier_registry.json`; `test_cortex_phase_state_survives_checkpoint_resume` passes after restoring the frontier/P10 state.
+- LLM controller proof: `tests.test_llm_pretraining.LLMPretrainingHarnessTest.test_full_cortex_phase_controller_uses_all_modules_during_training` asserts nonzero `frontier_compiled_circuit_count`, `frontier_compiled_skill_count`, `frontier_compiled_fastsolve_events`, nonzero accepted P7 `frontier_repair_*` evidence, and an on-disk `frontier_registry.json`; `test_cortex_phase_state_survives_checkpoint_resume` passes after restoring the frontier/P10 state.
 
 Remaining:
 
 - Run frontier discovery over larger held-out frontier suites.
-- Use compiled frontier circuits as first-class P7/P10 repair candidates before spending regrowth on a skill already covered by a verified circuit.
+- Feed accepted compiled frontier repairs into P10 proposal generation and extend P5 certificates to bind compiled-circuit contracts.
 
 ## Cross-phase final objective and metrics
 

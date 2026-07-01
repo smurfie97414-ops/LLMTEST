@@ -3303,7 +3303,17 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             self.assertGreater(influence["frontier_compiled_circuit_count"], 0)
             self.assertGreater(influence["frontier_compiled_skill_count"], 0)
             self.assertGreater(influence["frontier_compiled_fastsolve_events"], 0)
+            self.assertGreater(influence["frontier_repair_candidate_count"], 0)
+            self.assertGreater(influence["frontier_repair_accepted_events"], 0)
             self.assertTrue((Path(influence["frontier_registry_path"]) / "frontier_registry.json").exists())
+            self.assertTrue(phase_report["frontier_repair_candidates"], phase_report)
+            latest_frontier_repair = phase_report["frontier_repair_candidates"][-1]
+            self.assertTrue(latest_frontier_repair["accepted"], latest_frontier_repair)
+            self.assertTrue(latest_frontier_repair["frontier_compiled_selected"], latest_frontier_repair)
+            self.assertTrue(latest_frontier_repair["frontier_compiled_verified"], latest_frontier_repair)
+            self.assertTrue(latest_frontier_repair["repair_passed"], latest_frontier_repair)
+            self.assertTrue(latest_frontier_repair["non_regression_passed"], latest_frontier_repair)
+            self.assertGreater(latest_frontier_repair["repair_score_delta"], 0.0)
             self.assertGreater(
                 influence["improvement_archive_accepted"] + influence["improvement_archive_rejected"],
                 0,
@@ -3357,6 +3367,11 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 persisted["training_influence"]["frontier_compiled_fastsolve_events"],
                 influence["frontier_compiled_fastsolve_events"],
             )
+            self.assertEqual(
+                persisted["training_influence"]["frontier_repair_accepted_events"],
+                influence["frontier_repair_accepted_events"],
+            )
+            self.assertTrue(persisted["frontier_repair_candidates"], persisted)
             self.assertGreater(persisted["frontier_registry_summary"]["circuit_count"], 0)
             self.assertEqual(
                 persisted["training_influence"]["objective_feedback_events"],
