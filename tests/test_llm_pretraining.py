@@ -46,6 +46,7 @@ from cortex3_llm import (
     llm_doctor_report,
     main as llm_main,
     run_llm_batch_profile,
+    run_llm_batch_profile_matrix,
 )
 from tools.benchmark_learned_memory_policy import run_learned_memory_ablation
 from tools.launch_llm_ddp import _manifest_requests_cuda, _train_args_request_cuda
@@ -62,9 +63,9 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             report = run_llm_batch_profile(
                 out_dir=root / "profile",
                 steps=1,
-                batch_size=1,
+                batch_size=4,
                 gradient_accumulation_steps=1,
-                seq_len=16,
+                seq_len=32,
                 d_model=32,
                 n_heads=4,
                 n_layers=1,
@@ -75,13 +76,14 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 resource_interval=0.01,
                 min_resource_samples=1,
                 corpus_repeats=64,
-                max_corpus_tokens=1024,
+                max_corpus_tokens=2048,
             )
 
             profile_path = root / "profile" / "llm_batch_profile.json"
             self.assertTrue(profile_path.exists())
             payload = json.loads(profile_path.read_text(encoding="utf-8"))
             self.assertEqual(payload["schema_version"], 1)
+            self.assertTrue(payload["passed"], payload["failed_checks"])
             self.assertGreater(payload["throughput"]["planned_train_tokens"], 0)
             self.assertGreater(payload["throughput"]["train_tokens_per_second_wall"], 0.0)
             self.assertIn("process_memory_rss_bytes", payload["resource_usage"]["metrics"])
@@ -97,6 +99,47 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
 
             with self.assertRaises(FileExistsError):
                 run_llm_batch_profile(out_dir=out_dir, steps=1, device="cpu")
+
+    def test_llm_batch_profile_matrix_requires_multiple_shapes_and_seeds(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            report = run_llm_batch_profile_matrix(
+                out_dir=root / "matrix",
+                shape_specs=(
+                    {"seq_len": 32, "d_model": 32, "n_heads": 4, "n_layers": 1, "batch_size": 4},
+                    {"seq_len": 40, "d_model": 32, "n_heads": 4, "n_layers": 1, "batch_size": 4},
+                ),
+                seeds=(11, 13),
+                steps=1,
+                gradient_accumulation_steps=1,
+                vocab_size=128,
+                precision="fp32",
+                device="cpu",
+                require_cuda=False,
+                resource_interval=0.01,
+                min_resource_samples=1,
+                corpus_repeats=64,
+                max_corpus_tokens=2048,
+                min_cases=4,
+                require_multi_shape=True,
+                require_multi_seed=True,
+            )
+
+            matrix_path = root / "matrix" / "llm_batch_profile_matrix.json"
+            csv_path = root / "matrix" / "llm_batch_profile_matrix.csv"
+            self.assertTrue(matrix_path.exists())
+            self.assertTrue(csv_path.exists())
+            payload = json.loads(matrix_path.read_text(encoding="utf-8"))
+            self.assertTrue(payload["passed"], payload["failed_checks"])
+            self.assertEqual(payload["summary"]["case_count"], 4)
+            self.assertEqual(payload["summary"]["passed_cases"], 4)
+            self.assertEqual(payload["summary"]["shape_count"], 2)
+            self.assertEqual(payload["summary"]["seed_count"], 2)
+            self.assertEqual(payload["summary"]["all_phases_active_cases"], 4)
+            self.assertGreater(payload["summary"]["total_planned_train_tokens"], 0)
+            self.assertEqual(len(payload["cases"]), 4)
+            self.assertTrue(all(case["architecture"]["all_phases_active"] for case in payload["cases"]))
+            self.assertEqual(report["summary"]["case_count"], 4)
 
     def test_cuda_ternary_training_contract_is_strict_extension(self):
         loose_config = TransformerConfig(

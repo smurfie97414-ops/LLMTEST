@@ -173,6 +173,14 @@ python tools/train_llm.py profile-batch --out-dir runs/llm-batch-profile-v1 --ov
 
 Ce profil écrit `llm_batch_profile.json`, refuse d'écraser un dossier existant sans `--overwrite`, et échoue si une brique Cortex complète manque, si le backend CUDA strict ne reste pas `extension`, si les samples GPU/VRAM/puissance sont absents ou si le pic mémoire CUDA torch reste nul. Le run local court RTX 5070 passe avec `passed=true`, `native_ternary_backend_counts={"extension":1417}`, variants `tiled_shared_memory_int2/warp_reduction_int2/wmma_tensor_core_int2`, toutes les phases P1-P10 actives, `512` tokens entraînés planifiés, `117.646` tokens/s wall-clock, GPU moyen `10.344%`, GPU max `16%`, puissance moyenne `37.702 W`, VRAM moyenne `971.812 MB`, CPU process moyen `6.070%` du total et pic CUDA torch alloué `34,972,160` bytes.
 
+Pour éviter qu'un seul batch/seed masque une faiblesse, la matrice de profil lance plusieurs profils Cortex stricts et agrège les gates :
+
+```bash
+python tools/train_llm.py profile-matrix --out-dir runs/llm-batch-profile-matrix-v1 --overwrite --device cuda --require-cuda --precision bf16 --steps 1 --profile-shapes 32x64x4x2x4,40x64x4x2x4 --seeds 71,73 --min-cases 4 --require-multi-shape --require-multi-seed --resource-interval 0.05 --min-resource-samples 2 --corpus-repeats 128 --max-corpus-tokens 4096
+```
+
+Elle écrit `llm_batch_profile_matrix.json` et `llm_batch_profile_matrix.csv`, puis échoue si un profil enfant échoue, si toutes les phases ne sont pas actives, si un run CUDA strict n'est pas extension-only, ou si les exigences multi-shape/multi-seed ne sont pas satisfaites. Le run court RTX 5070 passe avec `case_count=4`, `passed_cases=4`, `shape_count=2`, `seed_count=2`, `strict_extension_only_cases=4`, `all_phases_active_cases=4`, `576` tokens planifiés, throughput moyen `78.816` tokens/s, GPU moyen par cas `13.147%`, puissance moyenne `39.738 W`, VRAM moyenne `975.956 MB` et dispatchs extension enfants `1230/1288/1317/1200`.
+
 `tools/benchmark_learned_memory_policy.py` exécute une ablation courte contrôlée : mêmes poids partagés, mémoire apprise active contre mémoire désactivée, puis entraînement de la seule politique exact/latent/drop. Le rapport JSON expose les losses avant/après, le gradient mémoire, les décisions exact/latent/drop et le delta `before - after`.
 
 ## Démo noyau
@@ -348,7 +356,7 @@ python -m pytest tests/test_llm_pretraining.py -q
 ## Roadmap immédiate
 
 1. Durcir Phase 1 jusqu'au statut Verifier OS complet : coût par cas réel, familles génératives plus larges, tests de faux positifs/faux négatifs d'oracle.
-2. Durcir Phase 2 au-delà du profil batch LLM court : élargir les shapes forward/backward réelles, puis répéter latence/VRAM/énergie/throughput sur batchs LLM plus grands et multi-seed.
+2. Durcir Phase 2 au-delà de la matrice batch LLM courte : élargir les shapes forward/backward réelles, puis répéter latence/VRAM/énergie/throughput sur batchs LLM plus grands, plus longs et multi-seed.
 3. Étendre Phase 3 vers des suites held-out plus larges, benchmarks MTP vs NTP et contrats FSP orientés objectifs de sortie.
 4. Étendre Phase 4 au-delà de l'ablation courte actuelle avec benchmarks coût/qualité de la politique mémoire apprise exact/latent/drop sur long contexte et held-out anchors.
 5. Étendre Phase 5 avec vérification algébrique multi-étapes, tests code plus riches et mesure held-out des économies de tokens de certificat.

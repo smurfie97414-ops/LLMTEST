@@ -8789,8 +8789,8 @@ def build_seed_corpus(path: str | Path, *, repeats: int = 256) -> tuple[str, ...
     ]
     with shard.open("w", encoding="utf-8") as handle:
         for index in range(repeats):
-            handle.write(patterns[index % len(patterns)] + "\n")
-            handle.write(f"sample {index:04d} keeps sequence marker {index % 17:02d}.\n")
+            handle.write(f"C3-SAMPLE-{index:04d} {patterns[index % len(patterns)]}\n")
+            handle.write(f"C3-MARK-{index % 17:02d} sample {index:04d} keeps sequence marker {index % 17:02d}.\n")
     return (str(shard),)
 
 
@@ -8916,6 +8916,7 @@ def run_llm_batch_profile(
     memory_before: Mapping[str, Any] = {"enabled": False}
     memory_after: Mapping[str, Any] = {"enabled": False}
     try:
+        strict_native_required = _strict_native_ternary_required_for_training(training)
         model_config = TransformerConfig(
             vocab_size=manifest.vocab_size,
             seq_len=seq_len,
@@ -8926,8 +8927,8 @@ def run_llm_batch_profile(
             horizons=config.horizons,
             use_cortex_heads=True,
             use_ternary_core=True,
-            use_native_ternary_kernel=True,
-            require_native_ternary_kernel=_strict_native_ternary_required_for_training(training),
+            use_native_ternary_kernel=strict_native_required,
+            require_native_ternary_kernel=strict_native_required,
             native_ternary_backend=native_ternary_backend,
             use_skill_aware_experts=True,
             use_variable_in_compressor=True,
@@ -9025,6 +9026,212 @@ def run_llm_batch_profile(
     return profile
 
 
+def _normalize_profile_shape_spec(spec: Mapping[str, Any], *, default_batch_size: int) -> Mapping[str, int]:
+    normalized = {
+        "seq_len": int(spec.get("seq_len", spec.get("seq", 0))),
+        "d_model": int(spec.get("d_model", spec.get("d", 0))),
+        "n_heads": int(spec.get("n_heads", spec.get("heads", 0))),
+        "n_layers": int(spec.get("n_layers", spec.get("layers", 0))),
+        "batch_size": int(spec.get("batch_size", spec.get("batch", default_batch_size))),
+    }
+    for key, value in normalized.items():
+        if value <= 0:
+            raise ValueError(f"profile shape field {key} must be positive, got {value}")
+    if normalized["d_model"] % normalized["n_heads"] != 0:
+        raise ValueError(
+            "profile shape d_model must be divisible by n_heads, "
+            f"got d_model={normalized['d_model']} n_heads={normalized['n_heads']}"
+        )
+    return normalized
+
+
+def _profile_shape_key(shape: Mapping[str, int]) -> str:
+    return (
+        f"seq{int(shape['seq_len'])}_d{int(shape['d_model'])}_"
+        f"h{int(shape['n_heads'])}_l{int(shape['n_layers'])}_b{int(shape['batch_size'])}"
+    )
+
+
+def run_llm_batch_profile_matrix(
+    *,
+    out_dir: str | Path,
+    shape_specs: Sequence[Mapping[str, Any]],
+    seeds: Sequence[int],
+    steps: int = 1,
+    gradient_accumulation_steps: int = 1,
+    vocab_size: int = 256,
+    precision: str = "auto",
+    device: str = "auto",
+    require_cuda: bool = False,
+    native_ternary_backend: str = STRICT_NATIVE_TERNARY_BACKEND,
+    resource_interval: float = 0.05,
+    min_resource_samples: int = 2,
+    corpus_repeats: int = 192,
+    max_corpus_tokens: int | None = 8192,
+    min_cases: int = 1,
+    require_multi_shape: bool = False,
+    require_multi_seed: bool = False,
+    default_batch_size: int = 8,
+    overwrite: bool = False,
+) -> Mapping[str, Any]:
+    output_dir = Path(out_dir)
+    if output_dir.exists():
+        if not overwrite:
+            raise FileExistsError(f"profile matrix output directory already exists: {output_dir}")
+        shutil.rmtree(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    normalized_shapes = tuple(
+        _normalize_profile_shape_spec(spec, default_batch_size=default_batch_size)
+        for spec in shape_specs
+    )
+    if not normalized_shapes:
+        raise ValueError("at least one profile shape spec is required")
+    normalized_seeds = tuple(int(seed) for seed in seeds)
+    if not normalized_seeds:
+        raise ValueError("at least one profile seed is required")
+    started = time.time()
+    cases: list[Mapping[str, Any]] = []
+    failed_checks: list[str] = []
+    csv_rows: list[Mapping[str, Any]] = []
+    case_index = 0
+    for shape_index, shape in enumerate(normalized_shapes):
+        shape_key = _profile_shape_key(shape)
+        for seed in normalized_seeds:
+            case_id = f"case_{case_index:03d}_{shape_key}_seed{seed}"
+            case_dir = output_dir / "cases" / case_id
+            profile = run_llm_batch_profile(
+                out_dir=case_dir,
+                steps=steps,
+                batch_size=int(shape["batch_size"]),
+                gradient_accumulation_steps=gradient_accumulation_steps,
+                seq_len=int(shape["seq_len"]),
+                d_model=int(shape["d_model"]),
+                n_heads=int(shape["n_heads"]),
+                n_layers=int(shape["n_layers"]),
+                vocab_size=vocab_size,
+                precision=precision,
+                device=device,
+                require_cuda=require_cuda,
+                native_ternary_backend=native_ternary_backend,
+                resource_interval=resource_interval,
+                min_resource_samples=min_resource_samples,
+                seed=seed,
+                corpus_repeats=corpus_repeats,
+                max_corpus_tokens=max_corpus_tokens,
+                overwrite=False,
+            )
+            metrics = dict((profile.get("resource_usage") or {}).get("metrics") or {})
+            case_failed = tuple(str(item) for item in profile.get("failed_checks", ()))
+            if not bool(profile.get("passed")):
+                failed_checks.append(f"case_failed:{case_id}")
+            if bool(profile.get("kernel_evidence", {}).get("native_ternary_kernel_required")) and not bool(profile.get("kernel_evidence", {}).get("strict_extension_only")):
+                failed_checks.append(f"case_not_strict_extension:{case_id}")
+            if not bool(profile.get("architecture", {}).get("all_phases_active")):
+                failed_checks.append(f"case_missing_phase:{case_id}")
+            row = {
+                "case_id": case_id,
+                "shape_index": shape_index,
+                "seed": seed,
+                "seq_len": int(shape["seq_len"]),
+                "d_model": int(shape["d_model"]),
+                "n_heads": int(shape["n_heads"]),
+                "n_layers": int(shape["n_layers"]),
+                "batch_size": int(shape["batch_size"]),
+                "passed": bool(profile.get("passed")),
+                "failed_checks": ";".join(case_failed),
+                "planned_train_tokens": int(profile.get("throughput", {}).get("planned_train_tokens", 0)),
+                "train_tokens_per_second_wall": float(profile.get("throughput", {}).get("train_tokens_per_second_wall", 0.0)),
+                "gpu_utilization_percent_avg": float(metrics.get("gpu_utilization_percent", {}).get("avg", 0.0)),
+                "gpu_memory_used_mb_avg": float(metrics.get("gpu_memory_used_mb", {}).get("avg", 0.0)),
+                "gpu_power_draw_watts_avg": float(metrics.get("gpu_power_draw_watts", {}).get("avg", 0.0)),
+                "process_cpu_percent_of_total_avg": float(metrics.get("process_cpu_percent_of_total", {}).get("avg", 0.0)),
+                "torch_cuda_peak_allocated_bytes": int(profile.get("torch_cuda_memory", {}).get("after", {}).get("max_memory_allocated_bytes", 0)),
+                "strict_extension_only": bool(profile.get("kernel_evidence", {}).get("strict_extension_only")),
+                "all_phases_active": bool(profile.get("architecture", {}).get("all_phases_active")),
+                "profile_path": str(case_dir / "llm_batch_profile.json"),
+            }
+            csv_rows.append(row)
+            cases.append(
+                {
+                    "case_id": case_id,
+                    "shape": dict(shape),
+                    "seed": seed,
+                    "profile_path": row["profile_path"],
+                    "passed": row["passed"],
+                    "failed_checks": case_failed,
+                    "throughput": profile.get("throughput", {}),
+                    "resource_metrics": metrics,
+                    "torch_cuda_memory": profile.get("torch_cuda_memory", {}),
+                    "kernel_evidence": profile.get("kernel_evidence", {}),
+                    "architecture": profile.get("architecture", {}),
+                }
+            )
+            case_index += 1
+    shape_count = len({_profile_shape_key(shape) for shape in normalized_shapes})
+    seed_count = len(set(normalized_seeds))
+    case_count = len(cases)
+    if case_count < int(min_cases):
+        failed_checks.append("min_cases")
+    if require_multi_shape and shape_count < 2:
+        failed_checks.append("multi_shape")
+    if require_multi_seed and seed_count < 2:
+        failed_checks.append("multi_seed")
+    passed_cases = sum(1 for case in cases if bool(case.get("passed")))
+    total_planned_tokens = sum(int(row["planned_train_tokens"]) for row in csv_rows)
+    tokens_per_second_values = [float(row["train_tokens_per_second_wall"]) for row in csv_rows if float(row["train_tokens_per_second_wall"]) > 0.0]
+    gpu_avg_values = [float(row["gpu_utilization_percent_avg"]) for row in csv_rows if float(row["gpu_utilization_percent_avg"]) > 0.0]
+    power_avg_values = [float(row["gpu_power_draw_watts_avg"]) for row in csv_rows if float(row["gpu_power_draw_watts_avg"]) > 0.0]
+    vram_avg_values = [float(row["gpu_memory_used_mb_avg"]) for row in csv_rows if float(row["gpu_memory_used_mb_avg"]) > 0.0]
+    summary = {
+        "case_count": case_count,
+        "passed_cases": passed_cases,
+        "shape_count": shape_count,
+        "seed_count": seed_count,
+        "total_planned_train_tokens": total_planned_tokens,
+        "wall_seconds": float(max(1e-9, time.time() - started)),
+        "train_tokens_per_second_wall_mean": float(statistics.fmean(tokens_per_second_values)) if tokens_per_second_values else 0.0,
+        "gpu_utilization_percent_case_mean": float(statistics.fmean(gpu_avg_values)) if gpu_avg_values else 0.0,
+        "gpu_power_draw_watts_case_mean": float(statistics.fmean(power_avg_values)) if power_avg_values else 0.0,
+        "gpu_memory_used_mb_case_mean": float(statistics.fmean(vram_avg_values)) if vram_avg_values else 0.0,
+        "strict_extension_only_cases": sum(1 for case in cases if bool(case.get("kernel_evidence", {}).get("strict_extension_only"))),
+        "all_phases_active_cases": sum(1 for case in cases if bool(case.get("architecture", {}).get("all_phases_active"))),
+    }
+    matrix = {
+        "schema_version": 1,
+        "run_dir": str(output_dir),
+        "shape_specs": tuple(dict(shape) for shape in normalized_shapes),
+        "seeds": normalized_seeds,
+        "config": {
+            "steps": int(steps),
+            "gradient_accumulation_steps": int(gradient_accumulation_steps),
+            "vocab_size": int(vocab_size),
+            "precision": precision,
+            "device": device,
+            "require_cuda": bool(require_cuda),
+            "native_ternary_backend": native_ternary_backend,
+            "resource_interval": float(resource_interval),
+            "min_resource_samples": int(min_resource_samples),
+            "corpus_repeats": int(corpus_repeats),
+            "max_corpus_tokens": max_corpus_tokens,
+            "min_cases": int(min_cases),
+            "require_multi_shape": bool(require_multi_shape),
+            "require_multi_seed": bool(require_multi_seed),
+        },
+        "summary": summary,
+        "cases": tuple(cases),
+        "failed_checks": tuple(failed_checks),
+        "passed": not failed_checks,
+    }
+    _write_json(output_dir / "llm_batch_profile_matrix.json", matrix)
+    csv_path = output_dir / "llm_batch_profile_matrix.csv"
+    with csv_path.open("w", encoding="utf-8", newline="") as handle:
+        fieldnames = tuple(csv_rows[0].keys()) if csv_rows else ("case_id",)
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(csv_rows)
+    return matrix
+
+
 def build_benchmark_corpus(path: str | Path, *, domain: str, repeats: int = 256) -> tuple[str, ...]:
     if repeats < 8:
         raise ValueError("benchmark repeats must be >= 8")
@@ -9063,6 +9270,35 @@ def _parse_seed_list(raw: str) -> tuple[int, ...]:
     if not seeds:
         raise ValueError("at least one seed is required")
     return tuple(seeds)
+
+
+def _parse_profile_shape_specs(raw: str) -> tuple[Mapping[str, int], ...]:
+    specs: list[Mapping[str, int]] = []
+    for part in _parse_list(raw):
+        tokens = tuple(token for token in part.lower().replace("*", "x").split("x") if token)
+        if len(tokens) != 5:
+            raise ValueError(
+                f"invalid profile shape {part!r}; expected seq_lenxd_modelxn_headsxn_layersxbatch_size"
+            )
+        try:
+            seq_len, d_model, n_heads, n_layers, batch_size = (int(token) for token in tokens)
+        except ValueError as exc:
+            raise ValueError(f"invalid profile shape {part!r}; all dimensions must be integers") from exc
+        specs.append(
+            _normalize_profile_shape_spec(
+                {
+                    "seq_len": seq_len,
+                    "d_model": d_model,
+                    "n_heads": n_heads,
+                    "n_layers": n_layers,
+                    "batch_size": batch_size,
+                },
+                default_batch_size=batch_size,
+            )
+        )
+    if not specs:
+        raise ValueError("at least one profile shape is required")
+    return tuple(specs)
 
 
 def _parse_named_corpus_specs(raw_specs: Sequence[str]) -> tuple[tuple[str, TextCorpusConfig], ...]:
@@ -9155,6 +9391,26 @@ def main(argv: Sequence[str] | None = None) -> None:
     profile_batch.add_argument("--max-corpus-tokens", type=int, default=8192)
     profile_batch.add_argument("--overwrite", action="store_true", help="delete and recreate the output directory instead of failing when it exists")
     profile_batch.add_argument("--native-ternary-backend", choices=NATIVE_TERNARY_BACKEND_CHOICES, default=STRICT_NATIVE_TERNARY_BACKEND)
+
+    profile_matrix = sub.add_parser("profile-matrix", help="profile strict Cortex LLM training across multiple shapes and seeds")
+    profile_matrix.add_argument("--out-dir", default="runs/llm-batch-profile-matrix")
+    profile_matrix.add_argument("--profile-shapes", default="32x64x4x2x8,40x64x4x2x8", help="comma/space list of seq_lenxd_modelxn_headsxn_layersxbatch_size specs")
+    profile_matrix.add_argument("--seeds", default="71,73")
+    profile_matrix.add_argument("--steps", type=int, default=1)
+    profile_matrix.add_argument("--gradient-accumulation-steps", type=int, default=1)
+    profile_matrix.add_argument("--vocab-size", type=int, default=256)
+    profile_matrix.add_argument("--precision", choices=("auto", "fp32", "bf16", "fp16"), default="auto")
+    profile_matrix.add_argument("--device", default="auto")
+    profile_matrix.add_argument("--require-cuda", action="store_true")
+    profile_matrix.add_argument("--resource-interval", type=float, default=0.05)
+    profile_matrix.add_argument("--min-resource-samples", type=int, default=2)
+    profile_matrix.add_argument("--corpus-repeats", type=int, default=192)
+    profile_matrix.add_argument("--max-corpus-tokens", type=int, default=8192)
+    profile_matrix.add_argument("--min-cases", type=int, default=1)
+    profile_matrix.add_argument("--require-multi-shape", action="store_true")
+    profile_matrix.add_argument("--require-multi-seed", action="store_true")
+    profile_matrix.add_argument("--overwrite", action="store_true", help="delete and recreate the output directory instead of failing when it exists")
+    profile_matrix.add_argument("--native-ternary-backend", choices=NATIVE_TERNARY_BACKEND_CHOICES, default=STRICT_NATIVE_TERNARY_BACKEND)
 
     compare = sub.add_parser("compare", help="run baseline vs Cortex comparison on text files or directories")
     compare.add_argument("paths", nargs="+")
@@ -9467,6 +9723,33 @@ def main(argv: Sequence[str] | None = None) -> None:
         if not bool(report["passed"]):
             failed = ", ".join(str(item) for item in report["failed_checks"])
             raise RuntimeError(f"Cortex LLM batch profile failed required checks: {failed}")
+        return
+
+    if args.command == "profile-matrix":
+        report = run_llm_batch_profile_matrix(
+            out_dir=args.out_dir,
+            shape_specs=_parse_profile_shape_specs(args.profile_shapes),
+            seeds=_parse_seed_list(args.seeds),
+            steps=args.steps,
+            gradient_accumulation_steps=args.gradient_accumulation_steps,
+            vocab_size=args.vocab_size,
+            precision=args.precision,
+            device=args.device,
+            require_cuda=args.require_cuda,
+            native_ternary_backend=args.native_ternary_backend,
+            resource_interval=args.resource_interval,
+            min_resource_samples=args.min_resource_samples,
+            corpus_repeats=args.corpus_repeats,
+            max_corpus_tokens=args.max_corpus_tokens,
+            min_cases=args.min_cases,
+            require_multi_shape=args.require_multi_shape,
+            require_multi_seed=args.require_multi_seed,
+            overwrite=args.overwrite,
+        )
+        print(json.dumps(report, indent=2, sort_keys=True, default=_json_default))
+        if not bool(report["passed"]):
+            failed = ", ".join(str(item) for item in report["failed_checks"])
+            raise RuntimeError(f"Cortex LLM batch profile matrix failed required checks: {failed}")
         return
 
     if args.command == "prepare-hf":
