@@ -124,6 +124,9 @@ extern "C" __global__ void ternary_matmul_bf16(
 #define C3_BLOCK_K 32
 #define C3_WARPS_PER_BLOCK 8
 #define C3_REQUANT_THREADS 256
+#define C3_GRAD_TILE_M 16
+#define C3_GRAD_TILE_N 16
+#define C3_GRAD_TILE_K 16
 
 __device__ __forceinline__ float c3_decode_weight(
     const unsigned char* packed,
@@ -149,6 +152,90 @@ __device__ __forceinline__ float c3_warp_sum(float value) {
     value += __shfl_down_sync(0xffffffff, value, offset);
   }
   return value;
+}
+
+template <typename T>
+__device__ __forceinline__ float c3_scalar_to_float(T value) {
+  return static_cast<float>(value);
+}
+
+template <>
+__device__ __forceinline__ float c3_scalar_to_float<__half>(__half value) {
+  return __half2float(value);
+}
+
+template <>
+__device__ __forceinline__ float c3_scalar_to_float<__nv_bfloat16>(__nv_bfloat16 value) {
+  return __bfloat162float(value);
+}
+
+template <typename T>
+__device__ __forceinline__ void c3_store_scalar(T* ptr, int index, float value) {
+  ptr[index] = static_cast<T>(value);
+}
+
+template <>
+__device__ __forceinline__ void c3_store_scalar<__half>(__half* ptr, int index, float value) {
+  ptr[index] = __float2half(value);
+}
+
+template <>
+__device__ __forceinline__ void c3_store_scalar<__nv_bfloat16>(__nv_bfloat16* ptr, int index, float value) {
+  ptr[index] = __float2bfloat16(value);
+}
+
+template <typename input_t, typename output_t>
+__global__ void ternary_grad_weight_bias_tiled(
+    const input_t* grad_out,
+    const input_t* x,
+    output_t* grad_weight,
+    output_t* grad_bias,
+    int m_rows,
+    int n_cols,
+    int k_cols,
+    int has_bias) {
+  __shared__ float grad_tile[C3_GRAD_TILE_M][C3_GRAD_TILE_N];
+  __shared__ float x_tile[C3_GRAD_TILE_M][C3_GRAD_TILE_K];
+  int local_k = threadIdx.x;
+  int local_n = threadIdx.y;
+  int global_k = blockIdx.x * C3_GRAD_TILE_K + local_k;
+  int global_n = blockIdx.y * C3_GRAD_TILE_N + local_n;
+  float weight_acc = 0.0f;
+  float bias_acc = 0.0f;
+  for (int m0 = 0; m0 < m_rows; m0 += C3_GRAD_TILE_M) {
+    int load_m = m0 + local_n;
+    int grad_n = blockIdx.y * C3_GRAD_TILE_N + local_k;
+    x_tile[local_n][local_k] = (load_m < m_rows && global_k < k_cols)
+        ? c3_scalar_to_float<input_t>(x[load_m * k_cols + global_k])
+        : 0.0f;
+    grad_tile[local_n][local_k] = (load_m < m_rows && grad_n < n_cols)
+        ? c3_scalar_to_float<input_t>(grad_out[load_m * n_cols + grad_n])
+        : 0.0f;
+    __syncthreads();
+    if (global_n < n_cols && global_k < k_cols) {
+      #pragma unroll
+      for (int mm = 0; mm < C3_GRAD_TILE_M; ++mm) {
+        if (m0 + mm < m_rows) {
+          weight_acc += grad_tile[mm][local_n] * x_tile[mm][local_k];
+        }
+      }
+    }
+    if (has_bias && local_k == 0 && global_n < n_cols) {
+      #pragma unroll
+      for (int mm = 0; mm < C3_GRAD_TILE_M; ++mm) {
+        if (m0 + mm < m_rows) {
+          bias_acc += grad_tile[mm][local_n];
+        }
+      }
+    }
+    __syncthreads();
+  }
+  if (global_n < n_cols && global_k < k_cols) {
+    c3_store_scalar<output_t>(grad_weight, global_n * k_cols + global_k, weight_acc);
+  }
+  if (has_bias && local_k == 0 && global_n < n_cols) {
+    c3_store_scalar<output_t>(grad_bias, global_n, bias_acc);
+  }
 }
 
 extern "C" __global__ void ternary_matmul_tiled_fp32(
@@ -741,6 +828,7 @@ _TERNARY_EXTENSION_ERROR: Exception | None = None
 _TERNARY_EXTENSION_BUILD_ATTEMPTED = False
 _NATIVE_CUDA_BACKENDS = {"auto", "extension", "rawkernel"}
 _LAST_NATIVE_REQUANTIZE_BACKEND = ""
+_LAST_NATIVE_GRAD_WEIGHT_BACKEND = ""
 
 
 def native_backend_from_runtime_label(label: str, default: str = "") -> str:
@@ -761,6 +849,7 @@ _TERNARY_EXTENSION_CPP_SOURCE = r"""
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAException.h>
 #include <cuda_runtime_api.h>
+#include <vector>
 
 extern "C" void launch_ternary_forward_dispatch(
     const void* x,
@@ -793,6 +882,19 @@ extern "C" void launch_ternary_grad_input_dispatch(
     int use_residual,
     cudaStream_t stream);
 
+extern "C" void launch_ternary_grad_weight_bias_dispatch(
+    const void* grad_out,
+    const void* x,
+    void* grad_weight,
+    void* grad_bias,
+    int input_dtype_code,
+    int output_dtype_code,
+    int m_rows,
+    int n_cols,
+    int k_cols,
+    int has_bias,
+    cudaStream_t stream);
+
 extern "C" void launch_ternary_requantize_pack_dispatch(
     const void* values,
     void* signs,
@@ -821,6 +923,19 @@ static int c3_dtype_code(const torch::Tensor& tensor) {
     return 2;
   }
   TORCH_CHECK(false, "unsupported ternary CUDA extension dtype: ", tensor.scalar_type());
+}
+
+static at::ScalarType c3_scalar_type_from_code(int64_t dtype_code) {
+  if (dtype_code == 0) {
+    return at::ScalarType::Float;
+  }
+  if (dtype_code == 1) {
+    return at::ScalarType::Half;
+  }
+  if (dtype_code == 2) {
+    return at::ScalarType::BFloat16;
+  }
+  TORCH_CHECK(false, "unsupported ternary CUDA extension output dtype code: ", dtype_code);
 }
 
 static void c3_check_cuda_contiguous(const torch::Tensor& tensor, const char* name) {
@@ -912,6 +1027,38 @@ torch::Tensor ternary_grad_input(
       stream);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return grad_x;
+}
+
+std::vector<torch::Tensor> ternary_grad_weight_bias(
+    torch::Tensor grad_out,
+    torch::Tensor x,
+    int64_t weight_dtype_code,
+    bool has_bias) {
+  c3_check_cuda_contiguous(grad_out, "grad_out");
+  c3_check_cuda_contiguous(x, "x");
+  TORCH_CHECK(grad_out.scalar_type() == x.scalar_type(), "grad_out/x dtype mismatch");
+  TORCH_CHECK(grad_out.dim() == 2, "grad_out must have shape [rows, out_features]");
+  TORCH_CHECK(x.dim() == 2, "x must have shape [rows, in_features]");
+  TORCH_CHECK(grad_out.size(0) == x.size(0), "grad_out/x row mismatch");
+  auto output_dtype = c3_scalar_type_from_code(weight_dtype_code);
+  auto output_options = x.options().dtype(output_dtype);
+  auto grad_weight = torch::empty({grad_out.size(1), x.size(1)}, output_options);
+  auto grad_bias = has_bias ? torch::empty({grad_out.size(1)}, output_options) : torch::empty({0}, output_options);
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream(grad_out.get_device()).stream();
+  launch_ternary_grad_weight_bias_dispatch(
+      grad_out.data_ptr(),
+      x.data_ptr(),
+      grad_weight.data_ptr(),
+      has_bias ? grad_bias.data_ptr() : nullptr,
+      c3_dtype_code(grad_out),
+      static_cast<int>(weight_dtype_code),
+      static_cast<int>(grad_out.size(0)),
+      static_cast<int>(grad_out.size(1)),
+      static_cast<int>(x.size(1)),
+      has_bias ? 1 : 0,
+      stream);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return {grad_weight, grad_bias};
 }
 
 torch::Tensor ternary_requantize_pack(
@@ -1042,6 +1189,63 @@ extern "C" void launch_ternary_grad_input_dispatch(
     ternary_grad_input_warp_bf16<<<blocks, threads, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(grad_out), packed, scales, residual,
         static_cast<__nv_bfloat16*>(grad_x), m_rows, n_cols, k_cols, packed_stride, use_residual);
+  }
+}
+
+template <typename input_t>
+void c3_launch_grad_weight_bias_for_input(
+    const void* grad_out,
+    const void* x,
+    void* grad_weight,
+    void* grad_bias,
+    int output_dtype_code,
+    int m_rows,
+    int n_cols,
+    int k_cols,
+    int has_bias,
+    cudaStream_t stream) {
+  dim3 blocks((k_cols + C3_GRAD_TILE_K - 1) / C3_GRAD_TILE_K,
+              (n_cols + C3_GRAD_TILE_N - 1) / C3_GRAD_TILE_N);
+  dim3 threads(C3_GRAD_TILE_K, C3_GRAD_TILE_N);
+  if (output_dtype_code == 0) {
+    ternary_grad_weight_bias_tiled<input_t, float><<<blocks, threads, 0, stream>>>(
+        static_cast<const input_t*>(grad_out), static_cast<const input_t*>(x),
+        static_cast<float*>(grad_weight), static_cast<float*>(grad_bias),
+        m_rows, n_cols, k_cols, has_bias);
+  } else if (output_dtype_code == 1) {
+    ternary_grad_weight_bias_tiled<input_t, __half><<<blocks, threads, 0, stream>>>(
+        static_cast<const input_t*>(grad_out), static_cast<const input_t*>(x),
+        static_cast<__half*>(grad_weight), static_cast<__half*>(grad_bias),
+        m_rows, n_cols, k_cols, has_bias);
+  } else {
+    ternary_grad_weight_bias_tiled<input_t, __nv_bfloat16><<<blocks, threads, 0, stream>>>(
+        static_cast<const input_t*>(grad_out), static_cast<const input_t*>(x),
+        static_cast<__nv_bfloat16*>(grad_weight), static_cast<__nv_bfloat16*>(grad_bias),
+        m_rows, n_cols, k_cols, has_bias);
+  }
+}
+
+extern "C" void launch_ternary_grad_weight_bias_dispatch(
+    const void* grad_out,
+    const void* x,
+    void* grad_weight,
+    void* grad_bias,
+    int input_dtype_code,
+    int output_dtype_code,
+    int m_rows,
+    int n_cols,
+    int k_cols,
+    int has_bias,
+    cudaStream_t stream) {
+  if (input_dtype_code == 0) {
+    c3_launch_grad_weight_bias_for_input<float>(
+        grad_out, x, grad_weight, grad_bias, output_dtype_code, m_rows, n_cols, k_cols, has_bias, stream);
+  } else if (input_dtype_code == 1) {
+    c3_launch_grad_weight_bias_for_input<__half>(
+        grad_out, x, grad_weight, grad_bias, output_dtype_code, m_rows, n_cols, k_cols, has_bias, stream);
+  } else {
+    c3_launch_grad_weight_bias_for_input<__nv_bfloat16>(
+        grad_out, x, grad_weight, grad_bias, output_dtype_code, m_rows, n_cols, k_cols, has_bias, stream);
   }
 }
 
@@ -1192,6 +1396,16 @@ def _normalize_native_cuda_backend(backend: str) -> str:
     return normalized
 
 
+def _extension_dtype_code(dtype: Any) -> int:
+    if dtype == torch.float32:
+        return 0
+    if dtype == torch.float16:
+        return 1
+    if dtype == torch.bfloat16:
+        return 2
+    raise RuntimeError(f"Cortex-3 CUDA extension does not support dtype {dtype}")
+
+
 def _torch_cuda_home_candidate() -> Path | None:
     torch_cuda = getattr(torch.version, "cuda", None)
     if not torch_cuda:
@@ -1309,10 +1523,10 @@ def _load_ternary_cuda_extension() -> Any:
         if target_include.exists():
             extra_include_paths.append(str(target_include))
         module = load_inline(
-            name="cortex3_ternary_cuda_extension_v1",
+            name="cortex3_ternary_cuda_extension_v2",
             cpp_sources=[_TERNARY_EXTENSION_CPP_SOURCE],
             cuda_sources=[_CUPY_TERNARY_KERNEL_SOURCE + "\n" + _TERNARY_EXTENSION_CUDA_WRAPPERS],
-            functions=["ternary_forward", "ternary_grad_input", "ternary_requantize_pack"],
+            functions=["ternary_forward", "ternary_grad_input", "ternary_grad_weight_bias", "ternary_requantize_pack"],
             extra_include_paths=extra_include_paths,
             extra_cflags=extra_cflags,
             extra_cuda_cflags=["-allow-unsupported-compiler", "--std=c++17"],
@@ -1487,6 +1701,27 @@ def _extension_ternary_grad_input_cuda(
     )
 
 
+def _extension_ternary_grad_weight_bias_cuda(
+    grad_output_flat: Any,
+    x_flat: Any,
+    float_weight_dtype: Any,
+    *,
+    has_bias: bool,
+) -> tuple[Any, Any]:
+    if grad_output_flat.dtype not in _CUPY_TERNARY_GRAD_INPUT_KERNEL_NAMES:
+        raise RuntimeError(f"CUDA extension grad-weight does not support dtype {grad_output_flat.dtype}")
+    module = _load_ternary_cuda_extension()
+    grad_out = grad_output_flat.detach().contiguous()
+    x_values = x_flat.detach().to(dtype=grad_out.dtype).contiguous()
+    grad_weight, grad_bias = module.ternary_grad_weight_bias(
+        grad_out,
+        x_values,
+        int(_extension_dtype_code(float_weight_dtype)),
+        bool(has_bias),
+    )
+    return grad_weight, grad_bias
+
+
 def _extension_requantize_pack_cuda(
     values: Any,
     signs: Any,
@@ -1581,6 +1816,45 @@ def _native_packed_ternary_grad_input_cuda(
             ),
         )
     return grad_x
+
+
+def _native_packed_ternary_grad_weight_bias_cuda(
+    grad_output_flat: Any,
+    x_flat: Any,
+    float_weight_dtype: Any,
+    *,
+    has_bias: bool,
+    backend: str = "auto",
+) -> tuple[Any, Any, str]:
+    global _LAST_NATIVE_GRAD_WEIGHT_BACKEND
+    backend = _normalize_native_cuda_backend(backend)
+    if not grad_output_flat.is_cuda:
+        weight_grad = grad_output_flat.transpose(0, 1).matmul(x_flat.to(dtype=grad_output_flat.dtype))
+        grad_weight = weight_grad.to(dtype=float_weight_dtype)
+        grad_bias = grad_output_flat.sum(dim=0).to(dtype=float_weight_dtype) if has_bias else grad_output_flat.new_empty((0,), dtype=float_weight_dtype)
+        _LAST_NATIVE_GRAD_WEIGHT_BACKEND = "torch_cpu_dense"
+        return grad_weight, grad_bias, "torch_cpu_dense"
+    if grad_output_flat.is_cuda and grad_output_flat.dtype in _CUPY_TERNARY_GRAD_INPUT_KERNEL_NAMES:
+        if backend in {"auto", "extension"}:
+            try:
+                grad_weight, grad_bias = _extension_ternary_grad_weight_bias_cuda(
+                    grad_output_flat,
+                    x_flat,
+                    float_weight_dtype,
+                    has_bias=has_bias,
+                )
+                _LAST_NATIVE_GRAD_WEIGHT_BACKEND = "extension"
+                return grad_weight, grad_bias, "extension"
+            except Exception:
+                if backend == "extension":
+                    raise
+    if backend == "extension":
+        raise RuntimeError(f"CUDA extension grad-weight does not support dtype/device {grad_output_flat.dtype}/{grad_output_flat.device}")
+    weight_grad = grad_output_flat.transpose(0, 1).matmul(x_flat.to(dtype=grad_output_flat.dtype))
+    grad_weight = weight_grad.to(dtype=float_weight_dtype)
+    grad_bias = grad_output_flat.sum(dim=0).to(dtype=float_weight_dtype) if has_bias else grad_output_flat.new_empty((0,), dtype=float_weight_dtype)
+    _LAST_NATIVE_GRAD_WEIGHT_BACKEND = "torch_dense"
+    return grad_weight, grad_bias, "torch_dense"
 
 
 def _native_requantize_pack_cuda(
@@ -1696,6 +1970,8 @@ class _PackedTernarySTEFunction(torch.autograd.Function):
         in_features: int,
         residual_runtime: bool,
         native_cuda_backend: str,
+        ledger: Any,
+        log_prefix: str,
     ) -> Any:
         ctx.input_shape = tuple(int(dim) for dim in x.shape)
         ctx.has_bias = bool(has_bias)
@@ -1703,6 +1979,8 @@ class _PackedTernarySTEFunction(torch.autograd.Function):
         ctx.residual_runtime = bool(residual_runtime)
         ctx.native_cuda_backend = _normalize_native_cuda_backend(native_cuda_backend)
         ctx.float_weight_dtype = float_weight.dtype
+        ctx.ledger = ledger
+        ctx.log_prefix = str(log_prefix)
         ctx.save_for_backward(x, packed_codes.detach(), scales.detach(), residual_weight.detach())
         return packed_output.detach()
 
@@ -1734,12 +2012,26 @@ class _PackedTernarySTEFunction(torch.autograd.Function):
                     residual_runtime=ctx.residual_runtime,
                 )
                 grad_x = grad_output_flat.matmul(input_weight).reshape(ctx.input_shape)
-        if ctx.needs_input_grad[1]:
-            weight_grad = grad_output_flat.transpose(0, 1).matmul(x_flat.to(dtype=grad_output_flat.dtype))
-            grad_weight = weight_grad.to(dtype=ctx.float_weight_dtype)
+        grad_weight_backend = ""
+        if ctx.needs_input_grad[1] or (ctx.has_bias and ctx.needs_input_grad[2]):
+            grad_weight, fused_grad_bias, grad_weight_backend = _native_packed_ternary_grad_weight_bias_cuda(
+                grad_output_flat,
+                x_flat,
+                ctx.float_weight_dtype,
+                has_bias=bool(ctx.has_bias and ctx.needs_input_grad[2]),
+                backend=ctx.native_cuda_backend,
+            )
+            if not ctx.needs_input_grad[1]:
+                grad_weight = None
+            if ctx.has_bias and ctx.needs_input_grad[2]:
+                grad_bias = fused_grad_bias
+            ledger = getattr(ctx, "ledger", None)
+            if ledger is not None and hasattr(ledger, "record_native_grad_weight_backend"):
+                ledger.record_native_grad_weight_backend(grad_weight_backend)
         if ctx.has_bias and ctx.needs_input_grad[2]:
-            grad_bias = grad_output_flat.sum(dim=0)
-        return grad_x, grad_weight, grad_bias, None, None, None, None, None, None, None, None
+            if grad_bias is None:
+                grad_bias = grad_output_flat.sum(dim=0).to(dtype=ctx.float_weight_dtype)
+        return grad_x, grad_weight, grad_bias, None, None, None, None, None, None, None, None, None, None
 
 
 @dataclass(frozen=True)
@@ -1854,8 +2146,10 @@ class CompressionTraceLedger:
     total_torch_packed_ternary_dispatches: int = 0
     total_native_ternary_autotuned_dispatches: int = 0
     total_native_ternary_autotune_cache_hits: int = 0
+    total_native_ternary_grad_weight_dispatches: int = 0
     native_ternary_backend_counts: dict[str, int] = field(default_factory=dict)
     native_ternary_requantize_backend_counts: dict[str, int] = field(default_factory=dict)
+    native_ternary_grad_weight_backend_counts: dict[str, int] = field(default_factory=dict)
     total_weight_bits_read: float = 0.0
     total_activation_bits: float = 0.0
     total_kv_bytes: float = 0.0
@@ -1923,6 +2217,13 @@ class CompressionTraceLedger:
             self.native_ternary_requantize_backend_counts.get(native_backend, 0) + 1
         )
 
+    def record_native_grad_weight_backend(self, backend: str) -> None:
+        native_backend = native_backend_from_runtime_label(backend, default=str(backend or "unknown"))
+        self.total_native_ternary_grad_weight_dispatches += 1
+        self.native_ternary_grad_weight_backend_counts[native_backend] = (
+            self.native_ternary_grad_weight_backend_counts.get(native_backend, 0) + 1
+        )
+
     @property
     def cost_trace(self) -> CostTrace:
         return CostTrace(
@@ -1952,6 +2253,7 @@ class CompressionTraceLedger:
     def to_dict(self) -> dict[str, Any]:
         native_backend_counts = dict(sorted(self.native_ternary_backend_counts.items()))
         native_requantize_backend_counts = dict(sorted(self.native_ternary_requantize_backend_counts.items()))
+        native_grad_weight_backend_counts = dict(sorted(self.native_ternary_grad_weight_backend_counts.items()))
         native_variants = tuple(sorted({
             item.kernel_variant
             for item in self.packed_ternary_dispatches
@@ -1969,11 +2271,14 @@ class CompressionTraceLedger:
             "torch_packed_ternary_dispatches": self.total_torch_packed_ternary_dispatches,
             "native_ternary_autotuned_dispatches": self.total_native_ternary_autotuned_dispatches,
             "native_ternary_autotune_cache_hits": self.total_native_ternary_autotune_cache_hits,
+            "native_ternary_grad_weight_dispatches": self.total_native_ternary_grad_weight_dispatches,
         }
         for backend, count in native_backend_counts.items():
             total_event_counts[f"native_ternary_{backend}_kernel_dispatches"] = int(count)
         for backend, count in native_requantize_backend_counts.items():
             total_event_counts[f"native_ternary_{backend}_requantize_dispatches"] = int(count)
+        for backend, count in native_grad_weight_backend_counts.items():
+            total_event_counts[f"native_ternary_{backend}_grad_weight_dispatches"] = int(count)
         return {
             "compression_decisions": [asdict(item) for item in self.compression_decisions],
             "activation_quantizations": [asdict(item) for item in self.activation_quantizations],
@@ -1997,8 +2302,10 @@ class CompressionTraceLedger:
             "packed_weight_bytes_read": self.total_packed_weight_bytes,
             "native_ternary_backend_counts": native_backend_counts,
             "native_ternary_requantize_backend_counts": native_requantize_backend_counts,
+            "native_ternary_grad_weight_backend_counts": native_grad_weight_backend_counts,
             "native_ternary_kernel_backends": tuple(native_backend_counts),
             "native_ternary_requantize_backends": tuple(native_requantize_backend_counts),
+            "native_ternary_grad_weight_backends": tuple(native_grad_weight_backend_counts),
             "native_ternary_kernel_variants": native_variants,
         }
 
@@ -2106,7 +2413,7 @@ class BitLinearConfig:
     use_packed_ternary_runtime: bool = True
     use_native_cuda_kernel: bool = True
     require_native_cuda_kernel: bool = False
-    native_cuda_backend: str = "auto"
+    native_cuda_backend: str = "extension"
     native_cuda_kernel_variant: str = "auto"
     native_cuda_autotune: bool = True
     native_cuda_autotune_warmup: int = 1
@@ -2604,6 +2911,8 @@ class BitLinear(nn.Module):
                     self.config.in_features,
                     self.config.residual_runtime,
                     self.config.native_cuda_backend,
+                    self.ledger,
+                    self.config.log_prefix,
                 )
                 max_abs_error = 0.0
                 ste_note = "custom autograd STE backward skips dense STE forward"

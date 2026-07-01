@@ -55,6 +55,35 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
         files = build_seed_corpus(root / "text", repeats=repeats)
         return TextCorpusConfig.from_paths(files, min_chars_per_chunk=512)
 
+    def test_cuda_ternary_training_contract_is_strict_extension(self):
+        loose_config = TransformerConfig(
+            vocab_size=64,
+            seq_len=16,
+            d_model=32,
+            n_heads=4,
+            n_layers=1,
+            use_ternary_core=True,
+            native_ternary_backend="auto",
+        )
+        trainer = object.__new__(LLMTrainer)
+        trainer.model = CortexTransformerLM(loose_config)
+        with self.assertRaisesRegex(RuntimeError, "requires native_ternary_backend='extension'"):
+            LLMTrainer._enforce_strict_native_ternary_cuda(trainer)
+
+        strict_config = replace(loose_config, native_ternary_backend="extension")
+        trainer.model = CortexTransformerLM(strict_config)
+        LLMTrainer._enforce_strict_native_ternary_cuda(trainer)
+        self.assertTrue(trainer.model.config.require_native_ternary_kernel)
+        bitlinear_modules = [module for module in trainer.model.modules() if module.__class__.__name__ == "BitLinear"]
+        self.assertTrue(bitlinear_modules)
+        for module in bitlinear_modules:
+            self.assertEqual(module.config.native_cuda_backend, "extension")
+            self.assertTrue(module.config.require_native_cuda_kernel)
+
+    def test_default_ternary_training_backend_is_extension(self):
+        self.assertEqual(TransformerConfig(vocab_size=64).native_ternary_backend, "extension")
+        self.assertEqual(ComparisonConfig(vocab_size=64).native_ternary_backend, "extension")
+
     def test_bpe_tokenizer_and_memmap_corpus_are_streamable(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

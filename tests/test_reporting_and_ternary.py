@@ -102,6 +102,7 @@ class ReportingAndTernaryTest(unittest.TestCase):
         import torch
 
         self.assertTrue(torch_available())
+        self.assertEqual(BitLinearConfig(3, 2).native_cuda_backend, "extension")
         ledger = CompressionTraceLedger()
         layer = BitLinear(BitLinearConfig(3, 2, activation_bits=4), ledger=ledger)
         output = layer(torch.ones(1, 3))
@@ -296,8 +297,10 @@ class ReportingAndTernaryTest(unittest.TestCase):
         payload = layer.ledger.to_dict()
         self.assertGreater(payload["native_ternary_backend_counts"].get("extension", 0), 0)
         self.assertGreater(payload["native_ternary_requantize_backend_counts"].get("extension", 0), 0)
+        self.assertGreater(payload["native_ternary_grad_weight_backend_counts"].get("extension", 0), 0)
         self.assertGreater(payload["total_event_counts"].get("native_ternary_extension_kernel_dispatches", 0), 0)
         self.assertGreater(payload["total_event_counts"].get("native_ternary_extension_requantize_dispatches", 0), 0)
+        self.assertGreater(payload["total_event_counts"].get("native_ternary_extension_grad_weight_dispatches", 0), 0)
 
     @unittest.skipUnless(
         __import__("torch").cuda.is_available() and native_ternary_cuda_available(),
@@ -356,6 +359,7 @@ class ReportingAndTernaryTest(unittest.TestCase):
                     dispatch = fast.ledger.packed_ternary_dispatches[-1]
                     self.assertTrue(dispatch.native_kernel)
                     self.assertIn("custom autograd STE backward", dispatch.note)
+                    self.assertGreater(fast.ledger.total_native_ternary_grad_weight_dispatches, 0)
 
     @unittest.skipUnless(
         __import__("torch").cuda.is_available() and native_ternary_cuda_available(),

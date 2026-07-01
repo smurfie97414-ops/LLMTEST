@@ -14,7 +14,7 @@ if str(ROOT) not in sys.path:
 import torch
 import torch.nn.functional as F
 
-from cortex3_ternary import BitLinear, BitLinearConfig, native_ternary_cuda_available
+from cortex3_ternary import BitLinear, BitLinearConfig, native_ternary_cuda_available, native_ternary_cuda_extension_available
 from cortex3_ternary import (
     clear_native_ternary_autotune_cache,
     load_native_ternary_autotune_cache,
@@ -51,6 +51,7 @@ def benchmark_case(
     out_features: int,
     dtype: torch.dtype,
     kernel_variant: str,
+    native_backend: str,
     enable_autotune: bool,
     autotune_warmup: int,
     autotune_repeat: int,
@@ -66,6 +67,7 @@ def benchmark_case(
             activation_bits=0,
             residual_runtime=False,
             require_native_cuda_kernel=True,
+            native_cuda_backend=native_backend,
             native_cuda_kernel_variant=kernel_variant,
             native_cuda_autotune=enable_autotune,
             native_cuda_autotune_warmup=autotune_warmup,
@@ -82,6 +84,7 @@ def benchmark_case(
             activation_bits=0,
             residual_runtime=False,
             require_native_cuda_kernel=True,
+            native_cuda_backend=native_backend,
             native_cuda_kernel_variant=kernel_variant,
             native_cuda_autotune=enable_autotune,
             native_cuda_autotune_warmup=autotune_warmup,
@@ -195,6 +198,10 @@ def benchmark_case(
         "legacy_dense_ste_forward_backward_ms": legacy_forward_backward_ms,
         "native_requantize_pack_ms": native_requantize_pack_ms,
         "torch_requantize_pack_ms": torch_requantize_pack_ms,
+        "native_grad_weight_backend_counts": dict(layer.ledger.native_ternary_grad_weight_backend_counts),
+        "native_extension_grad_weight_dispatches": int(
+            layer.ledger.native_ternary_grad_weight_backend_counts.get("extension", 0)
+        ),
         "requantize_pack_speedup_vs_torch": torch_requantize_pack_ms / max(native_requantize_pack_ms, 1e-9),
         "legacy_training_forward_native_plus_ste_dense_ms": legacy_training_forward_ms,
         "estimated_training_forward_native_plus_ste_ms": legacy_training_forward_ms,
@@ -223,6 +230,7 @@ def main() -> None:
     parser.add_argument("--in-features", type=int, default=512)
     parser.add_argument("--out-features", type=int, default=512)
     parser.add_argument("--dtype", choices=tuple(DTYPES), default="fp16")
+    parser.add_argument("--native-backend", choices=("auto", "extension", "rawkernel"), default="auto")
     parser.add_argument("--kernel-variant", choices=("auto", "tiled", "warp"), default="auto")
     parser.add_argument("--disable-autotune", action="store_true")
     parser.add_argument("--autotune-warmup", type=int, default=1)
@@ -237,7 +245,9 @@ def main() -> None:
 
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for native ternary kernel benchmarking")
-    if not native_ternary_cuda_available():
+    if args.native_backend == "extension" and not native_ternary_cuda_extension_available():
+        raise RuntimeError("Cortex ternary CUDA extension backend is unavailable")
+    if args.native_backend != "extension" and not native_ternary_cuda_available():
         raise RuntimeError("CuPy native ternary CUDA kernel is unavailable")
     if args.clear_autotune_cache:
         clear_native_ternary_autotune_cache()
@@ -251,6 +261,7 @@ def main() -> None:
         out_features=args.out_features,
         dtype=DTYPES[args.dtype],
         kernel_variant=args.kernel_variant,
+        native_backend=args.native_backend,
         enable_autotune=not args.disable_autotune,
         autotune_warmup=args.autotune_warmup,
         autotune_repeat=args.autotune_repeat,
