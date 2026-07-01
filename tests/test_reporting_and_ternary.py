@@ -367,6 +367,63 @@ class ReportingAndTernaryTest(unittest.TestCase):
         payload = layer.ledger.to_dict()
         self.assertGreater(payload["native_ternary_grad_weight_backend_counts"].get("extension", 0), 0)
 
+    def test_bitlinear_native_extension_cuda_wmma_handles_edge_tiles(self):
+        import torch
+
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA is required")
+        if not native_ternary_cuda_extension_available():
+            self.skipTest("Cortex ternary CUDA extension is not buildable in this environment")
+
+        torch.manual_seed(47)
+        fast = BitLinear(BitLinearConfig(
+            33,
+            35,
+            activation_bits=0,
+            residual_runtime=False,
+            require_native_cuda_kernel=True,
+            native_cuda_backend="extension",
+            native_cuda_kernel_variant="warp",
+            native_cuda_autotune=False,
+            use_fast_ste_autograd=True,
+            log_prefix="cuda-extension-wmma-edge-fast",
+        )).cuda()
+        dense = BitLinear(BitLinearConfig(
+            33,
+            35,
+            activation_bits=0,
+            residual_runtime=False,
+            require_native_cuda_kernel=True,
+            native_cuda_backend="extension",
+            native_cuda_kernel_variant="warp",
+            native_cuda_autotune=False,
+            use_fast_ste_autograd=False,
+            log_prefix="cuda-extension-wmma-edge-dense",
+        )).cuda()
+        with torch.no_grad():
+            dense.float_weight.copy_(fast.float_weight)
+            if fast.bias is not None and dense.bias is not None:
+                dense.bias.copy_(fast.bias)
+        fast.requantize()
+        dense.requantize()
+        x_fast = torch.randn(31, 33, device="cuda", dtype=torch.float16, requires_grad=True)
+        x_dense = x_fast.detach().clone().requires_grad_(True)
+
+        fast_loss = fast(x_fast).float().square().mean()
+        dense_loss = dense(x_dense).float().square().mean()
+        fast_loss.backward()
+        dense_loss.backward()
+        torch.cuda.synchronize()
+
+        self.assertTrue(torch.allclose(fast_loss.detach(), dense_loss.detach(), atol=4e-2, rtol=4e-2))
+        self.assertTrue(torch.allclose(x_fast.grad.float(), x_dense.grad.float(), atol=4e-2, rtol=4e-2))
+        self.assertTrue(torch.allclose(fast.float_weight.grad, dense.float_weight.grad, atol=4e-2, rtol=4e-2))
+        self.assertTrue(torch.allclose(fast.bias.grad, dense.bias.grad, atol=4e-2, rtol=4e-2))
+        self.assertEqual(last_native_grad_input_kernel(), "wmma_fp16_padded")
+        self.assertEqual(last_native_grad_weight_kernel(), "wmma_fp16_float_padded")
+        self.assertGreater(native_grad_input_kernel_counts().get("wmma_fp16_padded", 0), 0)
+        self.assertGreater(native_grad_weight_kernel_counts().get("wmma_fp16_float_padded", 0), 0)
+
     @unittest.skipUnless(
         __import__("torch").cuda.is_available() and native_ternary_cuda_available(),
         "CUDA plus CuPy native ternary kernel is required",
