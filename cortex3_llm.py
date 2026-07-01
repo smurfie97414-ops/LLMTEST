@@ -9520,7 +9520,7 @@ def run_llm_batch_profile_autosize(
     max_corpus_tokens: int | None = 8192,
     memory_budget_mb: float = 0.0,
     memory_budget_fraction: float = 0.35,
-    measure_candidate_count: int = 0,
+    measure_candidate_count: int = 4,
     measured_selection_metric: str = "throughput_gpu",
     min_cases: int = 1,
     require_multi_shape: bool = False,
@@ -9541,7 +9541,8 @@ def run_llm_batch_profile_autosize(
         raise ValueError("selected_shape_count must be positive")
     if min_selected_shapes < 1:
         raise ValueError("min_selected_shapes must be positive")
-    if int(measure_candidate_count) < 0:
+    requested_measure_candidate_count = int(measure_candidate_count)
+    if requested_measure_candidate_count < 0:
         raise ValueError("measure_candidate_count must be >= 0")
     if measured_selection_metric not in PROFILE_AUTOSIZE_MEASURED_SELECTION_METRICS:
         raise ValueError(
@@ -9612,8 +9613,13 @@ def run_llm_batch_profile_autosize(
     measurement_seed = int(normalized_seeds[0])
     selection_source = "estimated"
     selection_pool: Sequence[Mapping[str, Any]] = ranked_candidates
-    if int(measure_candidate_count) > 0:
-        measurement_inputs = tuple(ranked_candidates[: int(measure_candidate_count)])
+    effective_measure_candidate_count = (
+        max(requested_measure_candidate_count, int(selected_shape_count))
+        if requested_measure_candidate_count > 0
+        else 0
+    )
+    if effective_measure_candidate_count > 0:
+        measurement_inputs = tuple(ranked_candidates[:effective_measure_candidate_count])
         measurement_rows: list[Mapping[str, Any]] = []
         for candidate_index, candidate in enumerate(measurement_inputs):
             shape = dict(candidate["shape"])
@@ -9678,7 +9684,10 @@ def run_llm_batch_profile_autosize(
     selected = tuple(selection_pool[: int(selected_shape_count)])
     failed_checks: list[str] = []
     if not selected:
-        failed_checks.append("no_measured_viable_shapes" if int(measure_candidate_count) > 0 else "no_viable_shapes")
+        if not ranked_candidates:
+            failed_checks.append("no_viable_shapes")
+        else:
+            failed_checks.append("no_measured_viable_shapes" if effective_measure_candidate_count > 0 else "no_viable_shapes")
     if len(selected) < int(min_selected_shapes):
         failed_checks.append("min_selected_shapes")
     matrix_report: Mapping[str, Any] | None = None
@@ -9734,8 +9743,9 @@ def run_llm_batch_profile_autosize(
             "selected_shape_keys": tuple(str(item["shape_key"]) for item in selected),
         },
         "measurement": {
-            "enabled": int(measure_candidate_count) > 0,
-            "requested_candidate_count": int(measure_candidate_count),
+            "enabled": effective_measure_candidate_count > 0,
+            "requested_candidate_count": requested_measure_candidate_count,
+            "effective_candidate_count": effective_measure_candidate_count,
             "measured_candidate_count": len(measured_candidates),
             "measured_passed_candidate_count": len(measured_passed_candidates),
             "measurement_seed": measurement_seed,
@@ -9974,7 +9984,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     profile_autosize.add_argument("--max-corpus-tokens", type=int, default=8192)
     profile_autosize.add_argument("--memory-budget-mb", type=float, default=0.0)
     profile_autosize.add_argument("--memory-budget-fraction", type=float, default=0.35)
-    profile_autosize.add_argument("--measure-candidate-count", type=int, default=0)
+    profile_autosize.add_argument("--measure-candidate-count", type=int, default=4)
     profile_autosize.add_argument("--measured-selection-metric", choices=PROFILE_AUTOSIZE_MEASURED_SELECTION_METRICS, default="throughput_gpu")
     profile_autosize.add_argument("--min-cases", type=int, default=1)
     profile_autosize.add_argument("--require-multi-shape", action="store_true")
