@@ -477,7 +477,7 @@ P6 est le pont entre detection et correction :
 
 ### Impact Apprentissage
 
-P6 evite de transformer toute regression en retraining global aveugle. Il donne une cible de correction, ce qui rend P7 possible et mesure le cout relatif d'une reparation locale. Le controleur LLM conserve maintenant une memoire de politique d'attribution : quand P7 applique une reparation non-regressive et ameliore la loss de reparation, le couple skill/cause gagne un signal de succes, de gain par cout et d'intervention dominante. Les attributions suivantes peuvent donc privilegier les causes qui ont deja produit des reparations verifiees, au lieu de rester sur un classement purement statique.
+P6 evite de transformer toute regression en retraining global aveugle. Il donne une cible de correction, ce qui rend P7 possible et mesure le cout relatif d'une reparation locale. Le controleur LLM conserve maintenant une memoire de politique d'attribution : quand P7 applique une reparation non-regressive sur les vrais poids Transformer, ameliore `repair_loss_delta`, reste sous la tolerance de `protected_loss_delta`, modifie effectivement les parametres et produit un rollback signe/executable, le couple skill/cause gagne un signal de succes, de gain par cout et d'intervention dominante. Les attributions suivantes peuvent donc privilegier les causes qui ont deja produit des reparations verifiees par patch modele reel, au lieu de rester sur un classement purement statique ou simule.
 
 ## Phase 7 - Minimal Regrowth
 
@@ -502,7 +502,7 @@ P7 :
 11. signe le patch accepte ;
 12. ecrit un artefact rollback executable avec tensors pre-patch et checksums ;
 13. rollback si le gate echoue ou via `rollback_regrowth_model_patch` si le patch accepte doit etre annule ;
-14. renvoie le resultat accepte a la politique P6.
+14. renvoie le rapport du patch modele applique a la politique P6.
 
 ### Interaction Avec Les Autres Phases
 

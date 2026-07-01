@@ -8365,12 +8365,11 @@ class CortexTrainingPhaseController:
                 self._count("regrowth_candidate_actions", len(regrowth_plan.candidates))
                 model_regrowth = self._apply_model_regrowth(regrowth_plan, step=step)
                 audit["regrowth_model_application"] = model_regrowth
-                policy_signal = self.attribution_policy.observe_regrowth_plan(regrowth_plan)
-                if policy_signal is not None:
-                    self._count("attribution_policy_updates")
-                    if policy_signal.successes > 0:
-                        self._count("attribution_policy_success_events")
-                    audit["attribution_policy_update"] = policy_signal.to_dict()
+                policy_signal = self.attribution_policy.observe_model_regrowth_application(regrowth_plan, model_regrowth)
+                self._count("attribution_policy_updates")
+                if policy_signal.successes > 0:
+                    self._count("attribution_policy_success_events")
+                audit["attribution_policy_update"] = policy_signal.to_dict()
                 self._add_verified_phase_replay(
                     "P7",
                     regrowth_plan.failure.task,

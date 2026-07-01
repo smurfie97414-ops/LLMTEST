@@ -123,6 +123,75 @@ class RegrowthTest(unittest.TestCase):
         self.assertEqual(round_tripped.observation_count, policy.observation_count)
         self.assertEqual(round_tripped.success_count, policy.success_count)
 
+    def test_model_regrowth_application_updates_attribution_policy_from_real_patch(self):
+        verifier = _verifier()
+        task = Task("arith-policy-real-regrowth", "arithmetic", "Compute exactly 20 + 22.", 42)
+        failure = ArithmeticSkill().verify(task, CandidateAnswer("43", confidence=0.82))
+        trace = CausalTrace(task_id=task.task_id, skill=task.skill, mtp_horizon=4, activation_bits=4)
+        ledger = CompressionTraceLedger()
+        _, decision = make_compression_decision("policy-real-regrowth-block", [0.0, 0.01, 2.0, -3.0], certify_zeros=True)
+        ledger.record_compression(decision)
+        attribution = CausalAttributionEngine(verifier).attribute(failure, trace=trace, compression_ledger=ledger)
+        plan = MinimalRegrowthEngine(verifier).plan(attribution, _baseline_for_failure(failure), protected_tasks=(task,), budget=25.0)
+        self.assertIsNotNone(plan.selected)
+        assert plan.selected is not None
+        policy = AttributionPolicyMemory()
+
+        signal = policy.observe_model_regrowth_application(
+            plan,
+            {
+                "failure_skill": "arithmetic",
+                "repair_loss_delta": 2.5,
+                "protected_loss_delta": 0.0,
+                "protected_loss_tolerance": 0.1,
+                "non_regression_passed": True,
+                "rollback_executable": True,
+                "signed_patch_id": "p7-real",
+                "parameter_delta_l1": 3.0,
+                "updated_parameter_count": 2,
+                "gradient_parameter_count": 2,
+            },
+        )
+
+        self.assertEqual(signal.skill, "arithmetic")
+        self.assertEqual(signal.attempts, 1)
+        self.assertEqual(signal.successes, 1)
+        self.assertAlmostEqual(signal.mean_score_delta, 2.5)
+        expected_cost = plan.selected.total_cost + 0.04
+        self.assertAlmostEqual(signal.mean_gain_per_cost, 2.5 / expected_cost)
+        self.assertGreater(policy.observation_count, 0)
+        self.assertGreater(policy.success_count, 0)
+
+    def test_model_regrowth_application_rejects_non_executable_feedback_for_policy_learning(self):
+        verifier = _verifier()
+        task = Task("arith-policy-failed-regrowth", "arithmetic", "Compute exactly 20 + 22.", 42)
+        failure = ArithmeticSkill().verify(task, CandidateAnswer("43", confidence=0.82))
+        attribution = CausalAttributionEngine(verifier).attribute(failure)
+        plan = MinimalRegrowthEngine(verifier).plan(attribution, _baseline_for_failure(failure), protected_tasks=(task,), budget=25.0)
+        self.assertIsNotNone(plan.selected)
+        policy = AttributionPolicyMemory()
+
+        signal = policy.observe_model_regrowth_application(
+            plan,
+            {
+                "failure_skill": "arithmetic",
+                "repair_loss_delta": 2.5,
+                "protected_loss_delta": 0.0,
+                "protected_loss_tolerance": 0.1,
+                "non_regression_passed": True,
+                "rollback_executable": False,
+                "signed_patch_id": "",
+                "parameter_delta_l1": 3.0,
+            },
+        )
+
+        self.assertEqual(signal.attempts, 1)
+        self.assertEqual(signal.successes, 0)
+        self.assertEqual(signal.failures, 1)
+        self.assertEqual(signal.mean_score_delta, 0.0)
+        self.assertEqual(signal.mean_gain_per_cost, 0.0)
+        self.assertEqual(policy.success_count, 0)
+
     def test_force_exact_anchor_action_recovers_anchor_failure(self):
         verifier = _verifier()
         task = Task("anchor-regrowth", "long_context_anchor", "Return exact code.", "C3-7777-Z")

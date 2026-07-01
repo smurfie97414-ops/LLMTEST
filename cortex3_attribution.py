@@ -205,6 +205,57 @@ class AttributionPolicyMemory:
             protected_regression=protected_regression,
         )
 
+    def observe_model_regrowth_application(
+        self,
+        plan: Any,
+        application: Mapping[str, Any],
+    ) -> AttributionPolicySignal:
+        selected = getattr(plan, "selected", None)
+        if selected is None:
+            raise ValueError("cannot observe model regrowth without a selected P7 action")
+        action = getattr(selected, "action", None)
+        if action is None:
+            raise ValueError("cannot observe model regrowth without an action")
+        metadata = dict(getattr(action, "metadata", {}) or {})
+        cause = str(metadata.get("cause") or "")
+        if not cause:
+            raise ValueError("cannot observe model regrowth without an attributed cause")
+
+        failure = getattr(plan, "failure", None)
+        task = getattr(failure, "task", None)
+        skill = str(application.get("failure_skill") or getattr(task, "skill", getattr(action, "target", "")))
+        kind = getattr(action, "kind", "")
+        intervention = str(getattr(kind, "value", kind))
+
+        repair_delta = float(application.get("repair_loss_delta", 0.0) or 0.0)
+        protected_delta = float(application.get("protected_loss_delta", 0.0) or 0.0)
+        protected_tolerance = float(application.get("protected_loss_tolerance", 0.0) or 0.0)
+        non_regression_passed = bool(application.get("non_regression_passed"))
+        rollback_ready = bool(application.get("rollback_executable")) and bool(application.get("signed_patch_id"))
+        parameter_delta = float(application.get("parameter_delta_l1", 0.0) or 0.0)
+        updated_parameters = int(application.get("updated_parameter_count", 0) or 0)
+        gradient_parameters = int(application.get("gradient_parameter_count", 0) or 0)
+        action_cost = float(getattr(selected, "total_cost", 0.0) or 0.0)
+        effective_cost = max(action_cost + 0.01 * max(0, updated_parameters + gradient_parameters), 1e-9)
+        protected_regression = (not non_regression_passed) or protected_delta > protected_tolerance
+        accepted_real_patch = (
+            repair_delta > 0.0
+            and parameter_delta > 0.0
+            and rollback_ready
+            and not protected_regression
+        )
+        effective_score_delta = repair_delta if accepted_real_patch else 0.0
+
+        return self.observe(
+            skill=skill,
+            cause=cause,
+            intervention=intervention,
+            recovered=accepted_real_patch,
+            score_delta=effective_score_delta,
+            gain_per_cost=effective_score_delta / effective_cost,
+            protected_regression=protected_regression,
+        )
+
     def apply(
         self,
         skill: str,

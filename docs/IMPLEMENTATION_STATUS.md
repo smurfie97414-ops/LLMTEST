@@ -156,7 +156,7 @@ Current executable coverage:
 - FSP probes consume `FutureContractLedger` decisions and test stricter contract re-verification.
 - Probe results record baseline score, counterfactual score, recovery, score delta, cost and gain per cost.
 - Cause estimates normalize measured probe evidence into probabilities and best interventions.
-- `AttributionPolicyMemory` learns which causal hypotheses actually led to verified P7 repairs, with posterior success, gain-per-cost weighting, confidence and dominant intervention tracking.
+- `AttributionPolicyMemory` learns which causal hypotheses actually led to verified P7 repairs, with posterior success, gain-per-cost weighting, confidence and dominant intervention tracking; in full LLM training this learning is sourced from the real `_apply_model_regrowth` patch report, not from the simulated `RegrowthPlan` score.
 - `CausalAttributionEngine` can reweight deterministic probe estimates through that learned policy before P7 chooses a repair.
 - `cluster_regressions` groups failures by top cause and skill with recommended intervention.
 - `write_cycle_run` can persist causal attribution reports and clusters into `summary.json`; `tools/run_cycle_report.py` writes a real-forward-trace attribution smoke by default and `--skip-attribution` disables it.
@@ -185,7 +185,7 @@ Current executable coverage:
 - The full LLM Cortex phase controller converts verified regrowth outputs into causal replay examples, then applies the accepted repair to real Transformer parameters with a bounded gradient patch over targeted Cortex submodules.
 - The P7 model patch gate records before/after repair loss, protected loss, parameter L1 delta, updated parameter names, non-regression status and ternary requantization in `cortex_phase_report.json` and checkpoint sidecars.
 - Accepted P7 model patches are now signed and materialized as executable rollback artifacts with pre-patch tensors, pre/post checksums and patch metadata; `rollback_regrowth_model_patch` restores those weights only if the live model still matches the recorded post-patch checksums.
-- Accepted P7 repairs now feed their real outcome back into `AttributionPolicyMemory`, closing the loop P6 hypothesis -> P7 repair -> learned future attribution prior.
+- Accepted P7 repairs now feed their real model-patch outcome back into `AttributionPolicyMemory`: `repair_loss_delta`, `protected_loss_delta`, `protected_loss_tolerance`, `non_regression_passed`, `parameter_delta_l1`, `signed_patch_id` and `rollback_executable` close the loop P6 hypothesis -> P7 applied repair -> learned future attribution prior.
 
 Remaining:
 
