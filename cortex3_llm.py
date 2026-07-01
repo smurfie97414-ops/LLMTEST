@@ -3189,6 +3189,23 @@ def _cortex_architecture_audit_from_summary(summary: Mapping[str, Any]) -> dict[
         and float(item.get("protected_loss_delta", 0.0) or 0.0) <= float(item.get("protected_loss_tolerance", 0.0) or 0.0)
         for item in recursive_model_applications
     )
+    recursive_verified_artifacts = tuple(
+        dict(item)
+        for item in (summary.get("recursive_verified_artifacts") or ())
+        if isinstance(item, Mapping)
+    )
+    recursive_verified_artifact_count = max(integer("recursive_verified_artifact_count"), len(recursive_verified_artifacts))
+    recursive_artifact_verified = any(
+        bool(item.get("recursive_improvement_artifact"))
+        and bool(item.get("artifact_id"))
+        and bool(item.get("example_id"))
+        and bool(item.get("signed_patch_id"))
+        and bool(item.get("rollback_token"))
+        and int(item.get("verification_level", 0) or 0) >= 3
+        and float(item.get("repair_loss_delta", 0.0) or 0.0) > 0.0
+        and bool(item.get("non_regression_passed"))
+        for item in recursive_verified_artifacts
+    )
     checks: list[dict[str, Any]] = []
 
     def add(component: str, passed: bool, observed: Mapping[str, Any], requirement: str) -> None:
@@ -3504,19 +3521,23 @@ def _cortex_architecture_audit_from_summary(summary: Mapping[str, Any]) -> dict[
         phase_count("P10") > 0
         and improvement_decisions > 0
         and integer("recursive_model_application_count") > 0
+        and recursive_verified_artifact_count > 0
         and number("recursive_model_parameter_delta_l1") > 0.0
         and number("recursive_model_repair_loss_delta") > 0.0
-        and recursive_model_non_regressing,
+        and recursive_model_non_regressing
+        and recursive_artifact_verified,
         {
             "P10": phase_count("P10"),
             "improvement_decisions": improvement_decisions,
             "recursive_model_application_count": integer("recursive_model_application_count"),
+            "recursive_verified_artifact_count": recursive_verified_artifact_count,
             "recursive_model_parameter_delta_l1": number("recursive_model_parameter_delta_l1"),
             "recursive_model_repair_loss_delta": number("recursive_model_repair_loss_delta"),
             "recursive_model_protected_loss_delta": number("recursive_model_protected_loss_delta"),
             "recursive_model_non_regressing": recursive_model_non_regressing,
+            "recursive_artifact_verified": recursive_artifact_verified,
         },
-        "recursive improvement sandbox must evaluate a proposal and apply an accepted signed non-regressing patch to real Transformer state",
+        "recursive improvement sandbox must evaluate a proposal, apply an accepted signed non-regressing patch to real Transformer state, and materialize a verified replay artifact",
     )
     add(
         "training_feedback_loop",
@@ -3638,6 +3659,23 @@ def _cortex_phase_deliverable_audit_from_summary(summary: Mapping[str, Any]) -> 
         and float(item.get("repair_loss_delta", 0.0) or 0.0) > 0.0
         and float(item.get("protected_loss_delta", 0.0) or 0.0) <= float(item.get("protected_loss_tolerance", 0.0) or 0.0)
         for item in recursive_model_applications
+    )
+    recursive_verified_artifacts = tuple(
+        dict(item)
+        for item in (summary.get("recursive_verified_artifacts") or ())
+        if isinstance(item, Mapping)
+    )
+    recursive_verified_artifact_count = max(int(number("recursive_verified_artifact_count")), len(recursive_verified_artifacts))
+    recursive_artifact_verified = any(
+        bool(item.get("recursive_improvement_artifact"))
+        and bool(item.get("artifact_id"))
+        and bool(item.get("example_id"))
+        and bool(item.get("signed_patch_id"))
+        and bool(item.get("rollback_token"))
+        and int(item.get("verification_level", 0) or 0) >= 3
+        and float(item.get("repair_loss_delta", 0.0) or 0.0) > 0.0
+        and bool(item.get("non_regression_passed"))
+        for item in recursive_verified_artifacts
     )
 
     checks: list[dict[str, Any]] = []
@@ -3874,9 +3912,11 @@ def _cortex_phase_deliverable_audit_from_summary(summary: Mapping[str, Any]) -> 
         and count("recursive_persistent_archive_saves") > 0
         and int(number("improvement_persistent_archive_decisions")) > 0
         and int(number("recursive_model_application_count")) > 0
+        and recursive_verified_artifact_count > 0
         and number("recursive_model_parameter_delta_l1") > 0.0
         and number("recursive_model_repair_loss_delta") > 0.0
-        and recursive_model_non_regressing,
+        and recursive_model_non_regressing
+        and recursive_artifact_verified,
         {
             "recursive_proposal_events": count("recursive_proposal_events"),
             "recursive_sandbox_trials": count("recursive_sandbox_trials"),
@@ -3891,11 +3931,13 @@ def _cortex_phase_deliverable_audit_from_summary(summary: Mapping[str, Any]) -> 
             "improvement_persistent_archive_decisions": int(number("improvement_persistent_archive_decisions")),
             "improvement_persistent_rollback_events": int(number("improvement_persistent_rollback_events")),
             "recursive_model_application_count": int(number("recursive_model_application_count")),
+            "recursive_verified_artifact_count": recursive_verified_artifact_count,
             "recursive_model_parameter_delta_l1": number("recursive_model_parameter_delta_l1"),
             "recursive_model_repair_loss_delta": number("recursive_model_repair_loss_delta"),
             "recursive_model_non_regressing": recursive_model_non_regressing,
+            "recursive_artifact_verified": recursive_artifact_verified,
         },
-        "recursive improvement must propose, sandbox, evolve across generations, evaluate, gate, persist evolutionary and rollback archives, apply a signed model patch, preserve rollback tokens and run diversity checks",
+        "recursive improvement must propose, sandbox, evolve across generations, evaluate, gate, persist evolutionary and rollback archives, apply a signed model patch, preserve rollback tokens, run diversity checks and materialize a verified replay artifact",
     )
 
     failed_checks = tuple(f"{check['phase']}:{check['deliverable']}" for check in checks if not check["passed"])
@@ -4028,6 +4070,7 @@ class CortexTrainingPhaseController:
         self.regrowth_model_repair_loss_delta = 0.0
         self.regrowth_model_protected_loss_delta = 0.0
         self.recursive_model_applications: list[dict[str, Any]] = []
+        self.recursive_verified_artifacts: list[dict[str, Any]] = []
         self.recursive_model_parameter_delta_l1 = 0.0
         self.recursive_model_repair_loss_delta = 0.0
         self.recursive_model_protected_loss_delta = 0.0
@@ -5060,6 +5103,97 @@ class CortexTrainingPhaseController:
             f"accepted:{decision.evaluation.proposal.proposal_id}",
         )
 
+    def _materialize_recursive_improvement_artifact(
+        self,
+        decision: AcceptanceDecision,
+        cycle_report: Any,
+        *,
+        step: int,
+        model_patch: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        if not decision.accepted:
+            raise ValueError(f"P10 cannot materialize rejected proposal {decision.evaluation.proposal.proposal_id}")
+        proposal = decision.evaluation.proposal
+        task = self._recursive_improvement_task(decision, cycle_report, step=step)
+        task_id = str(proposal.patch_payload.get("task_id") or "")
+        if task_id:
+            for failure in cycle_report.regressions:
+                if failure.task.task_id == task_id:
+                    task = failure.task
+                    break
+
+        answer = self.reference_agent(task)
+        artifact_type_by_kind = {
+            ProposalKind.TEST: "verified_regression_test_replay",
+            ProposalKind.SKILL_SPEC: "verified_skill_micro_family_seed",
+            ProposalKind.COMPILED_FRONTIER: "verified_compiled_frontier_contract_replay",
+            ProposalKind.COMPRESSION: "verified_compression_repair_replay",
+            ProposalKind.ROUTER: "verified_router_repair_replay",
+            ProposalKind.MTP_HEAD: "verified_future_contract_repair_replay",
+            ProposalKind.REGROWTH_STRATEGY: "verified_regrowth_strategy_replay",
+            ProposalKind.HARDWARE_GRAMMAR: "verified_hardware_grammar_replay",
+            ProposalKind.KERNEL: "verified_kernel_repair_replay",
+        }
+        artifact_type = artifact_type_by_kind.get(proposal.kind, f"verified_{proposal.kind.value}_replay")
+        artifact_id = _sha256_json(
+            {
+                "proposal_id": proposal.proposal_id,
+                "proposal_kind": proposal.kind.value,
+                "task_id": task.task_id,
+                "answer": answer.text,
+                "signed_patch_id": model_patch.get("signed_patch_id", ""),
+                "rollback_token": decision.evaluation.sandbox.rollback_token,
+            }
+        )
+        metadata = {
+            "recursive_improvement_artifact": True,
+            "artifact_id": artifact_id,
+            "artifact_type": artifact_type,
+            "proposal_id": proposal.proposal_id,
+            "proposal_kind": proposal.kind.value,
+            "proposal_patch_payload": dict(proposal.patch_payload),
+            "signed_patch_id": str(model_patch.get("signed_patch_id", "")),
+            "rollback_token": decision.evaluation.sandbox.rollback_token,
+            "source_task_id": task.task_id,
+            "affected_skills": tuple(proposal.affected_skills),
+        }
+        example = self._add_verified_phase_replay(
+            "P10",
+            task,
+            answer=answer,
+            metadata=metadata,
+            origin=ExampleOrigin.TOOL_SOLVED,
+        )
+        if example is None:
+            raise ValueError(f"P10 accepted proposal {proposal.proposal_id} could not produce a verified replay artifact")
+
+        artifact = {
+            **metadata,
+            "step": int(step),
+            "example_id": example.example_id,
+            "task_id": task.task_id,
+            "skill": task.skill,
+            "verification_level": int(example.verification_level),
+            "confidence_label": float(example.confidence_label or 0.0),
+            "repair_loss_delta": float(model_patch.get("repair_loss_delta", 0.0) or 0.0),
+            "protected_loss_delta": float(model_patch.get("protected_loss_delta", 0.0) or 0.0),
+            "non_regression_passed": bool(model_patch.get("non_regression_passed")),
+        }
+        self.recursive_verified_artifacts.append(artifact)
+        self._count("recursive_verified_artifact_events")
+        self._count(f"recursive_verified_{proposal.kind.value}_artifact_events")
+        if proposal.kind == ProposalKind.TEST:
+            self._count("recursive_verified_test_artifacts")
+        elif proposal.kind == ProposalKind.SKILL_SPEC:
+            self._count("recursive_verified_skill_family_artifacts")
+        elif proposal.kind == ProposalKind.COMPILED_FRONTIER:
+            self._count("recursive_verified_frontier_contract_artifacts")
+        self.bit_ledger.ingest_cost(
+            CostTrace(verifier_steps=1, generated_tokens=max(1, len(answer.text.split()))),
+            note=f"P10:verified-artifact:{artifact_type}:{proposal.proposal_id}",
+        )
+        return artifact
+
     def _apply_recursive_model_improvement(self, decision: AcceptanceDecision, cycle_report: Any, *, step: int) -> dict[str, Any]:
         if not decision.accepted:
             raise ValueError(f"P10 cannot apply rejected proposal {decision.evaluation.proposal.proposal_id}: {decision.reason}")
@@ -5237,6 +5371,7 @@ class CortexTrainingPhaseController:
             "regrowth_model_repair_loss_delta": float(self.regrowth_model_repair_loss_delta),
             "regrowth_model_protected_loss_delta": float(self.regrowth_model_protected_loss_delta),
             "recursive_model_applications": list(self.recursive_model_applications),
+            "recursive_verified_artifacts": list(self.recursive_verified_artifacts),
             "recursive_model_parameter_delta_l1": float(self.recursive_model_parameter_delta_l1),
             "recursive_model_repair_loss_delta": float(self.recursive_model_repair_loss_delta),
             "recursive_model_protected_loss_delta": float(self.recursive_model_protected_loss_delta),
@@ -5363,6 +5498,10 @@ class CortexTrainingPhaseController:
         self.recursive_model_applications = [
             dict(item)
             for item in payload.get("recursive_model_applications", ())
+        ]
+        self.recursive_verified_artifacts = [
+            dict(item)
+            for item in payload.get("recursive_verified_artifacts", ())
         ]
         self.recursive_model_parameter_delta_l1 = float(payload.get("recursive_model_parameter_delta_l1", 0.0))
         self.recursive_model_repair_loss_delta = float(payload.get("recursive_model_repair_loss_delta", 0.0))
@@ -5594,6 +5733,8 @@ class CortexTrainingPhaseController:
             "recursive_model_repair_loss_delta": float(self.recursive_model_repair_loss_delta),
             "recursive_model_protected_loss_delta": float(self.recursive_model_protected_loss_delta),
             "recursive_model_applications": _last_items(self.recursive_model_applications, 5),
+            "recursive_verified_artifact_count": len(self.recursive_verified_artifacts),
+            "recursive_verified_artifacts": _last_items(self.recursive_verified_artifacts, 5),
             "error_count": len(self.errors),
             "improvement_archive_dir": str(self.improvement_archive_dir),
             "improvement_persistent_archive_state": dict(self.improvement_persistent_archive_state),
@@ -6138,7 +6279,14 @@ class CortexTrainingPhaseController:
                         cycle_report,
                         step=step,
                     )
+                    recursive_verified_artifact = self._materialize_recursive_improvement_artifact(
+                        accepted_decision,
+                        cycle_report,
+                        step=step,
+                        model_patch=recursive_model_patch,
+                    )
                     audit["recursive_model_application"] = recursive_model_patch
+                    audit["recursive_verified_artifact"] = recursive_verified_artifact
                     selected_decision = accepted_decision or improvement_report.decisions[0]
                     gate_label = (
                         selected_decision.evaluation.proposal.proposal_id
@@ -6159,6 +6307,7 @@ class CortexTrainingPhaseController:
                             "accepted": selected_decision.accepted,
                             "reason": selected_decision.reason,
                             "signed_patch_id": recursive_model_patch["signed_patch_id"],
+                            "recursive_verified_artifact_id": recursive_verified_artifact["artifact_id"],
                             "model_patch_parameter_delta_l1": recursive_model_patch["parameter_delta_l1"],
                             "model_patch_repair_loss_delta": recursive_model_patch["repair_loss_delta"],
                         },
@@ -6304,6 +6453,8 @@ class CortexTrainingPhaseController:
             "compiled_circuit_memory_restored_reuse_events": int(
                 self.integration_counts.get("compiled_circuit_memory_restored_reuse_events", 0)
             ),
+            "recursive_verified_artifact_count": len(self.recursive_verified_artifacts),
+            "recursive_verified_artifacts": _last_items(self.recursive_verified_artifacts, 5),
             "training_influence": {
                 "ternary_core_forward_events": trace_counts.get("layer_forward_events", 0),
                 "packed_ternary_dispatches": trace_counts.get("packed_ternary_dispatches", 0),
@@ -6392,6 +6543,8 @@ class CortexTrainingPhaseController:
                 "recursive_model_repair_loss_delta": float(self.recursive_model_repair_loss_delta),
                 "recursive_model_protected_loss_delta": float(self.recursive_model_protected_loss_delta),
                 "recursive_model_applications": _last_items(self.recursive_model_applications, 5),
+                "recursive_verified_artifact_count": len(self.recursive_verified_artifacts),
+                "recursive_verified_artifacts": _last_items(self.recursive_verified_artifacts, 5),
                 "improvement_archive_accepted": self.improvement.archive.accepted_count,
                 "improvement_archive_rejected": self.improvement.archive.rejected_count,
                 "recursive_improvement_generations_configured": int(self.config.cortex_phase_improvement_generations),
@@ -6505,6 +6658,8 @@ class CortexTrainingPhaseController:
                     "recursive_model_repair_loss_delta": float(self.recursive_model_repair_loss_delta),
                     "recursive_model_protected_loss_delta": float(self.recursive_model_protected_loss_delta),
                     "recursive_model_applications": _last_items(self.recursive_model_applications, 5),
+                    "recursive_verified_artifact_count": len(self.recursive_verified_artifacts),
+                    "recursive_verified_artifacts": _last_items(self.recursive_verified_artifacts, 5),
                     "improvement_archive_accepted": self.improvement.archive.accepted_count,
                     "improvement_archive_rejected": self.improvement.archive.rejected_count,
                     "recursive_improvement_generations_configured": int(self.config.cortex_phase_improvement_generations),
@@ -6597,6 +6752,8 @@ class CortexTrainingPhaseController:
                     "recursive_model_repair_loss_delta": float(self.recursive_model_repair_loss_delta),
                     "recursive_model_protected_loss_delta": float(self.recursive_model_protected_loss_delta),
                     "recursive_model_applications": _last_items(self.recursive_model_applications, 5),
+                    "recursive_verified_artifact_count": len(self.recursive_verified_artifacts),
+                    "recursive_verified_artifacts": _last_items(self.recursive_verified_artifacts, 5),
                     "improvement_archive_accepted": self.improvement.archive.accepted_count,
                     "improvement_archive_rejected": self.improvement.archive.rejected_count,
                     "recursive_improvement_generations_configured": int(self.config.cortex_phase_improvement_generations),
@@ -6639,6 +6796,7 @@ class CortexTrainingPhaseController:
             "improvement_persistent_archive_state": dict(self.improvement_persistent_archive_state),
             "regrowth_model_applications": _last_items(self.regrowth_model_applications, 5),
             "recursive_model_applications": _last_items(self.recursive_model_applications, 5),
+            "recursive_verified_artifacts": _last_items(self.recursive_verified_artifacts, 5),
             "phase_audits": _last_items(self.phase_audits, 2),
             "batch_contract_samples": _last_items(self.batch_contract_samples, 5),
             "phase_replay_example_ids": _last_items(self.phase_replay_example_ids, 10),

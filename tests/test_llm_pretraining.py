@@ -3295,6 +3295,8 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             self.assertGreater(influence["recursive_model_application_count"], 0)
             self.assertGreater(influence["recursive_model_parameter_delta_l1"], 0.0)
             self.assertGreater(influence["recursive_model_repair_loss_delta"], 0.0)
+            self.assertGreater(influence["recursive_verified_artifact_count"], 0)
+            self.assertTrue(influence["recursive_verified_artifacts"], influence)
             self.assertGreater(influence["objective_feedback_events"], 0)
             self.assertGreater(influence["last_objective_loss_total"], 0.0)
             self.assertGreater(influence["objective_feedback_scale"], 1.0)
@@ -3404,6 +3406,16 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 latest_recursive["protected_loss_delta"],
                 latest_recursive["protected_loss_tolerance"],
             )
+            self.assertTrue(phase_report["recursive_verified_artifacts"], phase_report)
+            latest_recursive_artifact = phase_report["recursive_verified_artifacts"][-1]
+            self.assertTrue(latest_recursive_artifact["recursive_improvement_artifact"], latest_recursive_artifact)
+            self.assertEqual(latest_recursive_artifact["proposal_kind"], latest_recursive["proposal_kind"], latest_recursive_artifact)
+            self.assertEqual(latest_recursive_artifact["signed_patch_id"], latest_recursive["signed_patch_id"], latest_recursive_artifact)
+            self.assertTrue(latest_recursive_artifact["artifact_id"], latest_recursive_artifact)
+            self.assertTrue(latest_recursive_artifact["example_id"], latest_recursive_artifact)
+            self.assertGreaterEqual(latest_recursive_artifact["verification_level"], 3, latest_recursive_artifact)
+            self.assertGreater(latest_recursive_artifact["repair_loss_delta"], 0.0, latest_recursive_artifact)
+            self.assertTrue(latest_recursive_artifact["non_regression_passed"], latest_recursive_artifact)
             self.assertTrue(phase_report["objective_feedback_history"], phase_report)
             latest_feedback = phase_report["objective_feedback_history"][-1]
             self.assertEqual(latest_feedback["term_count"], len(FINAL_LOSS_TERMS))
@@ -3424,6 +3436,8 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             self.assertEqual(set(persisted["last_objective_loss_terms"]), set(FINAL_LOSS_TERMS))
             self.assertTrue(persisted["regrowth_model_applications"], persisted)
             self.assertTrue(persisted["recursive_model_applications"], persisted)
+            self.assertTrue(persisted["recursive_verified_artifacts"], persisted)
+            self.assertGreater(persisted["training_influence"]["recursive_verified_artifact_count"], 0)
             self.assertEqual(persisted["training_influence"]["sleep_replay_updates"], influence["sleep_replay_updates"])
             self.assertEqual(
                 persisted["training_influence"]["frontier_compiled_fastsolve_events"],
@@ -3555,6 +3569,8 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 self.assertGreaterEqual(first_influence["recursive_improvement_generations_configured"], 2)
                 self.assertGreaterEqual(first_influence["recursive_generation_events"], 2)
                 self.assertGreater(first_influence["recursive_evolved_proposal_events"], 0)
+                self.assertGreater(first_influence["recursive_verified_artifact_count"], 0)
+                self.assertTrue(first_influence["recursive_verified_artifacts"], first_influence)
                 checkpoint = torch.load(run_dir / "checkpoint_final.pt", map_location="cpu", weights_only=False)
                 self.assertIn("cortex_phase_state", checkpoint)
                 self.assertGreater(len(checkpoint["cortex_phase_state"]["replay_batches"]), 0)
@@ -3568,6 +3584,7 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 self.assertGreater(len(checkpoint["cortex_phase_state"]["recursive_model_applications"]), 0)
                 self.assertGreater(checkpoint["cortex_phase_state"]["recursive_model_parameter_delta_l1"], 0.0)
                 self.assertGreater(checkpoint["cortex_phase_state"]["recursive_model_repair_loss_delta"], 0.0)
+                self.assertGreater(len(checkpoint["cortex_phase_state"]["recursive_verified_artifacts"]), 0)
                 self.assertGreater(checkpoint["cortex_phase_state"]["certificate_head_forward_events"], 0)
                 self.assertGreater(checkpoint["cortex_phase_state"]["certificate_algebra_tool_events"], 0)
                 self.assertGreater(checkpoint["cortex_phase_state"]["certificate_code_hidden_property_events"], 0)
@@ -3686,6 +3703,8 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 self.assertGreater(sidecar["cortex_phase_state_summary"]["recursive_model_parameter_delta_l1"], 0.0)
                 self.assertGreater(sidecar["cortex_phase_state_summary"]["recursive_model_repair_loss_delta"], 0.0)
                 self.assertTrue(sidecar["cortex_phase_state_summary"]["recursive_model_applications"])
+                self.assertGreater(sidecar["cortex_phase_state_summary"]["recursive_verified_artifact_count"], 0)
+                self.assertTrue(sidecar["cortex_phase_state_summary"]["recursive_verified_artifacts"])
                 self.assertGreater(sidecar["cortex_phase_state_summary"]["objective_feedback_events"], 0)
                 self.assertEqual(
                     tuple(sidecar["cortex_phase_state_summary"]["objective_feedback_term_names"]),
@@ -3798,6 +3817,11 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 resumed_influence["recursive_model_application_count"],
                 first_influence["recursive_model_application_count"],
             )
+            self.assertGreaterEqual(
+                resumed_influence["recursive_verified_artifact_count"],
+                first_influence["recursive_verified_artifact_count"],
+            )
+            self.assertTrue(resumed_influence["recursive_verified_artifacts"], resumed_influence)
             self.assertGreaterEqual(
                 resumed_influence["recursive_generation_events"],
                 first_influence["recursive_generation_events"],

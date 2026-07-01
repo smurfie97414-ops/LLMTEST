@@ -1,6 +1,6 @@
 # Cortex-3 Architecture Self-Critique
 
-Etat: boucle d'audit 66 apres relecture P1-P10 hors profiling/observabilite. La critique repart des 10 phases et vise les briques structurantes: SlowSolve -> verification -> attribution -> regrowth -> compilation -> selection runtime -> reutilisation persistante -> evolution recursive. Le dernier correctif structurel rend la selection Frontier robuste quand plusieurs circuits concurrents couvrent une tache: la couverture specialisee prime sur le score global du circuit.
+Etat: boucle d'audit 67 apres relecture P1-P10 hors profiling/observabilite. La critique repart des 10 phases et vise les briques structurantes: SlowSolve -> verification -> attribution -> regrowth -> compilation -> selection runtime -> reutilisation persistante -> evolution recursive. Le dernier correctif structurel force P10 a materialiser chaque proposition acceptee en artefact verifie, replayable, signe et persistant au lieu de s'arreter a un patch modele.
 
 Ce document sert de registre de critique et de correction. Il ne remplace pas les tests longs interdits pour cette iteration; il se limite aux preuves courtes disponibles, aux rapports du code et aux tests courts.
 
@@ -13,6 +13,7 @@ Mise a jour C63: P10 ne reste plus sur une seule vague de propositions par audit
 Mise a jour C64: P6 n'est plus seulement un classement de probes. `AttributionPolicyMemory` apprend skill/cause/intervention depuis les reparations P7 acceptees, repondere les causes futures, persiste dans les checkpoints et devient obligatoire dans l'audit P6 du controleur LLM.
 Mise a jour C65: P4/P8/P9/Frontier ne prouvent plus seulement qu'un circuit a existe avant checkpoint. A la reprise, le controleur recharge le registre Frontier, echoue si le manifeste manque, puis execute une FastSolve restauree avec binding P4 reconstruit, output-goal et certificat compile verifies.
 Mise a jour C66: Frontier ne choisit plus un circuit par score additif global quand plusieurs circuits couvrent partiellement la meme tache. `FrontierCircuitRegistry.select` utilise maintenant une cle lexicographique de couverture exacte/groupe/numerique/ancre avant les scores DSV/held-out/cout, ce qui empeche un circuit generique massif de voler la route FastSolve d'un circuit specialise.
+Mise a jour C67: P10 ne reste plus un patch accepte isole. Le controleur LLM materialise maintenant la proposition acceptee en artefact P10 verifie par oracle, ajoute l'exemple au replay causal, signe le lien patch/rollback/proposition, l'expose aux audits et le persiste dans les checkpoints.
 
 ## Audit transversal haut enjeu apres C55
 
@@ -25,7 +26,7 @@ Mise a jour C66: Frontier ne choisit plus un circuit par score additif global qu
 - P7 Minimal Regrowth: le LLM sait appliquer un patch borne aux vrais parametres. Le pont ajoute ici teste maintenant une competence compilee comme candidat de reparation verifie avant d'acheter du regrowth parametrique, puis conserve le regrowth existant sous gate stricte.
 - P8 Fast/Normal/Careful Inference: les routes existent, le chemin FastSolve consomme maintenant un registre frontier seulement quand un circuit couvre vraiment la tache, selectionne le circuit le plus specialise avant les scores globaux, chaque reponse inferee porte un contrat output-goal, et la reprise checkpoint execute une FastSolve restauree avant de continuer.
 - P9 Sleep Anti-Collapse: le replay et les exemples verifies alimentent le training, puis certaines familles coherentes acceptees par le sommeil sont maintenant promues en circuits Frontier persistants avec held-out gate, FastSolve immediat, FastSolve restauree apres checkpoint et proposition P10. Le manque suivant n'est plus le pont structurel, mais son scale sur cycles longs et donnees reelles.
-- P10 Recursive Improvement: les propositions peuvent appliquer des patchs signes. Le controleur LLM ne reste plus bloque sur une proposition unique apres reprise: il explore un budget borne de propositions tout en conservant les gates Pareto/protection/calibration/diversite/reward-hacking. Les reparations Frontier acceptees par P7 sont maintenant promues en propositions `compiled_frontier` prioritaires avant le patch modele P10, l'archive complete peut survivre a un run independant sans dependance au checkpoint, et les propositions acceptees peuvent engendrer une generation suivante sous pression de diversite.
+- P10 Recursive Improvement: les propositions peuvent appliquer des patchs signes et ne restent plus isolees du corpus d'entrainement. Le controleur LLM explore un budget borne de propositions tout en conservant les gates Pareto/protection/calibration/diversite/reward-hacking; les reparations Frontier acceptees par P7 sont promues en propositions `compiled_frontier` prioritaires, l'archive complete peut survivre a un run independant, les propositions acceptees peuvent engendrer une generation suivante sous pression de diversite, puis chaque proposition acceptee devient aussi un artefact P10 verifie, replayable et persistant.
 
 ### C56. Les circuits Frontier etaient valides mais pas reutilisables
 
@@ -123,6 +124,15 @@ Mise a jour C66: Frontier ne choisit plus un circuit par score additif global qu
 - Correction: `FrontierCircuitRegistry.select` utilise maintenant `_selection_key`, une cle lexicographique. Elle exige d'abord une couverture positive, puis ordonne par couverture exacte de task id, group id, signature numerique exacte, ancres, metadonnees, chevauchement numerique et score de couverture. Les scores held-out, DSV, nombre de solutions lentes et cout en bits ne servent qu'apres ce tri de specialisation. `_coverage_features` centralise ces signaux pour eviter que le score global ne masque la proximite reelle de la tache.
 - Verification courte: `py_compile`, le nouveau `tests.test_frontier_discovery.FrontierSkillDiscoveryTest.test_frontier_registry_prefers_exact_coverage_over_generic_high_score_circuit` et `tests.test_frontier_discovery` passent. Le nouveau test construit un registre concurrent avec un circuit generique artificiellement sur-score et un circuit exact artificiellement faible; la selection choisit quand meme le circuit exact.
 - Statut: corrige pour la selection multi-circuits courte. Reste a scaler sur registres persistants plus grands avec plusieurs skills, plusieurs familles sleep-frontier et cycles sleep/wake repetes.
+
+### C67. Les propositions P10 acceptees ne devenaient pas encore des artefacts entrainables
+
+- Critique: apres C62/C63, P10 proposait, sandboxait, gateait, persistait l'archive et appliquait un patch signe au Transformer. Mais l'amelioration acceptee pouvait encore rester principalement un patch parametrique et une decision d'archive. Pour l'architecture visee, c'etait trop faible: une competence corrigee par Recursive Improvement doit aussi redevenir une donnee verifiee, replayable et persistante, sinon les phases P1/P9/P10 ne peuvent pas la reutiliser comme experience.
+- Correction: `CortexTrainingPhaseController` ajoute maintenant `recursive_verified_artifacts`. Apres acceptation stricte et patch modele non-regressant, le controleur retrouve la tache source de la proposition, obtient la reponse reference, la reverifie par oracle, ajoute l'exemple au replay P10 comme `TOOL_SOLVED`, puis signe l'artefact avec `artifact_id`, `proposal_id`, `proposal_kind`, payload, `signed_patch_id`, rollback token, skill, example id, verification level, repair/protected deltas et statut non-regression.
+- Integration: `state_dict`/`load_state_dict`, `summary`, `checkpoint_state_summary`, `training_influence`, `architecture_audit` et `phase_deliverable_audit` exigent maintenant `recursive_verified_artifact_count > 0` et un artefact avec replay example, patch signe, rollback token, verification level >= 3 et delta repair positif. P10 ne peut donc plus passer seulement avec une archive et un patch.
+- Debug precis: le premier echec court montrait `recursive_model_application_count=2` mais `recursive_verified_artifact_count=0` dans l'audit. L'instrumentation runtime a prouve que la materialisation etait bien appelee deux fois et que la liste interne passait de 0 a 2; le bug etait l'un des dictionnaires internes d'audit, qui ne recevait pas les champs `recursive_verified_*`. Les deux dictionnaires d'audit ont ete alignes avec le rapport principal.
+- Verification courte: `py_compile`, `tests.test_llm_pretraining.LLMPretrainingHarnessTest.test_full_cortex_phase_controller_uses_all_modules_during_training` et `tests.test_llm_pretraining.LLMPretrainingHarnessTest.test_cortex_phase_state_survives_checkpoint_resume` passent. Les tests exigent l'artefact P10 verifie dans le rapport, dans `training_influence`, dans `cortex_phase_state`, dans le sidecar et apres reprise checkpoint.
+- Statut: corrige pour le pont court "P10 acceptation stricte -> patch modele -> artefact verifie -> replay causal -> checkpoint/resume". Reste a scaler P10 sur archives longues, reward-hacking adversarial hors suites internes et vrais corpus.
 
 ## Boucle 1 - Corrections executees maintenant
 
@@ -686,11 +696,11 @@ Mise a jour C66: Frontier ne choisit plus un circuit par score additif global qu
 
 ### P10 - Recursive Improvement
 
-- Ce qui est solide: proposal generator, sandbox, Pareto gate, rollback, diversity archive.
-- Preuve actuelle: tests recursive improvement et full Cortex report.
-- Faiblesse: propositions encore bornees par petit action space; peu de verification contre reward hacking hors suites internes.
-- Risque architectural: boucle d'amelioration peut etre trop conservatrice ou trop dependante du verifier P1.
-- Correction prioritaire restante: renforcer adversarial/reward-hacking probes et signer plus de metadata de patch.
+- Ce qui est solide: proposal generator, sandbox, Pareto gate, rollback, diversity archive, evolution multi-generation, patch modele signe non-regressant et artefact replay verifie persistant.
+- Preuve actuelle: tests recursive improvement, full Cortex report, artefacts P10 verifies dans `training_influence` et reprise checkpoint.
+- Faiblesse: propositions encore bornees par petit action space; peu de verification contre reward hacking hors suites internes longues.
+- Risque architectural: boucle d'amelioration peut etre trop conservatrice ou trop dependante du verifier P1 sur grands corpus, meme si l'acceptation courte devient maintenant entrainable.
+- Correction prioritaire restante: renforcer adversarial/reward-hacking probes et scaler les archives longues avec vrais corpus.
 
 ## Critique des composants du schema cible
 
