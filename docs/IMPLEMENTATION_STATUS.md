@@ -116,12 +116,13 @@ Current executable coverage:
 - `LatentProofState` stores a Torch latent proof vector, latent step count and checksum.
 - `LatentProofState.to_dict/from_dict` serializes proof vectors into JSON-safe rounded values for persisted audit trails.
 - `CertificateHead` maps hidden states to latent proof state, answer logits, certificate type logits and uncertainty.
+- The full LLM controller now materializes real `CertificateHead` outputs into verified `ShortCertificate` artifacts with model-token consistency, latent checksum verification, target-match metadata, checkpoint persistence and P5 audit gates.
 - `CertificateHeadCalibrator` trains the certificate head on verifier micro-task answers, certificate types and uncertainty targets.
 - `ShortCertificate` carries answer, claims, uncertainty, latent checksum, anchors and optional tool contract.
 - `CertificateVerifier` checks uncertainty bounds, latent checksum and tool-backed verification.
 - `CertificateVerifier` accepts explicitly calibrated high-uncertainty certificates, so `UNKNOWN` can stay low-confidence without being treated as proof corruption.
 - `RandomDelatentizer` samples latent dimensions deterministically for audit probes and detects tampering.
-- Tool-backed checks include arithmetic, exact match, anchor fidelity, multi-step linear algebra, richer executable code unit tests and compiled-circuit contracts.
+- Tool-backed checks include arithmetic, exact match, model-token certificate consistency, anchor fidelity, multi-step linear algebra, richer executable code unit tests and compiled-circuit contracts.
 - `CertificateType.COMPILED_CIRCUIT`, `build_compiled_circuit_certificate` and the `compiled_circuit` tool bind compiled skill reuse to a canonical contract checksum, source/frontier task lineage, DSV pass state, runtime output verification and answer checksum.
 - `ProofCarryingAnswer` converts answer + certificate + uncertainty into `CandidateAnswer` with a serializable latent proof payload.
 - `ProofCarryingGenerator` connects a calibrated certificate head to DSV-compatible answer generation and verifies every emitted certificate.
@@ -135,7 +136,7 @@ Current executable coverage:
 Remaining:
 
 - Expand tool verification to external solver hooks and broader multi-step domains beyond current linear algebra/rich code cases.
-- Benchmark certificate-token savings over held-out reasoning traces.
+- Benchmark certificate-token savings and semantic reliability of model-head certificates over held-out reasoning traces.
 
 ## Phase 6 - Causal regression attribution
 

@@ -399,6 +399,7 @@ P5 part d'une tache issue du cycle ou d'une tache controlee.
 La phase cree :
 
 - un `LatentProofState` ;
+- un certificat issu de la vraie `CertificateHead` du Transformer quand un forward LLM est disponible ;
 - un certificat court ;
 - une verification par outil ;
 - une random de-latentization probe ;
@@ -415,7 +416,7 @@ P5 alimente :
 
 ### Impact Apprentissage
 
-Le modele possede une `CertificateHead` dans le forward. Le loss de certificat pousse la tete a produire une reponse finale et une incertitude coherente. P5 rend cette tete auditable au lieu de laisser le latent reasoning devenir une boite noire.
+Le modele possede une `CertificateHead` dans le forward. Le loss de certificat pousse la tete a produire une reponse finale et une incertitude coherente. P5 materialise maintenant cette sortie en `ShortCertificate` verifie par checksum latent et coherence token (`model_token_certificate`), puis persiste l'artefact dans le rapport et les checkpoints. Les certificats algebre/code restent des preuves outil plus fortes; le certificat model-head prouve que la tete du modele participe vraiment au chemin P5 au lieu de rester un simple module appele en forward.
 
 ## Phase 6 - Causal Attribution
 

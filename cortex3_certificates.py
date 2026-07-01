@@ -388,6 +388,30 @@ def exact_match_tool(certificate: ShortCertificate) -> ToolVerification:
     return ToolVerification("exact_match", passed, 1.0 if passed else 0.0, "exact answer match" if passed else f"expected {expected!r}, got {certificate.answer!r}")
 
 
+def model_token_certificate_tool(certificate: ShortCertificate) -> ToolVerification:
+    args = dict(certificate.tool_args)
+    try:
+        answer_token_id = int(args["answer_token_id"])
+        head_token_id = int(args["certificate_head_token_id"])
+        lm_token_id = int(args.get("lm_head_token_id", head_token_id))
+    except (KeyError, TypeError, ValueError) as exc:
+        return ToolVerification("model_token_certificate", False, 0.0, f"missing token identity: {exc}")
+    decoded_answer = str(args.get("decoded_answer", ""))
+    if answer_token_id != head_token_id:
+        return ToolVerification("model_token_certificate", False, 0.0, "answer token does not match certificate head argmax")
+    if certificate.answer != decoded_answer:
+        return ToolVerification("model_token_certificate", False, 0.0, "certificate answer does not match decoded model token")
+    if bool(args.get("require_lm_head_match", False)) and answer_token_id != lm_token_id:
+        return ToolVerification("model_token_certificate", False, 0.0, "certificate head token does not match LM head token")
+    target_token = args.get("target_token_id")
+    if bool(args.get("require_target_match", False)) and target_token is not None and answer_token_id != int(target_token):
+        return ToolVerification("model_token_certificate", False, 0.0, "certificate head token does not match supervised target token")
+    target_note = ""
+    if target_token is not None:
+        target_note = f"; target_match={answer_token_id == int(target_token)}"
+    return ToolVerification("model_token_certificate", True, 1.0, f"model certificate token is internally consistent{target_note}")
+
+
 _CODE_FENCE_RE = re.compile(r"```(?:python)?\s*(.*?)```", re.IGNORECASE | re.DOTALL)
 _SAFE_BUILTINS = {"abs": abs, "all": all, "any": any, "bool": bool, "enumerate": enumerate, "len": len, "max": max, "min": min, "range": range, "sum": sum}
 _BANNED_CODE_TOKENS = ("import ", "__", "open(", "eval(", "exec(", "compile(", "globals(", "locals(", "input(", "breakpoint(")
@@ -486,6 +510,7 @@ def default_tool_registry() -> ToolVerifierRegistry:
     registry.register("anchor_fidelity", anchor_tool)
     registry.register("compiled_circuit", compiled_circuit_tool)
     registry.register("exact_match", exact_match_tool)
+    registry.register("model_token_certificate", model_token_certificate_tool)
     registry.register("code_tests", code_unit_test_tool)
     return registry
 

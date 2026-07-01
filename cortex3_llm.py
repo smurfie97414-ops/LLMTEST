@@ -3434,27 +3434,33 @@ def _cortex_architecture_audit_from_summary(summary: Mapping[str, Any]) -> dict[
     )
     add(
         "latent_reasoning_workspace",
-        phase_count("P5") > 0 and integer("certificate_head_forward_events") > 0 and replay_count("P5") > 0,
+        phase_count("P5") > 0
+        and integer("certificate_head_forward_events") > 0
+        and integer("model_certificate_head_verified_events") > 0
+        and replay_count("P5") > 0,
         {
             "P5": phase_count("P5"),
             "certificate_head_forward_events": integer("certificate_head_forward_events"),
+            "model_certificate_head_verified_events": integer("model_certificate_head_verified_events"),
             "phase_replay_P5": replay_count("P5"),
         },
-        "latent proof workspace must feed certificates and verified replay",
+        "latent proof workspace must feed model-head certificates and verified replay",
     )
     add(
         "certificate_generator",
         phase_count("P5") > 0
         and integer("certificate_head_forward_events") > 0
+        and integer("model_certificate_head_verified_events") > 0
         and integer("certificate_algebra_tool_events") > 0
         and integer("certificate_code_hidden_property_events") > 0,
         {
             "P5": phase_count("P5"),
             "certificate_head_forward_events": integer("certificate_head_forward_events"),
+            "model_certificate_head_verified_events": integer("model_certificate_head_verified_events"),
             "certificate_algebra_tool_events": integer("certificate_algebra_tool_events"),
             "certificate_code_hidden_property_events": integer("certificate_code_hidden_property_events"),
         },
-        "certificate generator/head must run with multi-step algebra and richer code tool contracts in training",
+        "certificate generator/head must materialize a verified model-head certificate plus multi-step algebra and richer code tool contracts in training",
     )
     add(
         "hierarchical_dynamic_verifier",
@@ -3817,6 +3823,7 @@ def _cortex_phase_deliverable_audit_from_summary(summary: Mapping[str, Any]) -> 
         and count("delatentization_probe_events") > 0
         and count("delatentization_probe_failures") == 0
         and count("certificate_tool_verification_events") > 0
+        and count("model_certificate_head_verified_events") > 0
         and count("certificate_algebra_tool_events") > 0
         and count("certificate_code_hidden_property_events") > 0,
         {
@@ -3824,10 +3831,12 @@ def _cortex_phase_deliverable_audit_from_summary(summary: Mapping[str, Any]) -> 
             "delatentization_probe_events": count("delatentization_probe_events"),
             "delatentization_probe_failures": count("delatentization_probe_failures"),
             "certificate_tool_verification_events": count("certificate_tool_verification_events"),
+            "model_certificate_head_verified_events": count("model_certificate_head_verified_events"),
+            "model_certificate_head_latent_checksum_events": count("model_certificate_head_latent_checksum_events"),
             "certificate_algebra_tool_events": count("certificate_algebra_tool_events"),
             "certificate_code_hidden_property_events": count("certificate_code_hidden_property_events"),
         },
-        "latent proof state must be audited by random de-latentization, multi-step algebra and richer code tool verification",
+        "latent proof state must include a verified model-head certificate plus random de-latentization, multi-step algebra and richer code tool verification",
     )
     add(
         "P6",
@@ -4090,6 +4099,7 @@ class CortexTrainingPhaseController:
         self.learned_memory_latent_decisions = 0
         self.learned_memory_drop_decisions = 0
         self.learned_memory_storage_ratio_total = 0.0
+        self.model_certificate_head_artifacts: list[dict[str, Any]] = []
         self.regrowth_model_applications: list[dict[str, Any]] = []
         self.regrowth_model_parameter_delta_l1 = 0.0
         self.regrowth_model_repair_loss_delta = 0.0
@@ -4261,6 +4271,102 @@ class CortexTrainingPhaseController:
         if decision.anchor_safety_override:
             self._count("learned_memory_retention_anchor_overrides")
 
+    def _decode_model_token(self, token_id: int) -> str:
+        text = self.tokenizer.decode([int(token_id)]).strip()
+        return text if text else f"<token:{int(token_id)}>"
+
+    def _record_model_certificate_from_forward(
+        self,
+        *,
+        step: int,
+        source: str,
+        output: LLMForwardOutput,
+        future_targets: torch.Tensor | None = None,
+    ) -> dict[str, Any] | None:
+        if output.certificate is None:
+            return None
+        certificate_output = output.certificate
+        if certificate_output.answer_logits.shape[0] <= 0:
+            return None
+        row_index = 0
+        answer_token_id = int(certificate_output.answer_logits[row_index].detach().argmax(dim=-1).cpu())
+        lm_head_token_id = int(output.logits[row_index, -1].detach().argmax(dim=-1).cpu())
+        target_token_id: int | None = None
+        if future_targets is not None and future_targets.numel() > 0:
+            target_token_id = int(future_targets[row_index, -1, 0].detach().cpu())
+        answer_text = self._decode_model_token(answer_token_id)
+        cert_types = tuple(CertificateType)
+        cert_type_index = int(certificate_output.certificate_type_logits[row_index].detach().argmax(dim=-1).cpu())
+        certificate_type = cert_types[cert_type_index % len(cert_types)]
+        uncertainty = float(certificate_output.uncertainty[row_index].detach().cpu())
+        target_match = target_token_id is not None and answer_token_id == target_token_id
+        latent_state = LatentProofState(
+            state_id=f"llm-model-cert-{source}-{step}-{len(self.model_certificate_head_artifacts)}",
+            task_id=f"llm-model-cert-task-{source}-{step}",
+            skill="llm_certificate_head",
+            tensor=certificate_output.latent_state[row_index:row_index + 1].detach().cpu(),
+            latent_steps=1,
+            visible_reasoning_tokens=0,
+        )
+        certificate = build_certificate(
+            certificate_id=f"llm-model-cert-{source}-{step}-{len(self.model_certificate_head_artifacts)}",
+            task_id=latent_state.task_id,
+            skill=latent_state.skill,
+            certificate_type=certificate_type,
+            answer=answer_text,
+            claims={
+                "model_certificate_head": True,
+                "predicted_certificate_type": certificate_type.value,
+                "answer_token_id": answer_token_id,
+                "lm_head_token_id": lm_head_token_id,
+                "target_token_id": target_token_id,
+                "target_match": target_match,
+                "source": source,
+                "step": int(step),
+                "calibrated_uncertainty": uncertainty > self.certificate_verifier.max_uncertainty,
+            },
+            uncertainty=uncertainty,
+            latent_state=latent_state,
+            tool="model_token_certificate",
+            tool_args={
+                "answer_token_id": answer_token_id,
+                "certificate_head_token_id": answer_token_id,
+                "decoded_answer": answer_text,
+                "lm_head_token_id": lm_head_token_id,
+                "target_token_id": target_token_id,
+                "require_target_match": False,
+                "require_lm_head_match": False,
+            },
+        )
+        verification = self.certificate_verifier.verify(certificate, latent_state)
+        artifact = {
+            "step": int(step),
+            "source": source,
+            "answer_token_id": answer_token_id,
+            "lm_head_token_id": lm_head_token_id,
+            "target_token_id": target_token_id,
+            "target_match": target_match,
+            "certificate_type": certificate_type.value,
+            "uncertainty": uncertainty,
+            "certificate": certificate.to_dict(),
+            "latent_state": latent_state.to_dict(),
+            "verification": verification.to_dict(),
+        }
+        self.model_certificate_head_artifacts.append(artifact)
+        self._count("model_certificate_head_events")
+        if verification.passed:
+            self._count("model_certificate_head_verified_events")
+            self.bit_ledger.add_certificate(certificate.to_dict())
+        else:
+            self._count("model_certificate_head_failed_events")
+        if verification.latent_checksum_ok:
+            self._count("model_certificate_head_latent_checksum_events")
+        if target_match:
+            self._count("model_certificate_head_target_match_events")
+        self.uncertainty_ledger.record("llm_certificate_head_token", 1.0 - uncertainty, bool(target_match))
+        self.bit_ledger.ingest_cost(CostTrace(verifier_steps=1, generated_tokens=1), note=f"P5:model-certificate-head:{source}:{step}")
+        return artifact
+
     def _ingest_cycle_ledgers(self, cycle_report: Any, *, step: int) -> dict[str, Any]:
         self.skill_ledger.update_from_report(cycle_report.trial)
         self._ingest_suite_ledgers(cycle_report.trial, step=step, source="trial")
@@ -4417,6 +4523,15 @@ class CortexTrainingPhaseController:
         future_targets: torch.Tensor,
         breakdown: LossBreakdown,
     ) -> None:
+        try:
+            self._record_model_certificate_from_forward(
+                step=step,
+                source="batch-contract",
+                output=output,
+                future_targets=future_targets,
+            )
+        except Exception as exc:
+            self._record_error("P5", exc)
         if not output.mtp_logits or output.confidence is None:
             return
         try:
@@ -5461,6 +5576,7 @@ class CortexTrainingPhaseController:
             "recursive_model_repair_loss_delta": float(self.recursive_model_repair_loss_delta),
             "recursive_model_protected_loss_delta": float(self.recursive_model_protected_loss_delta),
             "certificate_head_forward_events": int(self.model.certificate_forward_events),
+            "model_certificate_head_artifacts": list(self.model_certificate_head_artifacts),
             "certificate_algebra_tool_events": int(self.integration_counts.get("certificate_algebra_tool_events", 0)),
             "certificate_code_hidden_property_events": int(self.integration_counts.get("certificate_code_hidden_property_events", 0)),
             "input_anchor_observations": int(self.input_anchor_observations),
@@ -5592,6 +5708,10 @@ class CortexTrainingPhaseController:
         self.recursive_model_repair_loss_delta = float(payload.get("recursive_model_repair_loss_delta", 0.0))
         self.recursive_model_protected_loss_delta = float(payload.get("recursive_model_protected_loss_delta", 0.0))
         self.model.certificate_forward_events = int(payload.get("certificate_head_forward_events", 0))
+        self.model_certificate_head_artifacts = [
+            dict(item)
+            for item in payload.get("model_certificate_head_artifacts", ())
+        ]
         self.input_anchor_observations = int(payload.get("input_anchor_observations", 0))
         self.input_anchor_count = int(payload.get("input_anchor_count", 0))
         self.input_anchor_fidelity_failures = int(payload.get("input_anchor_fidelity_failures", 0))
@@ -5755,6 +5875,11 @@ class CortexTrainingPhaseController:
             "certificate_head_forward_events": int(self.model.certificate_forward_events),
             "certificate_algebra_tool_events": int(self.integration_counts.get("certificate_algebra_tool_events", 0)),
             "certificate_code_hidden_property_events": int(self.integration_counts.get("certificate_code_hidden_property_events", 0)),
+            "model_certificate_head_events": int(self.integration_counts.get("model_certificate_head_events", 0)),
+            "model_certificate_head_verified_events": int(self.integration_counts.get("model_certificate_head_verified_events", 0)),
+            "model_certificate_head_latent_checksum_events": int(self.integration_counts.get("model_certificate_head_latent_checksum_events", 0)),
+            "model_certificate_head_target_match_events": int(self.integration_counts.get("model_certificate_head_target_match_events", 0)),
+            "model_certificate_head_artifacts": _last_items(self.model_certificate_head_artifacts, 5),
             "input_anchor_observations": int(self.input_anchor_observations),
             "input_anchor_count": int(self.input_anchor_count),
             "input_anchor_fidelity_failures": int(self.input_anchor_fidelity_failures),
@@ -6092,6 +6217,11 @@ class CortexTrainingPhaseController:
                 "code_certificate": code_certificate.to_dict(),
                 "delatentization_probe": asdict(probe),
                 "delatentization_probe_verified": probe_ok,
+                "model_certificate_head_artifact": (
+                    dict(self.model_certificate_head_artifacts[-1])
+                    if self.model_certificate_head_artifacts
+                    else None
+                ),
             }
             if not probe_ok:
                 self._record_error("P5", ValueError(f"random de-latentization probe failed for {latent_state.state_id}"))
@@ -6572,6 +6702,11 @@ class CortexTrainingPhaseController:
                 "certificate_head_forward_events": int(self.model.certificate_forward_events),
                 "certificate_algebra_tool_events": int(self.integration_counts.get("certificate_algebra_tool_events", 0)),
                 "certificate_code_hidden_property_events": int(self.integration_counts.get("certificate_code_hidden_property_events", 0)),
+                "model_certificate_head_events": int(self.integration_counts.get("model_certificate_head_events", 0)),
+                "model_certificate_head_verified_events": int(self.integration_counts.get("model_certificate_head_verified_events", 0)),
+                "model_certificate_head_latent_checksum_events": int(self.integration_counts.get("model_certificate_head_latent_checksum_events", 0)),
+                "model_certificate_head_target_match_events": int(self.integration_counts.get("model_certificate_head_target_match_events", 0)),
+                "model_certificate_head_artifacts": _last_items(self.model_certificate_head_artifacts, 5),
                 "input_anchor_observations": int(self.input_anchor_observations),
                 "input_anchor_count": int(self.input_anchor_count),
                 "input_anchor_fidelity_failures": int(self.input_anchor_fidelity_failures),
@@ -6704,6 +6839,11 @@ class CortexTrainingPhaseController:
                     "certificate_head_forward_events": int(self.model.certificate_forward_events),
                     "certificate_algebra_tool_events": int(self.integration_counts.get("certificate_algebra_tool_events", 0)),
                     "certificate_code_hidden_property_events": int(self.integration_counts.get("certificate_code_hidden_property_events", 0)),
+                    "model_certificate_head_events": int(self.integration_counts.get("model_certificate_head_events", 0)),
+                    "model_certificate_head_verified_events": int(self.integration_counts.get("model_certificate_head_verified_events", 0)),
+                    "model_certificate_head_latent_checksum_events": int(self.integration_counts.get("model_certificate_head_latent_checksum_events", 0)),
+                    "model_certificate_head_target_match_events": int(self.integration_counts.get("model_certificate_head_target_match_events", 0)),
+                    "model_certificate_head_artifacts": _last_items(self.model_certificate_head_artifacts, 5),
                     **frontier_heldout_summary,
                     "input_anchor_observations": int(self.input_anchor_observations),
                     "input_anchor_count": int(self.input_anchor_count),
@@ -6814,6 +6954,11 @@ class CortexTrainingPhaseController:
                     "certificate_head_forward_events": int(self.model.certificate_forward_events),
                     "certificate_algebra_tool_events": int(self.integration_counts.get("certificate_algebra_tool_events", 0)),
                     "certificate_code_hidden_property_events": int(self.integration_counts.get("certificate_code_hidden_property_events", 0)),
+                    "model_certificate_head_events": int(self.integration_counts.get("model_certificate_head_events", 0)),
+                    "model_certificate_head_verified_events": int(self.integration_counts.get("model_certificate_head_verified_events", 0)),
+                    "model_certificate_head_latent_checksum_events": int(self.integration_counts.get("model_certificate_head_latent_checksum_events", 0)),
+                    "model_certificate_head_target_match_events": int(self.integration_counts.get("model_certificate_head_target_match_events", 0)),
+                    "model_certificate_head_artifacts": _last_items(self.model_certificate_head_artifacts, 5),
                     "input_anchor_observations": int(self.input_anchor_observations),
                     "input_anchor_count": int(self.input_anchor_count),
                     "input_anchor_fidelity_failures": int(self.input_anchor_fidelity_failures),

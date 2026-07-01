@@ -26,6 +26,7 @@ from cortex3_certificates import (
     compiled_circuit_tool,
     default_tool_registry,
     evaluate_certificate_efficiency,
+    model_token_certificate_tool,
 )
 from cortex3_cycle import CortexCycle
 from cortex3_reporting import write_cycle_run
@@ -124,6 +125,47 @@ class CertificatesTest(unittest.TestCase):
             tool=cert.tool,
         )
         self.assertFalse(CertificateVerifier().verify(bad, state).passed)
+
+    def test_model_token_certificate_binds_answer_to_certificate_head_output(self):
+        state = _latent_state()
+        cert = build_certificate(
+            certificate_id="cert-model-token",
+            task_id="task-model-token",
+            skill="llm_certificate_head",
+            certificate_type=CertificateType.EXACT_MATCH,
+            answer="alpha",
+            claims={"model_certificate_head": True},
+            uncertainty=0.12,
+            latent_state=state,
+            tool="model_token_certificate",
+            tool_args={
+                "answer_token_id": 17,
+                "certificate_head_token_id": 17,
+                "lm_head_token_id": 22,
+                "target_token_id": 23,
+                "decoded_answer": "alpha",
+            },
+        )
+        bad = build_certificate(
+            certificate_id="cert-model-token-bad",
+            task_id="task-model-token",
+            skill="llm_certificate_head",
+            certificate_type=CertificateType.EXACT_MATCH,
+            answer="beta",
+            claims={"model_certificate_head": True},
+            uncertainty=0.12,
+            latent_state=state,
+            tool="model_token_certificate",
+            tool_args={
+                "answer_token_id": 17,
+                "certificate_head_token_id": 17,
+                "decoded_answer": "alpha",
+            },
+        )
+
+        self.assertTrue(CertificateVerifier().verify(cert, state).passed)
+        self.assertTrue(model_token_certificate_tool(cert).passed)
+        self.assertFalse(model_token_certificate_tool(bad).passed)
 
     def test_code_certificate_runs_real_unit_tests(self):
         state = _latent_state()
@@ -403,7 +445,7 @@ class CertificatesTest(unittest.TestCase):
 
     def test_default_registry_contains_required_tools(self):
         registry = default_tool_registry()
-        self.assertEqual(set(registry.names), {"algebra_linear", "anchor_fidelity", "arithmetic", "code_tests", "compiled_circuit", "exact_match"})
+        self.assertEqual(set(registry.names), {"algebra_linear", "anchor_fidelity", "arithmetic", "code_tests", "compiled_circuit", "exact_match", "model_token_certificate"})
 
     def test_cycle_run_artifacts_can_include_short_certificates(self):
         state = _latent_state()
