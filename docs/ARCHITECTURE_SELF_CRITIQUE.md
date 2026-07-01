@@ -1,6 +1,6 @@
 # Cortex-3 Architecture Self-Critique
 
-Etat: boucle d'audit 7 apres integration du kernel CUDA natif tuilé/warp, de l'autotune CUDA mesure/cache, des profils persistants, du fast STE autograd, du backward `grad_input` natif sur poids int2 packes, de la requantization/packing CUDA fusionnee post-update et du doctor toolchain CUDA C++ explicite.
+Etat: boucle d'audit 8 apres integration du kernel CUDA natif tuilé/warp, de l'autotune CUDA mesure/cache, des profils persistants, du fast STE autograd, du backward `grad_input` natif sur poids int2 packes, de la requantization/packing CUDA fusionnee post-update, du doctor toolchain CUDA C++ explicite et d'un smoke extension PyTorch CUDA 12.8 reel.
 
 Ce document sert de registre de critique et de correction. Il ne remplace pas les tests longs interdits pour cette iteration; il se limite aux preuves courtes disponibles, aux rapports du code et aux benchmarks GPU courts.
 
@@ -101,12 +101,12 @@ Ce document sert de registre de critique et de correction. Il ne remplace pas le
 ### C13. Packaging C++/CUDA encore flou
 
 - Critique: l'auto-critique disait "pas extension C++/CUDA packagee" sans que le doctor sache si le PC pouvait vraiment la builder. C'etait trop flou pour un objectif qui mentionne explicitement `cl`.
-- Diagnostic reel: `cl` existe via Visual Studio Community 18 (`MSVC 14.51`), `nvcc` visible est CUDA 13.2, Torch est `2.11.0+cu128` donc `torch.version.cuda=12.8`. PyTorch refuse une extension CUDA quand `nvcc` major.minor ne matche pas Torch (`13.2` vs `12.8`). Le wheel pip `nvidia-cuda-nvcc-cu12==12.8.93` installe headers/NVVM/ptxas sur Windows, mais pas `nvcc.exe`, donc il ne suffit pas a compiler une extension PyTorch.
-- Correction: `llm_doctor_report` expose maintenant `cuda_toolchain`, `native_rawkernel_available`, `cuda_extension_toolchain_ready`, chemins `CUDA_HOME/CUDA_PATH/nvcc`, detection Visual Studio/cl et un check optionnel `require_cuda_extension`. `tools/train_llm.py doctor --require-cuda` passe pour le backend RawKernel actuel; `--require-cuda-extension` echoue explicitement sur `cuda:extension_toolchain_ready`.
-- Verification courte: test doctor cible mis a jour; commande doctor CUDA passee avec `native_rawkernel_available=true`; commande doctor stricte extension echoue comme attendu avec detail `torch=12.8, nvcc=13.2, cl_available=True`.
-- Statut: corrige pour la detection/preflight; la correction finale demandera installation d'un toolkit CUDA 12.8 complet avec `nvcc.exe` ou une roue Torch alignee sur le toolkit local, puis build extension.
+- Diagnostic reel: `cl` existe via Visual Studio Community 18 (`MSVC 14.51`), mais `nvcc 12.8` plante dans `cudafe++` avec ce host compiler, meme sur un `.cu` minimal. Visual Studio Build Tools 2022 est aussi installe (`MSVC 14.44`), et ce chemin compile correctement avec le toolkit CUDA 12.8 user-level installe par micromamba dans `C:\Users\hight\.codex\cuda-12.8\Library`.
+- Correction: `llm_doctor_report` expose maintenant plusieurs `cuda_home_candidates`, choisit le `nvcc` qui matche `torch.version.cuda=12.8`, detecte les installations Visual Studio/cl et prefere VS2022. Les scripts `tools\run_cuda128_minimal_nvcc_smoke.ps1` et `tools\run_cuda128_extension_smoke.ps1` chargent VS2022, fixent `CUDA_HOME`, isolent le cache torch extension et corrigent le layout conda `lib\x64\cudart.lib`.
+- Verification courte: `tools\train_llm.py doctor --require-cuda --require-cuda-extension --precision bf16 --device cuda` passe; le smoke `nvcc` minimal produit `minimal.obj`; le smoke PyTorch extension compile et execute `result [1.0, 2.0, 3.0, 4.0]` sur CUDA.
+- Statut: corrige pour la detection/preflight et la compilation extension; pas encore corrige pour le backend training Cortex, qui utilise toujours les RawKernels CuPy pour forward/grad_input/requantize.
 
-## Critique phase par phase - boucle 7
+## Critique phase par phase - boucle 8
 
 ### P1 - Verifier OS
 
@@ -118,9 +118,9 @@ Ce document sert de registre de critique et de correction. Il ne remplace pas le
 
 ### P2 - Ternary Core
 
-- Ce qui est solide: poids ternaires packes int2, quantization activations, STE, sync versionnee des buffers packes pendant training, kernels CUDA natifs tuiles/warp, autotune CUDA-event par shape, profil JSON persistant, cache layer-local, fast STE autograd forward, backward CUDA `grad_input` depuis poids int2 packes, requantization/packing post-update fusionnee CUDA, doctor CUDA distinguant RawKernel pret et extension C++/CUDA non prete, audit LLM exigeant native kernel autotune sur CUDA.
-- Preuve actuelle: tests CUDA courts, export/import profil, tests gradients fast-vs-dense STE en fp32/fp16/bf16, test de parite requantize/pack fp32/fp16/bf16, doctor toolchain, benchmark RTX 5070 avec full forward, forward+backward et requantize/pack profile, full Cortex court avec `native_ternary_autotuned_dispatches`.
-- Faiblesse: kernels encore CuPy/NVRTC car le toolkit local complet `nvcc.exe` ne matche pas Torch CUDA 12.8; pas de mesure energie/VRAM longue; `grad_weight` STE reste dense pour conserver l'exactitude du gradient.
+- Ce qui est solide: poids ternaires packes int2, quantization activations, STE, sync versionnee des buffers packes pendant training, kernels CUDA natifs tuiles/warp, autotune CUDA-event par shape, profil JSON persistant, cache layer-local, fast STE autograd forward, backward CUDA `grad_input` depuis poids int2 packes, requantization/packing post-update fusionnee CUDA, doctor CUDA distinguant RawKernel pret et extension C++/CUDA compilable, audit LLM exigeant native kernel autotune sur CUDA.
+- Preuve actuelle: tests CUDA courts, export/import profil, tests gradients fast-vs-dense STE en fp32/fp16/bf16, test de parite requantize/pack fp32/fp16/bf16, doctor toolchain strict, smoke `nvcc` minimal, smoke extension PyTorch CUDA reel, benchmark RTX 5070 avec full forward, forward+backward et requantize/pack profile, full Cortex court avec `native_ternary_autotuned_dispatches`.
+- Faiblesse: kernels training encore CuPy/NVRTC; le packaging extension est prouve mais pas encore le backend par defaut pour forward/grad_input/requantize; pas de mesure energie/VRAM longue; `grad_weight` STE reste dense pour conserver l'exactitude du gradient.
 - Risque architectural: le chemin training utilise maintenant les codes int2 en forward, pour `grad_input`, et pendant le repack post-update, mais le gain hardware complet demandera un kernel backward plus complet ou une strategie d'optimisation qui evite/compresse le `grad_weight` dense.
 - Correction prioritaire restante: reduire ou fusionner le cout `grad_weight` STE sans casser la semantique d'apprentissage, puis profiler energie/VRAM.
 

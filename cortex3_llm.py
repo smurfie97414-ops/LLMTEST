@@ -2651,27 +2651,52 @@ def _visual_studio_toolchain_probe() -> dict[str, Any]:
         if program_files_x86
         else None
     )
-    installation_path = None
+    installations: list[dict[str, Any]] = []
     if vswhere is not None and vswhere.exists():
-        installation_path = _command_stdout([
+        raw_installations = _command_stdout([
             str(vswhere),
-            "-latest",
+            "-all",
             "-products",
             "*",
             "-requires",
             "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
-            "-property",
-            "installationPath",
+            "-format",
+            "json",
         ])
-    cl_candidates: list[str] = []
-    if installation_path:
-        vc_root = Path(installation_path) / "VC" / "Tools" / "MSVC"
+        if raw_installations:
+            try:
+                installations = list(json.loads(raw_installations))
+            except Exception:
+                installations = []
+    cl_candidates: list[dict[str, Any]] = []
+    for installation in installations:
+        installation_path = installation.get("installationPath")
+        if not installation_path:
+            continue
+        vc_root = Path(str(installation_path)) / "VC" / "Tools" / "MSVC"
         for candidate in vc_root.glob("*/bin/Hostx64/x64/cl.exe"):
-            cl_candidates.append(str(candidate))
+            cl_candidates.append({
+                "cl_path": str(candidate),
+                "toolset_version": candidate.parents[2].name,
+                "installation_path": str(installation_path),
+                "installation_version": str(installation.get("installationVersion", "")),
+                "display_name": str(installation.get("displayName", "")),
+                "product_id": str(installation.get("productId", "")),
+            })
+    cl_candidates = sorted(
+        cl_candidates,
+        key=lambda item: (
+            not str(item["installation_version"]).startswith("17."),
+            str(item["installation_version"]),
+            str(item["toolset_version"]),
+        ),
+    )
+    selected = cl_candidates[0] if cl_candidates else None
     return {
         "cl_on_path": cl_on_path,
-        "visual_studio_installation_path": installation_path,
-        "cl_candidates": tuple(sorted(cl_candidates)),
+        "visual_studio_installations": tuple(installations),
+        "cl_candidates": tuple(cl_candidates),
+        "selected_cl": selected,
         "cl_available": bool(cl_on_path or cl_candidates),
     }
 
@@ -2698,10 +2723,49 @@ def _pip_nvcc_cu12_probe() -> dict[str, Any]:
         }
 
 
-def cuda_toolchain_report() -> dict[str, Any]:
+def _cuda_candidate_homes(torch_cuda: str | None) -> tuple[Path, ...]:
+    candidates: list[Path] = []
+    for value in (os.environ.get("CUDA_HOME"), os.environ.get("CUDA_PATH")):
+        if value:
+            candidates.append(Path(value))
+    if torch_cuda:
+        candidates.append(Path.home() / ".codex" / f"cuda-{torch_cuda}" / "Library")
     nvcc_path = shutil.which("nvcc")
-    nvcc_output = _command_stdout([nvcc_path, "--version"], timeout=5.0) if nvcc_path else None
+    if nvcc_path:
+        candidates.append(Path(nvcc_path).resolve(strict=False).parent.parent)
+    deduped: list[Path] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = str(candidate.resolve(strict=False)).lower()
+        if key not in seen:
+            deduped.append(candidate)
+            seen.add(key)
+    return tuple(deduped)
+
+
+def _cuda_home_probe(home: Path, torch_cuda: str | None) -> dict[str, Any]:
+    nvcc_path = home / "bin" / "nvcc.exe"
+    if not nvcc_path.exists():
+        nvcc_path = home / "bin" / "nvcc"
+    nvcc_output = _command_stdout([str(nvcc_path), "--version"], timeout=5.0) if nvcc_path.exists() else None
     nvcc_release = _nvcc_release_from_output(nvcc_output)
+    cudart_candidates = (
+        home / "lib" / "x64" / "cudart.lib",
+        home / "lib" / "cudart.lib",
+    )
+    cudart_lib = next((path for path in cudart_candidates if path.exists()), None)
+    return {
+        "cuda_home": str(home),
+        "nvcc_path": str(nvcc_path) if nvcc_path.exists() else None,
+        "nvcc_release": nvcc_release,
+        "nvcc_matches_torch_cuda": bool(torch_cuda and nvcc_release and str(nvcc_release).startswith(str(torch_cuda))),
+        "include_cuda_runtime_h": (home / "include" / "cuda_runtime.h").exists(),
+        "cudart_lib": str(cudart_lib) if cudart_lib else None,
+        "pytorch_windows_lib_x64_ready": (home / "lib" / "x64" / "cudart.lib").exists(),
+    }
+
+
+def cuda_toolchain_report() -> dict[str, Any]:
     torch_cuda = getattr(torch.version, "cuda", None)
     try:
         from torch.utils import cpp_extension
@@ -2711,6 +2775,10 @@ def cuda_toolchain_report() -> dict[str, Any]:
         cpp_cuda_home = None
     visual_studio = _visual_studio_toolchain_probe()
     pip_nvcc = _pip_nvcc_cu12_probe()
+    cuda_candidates = tuple(_cuda_home_probe(path, torch_cuda) for path in _cuda_candidate_homes(torch_cuda))
+    selected_cuda = next((item for item in cuda_candidates if item["nvcc_matches_torch_cuda"]), None)
+    if selected_cuda is None and cuda_candidates:
+        selected_cuda = cuda_candidates[0]
     rawkernel_available = False
     rawkernel_error = ""
     if torch.cuda.is_available():
@@ -2718,16 +2786,23 @@ def cuda_toolchain_report() -> dict[str, Any]:
             rawkernel_available = bool(native_ternary_cuda_available())
         except Exception as exc:
             rawkernel_error = f"{type(exc).__name__}: {exc}"
-    nvcc_matches_torch = bool(torch_cuda and nvcc_release and str(nvcc_release).startswith(str(torch_cuda)))
-    extension_ready = bool(torch.cuda.is_available() and visual_studio["cl_available"] and nvcc_matches_torch)
+    nvcc_matches_torch = bool(selected_cuda and selected_cuda["nvcc_matches_torch_cuda"])
+    has_cuda_headers = bool(selected_cuda and selected_cuda["include_cuda_runtime_h"])
+    has_cudart_lib = bool(selected_cuda and selected_cuda["cudart_lib"])
+    extension_ready = bool(torch.cuda.is_available() and visual_studio["cl_available"] and nvcc_matches_torch and has_cuda_headers and has_cudart_lib)
     return {
         "torch_cuda": torch_cuda,
         "cuda_available": bool(torch.cuda.is_available()),
         "cuda_home": str(cpp_cuda_home) if cpp_cuda_home else None,
         "cuda_path": os.environ.get("CUDA_PATH"),
-        "nvcc_path": nvcc_path,
-        "nvcc_release": nvcc_release,
+        "selected_cuda_home": selected_cuda["cuda_home"] if selected_cuda else None,
+        "cuda_home_candidates": cuda_candidates,
+        "nvcc_path": selected_cuda["nvcc_path"] if selected_cuda else shutil.which("nvcc"),
+        "nvcc_release": selected_cuda["nvcc_release"] if selected_cuda else None,
         "nvcc_matches_torch_cuda": nvcc_matches_torch,
+        "include_cuda_runtime_h": has_cuda_headers,
+        "cudart_lib": selected_cuda["cudart_lib"] if selected_cuda else None,
+        "pytorch_windows_lib_x64_ready": bool(selected_cuda and selected_cuda["pytorch_windows_lib_x64_ready"]),
         "visual_studio": visual_studio,
         "pip_nvidia_cuda_nvcc_cu12": pip_nvcc,
         "native_rawkernel_available": rawkernel_available,
@@ -2738,7 +2813,8 @@ def cuda_toolchain_report() -> dict[str, Any]:
             if extension_ready
             else (
                 "CUDA C++ extension build requires cl plus an nvcc toolkit whose major.minor version matches torch.version.cuda; "
-                f"torch={torch_cuda}, nvcc={nvcc_release}, cl_available={visual_studio['cl_available']}"
+                f"torch={torch_cuda}, nvcc={selected_cuda['nvcc_release'] if selected_cuda else None}, "
+                f"cl_available={visual_studio['cl_available']}, cuda_headers={has_cuda_headers}, cudart_lib={has_cudart_lib}"
             )
         ),
     }
