@@ -9378,6 +9378,7 @@ def _profile_autosize_adaptive_measurement_inputs(
                 if bool(item.get("measurement_passed"))
             ),
             key=lambda item: (
+                float(item.get("measured_score_upper_confidence", item.get("measured_score", 0.0))),
                 float(item.get("measured_score", 0.0)),
                 int(item.get("tokens_per_optimizer_step", 0)),
                 -int(item.get("estimated_rank", 0)),
@@ -9390,6 +9391,7 @@ def _profile_autosize_adaptive_measurement_inputs(
             sorted(
                 measured_candidates,
                 key=lambda item: (
+                    float(item.get("measured_score_upper_confidence", item.get("measured_score", 0.0))),
                     float(item.get("measured_score", 0.0)),
                     -int(item.get("estimated_rank", 0)),
                 ),
@@ -9438,6 +9440,13 @@ def _profile_autosize_adaptive_measurement_inputs(
     token_values = [float(candidate.get("tokens_per_optimizer_step", 0.0)) for candidate in all_candidates]
     token_low, token_high = min(token_values), max(token_values)
     token_span = max(1e-9, token_high - token_low)
+    reference_upper_values = [
+        float(reference.get("measured_score_upper_confidence", reference.get("measured_score", 0.0)))
+        for reference in references
+    ]
+    reference_upper_low = min(reference_upper_values, default=0.0)
+    reference_upper_high = max(reference_upper_values, default=0.0)
+    reference_upper_span = max(1e-9, reference_upper_high - reference_upper_low)
     measured_features = [
         features[str(item["shape_key"])]
         for item in measured_candidates
@@ -9458,7 +9467,21 @@ def _profile_autosize_adaptive_measurement_inputs(
     selected: list[Mapping[str, Any]] = []
     selected_keys: set[str] = set()
     while len(selected) < count:
-        best: tuple[float, float, float, float, int, Mapping[str, Any], str] | None = None
+        best: tuple[
+            float,
+            float,
+            float,
+            float,
+            float,
+            int,
+            Mapping[str, Any],
+            str,
+            float,
+            float,
+            float,
+            float,
+            float,
+        ] | None = None
         current_measured_features = measured_features + [
             features[str(item["shape_key"])]
             for item in selected
@@ -9475,7 +9498,16 @@ def _profile_autosize_adaptive_measurement_inputs(
             )
             nearest_reference_distance = min(distances_to_references)
             nearest_reference_index = distances_to_references.index(nearest_reference_distance)
-            source_shape_key = str(references[nearest_reference_index]["shape_key"])
+            source_reference = references[nearest_reference_index]
+            source_shape_key = str(source_reference["shape_key"])
+            source_score = float(source_reference.get("measured_score", 0.0))
+            source_score_mean = float(source_reference.get("measured_score_mean", source_score))
+            source_score_stddev = float(source_reference.get("measured_score_stddev", 0.0))
+            source_upper_confidence = float(
+                source_reference.get("measured_score_upper_confidence", source_score)
+            )
+            source_stability_ratio = float(source_reference.get("measured_score_stability_ratio", 0.0))
+            source_potential = (source_upper_confidence - reference_upper_low) / reference_upper_span
             proximity = 1.0 / (1.0 + nearest_reference_distance)
             novelty = min(
                 (
@@ -9486,19 +9518,30 @@ def _profile_autosize_adaptive_measurement_inputs(
             )
             estimated_score_norm = (float(candidate.get("score", 0.0)) - score_low) / score_span
             token_norm = (float(candidate.get("tokens_per_optimizer_step", 0.0)) - token_low) / token_span
-            score = (0.45 * proximity) + (0.25 * novelty) + (0.20 * estimated_score_norm) + (0.10 * token_norm)
+            score = (
+                (0.35 * proximity)
+                + (0.20 * novelty)
+                + (0.20 * source_potential)
+                + (0.15 * estimated_score_norm)
+                + (0.10 * token_norm)
+            )
             rank = int(candidate.get("estimated_rank", 0))
-            key = (score, proximity, novelty, float(candidate.get("score", 0.0)), -rank, candidate, source_shape_key)
+            key = (score, source_potential, proximity, novelty, float(candidate.get("score", 0.0)), -rank, candidate, source_shape_key, source_score, source_score_mean, source_score_stddev, source_upper_confidence, source_stability_ratio)
             if best is None or key[:5] > best[:5]:
                 best = key
         if best is None:
             break
-        _, _, _, _, _, candidate, source_shape_key = best
+        _, _, _, _, _, _, candidate, source_shape_key, source_score, source_score_mean, source_score_stddev, source_upper_confidence, source_stability_ratio = best
         selected.append(
             {
                 **candidate,
                 "measurement_selection_reason": "adaptive_measured_frontier",
                 "measurement_selection_source_shape_key": source_shape_key,
+                "measurement_selection_source_score": float(source_score),
+                "measurement_selection_source_score_mean": float(source_score_mean),
+                "measurement_selection_source_score_stddev": float(source_score_stddev),
+                "measurement_selection_source_upper_confidence": float(source_upper_confidence),
+                "measurement_selection_source_stability_ratio": float(source_stability_ratio),
                 "measurement_selection_distance": float(
                     min(
                         math.sqrt(
@@ -9543,6 +9586,11 @@ def _profile_autosize_measurement_summary(
         "measurement_candidate_index": int(candidate.get("measurement_candidate_index", 0)),
         "measurement_selection_reason": str(candidate.get("measurement_selection_reason", "")),
         "measurement_selection_source_shape_key": str(candidate.get("measurement_selection_source_shape_key", "")),
+        "measurement_selection_source_score": float(candidate.get("measurement_selection_source_score", 0.0)),
+        "measurement_selection_source_score_mean": float(candidate.get("measurement_selection_source_score_mean", 0.0)),
+        "measurement_selection_source_score_stddev": float(candidate.get("measurement_selection_source_score_stddev", 0.0)),
+        "measurement_selection_source_upper_confidence": float(candidate.get("measurement_selection_source_upper_confidence", 0.0)),
+        "measurement_selection_source_stability_ratio": float(candidate.get("measurement_selection_source_stability_ratio", 0.0)),
         "measurement_selection_distance": float(candidate.get("measurement_selection_distance", 0.0)),
         "fits_budget": bool(candidate["fits_budget"]),
         "measurement_metric": metric,
@@ -9691,6 +9739,7 @@ def _profile_autosize_aggregate_measurements(
     measured_score_max = float(max(measured_score_values, default=0.0))
     measured_score_stddev = float(statistics.stdev(measured_score_values)) if len(measured_score_values) > 1 else 0.0
     measured_score_lower_confidence = max(0.0, measured_score_mean - measured_score_stddev)
+    measured_score_upper_confidence = measured_score_mean + measured_score_stddev
     measured_score_stability_ratio = (
         float(measured_score_lower_confidence / measured_score_mean)
         if measured_score_mean > 0.0
@@ -9714,6 +9763,11 @@ def _profile_autosize_aggregate_measurements(
         "measurement_candidate_index": int(candidate.get("measurement_candidate_index", 0)),
         "measurement_selection_reason": str(candidate.get("measurement_selection_reason", "")),
         "measurement_selection_source_shape_key": str(candidate.get("measurement_selection_source_shape_key", "")),
+        "measurement_selection_source_score": float(candidate.get("measurement_selection_source_score", 0.0)),
+        "measurement_selection_source_score_mean": float(candidate.get("measurement_selection_source_score_mean", 0.0)),
+        "measurement_selection_source_score_stddev": float(candidate.get("measurement_selection_source_score_stddev", 0.0)),
+        "measurement_selection_source_upper_confidence": float(candidate.get("measurement_selection_source_upper_confidence", 0.0)),
+        "measurement_selection_source_stability_ratio": float(candidate.get("measurement_selection_source_stability_ratio", 0.0)),
         "measurement_selection_distance": float(candidate.get("measurement_selection_distance", 0.0)),
         "fits_budget": bool(candidate["fits_budget"]),
         "measurement_metric": metric,
@@ -9729,6 +9783,7 @@ def _profile_autosize_aggregate_measurements(
         "measured_score_max": measured_score_max,
         "measured_score_stddev": measured_score_stddev,
         "measured_score_lower_confidence": measured_score_lower_confidence,
+        "measured_score_upper_confidence": measured_score_upper_confidence,
         "measured_score_stability_ratio": measured_score_stability_ratio,
         "train_tokens_per_second_wall": _mean_float("train_tokens_per_second_wall"),
         "planned_train_tokens": sum(int(row.get("planned_train_tokens", 0)) for row in rows),
@@ -10284,6 +10339,11 @@ def run_llm_batch_profile_autosize(
                         "estimated_ranks": tuple(int(item.get("estimated_rank", 0)) for item in round_rows),
                         "selection_reasons": tuple(str(item.get("measurement_selection_reason", "")) for item in round_rows),
                         "source_shape_keys": tuple(str(item.get("measurement_selection_source_shape_key", "")) for item in round_rows),
+                        "source_scores": tuple(float(item.get("measurement_selection_source_score", 0.0)) for item in round_rows),
+                        "source_score_means": tuple(float(item.get("measurement_selection_source_score_mean", 0.0)) for item in round_rows),
+                        "source_score_stddevs": tuple(float(item.get("measurement_selection_source_score_stddev", 0.0)) for item in round_rows),
+                        "source_upper_confidences": tuple(float(item.get("measurement_selection_source_upper_confidence", 0.0)) for item in round_rows),
+                        "source_stability_ratios": tuple(float(item.get("measurement_selection_source_stability_ratio", 0.0)) for item in round_rows),
                     }
                 )
 

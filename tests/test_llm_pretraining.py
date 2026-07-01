@@ -45,6 +45,7 @@ from cortex3_llm import (
     inspect_llm_experiment,
     llm_doctor_report,
     main as llm_main,
+    _profile_autosize_adaptive_measurement_inputs,
     run_llm_batch_profile_autosize,
     run_llm_batch_profile,
     run_llm_batch_profile_matrix,
@@ -538,6 +539,66 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             report["measurement"]["measured_candidate_count"],
         )
         self.assertEqual(len(profile_calls), 7)
+
+    def test_llm_batch_profile_autosize_adaptive_frontier_uses_uncertainty_potential(self):
+        def candidate(shape_key, *, seq_len, d_model, score, rank):
+            shape = {
+                "seq_len": seq_len,
+                "d_model": d_model,
+                "n_heads": 4,
+                "n_layers": 1,
+                "batch_size": 2,
+                "gradient_accumulation_steps": 1,
+            }
+            return {
+                "shape": shape,
+                "shape_key": shape_key,
+                "estimated_peak_training_bytes": 128 * 1024 * 1024,
+                "budget_bytes": 512 * 1024 * 1024,
+                "budget_fraction_used": 0.25,
+                "tokens_per_optimizer_step": int(seq_len) * 2,
+                "score": float(score),
+                "estimated_rank": int(rank),
+                "fits_budget": True,
+            }
+
+        stable_source = candidate("stable_source", seq_len=32, d_model=32, score=100.0, rank=1)
+        uncertain_source = candidate("uncertain_source", seq_len=96, d_model=96, score=90.0, rank=2)
+        near_stable = candidate("near_stable", seq_len=40, d_model=32, score=85.0, rank=3)
+        near_uncertain = candidate("near_uncertain", seq_len=96, d_model=64, score=80.0, rank=4)
+        selected = _profile_autosize_adaptive_measurement_inputs(
+            (stable_source, uncertain_source, near_stable, near_uncertain),
+            measured_candidates=(
+                {
+                    **stable_source,
+                    "measurement_passed": True,
+                    "measured_score": 500.0,
+                    "measured_score_mean": 500.0,
+                    "measured_score_stddev": 0.0,
+                    "measured_score_upper_confidence": 500.0,
+                    "measured_score_stability_ratio": 1.0,
+                },
+                {
+                    **uncertain_source,
+                    "measurement_passed": True,
+                    "measured_score": 100.0,
+                    "measured_score_mean": 1050.0,
+                    "measured_score_stddev": 950.0,
+                    "measured_score_upper_confidence": 2000.0,
+                    "measured_score_stability_ratio": 0.095,
+                },
+            ),
+            already_measured_shape_keys={"stable_source", "uncertain_source"},
+            requested_count=1,
+        )
+
+        self.assertEqual(tuple(item["shape_key"] for item in selected), ("near_uncertain",))
+        self.assertEqual(selected[0]["measurement_selection_source_shape_key"], "uncertain_source")
+        self.assertEqual(selected[0]["measurement_selection_source_score"], 100.0)
+        self.assertEqual(selected[0]["measurement_selection_source_score_mean"], 1050.0)
+        self.assertEqual(selected[0]["measurement_selection_source_score_stddev"], 950.0)
+        self.assertEqual(selected[0]["measurement_selection_source_upper_confidence"], 2000.0)
+        self.assertAlmostEqual(selected[0]["measurement_selection_source_stability_ratio"], 0.095)
 
     def test_llm_batch_profile_autosize_matrix_uses_selected_gradient_accumulation(self):
         profile_calls = []
