@@ -156,6 +156,7 @@ python tools/benchmark_learned_memory_policy.py --device cuda
 - `batch=128, in=256, out=256, fp16`, requantize/pack post-update : kernel CUDA fusionné `0.2245 ms` contre chemin PyTorch `0.5901 ms`, soit `2.63x`.
 - `batch=512, in=512, out=512, fp16` : autotune `warp_reduction_int2`, candidats `tiled=0.5668 ms`, `warp=0.3368 ms`, runtime natif `0.2561 ms` contre `0.2734 ms` pour unpack+`F.linear`, soit `1.07x`, erreur max `0.000976`.
 - Matrice courte stricte `64x128x128`, `128x256x256`, `256x512x512`, fp16 : `strict_extension_only=true`, speedup forward+backward min `1.37x`, moyen `1.70x`, moyenne GPU `8.67%` et CPU process `26.67%` sur fenêtre sub-seconde `nvidia-smi`.
+- Matrice soutenue courte, mêmes shapes, `--sustain-seconds 0.35 --min-resource-samples 2` : `strict_extension_only=true`, `resource_samples_passed=true`, speedup forward+backward min `1.02x`, moyen `1.41x`, GPU moyen `21.83%`, puissance GPU moyenne `40.21 W`, CPU process moyen `25.28%`.
 
 Le doctor distingue le backend RawKernel et le backend extension. Sur ce PC, `tools/train_llm.py doctor --require-cuda --require-cuda-extension --precision bf16 --device cuda` passe avec `native_rawkernel_available=true`, `native_extension_runtime_available=true`, `nvcc=12.8` depuis `C:\Users\hight\.codex\cuda-12.8\Library` et Visual Studio Build Tools 2022. Le smoke strict `tools\train_llm.py smoke --device cuda --require-cuda --steps 2` utilise donc l'extension par défaut et produit un rapport avec `native_ternary_backend_counts={'extension': 2185}`, `native_ternary_requantize_backend_counts={'extension': 230}`, `native_ternary_grad_weight_backend_counts={'extension': 160}`, `torch_packed_ternary_dispatches=0`, `strict_extension_only=true`, et les audits P2/architecture passent avec exigence native explicite. Le prochain point dur n'est plus le branchement extension, mais les benchmarks multi-shapes latence/VRAM/énergie et la comparaison longue Cortex vs baseline.
 
@@ -334,7 +335,7 @@ python -m pytest tests/test_llm_pretraining.py -q
 ## Roadmap immédiate
 
 1. Durcir Phase 1 jusqu'au statut Verifier OS complet : coût par cas réel, familles génératives plus larges, tests de faux positifs/faux négatifs d'oracle.
-2. Durcir Phase 2 au-delà de la matrice courte stricte : fenêtre de monitoring plus soutenue, meilleur remplissage GPU, éventuelle variante WMMA/Tensor Core pour `grad_weight`, puis benchmarker latence/VRAM/énergie sous vrais batchs LLM.
+2. Durcir Phase 2 au-delà de la matrice soutenue courte : meilleur remplissage GPU sur shapes LLM plus grandes, éventuelle variante WMMA/Tensor Core pour `grad_weight`, puis benchmarker latence/VRAM/énergie sous vrais batchs LLM.
 3. Étendre Phase 3 vers des suites held-out plus larges, benchmarks MTP vs NTP et contrats FSP orientés objectifs de sortie.
 4. Étendre Phase 4 au-delà de l'ablation courte actuelle avec benchmarks coût/qualité de la politique mémoire apprise exact/latent/drop sur long contexte et held-out anchors.
 5. Étendre Phase 5 avec vérification algébrique multi-étapes, tests code plus riches et mesure held-out des économies de tokens de certificat.

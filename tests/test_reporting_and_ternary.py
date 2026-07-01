@@ -23,9 +23,35 @@ from cortex3_ternary import (
     save_native_ternary_autotune_cache,
     torch_available,
 )
+from tools.benchmark_ternary_kernel import _case_strict_extension_only, _matrix_summary, _parse_shape
 
 
 class ReportingAndTernaryTest(unittest.TestCase):
+    def test_ternary_benchmark_matrix_summary_requires_strict_extension_and_samples(self):
+        self.assertEqual(_parse_shape("64x128x256"), (64, 128, 256))
+        case = {
+            "native_backend": "native_int2_extension_cuda_warp_reduction_int2",
+            "native_grad_weight_backend_counts": {"extension": 3},
+            "strict_extension_only": True,
+            "full_forward_backward_speedup_vs_legacy_dense_ste": 1.5,
+            "full_bitlinear_forward_ms": 0.1,
+            "full_bitlinear_forward_backward_ms": 0.7,
+            "resource_usage": {"sample_count": 4},
+            "resource_metrics": {
+                "gpu_utilization_percent": {"avg": 42.0},
+                "gpu_power_draw_watts": {"avg": 51.0},
+                "process_cpu_percent_of_total": {"avg": 18.0},
+            },
+        }
+        self.assertTrue(_case_strict_extension_only(case))
+        passed = _matrix_summary([case], min_resource_samples=2)
+        self.assertTrue(passed["passed"])
+        self.assertEqual(passed["min_resource_sample_count"], 4)
+        self.assertEqual(passed["avg_gpu_power_draw_watts"], 51.0)
+        failed = _matrix_summary([case], min_resource_samples=5)
+        self.assertFalse(failed["passed"])
+        self.assertFalse(failed["resource_samples_passed"])
+
     def test_cycle_run_artifacts_are_persisted(self):
         verifier = DynamicSkillVerifier(default_skill_specs())
         report = CortexCycle(verifier).run(ReferenceRuleAgent(), CorruptedCompressedAgent(), seed=3, n_per_skill=1)

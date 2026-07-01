@@ -131,6 +131,14 @@ Ce document sert de registre de critique et de correction. Il ne remplace pas le
 - Limite: les mesures `nvidia-smi` sont sub-seconde et n'ont souvent qu'un echantillon par cas; elles prouvent que le monitoring est branche, pas encore que l'occupation GPU finale est optimale.
 - Statut: corrige pour matrice courte + monitoring branche. Prochain point: fenetre soutenue courte mais plus stable, plus grandes shapes LLM, et eventuelle variante WMMA/Tensor Core si `grad_weight` tuilé devient limitant.
 
+### C17. Monitoring soutenu trop faible pour juger l'occupation GPU
+
+- Critique: C16 branchait le monitoring mais la fenetre sub-seconde donnait souvent un seul echantillon par shape. C'etait trop faible pour discuter serieusement de GPU/VRAM/CPU moyens.
+- Correction: `tools/benchmark_ternary_kernel.py` accepte maintenant `--sustain-seconds`, `--sustain-op`, `--sustain-sync-every` et `--min-resource-samples`. Le workload soutenu relance le meme chemin strict extension, synchronise par paquets, garde les compteurs `grad_weight` extension actifs, et le resume matrix refuse les cas qui n'atteignent pas le nombre minimal d'echantillons. `ResourceUsageMonitor` lit aussi `power.draw` quand `nvidia-smi` le fournit.
+- Verification courte: matrice fp16 `64x128x128`, `128x256x256`, `256x512x512`, `--sustain-seconds 0.35`, `--min-resource-samples 2` passee avec `strict_extension_only=true`, `resource_samples_passed=true`, sample min `4`, speedup forward/backward min `1.02x`, moyen `1.41x`, GPU moyen `21.83%`, puissance moyenne `40.21 W`, CPU process moyen `25.28%`.
+- Limite: le GPU reste loin d'une saturation ambitieuse sur ces petites shapes; c'est maintenant mesure au lieu d'etre suppose. Le prochain durcissement doit viser des shapes plus grandes ou une variante kernel plus adaptée.
+- Statut: corrige pour monitoring soutenu court. Prochain point: remplir mieux le GPU sans retirer de composants, puis evaluer WMMA/Tensor Core pour `grad_weight`.
+
 ## Critique phase par phase - boucle 11
 
 ### P1 - Verifier OS
@@ -144,10 +152,10 @@ Ce document sert de registre de critique et de correction. Il ne remplace pas le
 ### P2 - Ternary Core
 
 - Ce qui est solide: poids ternaires packes int2, quantization activations, STE, sync versionnee des buffers packes pendant training, kernels CUDA natifs tuiles/warp, autotune CUDA-event par shape, profil JSON persistant, cache layer-local, fast STE autograd forward, backward CUDA `grad_input` depuis poids int2 packes, backward CUDA tuilé `grad_weight` + `grad_bias`, requantization/packing post-update fusionnee CUDA, backend extension C++/CUDA strict par defaut, doctor CUDA distinguant RawKernel et extension runtime, audit LLM exigeant native forward/requantize/grad_weight exclusivement extension en training CUDA strict.
-- Preuve actuelle: tests CUDA courts, export/import profil, tests gradients fast-vs-dense STE en fp32/fp16/bf16, test de parite requantize/pack fp32/fp16/bf16, test extension forcee, doctor toolchain strict, benchmark RTX 5070 avec full forward/backward et requantize/pack profile, matrice courte strict extension 3 shapes avec monitoring GPU/CPU, smoke LLM extension avec 2185 dispatches forward extension, 230 requantize extension et 160 `grad_weight` extension.
-- Faiblesse: pas de mesure energie/VRAM longue; matrice courte encore trop sub-seconde pour conclure sur l'occupation GPU; pas encore de kernel WMMA/Tensor Core specialise pour `grad_weight` si le tuilé fp32 devient limite a grande taille.
+- Preuve actuelle: tests CUDA courts, export/import profil, tests gradients fast-vs-dense STE en fp32/fp16/bf16, test de parite requantize/pack fp32/fp16/bf16, test extension forcee, doctor toolchain strict, benchmark RTX 5070 avec full forward/backward et requantize/pack profile, matrice strict extension 3 shapes avec monitoring soutenu GPU/CPU/power, smoke LLM extension avec 2185 dispatches forward extension, 230 requantize extension et 160 `grad_weight` extension.
+- Faiblesse: pas de mesure energie/VRAM longue; GPU moyen encore faible sur petites shapes soutenues; pas encore de kernel WMMA/Tensor Core specialise pour `grad_weight` si le tuilé fp32 devient limite a grande taille.
 - Risque architectural: le chemin training est maintenant completement branché en extension pour forward, `grad_input`, `grad_weight`, `grad_bias` et repack, mais une preuve de paradigme demandera que ce gain survive aux vrais batchs LLM et ne degrade pas la convergence.
-- Correction prioritaire restante: fenetre de monitoring soutenue + shapes LLM plus grandes, puis run long seulement quand autorise.
+- Correction prioritaire restante: shapes LLM plus grandes + meilleur remplissage GPU, puis run long seulement quand autorise.
 
 ### P3 - Future Contract / FSP / MTP
 
@@ -289,7 +297,7 @@ Ce document sert de registre de critique et de correction. Il ne remplace pas le
 
 ## File de correction priorisee apres boucle 11
 
-1. P2: stabiliser le monitoring GPU/VRAM/CPU sur une fenetre courte mais soutenue et des shapes LLM plus grandes.
+1. P2: augmenter le remplissage GPU sur shapes LLM plus grandes sans fallback ni retrait architectural.
 2. P2: etudier une variante `grad_weight` WMMA/Tensor Core si le kernel tuilé fp32 ne tient pas sur grandes shapes.
 3. P4: scaler l'ablation learned memory vs deterministic memory sur anchors long-context synthetiques puis held-out.
 4. P6/P7: afficher partout `repair_loss_before`, `repair_loss_after`, `protected_loss_before`, `protected_loss_after`, delta et convention.

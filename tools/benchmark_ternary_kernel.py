@@ -61,6 +61,9 @@ def benchmark_case(
     autotune_cache_write: bool,
     warmup: int,
     repeat: int,
+    sustain_seconds: float,
+    sustain_op: str,
+    sustain_sync_every: int,
 ) -> dict[str, Any]:
     layer = BitLinear(
         BitLinearConfig(
@@ -163,6 +166,42 @@ def benchmark_case(
         torch_requant_layer._sync_quantized_buffers_from_weight(record_decision=False)
         return torch_requant_layer.scales
 
+    sustained_workloads = {
+        "forward": bitlinear_forward,
+        "forward_backward": bitlinear_forward_backward,
+        "native": native,
+        "requantize": native_requantize_pack,
+    }
+    if sustain_op not in sustained_workloads:
+        raise ValueError(f"unsupported sustain_op={sustain_op!r}; choose from {sorted(sustained_workloads)}")
+
+    def sustained_workload() -> dict[str, Any]:
+        if sustain_seconds <= 0:
+            return {"enabled": False}
+        fn = sustained_workloads[sustain_op]
+        target_seconds = float(sustain_seconds)
+        sync_every = max(1, int(sustain_sync_every))
+        start_wall = time()
+        iterations = 0
+        while True:
+            fn()
+            iterations += 1
+            if iterations % sync_every == 0:
+                torch.cuda.synchronize()
+                if time() - start_wall >= target_seconds:
+                    break
+        torch.cuda.synchronize()
+        elapsed = time() - start_wall
+        return {
+            "enabled": True,
+            "op": sustain_op,
+            "target_seconds": target_seconds,
+            "duration_seconds": elapsed,
+            "iterations": iterations,
+            "sync_every": sync_every,
+            "iterations_per_second": iterations / max(elapsed, 1e-9),
+        }
+
     native_out = native()
     unpacked_out = torch_unpacked()
     ste_out = ste_dense()
@@ -179,6 +218,7 @@ def benchmark_case(
     legacy_forward_backward_ms = _time_cuda(legacy_forward_backward, warmup=max(1, warmup // 2), repeat=max(1, repeat // 2))
     native_requantize_pack_ms = _time_cuda(native_requantize_pack, warmup=warmup, repeat=repeat)
     torch_requantize_pack_ms = _time_cuda(torch_requantize_pack, warmup=warmup, repeat=repeat)
+    sustained = sustained_workload()
     legacy_training_forward_ms = native_ms + ste_dense_ms
     return {
         "batch": int(batch),
@@ -200,6 +240,7 @@ def benchmark_case(
         "legacy_dense_ste_forward_backward_ms": legacy_forward_backward_ms,
         "native_requantize_pack_ms": native_requantize_pack_ms,
         "torch_requantize_pack_ms": torch_requantize_pack_ms,
+        "sustained_workload": sustained,
         "native_grad_weight_backend_counts": dict(layer.ledger.native_ternary_grad_weight_backend_counts),
         "native_extension_grad_weight_dispatches": int(
             layer.ledger.native_ternary_grad_weight_backend_counts.get("extension", 0)
@@ -250,6 +291,7 @@ def _resource_metrics(report: dict[str, Any]) -> dict[str, Any]:
         "gpu_utilization_percent",
         "gpu_memory_utilization_percent",
         "gpu_memory_used_mb",
+        "gpu_power_draw_watts",
     ):
         stats = metrics.get(key)
         if isinstance(stats, dict):
@@ -269,7 +311,7 @@ def _case_strict_extension_only(report: dict[str, Any]) -> bool:
     )
 
 
-def _benchmark_case_with_resource_monitor(*, resource_interval: float, **kwargs: Any) -> dict[str, Any]:
+def _benchmark_case_with_resource_monitor(*, resource_interval: float, min_resource_samples: int, **kwargs: Any) -> dict[str, Any]:
     device = torch.device("cuda", torch.cuda.current_device())
     monitor = ResourceUsageMonitor(device=device, interval_seconds=max(0.01, float(resource_interval)))
     monitor.start()
@@ -279,11 +321,12 @@ def _benchmark_case_with_resource_monitor(*, resource_interval: float, **kwargs:
         resource_usage = monitor.stop()
     report["resource_usage"] = resource_usage
     report["resource_metrics"] = _resource_metrics(report)
+    report["resource_sample_count_passed"] = int(resource_usage.get("sample_count", 0) or 0) >= int(min_resource_samples)
     report["strict_extension_only"] = _case_strict_extension_only(report)
     return report
 
 
-def _matrix_summary(cases: list[dict[str, Any]]) -> dict[str, Any]:
+def _matrix_summary(cases: list[dict[str, Any]], *, min_resource_samples: int) -> dict[str, Any]:
     speedups = [float(case.get("full_forward_backward_speedup_vs_legacy_dense_ste", 0.0) or 0.0) for case in cases]
     forward_ms = [float(case.get("full_bitlinear_forward_ms", 0.0) or 0.0) for case in cases]
     forward_backward_ms = [float(case.get("full_bitlinear_forward_backward_ms", 0.0) or 0.0) for case in cases]
@@ -291,23 +334,33 @@ def _matrix_summary(cases: list[dict[str, Any]]) -> dict[str, Any]:
         float(dict(dict(case.get("resource_metrics") or {}).get("gpu_utilization_percent") or {}).get("avg", 0.0) or 0.0)
         for case in cases
     ]
+    gpu_power_avg = [
+        float(dict(dict(case.get("resource_metrics") or {}).get("gpu_power_draw_watts") or {}).get("avg", 0.0) or 0.0)
+        for case in cases
+    ]
     cpu_avg = [
         float(dict(dict(case.get("resource_metrics") or {}).get("process_cpu_percent_of_total") or {}).get("avg", 0.0) or 0.0)
         for case in cases
     ]
+    sample_counts = [int(dict(case.get("resource_usage") or {}).get("sample_count", 0) or 0) for case in cases]
     strict_extension_only = all(bool(case.get("strict_extension_only")) for case in cases)
     speedup_passed = all(speedup > 1.0 for speedup in speedups)
+    resource_samples_passed = all(count >= int(min_resource_samples) for count in sample_counts)
     return {
         "schema_version": 1,
         "case_count": len(cases),
         "strict_extension_only": strict_extension_only,
         "speedup_vs_legacy_dense_ste_passed": speedup_passed,
-        "passed": strict_extension_only and speedup_passed,
+        "resource_samples_passed": resource_samples_passed,
+        "passed": strict_extension_only and speedup_passed and resource_samples_passed,
+        "min_resource_samples_required": int(min_resource_samples),
+        "min_resource_sample_count": min(sample_counts) if sample_counts else 0,
         "min_full_forward_backward_speedup_vs_legacy_dense_ste": min(speedups) if speedups else 0.0,
         "avg_full_forward_backward_speedup_vs_legacy_dense_ste": sum(speedups) / len(speedups) if speedups else 0.0,
         "avg_full_bitlinear_forward_ms": sum(forward_ms) / len(forward_ms) if forward_ms else 0.0,
         "avg_full_bitlinear_forward_backward_ms": sum(forward_backward_ms) / len(forward_backward_ms) if forward_backward_ms else 0.0,
         "avg_gpu_utilization_percent": sum(gpu_avg) / len(gpu_avg) if gpu_avg else 0.0,
+        "avg_gpu_power_draw_watts": sum(gpu_power_avg) / len(gpu_power_avg) if gpu_power_avg else 0.0,
         "avg_process_cpu_percent_of_total": sum(cpu_avg) / len(cpu_avg) if cpu_avg else 0.0,
     }
 
@@ -331,6 +384,10 @@ def main() -> None:
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--repeat", type=int, default=100)
     parser.add_argument("--resource-interval", type=float, default=0.05)
+    parser.add_argument("--min-resource-samples", type=int, default=1)
+    parser.add_argument("--sustain-seconds", type=float, default=0.0)
+    parser.add_argument("--sustain-op", choices=("forward", "forward_backward", "native", "requantize"), default="forward_backward")
+    parser.add_argument("--sustain-sync-every", type=int, default=8)
     parser.add_argument("--allow-speedup-failure", action="store_true", help="write a matrix report even if a strict extension case is not faster than dense STE")
     parser.add_argument("--json-out", type=Path, default=None)
     args = parser.parse_args()
@@ -361,11 +418,15 @@ def main() -> None:
         "autotune_cache_write": not args.no_autotune_cache_write,
         "warmup": args.warmup,
         "repeat": args.repeat,
+        "sustain_seconds": args.sustain_seconds,
+        "sustain_op": args.sustain_op,
+        "sustain_sync_every": args.sustain_sync_every,
     }
     if shapes:
         cases = [
             _benchmark_case_with_resource_monitor(
                 resource_interval=args.resource_interval,
+                min_resource_samples=args.min_resource_samples,
                 batch=batch,
                 in_features=in_features,
                 out_features=out_features,
@@ -380,13 +441,17 @@ def main() -> None:
             "dtype": args.dtype,
             "native_backend_requested": args.native_backend,
             "kernel_variant_requested": args.kernel_variant,
+            "sustain_seconds": float(args.sustain_seconds),
+            "sustain_op": args.sustain_op,
+            "min_resource_samples": int(args.min_resource_samples),
             "elapsed_seconds": time() - started,
-            "summary": _matrix_summary(cases),
+            "summary": _matrix_summary(cases, min_resource_samples=args.min_resource_samples),
             "cases": cases,
         }
     else:
         report = _benchmark_case_with_resource_monitor(
             resource_interval=args.resource_interval,
+            min_resource_samples=args.min_resource_samples,
             batch=args.batch,
             in_features=args.in_features,
             out_features=args.out_features,

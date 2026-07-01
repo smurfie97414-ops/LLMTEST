@@ -308,7 +308,7 @@ Le forward lit la valeur runtime depuis les codes ternaires packes, puis utilise
 
 Le checkpoint inspecte montre `P2=238652` evenements. Le smoke court extension `tools\train_llm.py smoke --device cuda --require-cuda --steps 2` utilise l'extension par defaut et montre aussi `native_ternary_backend_counts={'extension': 2185}`, `native_ternary_requantize_backend_counts={'extension': 230}`, `native_ternary_grad_weight_backend_counts={'extension': 160}`, `torch_packed_ternary_dispatches=0`, `strict_extension_only=true` et audits P2/architecture passants. Les tests ajoutes verifient en plus que `BitLinear` execute un dispatch CUDA natif tuilé ou warp-reduction sur GPU local, que les valeurs fp32/fp16/bf16 correspondent au runtime packe, que l'auto-selection choisit la variante attendue selon la forme, que le backward fast STE garde la meme semantique que le dense STE pour `grad_input`, `grad_weight` et `grad_bias`, et que le gradient STE reste non nul vers les poids entrainables.
 
-La matrice courte `tools\benchmark_ternary_kernel.py --matrix --dtype fp16 --kernel-variant auto --warmup 2 --repeat 8` couvre `64x128x128`, `128x256x256` et `256x512x512`: `strict_extension_only=true`, speedup forward+backward min `1.37x`, moyen `1.70x`, GPU moyen `8.67%`, CPU process moyen `26.67%`. Ces compteurs prouvent que le monitoring est branche; la fenetre sub-seconde reste trop courte pour conclure sur l'occupation GPU finale.
+La matrice soutenue courte `tools\benchmark_ternary_kernel.py --matrix --dtype fp16 --kernel-variant auto --warmup 2 --repeat 6 --sustain-seconds 0.35 --sustain-op forward_backward --min-resource-samples 2` couvre `64x128x128`, `128x256x256` et `256x512x512`: `strict_extension_only=true`, `resource_samples_passed=true`, sample min `4`, speedup forward+backward min `1.02x`, moyen `1.41x`, GPU moyen `21.83%`, puissance GPU moyenne `40.21 W`, CPU process moyen `25.28%`. Ces compteurs prouvent que le monitoring est branche sur une fenetre courte mais soutenue; ils montrent aussi que les petites shapes ne saturent pas encore le GPU.
 
 La boucle post-update est aussi native sur CUDA: apres un changement de poids, `_sync_quantized_buffers_from_weight` peut regenerer `signs`, `mask`, `scales`, `residual_weight` et `packed_codes` via un kernel fusionne. Le benchmark court RTX 5070 `128x256x256 fp16` mesure `0.2245 ms` pour le chemin fusionne contre `0.5901 ms` pour le chemin PyTorch tensoriel.
 
@@ -744,7 +744,7 @@ Limite restante :
 
 Critere de fermeture :
 
-- durcir le backend extension strict par matrice multi-shapes et eventuelle variante WMMA/Tensor Core si necessaire ;
+- augmenter le remplissage GPU sur shapes LLM plus grandes et eventuelle variante WMMA/Tensor Core si necessaire ;
 - benchmarker latence, VRAM, energie estimee, throughput et qualite face a une baseline dense sur runs LLM larges.
 
 ### Verifier Dynamique A Grande Echelle

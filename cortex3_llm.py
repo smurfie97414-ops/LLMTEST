@@ -2495,7 +2495,7 @@ class ResourceUsageMonitor:
                 device_index = 0
         command = [
             "nvidia-smi",
-            "--query-gpu=index,utilization.gpu,utilization.memory,memory.used,memory.total",
+            "--query-gpu=index,utilization.gpu,utilization.memory,memory.used,memory.total,power.draw",
             "--format=csv,noheader,nounits",
         ]
         try:
@@ -2516,13 +2516,19 @@ class ResourceUsageMonitor:
                 continue
             if index != device_index:
                 continue
-            return {
+            out = {
                 "gpu_index": index,
                 "gpu_utilization_percent": float(parts[1]),
                 "gpu_memory_utilization_percent": float(parts[2]),
                 "gpu_memory_used_mb": float(parts[3]),
                 "gpu_memory_total_mb": float(parts[4]),
             }
+            if len(parts) >= 6:
+                try:
+                    out["gpu_power_draw_watts"] = float(parts[5])
+                except ValueError:
+                    pass
+            return out
         return {"gpu_monitor_error": f"cuda device index {device_index} not reported by nvidia-smi"}
 
     def summary(self) -> Mapping[str, Any]:
@@ -2558,6 +2564,7 @@ class ResourceUsageMonitor:
             "gpu_memory_utilization_percent",
             "gpu_memory_used_mb",
             "gpu_memory_total_mb",
+            "gpu_power_draw_watts",
         )
         metric_stats = {key: stats(key) for key in keys}
         return {
