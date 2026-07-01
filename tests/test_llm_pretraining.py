@@ -910,6 +910,7 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                     memory_budget_mb=512,
                     measure_candidate_count=2,
                     measure_candidate_adaptive_rounds=1,
+                    refine_uncertain_extra_seed_count=0,
                     measured_selection_metric="throughput",
                     min_cases=2,
                     require_multi_seed=True,
@@ -926,6 +927,110 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
         self.assertLess(measured_by_key[unstable_key]["measured_score"], measured_by_key[stable_key]["measured_score"])
         self.assertEqual(measured_by_key[stable_key]["measured_score"], measured_by_key[stable_key]["measured_score_lower_confidence"])
         self.assertEqual(len(profile_calls), 6)
+
+    def test_llm_batch_profile_autosize_refines_uncertain_candidate_with_extra_seed(self):
+        profile_calls = []
+
+        def fake_profile(**kwargs):
+            profile_calls.append(dict(kwargs))
+            seq_len = int(kwargs["seq_len"])
+            seed = int(kwargs["seed"])
+            if seq_len == 64:
+                train_tokens_per_second = 1600.0 if seed in (11, 104742) else 600.0
+            else:
+                train_tokens_per_second = 650.0
+            planned = (
+                int(kwargs["steps"])
+                * int(kwargs["batch_size"])
+                * int(kwargs["gradient_accumulation_steps"])
+                * int(kwargs["seq_len"])
+            )
+            return {
+                "passed": True,
+                "failed_checks": (),
+                "throughput": {
+                    "train_tokens_per_second_wall": train_tokens_per_second,
+                    "planned_train_tokens": planned,
+                },
+                "resource_usage": {
+                    "sample_count": 1,
+                    "metrics": {
+                        "gpu_utilization_percent": {"avg": 10.0, "min": 10.0, "max": 10.0},
+                        "gpu_memory_used_mb": {"avg": 128.0, "min": 128.0, "max": 128.0},
+                        "gpu_power_draw_watts": {"avg": 45.0, "min": 45.0, "max": 45.0},
+                        "process_cpu_percent_of_total": {"avg": 1.0, "min": 1.0, "max": 1.0},
+                    },
+                },
+                "torch_cuda_memory": {
+                    "after": {
+                        "max_memory_allocated_bytes": 8 * 1024 * 1024,
+                    }
+                },
+                "kernel_evidence": {
+                    "native_ternary_kernel_required": False,
+                    "strict_extension_only": True,
+                },
+                "architecture": {"all_phases_active": True},
+            }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch("cortex3_llm.run_llm_batch_profile", side_effect=fake_profile):
+                report = run_llm_batch_profile_autosize(
+                    out_dir=root / "autosize-uncertain-refinement",
+                    candidate_seq_lens=(32, 64),
+                    candidate_d_models=(32,),
+                    candidate_n_layers=(1,),
+                    candidate_batch_sizes=(2,),
+                    candidate_gradient_accumulation_steps=(1,),
+                    n_heads=4,
+                    selected_shape_count=1,
+                    min_selected_shapes=1,
+                    seeds=(11, 13),
+                    steps=1,
+                    gradient_accumulation_steps=1,
+                    vocab_size=128,
+                    precision="fp32",
+                    device="cpu",
+                    require_cuda=False,
+                    memory_budget_mb=512,
+                    measure_candidate_count=2,
+                    measure_candidate_adaptive_rounds=1,
+                    refine_uncertain_candidate_count=1,
+                    refine_uncertain_extra_seed_count=1,
+                    measured_selection_metric="throughput",
+                    min_cases=2,
+                    require_multi_seed=True,
+                    min_resource_samples=1,
+                )
+
+        measured_by_key = {item["shape_key"]: item for item in report["measured_candidates"]}
+        stable_key = "seq32_d32_h4_l1_b2_g1"
+        uncertain_key = "seq64_d32_h4_l1_b2_g1"
+        refinement_round = report["measurement"]["refinement_rounds"][0]
+        detail = refinement_round["details"][0]
+        self.assertTrue(report["passed"], report["failed_checks"])
+        self.assertEqual(report["selection"]["selected_shape_keys"], (uncertain_key,))
+        self.assertEqual(report["measurement"]["refinement_rounds_used"], 1)
+        self.assertEqual(report["measurement"]["refined_candidate_count"], 1)
+        self.assertEqual(report["measurement"]["refinement_profile_count"], 1)
+        self.assertEqual(report["measurement"]["refinement_seed_count"], 1)
+        self.assertEqual(report["measurement"]["refinement_seeds"], (104742,))
+        self.assertEqual(report["measurement"]["measured_candidate_profile_count"], 5)
+        self.assertEqual(refinement_round["round_kind"], "uncertainty_seed_refinement")
+        self.assertEqual(refinement_round["shape_keys"], (uncertain_key,))
+        self.assertEqual(refinement_round["extra_seeds"], (104742,))
+        self.assertEqual(detail["shape_key"], uncertain_key)
+        self.assertLess(detail["before"]["measured_score"], measured_by_key[stable_key]["measured_score"])
+        self.assertGreater(detail["after"]["measured_score"], measured_by_key[stable_key]["measured_score"])
+        self.assertEqual(measured_by_key[uncertain_key]["measurement_seed_count"], 3)
+        self.assertEqual(measured_by_key[uncertain_key]["measurement_seeds"], (11, 13, 104742))
+        self.assertEqual(tuple(row["seed"] for row in measured_by_key[uncertain_key]["seed_measurements"]), (11, 13, 104742))
+        self.assertEqual(measured_by_key[stable_key]["measurement_seeds"], (11, 13))
+        self.assertEqual(len(profile_calls), 7)
+        self.assertEqual(profile_calls[4]["seed"], 104742)
+        self.assertEqual(profile_calls[4]["seq_len"], 64)
+        self.assertIn("refine_seed_104742", str(profile_calls[4]["out_dir"]))
 
     def test_llm_batch_profile_autosize_blocks_measured_vram_over_budget(self):
         fake_profile = {

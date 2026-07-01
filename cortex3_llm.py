@@ -9837,6 +9837,38 @@ def _profile_autosize_measurement_seeds(
     return tuple(selected)
 
 
+def _profile_autosize_uncertainty_refinement_inputs(
+    measured_candidates: Sequence[Mapping[str, Any]],
+    *,
+    requested_count: int,
+) -> tuple[Mapping[str, Any], ...]:
+    if requested_count <= 0:
+        return ()
+    uncertain = tuple(
+        candidate
+        for candidate in measured_candidates
+        if bool(candidate.get("measurement_passed"))
+        and float(candidate.get("measured_score_stddev", 0.0)) > 0.0
+    )
+    if len(uncertain) < 1:
+        return ()
+    ranked = sorted(
+        uncertain,
+        key=lambda candidate: (
+            float(candidate.get("measured_score_upper_confidence", candidate.get("measured_score", 0.0)))
+            - float(candidate.get("measured_score", 0.0)),
+            float(candidate.get("measured_score_upper_confidence", 0.0)),
+            float(candidate.get("measured_score_stddev", 0.0)),
+            float(candidate.get("measured_score_mean", 0.0)),
+            int(candidate.get("tokens_per_optimizer_step", 0)),
+            -int(candidate.get("estimated_rank", 0)),
+            str(candidate.get("shape_key", "")),
+        ),
+        reverse=True,
+    )
+    return tuple(ranked[: int(requested_count)])
+
+
 def run_llm_batch_profile_matrix(
     *,
     out_dir: str | Path,
@@ -10090,6 +10122,8 @@ def run_llm_batch_profile_autosize(
     min_measure_candidate_seed_count: int = 2,
     measure_candidate_strategy: str = "diverse",
     measure_candidate_adaptive_rounds: int = 2,
+    refine_uncertain_candidate_count: int = 1,
+    refine_uncertain_extra_seed_count: int = 1,
     measured_selection_metric: str = "throughput_gpu",
     min_cases: int = 1,
     require_multi_shape: bool = False,
@@ -10116,6 +10150,12 @@ def run_llm_batch_profile_autosize(
     requested_measure_candidate_adaptive_rounds = int(measure_candidate_adaptive_rounds)
     if requested_measure_candidate_adaptive_rounds < 1:
         raise ValueError("measure_candidate_adaptive_rounds must be positive")
+    requested_refine_uncertain_candidate_count = int(refine_uncertain_candidate_count)
+    if requested_refine_uncertain_candidate_count < 0:
+        raise ValueError("refine_uncertain_candidate_count must be >= 0")
+    requested_refine_uncertain_extra_seed_count = int(refine_uncertain_extra_seed_count)
+    if requested_refine_uncertain_extra_seed_count < 0:
+        raise ValueError("refine_uncertain_extra_seed_count must be >= 0")
     if measure_candidate_strategy not in PROFILE_AUTOSIZE_MEASUREMENT_STRATEGIES:
         raise ValueError(
             f"unknown measure_candidate_strategy {measure_candidate_strategy!r}; "
@@ -10247,6 +10287,9 @@ def run_llm_batch_profile_autosize(
     selection_pool: Sequence[Mapping[str, Any]] = ranked_candidates
     measurement_inputs: tuple[Mapping[str, Any], ...] = ()
     measurement_rounds: list[Mapping[str, Any]] = []
+    refinement_rounds: list[Mapping[str, Any]] = []
+    refinement_seeds: tuple[int, ...] = ()
+    synthesized_refinement_seed_count = 0
     effective_measure_candidate_count = (
         max(requested_measure_candidate_count, int(selected_shape_count))
         if requested_measure_candidate_count > 0
@@ -10255,6 +10298,57 @@ def run_llm_batch_profile_autosize(
     if effective_measure_candidate_count > 0:
         aggregated_measurement_rows: list[Mapping[str, Any]] = []
         already_measured_shape_keys: set[str] = set()
+
+        def measure_candidate_seed(
+            candidate: Mapping[str, Any],
+            *,
+            candidate_index: int,
+            seed: int,
+            seed_dir_prefix: str = "seed",
+        ) -> Mapping[str, Any]:
+            shape = dict(candidate["shape"])
+            measure_dir = (
+                output_dir
+                / "candidate_measurements"
+                / f"candidate_{candidate_index:03d}_{candidate['shape_key']}"
+                / f"{seed_dir_prefix}_{int(seed)}"
+            )
+            profile: Mapping[str, Any] | None = None
+            error: BaseException | None = None
+            try:
+                profile = run_llm_batch_profile(
+                    out_dir=measure_dir,
+                    steps=steps,
+                    batch_size=int(shape["batch_size"]),
+                    gradient_accumulation_steps=int(shape.get("gradient_accumulation_steps", gradient_accumulation_steps)),
+                    seq_len=int(shape["seq_len"]),
+                    d_model=int(shape["d_model"]),
+                    n_heads=int(shape["n_heads"]),
+                    n_layers=int(shape["n_layers"]),
+                    vocab_size=vocab_size,
+                    precision=precision,
+                    device=device,
+                    require_cuda=require_cuda,
+                    native_ternary_backend=native_ternary_backend,
+                    resource_interval=resource_interval,
+                    min_resource_samples=min_resource_samples,
+                    seed=int(seed),
+                    corpus_repeats=corpus_repeats,
+                    max_corpus_tokens=max_corpus_tokens,
+                    overwrite=False,
+                )
+            except Exception as exc:
+                error = exc
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            return _profile_autosize_measurement_summary(
+                candidate,
+                profile=profile,
+                profile_path=measure_dir / "llm_batch_profile.json",
+                seed=int(seed),
+                metric=measured_selection_metric,
+                error=error,
+            )
 
         def measure_round(
             inputs: Sequence[Mapping[str, Any]],
@@ -10273,51 +10367,13 @@ def run_llm_batch_profile_autosize(
                     **candidate,
                     "measurement_candidate_index": candidate_index,
                 }
-                shape = dict(candidate["shape"])
                 seed_measurement_rows: list[Mapping[str, Any]] = []
                 for seed in measurement_seeds:
-                    measure_dir = (
-                        output_dir
-                        / "candidate_measurements"
-                        / f"candidate_{candidate_index:03d}_{candidate['shape_key']}"
-                        / f"seed_{int(seed)}"
-                    )
-                    profile: Mapping[str, Any] | None = None
-                    error: BaseException | None = None
-                    try:
-                        profile = run_llm_batch_profile(
-                            out_dir=measure_dir,
-                            steps=steps,
-                            batch_size=int(shape["batch_size"]),
-                            gradient_accumulation_steps=int(shape.get("gradient_accumulation_steps", gradient_accumulation_steps)),
-                            seq_len=int(shape["seq_len"]),
-                            d_model=int(shape["d_model"]),
-                            n_heads=int(shape["n_heads"]),
-                            n_layers=int(shape["n_layers"]),
-                            vocab_size=vocab_size,
-                            precision=precision,
-                            device=device,
-                            require_cuda=require_cuda,
-                            native_ternary_backend=native_ternary_backend,
-                            resource_interval=resource_interval,
-                            min_resource_samples=min_resource_samples,
-                            seed=int(seed),
-                            corpus_repeats=corpus_repeats,
-                            max_corpus_tokens=max_corpus_tokens,
-                            overwrite=False,
-                        )
-                    except Exception as exc:
-                        error = exc
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
                     seed_measurement_rows.append(
-                        _profile_autosize_measurement_summary(
+                        measure_candidate_seed(
                             candidate,
-                            profile=profile,
-                            profile_path=measure_dir / "llm_batch_profile.json",
+                            candidate_index=candidate_index,
                             seed=int(seed),
-                            metric=measured_selection_metric,
-                            error=error,
                         )
                     )
                 aggregated = _profile_autosize_aggregate_measurements(
@@ -10344,6 +10400,107 @@ def run_llm_batch_profile_autosize(
                         "source_score_stddevs": tuple(float(item.get("measurement_selection_source_score_stddev", 0.0)) for item in round_rows),
                         "source_upper_confidences": tuple(float(item.get("measurement_selection_source_upper_confidence", 0.0)) for item in round_rows),
                         "source_stability_ratios": tuple(float(item.get("measurement_selection_source_stability_ratio", 0.0)) for item in round_rows),
+                    }
+                )
+
+        def refine_uncertain_candidates(*, round_index: int) -> None:
+            nonlocal measurement_inputs, refinement_seeds, synthesized_refinement_seed_count
+            if (
+                requested_refine_uncertain_candidate_count <= 0
+                or requested_refine_uncertain_extra_seed_count <= 0
+                or len(aggregated_measurement_rows) < 2
+            ):
+                return
+            expanded_seeds = _profile_autosize_measurement_seeds(
+                normalized_seeds,
+                requested_count=len(measurement_seeds) + requested_refine_uncertain_extra_seed_count,
+            )
+            measured_seed_set = set(int(seed) for seed in measurement_seeds)
+            extra_seeds = tuple(
+                int(seed)
+                for seed in expanded_seeds
+                if int(seed) not in measured_seed_set
+            )[:requested_refine_uncertain_extra_seed_count]
+            if not extra_seeds:
+                return
+            refinement_inputs = _profile_autosize_uncertainty_refinement_inputs(
+                aggregated_measurement_rows,
+                requested_count=requested_refine_uncertain_candidate_count,
+            )
+            if not refinement_inputs:
+                return
+
+            refined_rows: list[Mapping[str, Any]] = []
+            refinement_details: list[Mapping[str, Any]] = []
+            for candidate in refinement_inputs:
+                shape_key = str(candidate["shape_key"])
+                row_index = next(
+                    (
+                        index
+                        for index, row in enumerate(aggregated_measurement_rows)
+                        if str(row["shape_key"]) == shape_key
+                    ),
+                    None,
+                )
+                if row_index is None:
+                    continue
+                candidate_index = int(candidate.get("measurement_candidate_index", row_index))
+                previous_seed_rows = tuple(candidate.get("seed_measurements", ()))
+                before = {
+                    "measured_score": float(candidate.get("measured_score", 0.0)),
+                    "measured_score_mean": float(candidate.get("measured_score_mean", 0.0)),
+                    "measured_score_stddev": float(candidate.get("measured_score_stddev", 0.0)),
+                    "measured_score_lower_confidence": float(candidate.get("measured_score_lower_confidence", candidate.get("measured_score", 0.0))),
+                    "measured_score_upper_confidence": float(candidate.get("measured_score_upper_confidence", candidate.get("measured_score", 0.0))),
+                    "measurement_seed_count": int(candidate.get("measurement_seed_count", len(previous_seed_rows))),
+                }
+                extra_rows = tuple(
+                    measure_candidate_seed(
+                        candidate,
+                        candidate_index=candidate_index,
+                        seed=int(seed),
+                        seed_dir_prefix="refine_seed",
+                    )
+                    for seed in extra_seeds
+                )
+                refined = _profile_autosize_aggregate_measurements(
+                    candidate,
+                    seed_measurements=previous_seed_rows + extra_rows,
+                    metric=measured_selection_metric,
+                )
+                aggregated_measurement_rows[row_index] = refined
+                refined_rows.append(refined)
+                refinement_details.append(
+                    {
+                        "shape_key": shape_key,
+                        "estimated_rank": int(candidate.get("estimated_rank", 0)),
+                        "candidate_index": candidate_index,
+                        "extra_seeds": extra_seeds,
+                        "before": before,
+                        "after": {
+                            "measured_score": float(refined.get("measured_score", 0.0)),
+                            "measured_score_mean": float(refined.get("measured_score_mean", 0.0)),
+                            "measured_score_stddev": float(refined.get("measured_score_stddev", 0.0)),
+                            "measured_score_lower_confidence": float(refined.get("measured_score_lower_confidence", refined.get("measured_score", 0.0))),
+                            "measured_score_upper_confidence": float(refined.get("measured_score_upper_confidence", refined.get("measured_score", 0.0))),
+                            "measurement_seed_count": int(refined.get("measurement_seed_count", 0)),
+                        },
+                    }
+                )
+            if refined_rows:
+                measurement_inputs = tuple(aggregated_measurement_rows)
+                refinement_seeds = extra_seeds
+                synthesized_refinement_seed_count = sum(1 for seed in refinement_seeds if seed not in provided_seed_set)
+                refinement_rounds.append(
+                    {
+                        "round_index": int(round_index),
+                        "round_kind": "uncertainty_seed_refinement",
+                        "candidate_count": len(refined_rows),
+                        "shape_keys": tuple(str(item["shape_key"]) for item in refined_rows),
+                        "estimated_ranks": tuple(int(item.get("estimated_rank", 0)) for item in refined_rows),
+                        "extra_seed_count": len(extra_seeds),
+                        "extra_seeds": extra_seeds,
+                        "details": tuple(refinement_details),
                     }
                 )
 
@@ -10393,6 +10550,7 @@ def run_llm_batch_profile_autosize(
                 strategy=measure_candidate_strategy,
             )
             measure_round(remaining_inputs, round_index=round_index, round_kind=f"fill_{measure_candidate_strategy}")
+        refine_uncertain_candidates(round_index=round_index + 1)
         measured_candidates = tuple(aggregated_measurement_rows)
         measured_candidate_profile_count = sum(
             len(tuple(item.get("seed_measurements", ()))) for item in measured_candidates
@@ -10518,6 +10676,23 @@ def run_llm_batch_profile_autosize(
             "adaptive_rounds_requested": requested_measure_candidate_adaptive_rounds,
             "adaptive_rounds_used": len(measurement_rounds),
             "measurement_rounds": tuple(measurement_rounds),
+            "refinement_enabled": (
+                effective_measure_candidate_count > 0
+                and requested_refine_uncertain_candidate_count > 0
+                and requested_refine_uncertain_extra_seed_count > 0
+            ),
+            "refine_uncertain_candidate_count": requested_refine_uncertain_candidate_count,
+            "refine_uncertain_extra_seed_count": requested_refine_uncertain_extra_seed_count,
+            "refinement_rounds_used": len(refinement_rounds),
+            "refined_candidate_count": sum(int(round_["candidate_count"]) for round_ in refinement_rounds),
+            "refinement_profile_count": sum(
+                int(round_["candidate_count"]) * int(round_["extra_seed_count"])
+                for round_ in refinement_rounds
+            ),
+            "refinement_seed_count": len(refinement_seeds),
+            "refinement_seeds": refinement_seeds,
+            "synthesized_refinement_seed_count": synthesized_refinement_seed_count,
+            "refinement_rounds": tuple(refinement_rounds),
             "measurement_input_shape_keys": tuple(str(item["shape_key"]) for item in measurement_inputs),
             "measurement_input_estimated_ranks": tuple(int(item.get("estimated_rank", 0)) for item in measurement_inputs),
             "measured_selection_metric": measured_selection_metric,
@@ -10767,6 +10942,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     profile_autosize.add_argument("--min-measure-candidate-seed-count", type=int, default=2, help="minimum candidate measurement seeds; deterministic extra seeds are synthesized when fewer seeds are provided")
     profile_autosize.add_argument("--measure-candidate-strategy", choices=PROFILE_AUTOSIZE_MEASUREMENT_STRATEGIES, default="diverse", help="candidate subset measured before final matrix; diverse samples shape frontiers instead of only the top estimated ranks")
     profile_autosize.add_argument("--measure-candidate-adaptive-rounds", type=int, default=2, help="bounded measurement waves; with diverse strategy, later rounds refine around measured winners without increasing measure-candidate-count")
+    profile_autosize.add_argument("--refine-uncertain-candidate-count", type=int, default=1, help="after candidate waves, add extra seeds to this many high-variance measured candidates before final selection")
+    profile_autosize.add_argument("--refine-uncertain-extra-seed-count", type=int, default=1, help="extra measurement seeds per refined uncertain candidate")
     profile_autosize.add_argument("--measured-selection-metric", choices=PROFILE_AUTOSIZE_MEASURED_SELECTION_METRICS, default="throughput_gpu")
     profile_autosize.add_argument("--min-cases", type=int, default=1)
     profile_autosize.add_argument("--require-multi-shape", action="store_true")
@@ -11156,6 +11333,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             min_measure_candidate_seed_count=args.min_measure_candidate_seed_count,
             measure_candidate_strategy=args.measure_candidate_strategy,
             measure_candidate_adaptive_rounds=args.measure_candidate_adaptive_rounds,
+            refine_uncertain_candidate_count=args.refine_uncertain_candidate_count,
+            refine_uncertain_extra_seed_count=args.refine_uncertain_extra_seed_count,
             measured_selection_metric=args.measured_selection_metric,
             min_cases=args.min_cases,
             require_multi_shape=args.require_multi_shape,
