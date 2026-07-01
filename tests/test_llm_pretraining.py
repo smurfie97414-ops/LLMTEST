@@ -214,6 +214,57 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             self.assertTrue(payload["matrix"]["summary"]["threshold_checks"]["min_train_tokens_per_second_mean"]["passed"])
             self.assertEqual(report["selection"]["viable_candidate_count"], 4)
 
+    def test_llm_batch_profile_autosize_can_select_from_measured_candidates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            report = run_llm_batch_profile_autosize(
+                out_dir=root / "autosize-measured",
+                candidate_seq_lens=(32, 40),
+                candidate_d_models=(32,),
+                candidate_n_layers=(1,),
+                candidate_batch_sizes=(2, 4),
+                n_heads=4,
+                selected_shape_count=1,
+                min_selected_shapes=1,
+                seeds=(11,),
+                steps=1,
+                gradient_accumulation_steps=1,
+                vocab_size=128,
+                precision="fp32",
+                device="cpu",
+                require_cuda=False,
+                resource_interval=0.01,
+                min_resource_samples=1,
+                corpus_repeats=64,
+                max_corpus_tokens=2048,
+                memory_budget_mb=512,
+                measure_candidate_count=2,
+                measured_selection_metric="throughput_gpu",
+                min_cases=1,
+            )
+
+            self.assertTrue(report["passed"], report["failed_checks"])
+            self.assertTrue(report["measurement"]["enabled"])
+            self.assertEqual(report["selection"]["selection_source"], "measured")
+            self.assertEqual(report["measurement"]["requested_candidate_count"], 2)
+            self.assertEqual(report["measurement"]["measured_candidate_count"], 2)
+            self.assertGreaterEqual(report["measurement"]["measured_passed_candidate_count"], 1)
+            measured_passed_keys = {
+                item["shape_key"]
+                for item in report["measured_candidates"]
+                if item["measurement_passed"]
+            }
+            self.assertIn(report["selection"]["selected_shape_keys"][0], measured_passed_keys)
+            selected_measurement = next(
+                item
+                for item in report["measured_candidates"]
+                if item["shape_key"] == report["selection"]["selected_shape_keys"][0]
+            )
+            self.assertGreater(selected_measurement["measured_score"], 0.0)
+            self.assertTrue(Path(selected_measurement["profile_path"]).exists())
+            self.assertTrue(report["matrix"]["passed"], report["matrix"]["failed_checks"])
+            self.assertEqual(report["matrix"]["summary"]["case_count"], 1)
+
     def test_llm_batch_profile_autosize_blocks_when_budget_has_no_viable_shape(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

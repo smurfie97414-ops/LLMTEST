@@ -9187,6 +9187,97 @@ def _profile_autosize_candidate(
     }
 
 
+PROFILE_AUTOSIZE_MEASURED_SELECTION_METRICS = ("throughput", "gpu", "throughput_gpu")
+
+
+def _profile_autosize_measured_score(
+    *,
+    train_tokens_per_second: float,
+    gpu_utilization_percent: float,
+    metric: str,
+) -> float:
+    if metric not in PROFILE_AUTOSIZE_MEASURED_SELECTION_METRICS:
+        raise ValueError(
+            f"unknown measured selection metric {metric!r}; "
+            f"expected one of {PROFILE_AUTOSIZE_MEASURED_SELECTION_METRICS}"
+        )
+    if metric == "throughput":
+        return float(train_tokens_per_second)
+    if metric == "gpu":
+        return float(gpu_utilization_percent)
+    return float(train_tokens_per_second) * max(1.0, float(gpu_utilization_percent))
+
+
+def _profile_autosize_measurement_summary(
+    candidate: Mapping[str, Any],
+    *,
+    profile: Mapping[str, Any] | None,
+    profile_path: Path,
+    seed: int,
+    metric: str,
+    error: BaseException | None = None,
+) -> Mapping[str, Any]:
+    shape = dict(candidate["shape"])
+    base = {
+        "shape": shape,
+        "shape_key": str(candidate["shape_key"]),
+        "seed": int(seed),
+        "profile_path": str(profile_path),
+        "estimated_peak_training_bytes": int(candidate["estimated_peak_training_bytes"]),
+        "budget_bytes": int(candidate["budget_bytes"]),
+        "budget_fraction_used": float(candidate["budget_fraction_used"]),
+        "tokens_per_optimizer_step": int(candidate["tokens_per_optimizer_step"]),
+        "estimated_score": float(candidate["score"]),
+        "fits_budget": bool(candidate["fits_budget"]),
+        "measurement_metric": metric,
+    }
+    if error is not None:
+        return {
+            **base,
+            "measurement_passed": False,
+            "measurement_error_type": type(error).__name__,
+            "measurement_error": str(error),
+            "measured_score": 0.0,
+            "train_tokens_per_second_wall": 0.0,
+            "gpu_utilization_percent_avg": 0.0,
+            "gpu_memory_used_mb_avg": 0.0,
+            "gpu_power_draw_watts_avg": 0.0,
+            "torch_cuda_peak_allocated_bytes": 0,
+            "strict_extension_only": False,
+            "all_phases_active": False,
+        }
+    assert profile is not None
+    metrics = dict((profile.get("resource_usage") or {}).get("metrics") or {})
+    throughput = dict(profile.get("throughput") or {})
+    train_tokens_per_second = float(throughput.get("train_tokens_per_second_wall", 0.0))
+    gpu_utilization_percent = float(metrics.get("gpu_utilization_percent", {}).get("avg", 0.0))
+    gpu_memory_used_mb = float(metrics.get("gpu_memory_used_mb", {}).get("avg", 0.0))
+    gpu_power_draw_watts = float(metrics.get("gpu_power_draw_watts", {}).get("avg", 0.0))
+    torch_cuda_peak = int(profile.get("torch_cuda_memory", {}).get("after", {}).get("max_memory_allocated_bytes", 0))
+    measured_score = _profile_autosize_measured_score(
+        train_tokens_per_second=train_tokens_per_second,
+        gpu_utilization_percent=gpu_utilization_percent,
+        metric=metric,
+    )
+    return {
+        **base,
+        "measurement_passed": bool(profile.get("passed")),
+        "measurement_failed_checks": tuple(str(item) for item in profile.get("failed_checks", ())),
+        "measured_score": float(measured_score),
+        "train_tokens_per_second_wall": train_tokens_per_second,
+        "planned_train_tokens": int(throughput.get("planned_train_tokens", 0)),
+        "gpu_utilization_percent_avg": gpu_utilization_percent,
+        "gpu_memory_used_mb_avg": gpu_memory_used_mb,
+        "gpu_power_draw_watts_avg": gpu_power_draw_watts,
+        "torch_cuda_peak_allocated_bytes": torch_cuda_peak,
+        "torch_cuda_peak_to_estimate_ratio": float(
+            torch_cuda_peak / max(1, int(candidate["estimated_peak_training_bytes"]))
+        ),
+        "strict_extension_only": bool(profile.get("kernel_evidence", {}).get("strict_extension_only")),
+        "all_phases_active": bool(profile.get("architecture", {}).get("all_phases_active")),
+    }
+
+
 def run_llm_batch_profile_matrix(
     *,
     out_dir: str | Path,
@@ -9429,6 +9520,8 @@ def run_llm_batch_profile_autosize(
     max_corpus_tokens: int | None = 8192,
     memory_budget_mb: float = 0.0,
     memory_budget_fraction: float = 0.35,
+    measure_candidate_count: int = 0,
+    measured_selection_metric: str = "throughput_gpu",
     min_cases: int = 1,
     require_multi_shape: bool = False,
     require_multi_seed: bool = False,
@@ -9448,6 +9541,13 @@ def run_llm_batch_profile_autosize(
         raise ValueError("selected_shape_count must be positive")
     if min_selected_shapes < 1:
         raise ValueError("min_selected_shapes must be positive")
+    if int(measure_candidate_count) < 0:
+        raise ValueError("measure_candidate_count must be >= 0")
+    if measured_selection_metric not in PROFILE_AUTOSIZE_MEASURED_SELECTION_METRICS:
+        raise ValueError(
+            f"unknown measured_selection_metric {measured_selection_metric!r}; "
+            f"expected one of {PROFILE_AUTOSIZE_MEASURED_SELECTION_METRICS}"
+        )
     normalized_seeds = tuple(int(seed) for seed in seeds)
     if not normalized_seeds:
         raise ValueError("at least one autosize seed is required")
@@ -9507,10 +9607,78 @@ def run_llm_batch_profile_autosize(
         ),
         reverse=True,
     )
-    selected = tuple(ranked_candidates[: int(selected_shape_count)])
+    measured_candidates: tuple[Mapping[str, Any], ...] = ()
+    measured_passed_candidates: tuple[Mapping[str, Any], ...] = ()
+    measurement_seed = int(normalized_seeds[0])
+    selection_source = "estimated"
+    selection_pool: Sequence[Mapping[str, Any]] = ranked_candidates
+    if int(measure_candidate_count) > 0:
+        measurement_inputs = tuple(ranked_candidates[: int(measure_candidate_count)])
+        measurement_rows: list[Mapping[str, Any]] = []
+        for candidate_index, candidate in enumerate(measurement_inputs):
+            shape = dict(candidate["shape"])
+            measure_dir = (
+                output_dir
+                / "candidate_measurements"
+                / f"candidate_{candidate_index:03d}_{candidate['shape_key']}_seed{measurement_seed}"
+            )
+            profile: Mapping[str, Any] | None = None
+            error: BaseException | None = None
+            try:
+                profile = run_llm_batch_profile(
+                    out_dir=measure_dir,
+                    steps=steps,
+                    batch_size=int(shape["batch_size"]),
+                    gradient_accumulation_steps=gradient_accumulation_steps,
+                    seq_len=int(shape["seq_len"]),
+                    d_model=int(shape["d_model"]),
+                    n_heads=int(shape["n_heads"]),
+                    n_layers=int(shape["n_layers"]),
+                    vocab_size=vocab_size,
+                    precision=precision,
+                    device=device,
+                    require_cuda=require_cuda,
+                    native_ternary_backend=native_ternary_backend,
+                    resource_interval=resource_interval,
+                    min_resource_samples=min_resource_samples,
+                    seed=measurement_seed,
+                    corpus_repeats=corpus_repeats,
+                    max_corpus_tokens=max_corpus_tokens,
+                    overwrite=False,
+                )
+            except Exception as exc:
+                error = exc
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            measurement_rows.append(
+                _profile_autosize_measurement_summary(
+                    candidate,
+                    profile=profile,
+                    profile_path=measure_dir / "llm_batch_profile.json",
+                    seed=measurement_seed,
+                    metric=measured_selection_metric,
+                    error=error,
+                )
+            )
+        measured_candidates = tuple(measurement_rows)
+        measured_passed_candidates = tuple(
+            sorted(
+                (item for item in measured_candidates if bool(item.get("measurement_passed"))),
+                key=lambda item: (
+                    float(item["measured_score"]),
+                    int(item["estimated_peak_training_bytes"]),
+                    int(item["tokens_per_optimizer_step"]),
+                    str(item["shape_key"]),
+                ),
+                reverse=True,
+            )
+        )
+        selection_source = "measured"
+        selection_pool = measured_passed_candidates
+    selected = tuple(selection_pool[: int(selected_shape_count)])
     failed_checks: list[str] = []
     if not selected:
-        failed_checks.append("no_viable_shapes")
+        failed_checks.append("no_measured_viable_shapes" if int(measure_candidate_count) > 0 else "no_viable_shapes")
     if len(selected) < int(min_selected_shapes):
         failed_checks.append("min_selected_shapes")
     matrix_report: Mapping[str, Any] | None = None
@@ -9557,12 +9725,25 @@ def run_llm_batch_profile_autosize(
         "selection": {
             "selected_shape_count": int(selected_shape_count),
             "min_selected_shapes": int(min_selected_shapes),
+            "selection_source": selection_source,
             "viable_candidate_count": len(candidates),
             "rejected_candidate_count": len(rejected),
+            "measured_candidate_count": len(measured_candidates),
+            "measured_passed_candidate_count": len(measured_passed_candidates),
             "selected_shapes": tuple(dict(item["shape"]) for item in selected),
             "selected_shape_keys": tuple(str(item["shape_key"]) for item in selected),
         },
+        "measurement": {
+            "enabled": int(measure_candidate_count) > 0,
+            "requested_candidate_count": int(measure_candidate_count),
+            "measured_candidate_count": len(measured_candidates),
+            "measured_passed_candidate_count": len(measured_passed_candidates),
+            "measurement_seed": measurement_seed,
+            "measured_selection_metric": measured_selection_metric,
+            "selected_from_measurements": selection_source == "measured",
+        },
         "candidates": tuple(ranked_candidates),
+        "measured_candidates": measured_candidates,
         "rejected_candidates": tuple(rejected),
         "matrix": matrix_report,
         "failed_checks": tuple(failed_checks),
@@ -9793,6 +9974,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     profile_autosize.add_argument("--max-corpus-tokens", type=int, default=8192)
     profile_autosize.add_argument("--memory-budget-mb", type=float, default=0.0)
     profile_autosize.add_argument("--memory-budget-fraction", type=float, default=0.35)
+    profile_autosize.add_argument("--measure-candidate-count", type=int, default=0)
+    profile_autosize.add_argument("--measured-selection-metric", choices=PROFILE_AUTOSIZE_MEASURED_SELECTION_METRICS, default="throughput_gpu")
     profile_autosize.add_argument("--min-cases", type=int, default=1)
     profile_autosize.add_argument("--require-multi-shape", action="store_true")
     profile_autosize.add_argument("--require-multi-seed", action="store_true")
@@ -10171,6 +10354,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             max_corpus_tokens=args.max_corpus_tokens,
             memory_budget_mb=args.memory_budget_mb,
             memory_budget_fraction=args.memory_budget_fraction,
+            measure_candidate_count=args.measure_candidate_count,
+            measured_selection_metric=args.measured_selection_metric,
             min_cases=args.min_cases,
             require_multi_shape=args.require_multi_shape,
             require_multi_seed=args.require_multi_seed,
