@@ -124,6 +124,7 @@ Le modele n'est pas un Transformer standard habille par un rapport. Son forward 
 - `BitLinear` pour le coeur ternaire ;
 - `VariableInCompressor` pour compression adaptative ;
 - `LearnedMemoryPolicy` pour decider quoi garder exact, latent ou drop ;
+- prior d'utilite memoire appris depuis les reconstructions aval fideles ;
 - `SkillAwareExpertMoE` pour experts skill-aware, maintenant conditionne par le Skill Ledger et les skills de replay verifies ;
 - `LatentReasoningWorkspace` pour pas latents trainables avec feedback dans le hidden ;
 - tetes MTP multi-horizon ;
@@ -142,10 +143,12 @@ Le loss total contient :
 - calibration/confiance ;
 - penalite de compression Variable-In ;
 - supervision de politique memoire apprise exact/latent/drop basee sur l'utilite token-level ;
+- alignement de politique memoire sur un prior exact/latent/drop issu de credits d'utilite aval ;
 - certificate loss.
 - skill-expert routing loss, qui aligne la distribution du routeur MoE sur les competences fragiles ou les skills de replay.
 
 Donc le modele n'apprend pas seulement a predire le prochain token. Il apprend aussi a predire des horizons futurs, calibrer sa confiance, produire des preuves latentes, compresser differemment selon l'importance des tokens et choisir une politique memoire exact/latent/drop.
+Depuis C76, cette politique memoire ne depend plus seulement de la difficulte locale des tokens: les reconstructions P4, les bindings Frontier et les inferences P8 qui selectionnent des segments retenus creent des credits d'utilite. Ces credits normalisent un prior exact/latent/drop reinjecte dans `LearnedMemoryPolicy.forward` et dans `CortexObjective`, donc la memoire apprend progressivement quels choix de retention servent vraiment les phases aval.
 Depuis C73, il apprend aussi a router son calcul vers des experts lies aux competences que le Verifier OS et le Skill Ledger jugent fragiles, au lieu de seulement activer des experts generiques.
 
 ### 3. Replay Causal Verifie
@@ -371,6 +374,8 @@ Le controleur :
 - refuse le drop reel d'un segment porteur d'ancres en le promouvant en exact via l'Exact Anchor Ledger ;
 - reconstruit via memoire recent exact + latent old KV ;
 - verifie la fidelite des anchors ;
+- enregistre un `MemoryUtilityCredit` quand une reconstruction utilise un segment retenu ;
+- transforme les credits appris en prior exact/latent/drop pour le prochain forward ;
 - observe la politique `LearnedMemoryPolicy` du forward ;
 - compte les decisions/probabilites exact/latent/drop demandees et appliquees ;
 - ajoute une supervision d'ancre vers la memoire exacte quand des ancres sont detectees ;
@@ -384,11 +389,14 @@ P4 alimente :
 - P6, si une regression vient de perte d'ancre ;
 - `L_anchor_fidelity` ;
 - le loss `learned_memory`, qui apprend la retention exacte/latente/drop a partir de l'utilite token-level ;
+- le prior d'utilite memoire qui apprend depuis les reconstructions aval reussies ;
 - `CausalLedger`.
 
 ### Impact Apprentissage
 
-La memoire n'est pas un stockage passif. `LearnedMemoryPolicy` modifie le hidden state avec un melange differentiable entre exact, latent local et drop vector, puis `CortexObjective` supervise cette politique avec les pertes token-level : les tokens difficiles tendent vers exact, les tokens intermediaires vers latent et les tokens faciles/corrects vers drop. Le controleur convertit maintenant cette politique en `MemoryRetentionDecision` pour la memoire partagee : exact reste en recent KV, latent va directement en KV latent compresse, drop oublie reellement un segment non-ancre, et les ancres critiques bloquent le drop par override. Les exemples d'ancrage restent du replay et les echecs de fidelite peuvent faire echouer l'audit.
+La memoire n'est pas un stockage passif. `LearnedMemoryPolicy` modifie le hidden state avec un melange differentiable entre exact, latent local et drop vector, puis `CortexObjective` supervise cette politique avec les pertes token-level : les tokens difficiles tendent vers exact, les tokens intermediaires vers latent et les tokens faciles/corrects vers drop. Le controleur convertit cette politique en `MemoryRetentionDecision` pour la memoire partagee : exact reste en recent KV, latent va directement en KV latent compresse, drop oublie reellement un segment non-ancre, et les ancres critiques bloquent le drop par override.
+
+Depuis C76, les reconstructions fideles creent aussi des credits d'utilite lies aux decisions appliquees. Les credits issus de `learned_memory_policy` mettent a jour un prior exact/latent/drop persistant; ce prior biaise les logits de `LearnedMemoryPolicy` et ajoute une cible d'alignement dans `CortexObjective`. Les exemples d'ancrage restent du replay et les echecs de fidelite peuvent faire echouer l'audit, mais la partie apprise regarde maintenant ce qui a vraiment ete reutilise par P4/P8/Frontier.
 
 Une ablation courte reproductible existe avec `tools/benchmark_learned_memory_policy.py` : elle charge les memes poids partages dans un modele avec memoire apprise et un modele sans memoire apprise, fige tout sauf `learned_memory.*`, puis mesure gradient, decisions exact/latent/drop, ratio de stockage et delta de loss. Cette preuve montre que la politique peut modifier l'apprentissage sur un batch controle ; elle ne remplace pas encore une preuve long-contexte held-out.
 

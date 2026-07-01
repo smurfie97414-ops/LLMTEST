@@ -2386,11 +2386,15 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
         future = torch.stack((y, y, y, y), dim=-1)
 
         model.set_skill_expert_context((0.70, 0.10, 0.10, 0.10), source="unit-skill-ledger")
+        model.learned_memory.set_memory_utility_prior((0.72, 0.22, 0.06), events=5)
         output = model(x)
         loss, breakdown = CortexObjective().compute(output, y, future, use_cortex_terms=True)
         loss.backward()
 
         self.assertIsNotNone(output.learned_memory_policy)
+        self.assertEqual(output.learned_memory_policy.utility_feedback_events, 5)
+        self.assertAlmostEqual(float(output.learned_memory_policy.utility_prior.sum()), 1.0, places=6)
+        self.assertGreater(float(output.learned_memory_policy.utility_prior[0]), float(output.learned_memory_policy.utility_prior[1]))
         self.assertIsNotNone(output.skill_expert_routing)
         self.assertIsNotNone(output.skill_expert_routing.target_distribution)
         self.assertIsNotNone(output.latent_workspace)
@@ -3295,6 +3299,13 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 + influence["learned_memory_retention_applied_latent"]
                 + influence["learned_memory_retention_applied_drop"],
             )
+            self.assertGreater(influence["learned_memory_utility_credit_count"], 0)
+            self.assertGreater(influence["learned_memory_utility_positive_count"], 0)
+            self.assertGreater(influence["learned_memory_utility_prior_updates"], 0)
+            self.assertGreater(influence["learned_memory_utility_feedback_events"], 0)
+            self.assertTrue(influence["learned_memory_last_utility_prior"], influence)
+            self.assertAlmostEqual(sum(influence["learned_memory_last_utility_prior"]), 1.0, places=6)
+            self.assertTrue(influence["learned_memory_utility_credits"], influence)
             self.assertGreater(influence["skill_expert_activations"], 0)
             self.assertGreater(influence["skill_expert_context_events"], 0)
             self.assertGreater(influence["skill_expert_replay_context_events"], 0)
@@ -3503,6 +3514,8 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             self.assertGreater(phase_report["ledgers"]["uncertainty_ledger"]["observation_count"], 0)
             self.assertGreater(len(phase_report["memory_state_summary"]["anchors"]), 0)
             self.assertGreater(phase_report["memory_state_summary"]["learned_retention_decision_count"], 0)
+            self.assertGreater(phase_report["memory_state_summary"]["learned_memory_utility_credit_count"], 0)
+            self.assertGreater(phase_report["memory_state_summary"]["learned_memory_utility_positive_count"], 0)
             for sample in phase_report["batch_contract_samples"]:
                 self.assertGreaterEqual(sample["observed_token_count"], sample["horizon"])
             self.assertTrue((run_dir / "cortex_phase_report.json").exists())
@@ -3516,6 +3529,9 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             self.assertTrue(persisted["recursive_model_applications"], persisted)
             self.assertTrue(persisted["recursive_verified_artifacts"], persisted)
             self.assertGreater(persisted["training_influence"]["recursive_verified_artifact_count"], 0)
+            self.assertGreater(persisted["training_influence"]["learned_memory_utility_credit_count"], 0)
+            self.assertGreater(persisted["training_influence"]["learned_memory_utility_prior_updates"], 0)
+            self.assertTrue(persisted["training_influence"]["learned_memory_last_utility_prior"])
             self.assertEqual(persisted["training_influence"]["sleep_replay_updates"], influence["sleep_replay_updates"])
             self.assertEqual(
                 persisted["training_influence"]["frontier_compiled_fastsolve_events"],
@@ -3699,6 +3715,11 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 self.assertGreater(first_influence["recursive_evolved_proposal_events"], 0)
                 self.assertGreater(first_influence["recursive_verified_artifact_count"], 0)
                 self.assertTrue(first_influence["recursive_verified_artifacts"], first_influence)
+                self.assertGreater(first_influence["learned_memory_utility_credit_count"], 0)
+                self.assertGreater(first_influence["learned_memory_utility_positive_count"], 0)
+                self.assertGreater(first_influence["learned_memory_utility_prior_updates"], 0)
+                self.assertGreater(first_influence["learned_memory_utility_feedback_events"], 0)
+                self.assertTrue(first_influence["learned_memory_last_utility_prior"], first_influence)
                 checkpoint = torch.load(run_dir / "checkpoint_final.pt", map_location="cpu", weights_only=False)
                 self.assertIn("cortex_phase_state", checkpoint)
                 self.assertGreater(len(checkpoint["cortex_phase_state"]["replay_batches"]), 0)
@@ -3725,6 +3746,8 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 self.assertGreater(checkpoint["cortex_phase_state"]["input_anchor_observations"], 0)
                 self.assertGreater(checkpoint["cortex_phase_state"]["input_anchor_count"], 0)
                 self.assertEqual(checkpoint["cortex_phase_state"]["input_anchor_fidelity_failures"], 0)
+                self.assertGreater(checkpoint["cortex_phase_state"]["learned_memory_utility_prior_updates"], 0)
+                self.assertTrue(checkpoint["cortex_phase_state"]["learned_memory_last_utility_prior"])
                 self.assertGreater(checkpoint["cortex_phase_state"]["skill_expert_context_events"], 0)
                 self.assertGreater(checkpoint["cortex_phase_state"]["skill_expert_replay_context_events"], 0)
                 self.assertTrue(checkpoint["cortex_phase_state"]["skill_expert_last_context"])
@@ -3766,8 +3789,13 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 )
                 self.assertGreater(len(checkpoint["cortex_phase_state"]["memory_state"]["recent"]), 0)
                 self.assertGreater(len(checkpoint["cortex_phase_state"]["memory_state"]["retention_decisions"]), 0)
+                self.assertGreater(len(checkpoint["cortex_phase_state"]["memory_state"]["utility_credits"]), 0)
                 self.assertGreater(
                     checkpoint["cortex_phase_state"]["memory_state"]["compression_report"]["learned_retention_decision_count"],
+                    0,
+                )
+                self.assertGreater(
+                    checkpoint["cortex_phase_state"]["memory_state"]["compression_report"]["learned_memory_utility_credit_count"],
                     0,
                 )
                 self.assertGreater(
@@ -3922,6 +3950,9 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                     + sidecar["cortex_phase_state_summary"]["learned_memory_retention_applied_latent"]
                     + sidecar["cortex_phase_state_summary"]["learned_memory_retention_applied_drop"],
                 )
+                self.assertGreater(sidecar["cortex_phase_state_summary"]["learned_memory_utility_credit_count"], 0)
+                self.assertGreater(sidecar["cortex_phase_state_summary"]["learned_memory_utility_prior_updates"], 0)
+                self.assertTrue(sidecar["cortex_phase_state_summary"]["learned_memory_last_utility_prior"])
                 self.assertGreater(sidecar["cortex_phase_state_summary"]["bit_ledger_total_effective_bits"], 0.0)
                 self.assertGreater(sidecar["cortex_phase_state_summary"]["skill_ledger_states"], 0)
                 self.assertGreater(sidecar["cortex_phase_state_summary"]["causal_ledger_traces"], 0)
@@ -4089,6 +4120,15 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 first_influence["input_anchor_count"],
             )
             self.assertEqual(resumed_influence["input_anchor_fidelity_failures"], 0)
+            self.assertGreaterEqual(
+                resumed_influence["learned_memory_utility_credit_count"],
+                first_influence["learned_memory_utility_credit_count"],
+            )
+            self.assertGreaterEqual(
+                resumed_influence["learned_memory_utility_feedback_events"],
+                first_influence["learned_memory_utility_feedback_events"],
+            )
+            self.assertTrue(resumed_influence["learned_memory_last_utility_prior"], resumed_influence)
             self.assertGreaterEqual(
                 resumed_influence["bit_ledger_total_effective_bits"],
                 first_influence["bit_ledger_total_effective_bits"],

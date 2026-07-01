@@ -57,7 +57,7 @@ from cortex3_future import (
 from cortex3_improvement import AcceptanceDecision, ProposalKind, RecursiveImprovementEngine
 from cortex3_inference import InferenceConfig, InferencePath, UltraFastInferenceEngine
 from cortex3_ledgers import BitLedger, CausalLedger, CausalTrace, SkillLedger, SkillState, UncertaintyLedger
-from cortex3_memory import CognitiveMemory, CognitiveMemoryConfig, CompiledCircuitMemoryBinding, MemoryMode, MemoryRetentionDecision, MemorySegment
+from cortex3_memory import CognitiveMemory, CognitiveMemoryConfig, CompiledCircuitMemoryBinding, MemoryMode, MemoryRetentionDecision, MemorySegment, MemoryUtilityCredit
 from cortex3_objective import FINAL_LOSS_TERMS, build_objective_report
 from cortex3_phases import CORTEX3_PHASES
 from cortex3_regrowth import MinimalRegrowthEngine, RegrowthActionKind, RegrowthPlan
@@ -698,6 +698,10 @@ def _memory_state(memory: CognitiveMemory) -> dict[str, Any]:
             decision.to_dict()
             for decision in memory.retention_decisions
         ],
+        "utility_credits": [
+            credit.to_dict()
+            for credit in memory.utility_credits
+        ],
         "compiled_circuit_bindings": [
             binding.to_dict()
             for binding in memory.compiled_circuit_bindings.values()
@@ -715,6 +719,10 @@ def _restore_memory_state(memory: CognitiveMemory, payload: Mapping[str, Any] | 
     memory.retention_decisions = [
         MemoryRetentionDecision.from_dict(dict(item))
         for item in payload.get("retention_decisions", ())
+    ]
+    memory.utility_credits = [
+        MemoryUtilityCredit.from_dict(dict(item))
+        for item in payload.get("utility_credits", ())
     ]
     memory.compiled_circuit_bindings = {
         binding.circuit_id: binding
@@ -1648,6 +1656,7 @@ class TransformerConfig:
     variable_compression_wide_kernel: int = 8
     use_learned_memory_policy: bool = False
     learned_memory_temperature: float = 1.0
+    learned_memory_utility_prior_strength: float = 0.35
     use_certificate_head: bool = False
     certificate_latent_size: int = 64
     use_latent_reasoning_workspace: bool = False
@@ -1681,6 +1690,8 @@ class TransformerConfig:
             raise ValueError("variable_compression_wide_kernel must be >= 2")
         if self.use_learned_memory_policy and self.learned_memory_temperature <= 0:
             raise ValueError("learned_memory_temperature must be positive")
+        if self.learned_memory_utility_prior_strength < 0:
+            raise ValueError("learned_memory_utility_prior_strength must be non-negative")
         if self.certificate_latent_size < 1:
             raise ValueError("certificate_latent_size must be positive")
         if self.latent_workspace_steps < 1:
@@ -1871,14 +1882,20 @@ class LearnedMemoryPolicyState:
     storage_ratio: torch.Tensor
     entropy: torch.Tensor
     input_ids: torch.Tensor
+    utility_prior: torch.Tensor
+    utility_feedback_events: int = 0
 
-    def to_summary(self) -> dict[str, float]:
+    def to_summary(self) -> dict[str, Any]:
         return {
             "exact_prob_mean": float(self.exact_prob.detach().mean().cpu()),
             "latent_prob_mean": float(self.latent_prob.detach().mean().cpu()),
             "drop_prob_mean": float(self.drop_prob.detach().mean().cpu()),
             "storage_ratio_mean": float(self.storage_ratio.detach().mean().cpu()),
             "entropy_mean": float(self.entropy.detach().mean().cpu()),
+            "utility_prior_exact": float(self.utility_prior.detach().cpu()[0]),
+            "utility_prior_latent": float(self.utility_prior.detach().cpu()[1]),
+            "utility_prior_drop": float(self.utility_prior.detach().cpu()[2]),
+            "utility_feedback_events": int(self.utility_feedback_events),
         }
 
 
@@ -1906,6 +1923,35 @@ class LearnedMemoryPolicy(nn.Module):
             log_prefix="learned_memory.latent_projector",
         )
         self.drop_vector = nn.Parameter(torch.zeros(config.d_model))
+        self.register_buffer("_utility_prior", torch.full((3,), 1.0 / 3.0, dtype=torch.float32))
+        self.utility_feedback_events = 0
+
+    @property
+    def utility_prior(self) -> torch.Tensor:
+        return self._utility_prior
+
+    def set_memory_utility_prior(
+        self,
+        distribution: Sequence[float] | torch.Tensor | None,
+        *,
+        events: int = 0,
+    ) -> None:
+        if distribution is None:
+            prior = torch.full((3,), 1.0 / 3.0, dtype=torch.float32, device=self._utility_prior.device)
+            events = 0
+        else:
+            prior = torch.as_tensor(distribution, dtype=torch.float32, device=self._utility_prior.device).flatten()
+            if prior.numel() != 3:
+                raise ValueError("learned memory utility prior must have exactly three entries")
+            prior = prior.clamp_min(0.0)
+            total = prior.sum()
+            if not bool(torch.isfinite(total).detach().cpu().item()) or float(total.detach().cpu()) <= 0.0:
+                prior = torch.full((3,), 1.0 / 3.0, dtype=torch.float32, device=self._utility_prior.device)
+                events = 0
+            else:
+                prior = prior / total
+        self._utility_prior.copy_(prior.to(device=self._utility_prior.device, dtype=self._utility_prior.dtype))
+        self.utility_feedback_events = max(0, int(events))
 
     def _local_latent(self, hidden: torch.Tensor) -> torch.Tensor:
         time_steps = hidden.shape[1]
@@ -1918,6 +1964,9 @@ class LearnedMemoryPolicy(nn.Module):
 
     def forward(self, hidden: torch.Tensor, input_ids: torch.Tensor) -> tuple[torch.Tensor, LearnedMemoryPolicyState]:
         logits = self.policy(hidden) / float(self.config.learned_memory_temperature)
+        if self.utility_feedback_events > 0 and float(self.config.learned_memory_utility_prior_strength) > 0.0:
+            utility_prior = self._utility_prior.to(device=logits.device, dtype=logits.dtype).clamp_min(1e-6)
+            logits = logits + float(self.config.learned_memory_utility_prior_strength) * utility_prior.log().view(1, 1, 3)
         probs = F.softmax(logits, dim=-1)
         exact_prob = probs[..., self.EXACT]
         latent_prob = probs[..., self.LATENT]
@@ -1940,6 +1989,8 @@ class LearnedMemoryPolicy(nn.Module):
             storage_ratio=storage_ratio,
             entropy=entropy,
             input_ids=input_ids.detach(),
+            utility_prior=self._utility_prior.detach().to(device=hidden.device, dtype=hidden.dtype),
+            utility_feedback_events=int(self.utility_feedback_events),
         )
         if self.ledger is not None:
             batch, time_steps, channels = hidden.shape
@@ -2680,14 +2731,33 @@ class CortexObjective:
                     mode_target = torch.where(drop_target, torch.full_like(mode_target, LearnedMemoryPolicy.DROP), mode_target)
                     exact_supervision = exact_target.to(policy.exact_prob.dtype)
                     target_distribution = F.one_hot(mode_target, num_classes=3).to(policy.probs.dtype).mean(dim=(0, 1))
+                    utility_prior = policy.utility_prior.to(device=policy.probs.device, dtype=policy.probs.dtype)
+                    if int(policy.utility_feedback_events) > 0:
+                        utility_prior = utility_prior.clamp_min(1e-8)
+                        utility_prior = utility_prior / utility_prior.sum().clamp_min(1e-8)
+                        target_distribution = 0.75 * target_distribution + 0.25 * utility_prior
+                        target_distribution = target_distribution / target_distribution.sum().clamp_min(1e-8)
                 mode_loss = F.cross_entropy(policy.logits.reshape(-1, 3), mode_target.reshape(-1))
                 anchor_loss = F.binary_cross_entropy_with_logits(
                     policy.logits[..., LearnedMemoryPolicy.EXACT],
                     exact_supervision,
                 )
                 storage_loss = policy.storage_ratio.mean()
-                collapse_loss = (policy.probs.mean(dim=(0, 1)) - target_distribution).square().sum()
-                learned_memory_loss = mode_loss + 0.50 * anchor_loss + 0.05 * storage_loss + 0.10 * collapse_loss
+                policy_mean = policy.probs.mean(dim=(0, 1)).clamp_min(1e-8)
+                policy_mean = policy_mean / policy_mean.sum().clamp_min(1e-8)
+                collapse_loss = (policy_mean - target_distribution).square().sum()
+                utility_alignment_loss = output.logits.new_tensor(0.0)
+                if int(policy.utility_feedback_events) > 0:
+                    utility_target = policy.utility_prior.to(device=policy_mean.device, dtype=policy_mean.dtype).clamp_min(1e-8)
+                    utility_target = utility_target / utility_target.sum().clamp_min(1e-8)
+                    utility_alignment_loss = F.kl_div(policy_mean.log(), utility_target, reduction="sum")
+                learned_memory_loss = (
+                    mode_loss
+                    + 0.50 * anchor_loss
+                    + 0.05 * storage_loss
+                    + 0.10 * collapse_loss
+                    + 0.10 * utility_alignment_loss
+                )
                 total = total + self.weights.learned_memory * learned_memory_loss
             if (
                 output.skill_expert_routing is not None
@@ -3780,7 +3850,11 @@ def _cortex_architecture_audit_from_summary(summary: Mapping[str, Any]) -> dict[
             + integer("learned_memory_retention_applied_latent")
             + integer("learned_memory_retention_applied_drop")
         )
-        == integer("learned_memory_retention_decisions"),
+        == integer("learned_memory_retention_decisions")
+        and integer("learned_memory_utility_credit_count") > 0
+        and integer("learned_memory_utility_positive_count") > 0
+        and integer("learned_memory_utility_prior_updates") > 0
+        and integer("learned_memory_utility_feedback_events") > 0,
         {
             "learned_memory_policy_events": integer("learned_memory_policy_events"),
             "learned_memory_anchor_supervision_events": integer("learned_memory_anchor_supervision_events"),
@@ -3793,8 +3867,13 @@ def _cortex_architecture_audit_from_summary(summary: Mapping[str, Any]) -> dict[
             "learned_memory_retention_applied_latent": integer("learned_memory_retention_applied_latent"),
             "learned_memory_retention_applied_drop": integer("learned_memory_retention_applied_drop"),
             "learned_memory_retention_anchor_overrides": integer("learned_memory_retention_anchor_overrides"),
+            "learned_memory_utility_credit_count": integer("learned_memory_utility_credit_count"),
+            "learned_memory_utility_positive_count": integer("learned_memory_utility_positive_count"),
+            "learned_memory_utility_prior_updates": integer("learned_memory_utility_prior_updates"),
+            "learned_memory_utility_feedback_events": integer("learned_memory_utility_feedback_events"),
+            "learned_memory_last_utility_prior": tuple(summary.get("learned_memory_last_utility_prior", ()) or ()),
         },
-        "cognitive memory must learn exact/latent/drop retention decisions and apply them to P4 storage during LLM training",
+        "cognitive memory must learn exact/latent/drop retention decisions, apply them to P4 storage, and update the policy from downstream reconstruction utility",
     )
     add(
         "compiled_circuit_memory_retention",
@@ -4322,6 +4401,10 @@ def _cortex_phase_deliverable_audit_from_summary(summary: Mapping[str, Any]) -> 
         and int(summary.get("learned_memory_policy_events", 0) or 0) > 0
         and int(summary.get("learned_memory_anchor_supervision_events", 0) or 0) > 0
         and int(summary.get("learned_memory_retention_decisions", 0) or 0) > 0
+        and int(summary.get("learned_memory_utility_credit_count", 0) or 0) > 0
+        and int(summary.get("learned_memory_utility_positive_count", 0) or 0) > 0
+        and int(summary.get("learned_memory_utility_prior_updates", 0) or 0) > 0
+        and int(summary.get("learned_memory_utility_feedback_events", 0) or 0) > 0
         and int(summary.get("compiled_circuit_memory_binding_count", 0) or 0) > 0
         and int(summary.get("compiled_circuit_memory_binding_events", 0) or 0) > 0
         and int(summary.get("compiled_circuit_memory_fidelity_failures", 0) or 0) == 0
@@ -4343,6 +4426,11 @@ def _cortex_phase_deliverable_audit_from_summary(summary: Mapping[str, Any]) -> 
             "learned_memory_retention_applied_exact": int(summary.get("learned_memory_retention_applied_exact", 0) or 0),
             "learned_memory_retention_applied_latent": int(summary.get("learned_memory_retention_applied_latent", 0) or 0),
             "learned_memory_retention_applied_drop": int(summary.get("learned_memory_retention_applied_drop", 0) or 0),
+            "learned_memory_utility_credit_count": int(summary.get("learned_memory_utility_credit_count", 0) or 0),
+            "learned_memory_utility_positive_count": int(summary.get("learned_memory_utility_positive_count", 0) or 0),
+            "learned_memory_utility_prior_updates": int(summary.get("learned_memory_utility_prior_updates", 0) or 0),
+            "learned_memory_utility_feedback_events": int(summary.get("learned_memory_utility_feedback_events", 0) or 0),
+            "learned_memory_last_utility_prior": tuple(summary.get("learned_memory_last_utility_prior", ()) or ()),
             "compiled_circuit_memory_binding_count": int(summary.get("compiled_circuit_memory_binding_count", 0) or 0),
             "compiled_circuit_memory_binding_events": int(summary.get("compiled_circuit_memory_binding_events", 0) or 0),
             "compiled_circuit_memory_fidelity_failures": int(summary.get("compiled_circuit_memory_fidelity_failures", 0) or 0),
@@ -4350,7 +4438,7 @@ def _cortex_phase_deliverable_audit_from_summary(summary: Mapping[str, Any]) -> 
             "frontier_restored_fastsolve_events": count("frontier_restored_fastsolve_events"),
             "compiled_circuit_memory_restored_reuse_events": count("compiled_circuit_memory_restored_reuse_events"),
         },
-        "Cognitive memory must preserve exact anchors, learn exact/latent/drop retention decisions, and retain restored compiled Frontier circuits for reuse",
+        "Cognitive memory must preserve exact anchors, learn exact/latent/drop retention decisions from downstream utility, and retain restored compiled Frontier circuits for reuse",
     )
     add(
         "P5",
@@ -4669,6 +4757,8 @@ class CortexTrainingPhaseController:
         self.learned_memory_latent_decisions = 0
         self.learned_memory_drop_decisions = 0
         self.learned_memory_storage_ratio_total = 0.0
+        self.learned_memory_utility_prior_updates = 0
+        self.learned_memory_last_utility_prior: tuple[float, ...] = ()
         self.skill_expert_context_events = 0
         self.skill_expert_replay_context_events = 0
         self.skill_expert_last_context: tuple[float, ...] = ()
@@ -4904,6 +4994,88 @@ class CortexTrainingPhaseController:
         self._count(f"learned_memory_retention_applied_{applied}")
         if decision.anchor_safety_override:
             self._count("learned_memory_retention_anchor_overrides")
+
+    def _refresh_learned_memory_utility_prior(self, *, source: str, count_update: bool = True) -> None:
+        if self.model.learned_memory is None:
+            return
+        learned_credits = [
+            credit
+            for credit in self.memory.utility_credits
+            if credit.retention_source.startswith("learned_memory")
+        ]
+        if not learned_credits:
+            self.model.learned_memory.set_memory_utility_prior(None)
+            self.learned_memory_last_utility_prior = ()
+            return
+        scores = [0.05, 0.05, 0.05]
+        for credit in learned_credits:
+            mode = credit.applied_mode if credit.applied_mode is not None else MemoryMode.DROP
+            if mode == MemoryMode.EXACT:
+                index = LearnedMemoryPolicy.EXACT
+            elif mode == MemoryMode.LATENT:
+                index = LearnedMemoryPolicy.LATENT
+            else:
+                index = LearnedMemoryPolicy.DROP
+            utility = max(-1.0, min(2.0, float(credit.utility)))
+            reward = max(0.0, utility)
+            if credit.fidelity_passed:
+                reward += 0.35
+            else:
+                reward *= 0.25
+            if int(credit.required_anchor_count) > 0:
+                if mode == MemoryMode.EXACT:
+                    reward += 0.35 * float(credit.required_anchor_count)
+                elif mode == MemoryMode.LATENT:
+                    reward += 0.15 * float(credit.required_anchor_count)
+                else:
+                    reward = max(0.0, reward - 0.50 * float(credit.required_anchor_count))
+            elif mode == MemoryMode.DROP and utility <= 0.0:
+                reward += 0.02
+            scores[index] += max(0.0, reward)
+        total = sum(scores)
+        prior = tuple(float(value / total) for value in scores) if total > 0.0 else (1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0)
+        self.model.learned_memory.set_memory_utility_prior(prior, events=len(learned_credits))
+        self.learned_memory_last_utility_prior = prior
+        if count_update:
+            self.learned_memory_utility_prior_updates += 1
+            self._count("learned_memory_utility_prior_updates")
+        self.integration_counts["learned_memory_utility_feedback_events"] = max(
+            int(self.integration_counts.get("learned_memory_utility_feedback_events", 0)),
+            len(learned_credits),
+        )
+        self.integration_counts["learned_memory_last_utility_prior_events"] = len(learned_credits)
+        self.integration_counts["learned_memory_last_utility_prior_exact_milli"] = int(round(prior[0] * 1000.0))
+        self.integration_counts["learned_memory_last_utility_prior_latent_milli"] = int(round(prior[1] * 1000.0))
+        self.integration_counts["learned_memory_last_utility_prior_drop_milli"] = int(round(prior[2] * 1000.0))
+
+    def _record_memory_utility(
+        self,
+        reconstruction: Any,
+        *,
+        phase: str,
+        source: str,
+        reason: str = "",
+        utility: float | None = None,
+    ) -> tuple[MemoryUtilityCredit, ...]:
+        credits = self.memory.record_utility(
+            reconstruction,
+            phase=phase,
+            source=source,
+            reason=reason,
+            utility=utility,
+        )
+        if not credits:
+            return ()
+        learned = tuple(
+            credit
+            for credit in credits
+            if credit.retention_source.startswith("learned_memory")
+        )
+        self._count("memory_utility_credit_events", len(credits))
+        if learned:
+            self._count("learned_memory_utility_credit_events", len(learned))
+            self._refresh_learned_memory_utility_prior(source=source)
+        return credits
 
     def _real_exogenous_llm_examples(self) -> tuple[TrainingExample, ...]:
         return tuple(
@@ -5221,6 +5393,12 @@ class CortexTrainingPhaseController:
                         ),
                     )
                 reconstruction = self.memory.reconstruct(text[:512], required_anchors=segment.anchors)
+                self._record_memory_utility(
+                    reconstruction,
+                    phase="P4",
+                    source=f"input-anchor:{source}:{step}:{row_index}",
+                    reason="input_anchor_fidelity",
+                )
                 if not reconstruction.fidelity.passed:
                     self.input_anchor_fidelity_failures += 1
                     self._record_error(
@@ -5551,6 +5729,12 @@ class CortexTrainingPhaseController:
         _, reconstruction = self.memory.reconstruct_compiled_circuit_binding(
             circuit_id,
             query=f"{source_phase} compiled circuit {circuit_id} skill {runtime_circuit.skill}",
+        )
+        self._record_memory_utility(
+            reconstruction,
+            phase=source_phase,
+            source=f"compiled-circuit:{circuit_id}",
+            reason="compiled_circuit_binding",
         )
         if not reconstruction.fidelity.passed or binding.segment_id not in reconstruction.selected_segment_ids:
             self._count("compiled_circuit_memory_fidelity_failures")
@@ -6362,6 +6546,8 @@ class CortexTrainingPhaseController:
             "learned_memory_latent_decisions": int(self.learned_memory_latent_decisions),
             "learned_memory_drop_decisions": int(self.learned_memory_drop_decisions),
             "learned_memory_storage_ratio_total": float(self.learned_memory_storage_ratio_total),
+            "learned_memory_utility_prior_updates": int(self.learned_memory_utility_prior_updates),
+            "learned_memory_last_utility_prior": tuple(float(value) for value in self.learned_memory_last_utility_prior),
             "skill_expert_context_events": int(self.skill_expert_context_events),
             "skill_expert_replay_context_events": int(self.skill_expert_replay_context_events),
             "skill_expert_last_context": tuple(float(value) for value in self.skill_expert_last_context),
@@ -6509,6 +6695,11 @@ class CortexTrainingPhaseController:
         self.learned_memory_latent_decisions = int(payload.get("learned_memory_latent_decisions", 0))
         self.learned_memory_drop_decisions = int(payload.get("learned_memory_drop_decisions", 0))
         self.learned_memory_storage_ratio_total = float(payload.get("learned_memory_storage_ratio_total", 0.0))
+        self.learned_memory_utility_prior_updates = int(payload.get("learned_memory_utility_prior_updates", 0))
+        self.learned_memory_last_utility_prior = tuple(
+            float(value)
+            for value in payload.get("learned_memory_last_utility_prior", ())
+        )
         self.skill_expert_context_events = int(payload.get("skill_expert_context_events", 0))
         self.skill_expert_replay_context_events = int(payload.get("skill_expert_replay_context_events", 0))
         self.skill_expert_last_context = tuple(float(value) for value in payload.get("skill_expert_last_context", ()))
@@ -6524,6 +6715,13 @@ class CortexTrainingPhaseController:
         _restore_causal_ledger(self.causal_ledger, ledgers.get("causal_ledger"))
         _restore_uncertainty_ledger(self.uncertainty_ledger, ledgers.get("uncertainty_ledger"))
         _restore_memory_state(self.memory, payload.get("memory_state"))
+        if self.learned_memory_last_utility_prior and self.model.learned_memory is not None:
+            self.model.learned_memory.set_memory_utility_prior(
+                self.learned_memory_last_utility_prior,
+                events=int(self.integration_counts.get("learned_memory_utility_feedback_events", 0)),
+            )
+        else:
+            self._refresh_learned_memory_utility_prior(source="checkpoint-restore", count_update=False)
         _restore_sleep_state(self.sleep, payload.get("sleep_state"))
         _restore_improvement_state(self.improvement, payload.get("improvement_state"))
         frontier_summary = dict(payload.get("frontier_registry_summary") or {})
@@ -6699,6 +6897,13 @@ class CortexTrainingPhaseController:
             "learned_memory_retention_applied_latent": int(memory_report.get("learned_retention_applied_latent", 0) or 0),
             "learned_memory_retention_applied_drop": int(memory_report.get("learned_retention_applied_drop", 0) or 0),
             "learned_memory_retention_anchor_overrides": int(memory_report.get("learned_retention_anchor_overrides", 0) or 0),
+            "memory_utility_credit_count": int(memory_report.get("memory_utility_credit_count", 0) or 0),
+            "learned_memory_utility_credit_count": int(memory_report.get("learned_memory_utility_credit_count", 0) or 0),
+            "learned_memory_utility_positive_count": int(memory_report.get("learned_memory_utility_positive_count", 0) or 0),
+            "learned_memory_utility_prior_updates": int(self.learned_memory_utility_prior_updates),
+            "learned_memory_utility_feedback_events": int(self.integration_counts.get("learned_memory_utility_feedback_events", 0)),
+            "learned_memory_last_utility_prior": tuple(float(value) for value in self.learned_memory_last_utility_prior),
+            "learned_memory_utility_credits": _last_items(memory_report.get("learned_memory_utility_credits", ()), 5),
             "skill_expert_context_events": int(self.skill_expert_context_events),
             "skill_expert_replay_context_events": int(self.skill_expert_replay_context_events),
             "skill_expert_context_updates": int(self.model.skill_expert_context_updates),
@@ -6898,6 +7103,12 @@ class CortexTrainingPhaseController:
                 )
                 self.memory.ingest(f"step-{step}-general", "Cortex-3 LLM training memory anchor C3-LLM-ANCHOR.")
                 reconstruction = self.memory.reconstruct("C3-LLM-ANCHOR")
+            self._record_memory_utility(
+                reconstruction,
+                phase="P4",
+                source=f"phase-audit:{step}",
+                reason="phase_memory_reconstruction",
+            )
             self._touch("P4")
             audit["memory"] = {
                 "selected_segment_ids": reconstruction.selected_segment_ids,
@@ -7244,6 +7455,12 @@ class CortexTrainingPhaseController:
                     self._count("inference_self_speculative_events")
                 if inferred.memory_reconstruction is not None:
                     self._count("inference_latent_kv_events")
+                    self._record_memory_utility(
+                        inferred.memory_reconstruction,
+                        phase="P8",
+                        source=f"inference:{inferred.route.path.value}:{inferred.task.task_id}",
+                        reason="inference_memory_reconstruction",
+                    )
                 if bool(inferred.answer.raw.get("frontier_compiled_selected")):
                     self._count("frontier_compiled_fastsolve_events")
                     self.frontier_compiled_fastsolve_events += 1
@@ -7267,6 +7484,12 @@ class CortexTrainingPhaseController:
                 self._count("inference_self_speculative_events")
             if model_inferred.memory_reconstruction is not None:
                 self._count("inference_latent_kv_events")
+                self._record_memory_utility(
+                    model_inferred.memory_reconstruction,
+                    phase="P8",
+                    source=f"inference:{model_inferred.route.path.value}:{model_inferred.task.task_id}",
+                    reason="model_backed_inference_memory_reconstruction",
+                )
             self._touch("P8")
             audit["inference"] = route_reports[0] if route_reports else {}
             audit["inference_routes"] = route_reports
@@ -7636,6 +7859,13 @@ class CortexTrainingPhaseController:
                 "learned_memory_retention_applied_latent": int(memory_report.get("learned_retention_applied_latent", 0) or 0),
                 "learned_memory_retention_applied_drop": int(memory_report.get("learned_retention_applied_drop", 0) or 0),
                 "learned_memory_retention_anchor_overrides": int(memory_report.get("learned_retention_anchor_overrides", 0) or 0),
+                "memory_utility_credit_count": int(memory_report.get("memory_utility_credit_count", 0) or 0),
+                "learned_memory_utility_credit_count": int(memory_report.get("learned_memory_utility_credit_count", 0) or 0),
+                "learned_memory_utility_positive_count": int(memory_report.get("learned_memory_utility_positive_count", 0) or 0),
+                "learned_memory_utility_prior_updates": int(self.learned_memory_utility_prior_updates),
+                "learned_memory_utility_feedback_events": int(self.integration_counts.get("learned_memory_utility_feedback_events", 0)),
+                "learned_memory_last_utility_prior": tuple(float(value) for value in self.learned_memory_last_utility_prior),
+                "learned_memory_utility_credits": _last_items(memory_report.get("learned_memory_utility_credits", ()), 5),
                 "future_contract_decisions": len(self.future_ledger.decisions),
                 **output_goal_summary,
                 "bit_ledger_total_effective_bits": self.bit_ledger.total_effective_bits,
@@ -7798,6 +8028,13 @@ class CortexTrainingPhaseController:
                     "learned_memory_retention_applied_latent": int(memory_report.get("learned_retention_applied_latent", 0) or 0),
                     "learned_memory_retention_applied_drop": int(memory_report.get("learned_retention_applied_drop", 0) or 0),
                     "learned_memory_retention_anchor_overrides": int(memory_report.get("learned_retention_anchor_overrides", 0) or 0),
+                    "memory_utility_credit_count": int(memory_report.get("memory_utility_credit_count", 0) or 0),
+                    "learned_memory_utility_credit_count": int(memory_report.get("learned_memory_utility_credit_count", 0) or 0),
+                    "learned_memory_utility_positive_count": int(memory_report.get("learned_memory_utility_positive_count", 0) or 0),
+                    "learned_memory_utility_prior_updates": int(self.learned_memory_utility_prior_updates),
+                    "learned_memory_utility_feedback_events": int(self.integration_counts.get("learned_memory_utility_feedback_events", 0)),
+                    "learned_memory_last_utility_prior": tuple(float(value) for value in self.learned_memory_last_utility_prior),
+                    "learned_memory_utility_credits": _last_items(memory_report.get("learned_memory_utility_credits", ()), 5),
                     "skill_expert_context_events": int(self.skill_expert_context_events),
                     "skill_expert_replay_context_events": int(self.skill_expert_replay_context_events),
                     "skill_expert_context_updates": int(self.model.skill_expert_context_updates),
@@ -7941,6 +8178,13 @@ class CortexTrainingPhaseController:
                     "learned_memory_retention_applied_latent": int(memory_report.get("learned_retention_applied_latent", 0) or 0),
                     "learned_memory_retention_applied_drop": int(memory_report.get("learned_retention_applied_drop", 0) or 0),
                     "learned_memory_retention_anchor_overrides": int(memory_report.get("learned_retention_anchor_overrides", 0) or 0),
+                    "memory_utility_credit_count": int(memory_report.get("memory_utility_credit_count", 0) or 0),
+                    "learned_memory_utility_credit_count": int(memory_report.get("learned_memory_utility_credit_count", 0) or 0),
+                    "learned_memory_utility_positive_count": int(memory_report.get("learned_memory_utility_positive_count", 0) or 0),
+                    "learned_memory_utility_prior_updates": int(self.learned_memory_utility_prior_updates),
+                    "learned_memory_utility_feedback_events": int(self.integration_counts.get("learned_memory_utility_feedback_events", 0)),
+                    "learned_memory_last_utility_prior": tuple(float(value) for value in self.learned_memory_last_utility_prior),
+                    "learned_memory_utility_credits": _last_items(memory_report.get("learned_memory_utility_credits", ()), 5),
                     "skill_expert_context_events": int(self.skill_expert_context_events),
                     "skill_expert_replay_context_events": int(self.skill_expert_replay_context_events),
                     "skill_expert_context_updates": int(self.model.skill_expert_context_updates),

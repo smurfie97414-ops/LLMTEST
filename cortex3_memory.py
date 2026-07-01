@@ -105,6 +105,58 @@ class MemoryRetentionDecision:
 
 
 @dataclass(frozen=True)
+class MemoryUtilityCredit:
+    segment_id: str
+    source: str
+    phase: str
+    query: str
+    selected: bool
+    fidelity_passed: bool
+    fidelity_score: float
+    required_anchor_count: int
+    utility: float
+    requested_mode: MemoryMode | None = None
+    applied_mode: MemoryMode | None = None
+    retention_source: str = ""
+    reason: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "segment_id": self.segment_id,
+            "source": self.source,
+            "phase": self.phase,
+            "query": self.query,
+            "selected": bool(self.selected),
+            "fidelity_passed": bool(self.fidelity_passed),
+            "fidelity_score": float(self.fidelity_score),
+            "required_anchor_count": int(self.required_anchor_count),
+            "utility": float(self.utility),
+            "requested_mode": self.requested_mode.value if self.requested_mode is not None else None,
+            "applied_mode": self.applied_mode.value if self.applied_mode is not None else None,
+            "retention_source": self.retention_source,
+            "reason": self.reason,
+        }
+
+    @staticmethod
+    def from_dict(payload: Mapping[str, Any]) -> "MemoryUtilityCredit":
+        return MemoryUtilityCredit(
+            segment_id=str(payload.get("segment_id", "")),
+            source=str(payload.get("source", "")),
+            phase=str(payload.get("phase", "")),
+            query=str(payload.get("query", "")),
+            selected=bool(payload.get("selected", True)),
+            fidelity_passed=bool(payload.get("fidelity_passed", False)),
+            fidelity_score=float(payload.get("fidelity_score", 0.0)),
+            required_anchor_count=int(payload.get("required_anchor_count", 0)),
+            utility=float(payload.get("utility", 0.0)),
+            requested_mode=_coerce_memory_mode(payload.get("requested_mode"), default=None),
+            applied_mode=_coerce_memory_mode(payload.get("applied_mode"), default=None),
+            retention_source=str(payload.get("retention_source", "")),
+            reason=str(payload.get("reason", "")),
+        )
+
+
+@dataclass(frozen=True)
 class CognitiveMemoryConfig:
     recent_exact_limit: int = 2
     embedding_dim: int = 64
@@ -383,6 +435,7 @@ class CognitiveMemory:
         self.fidelity = AnchorFidelityVerifier()
         self.compiled_circuit_bindings: dict[str, CompiledCircuitMemoryBinding] = {}
         self.retention_decisions: list[MemoryRetentionDecision] = []
+        self.utility_credits: list[MemoryUtilityCredit] = []
 
     def _make_exact_segment(self, segment_id: str, text: str, metadata: Mapping[str, Any] | None = None, extra_anchors: Iterable[Anchor] = ()) -> MemorySegment:
         extracted = self.anchor_ledger.ingest(text, segment_id)
@@ -671,6 +724,83 @@ class CognitiveMemory:
         )
         return binding, reconstruction
 
+    def record_utility(
+        self,
+        reconstruction: MemoryReconstruction,
+        *,
+        phase: str,
+        source: str,
+        utility: float | None = None,
+        reason: str = "",
+    ) -> tuple[MemoryUtilityCredit, ...]:
+        decision_by_segment: dict[str, MemoryRetentionDecision] = {}
+        for decision in self.retention_decisions:
+            decision_by_segment[decision.segment_id] = decision
+        selected_ids = tuple(str(segment_id) for segment_id in reconstruction.selected_segment_ids)
+        if not selected_ids:
+            return ()
+        base_utility = (
+            float(utility)
+            if utility is not None
+            else (float(reconstruction.fidelity.score) if reconstruction.fidelity.passed else -1.0)
+        )
+        credits: list[MemoryUtilityCredit] = []
+        for segment_id in selected_ids:
+            decision = decision_by_segment.get(segment_id)
+            credit = MemoryUtilityCredit(
+                segment_id=segment_id,
+                source=str(source),
+                phase=str(phase),
+                query=reconstruction.query,
+                selected=True,
+                fidelity_passed=bool(reconstruction.fidelity.passed),
+                fidelity_score=float(reconstruction.fidelity.score),
+                required_anchor_count=int(reconstruction.fidelity.required),
+                utility=base_utility,
+                requested_mode=decision.requested_mode if decision is not None else None,
+                applied_mode=decision.applied_mode if decision is not None else None,
+                retention_source=decision.source if decision is not None else "",
+                reason=str(reason),
+            )
+            credits.append(credit)
+        self.utility_credits.extend(credits)
+        return tuple(credits)
+
+    def utility_report(self) -> dict[str, Any]:
+        learned_credits = [
+            credit
+            for credit in self.utility_credits
+            if credit.retention_source.startswith("learned_memory")
+        ]
+
+        def mode_count(mode: MemoryMode | None, *, learned: bool = False) -> int:
+            credits = learned_credits if learned else self.utility_credits
+            return sum(1 for credit in credits if credit.applied_mode == mode)
+
+        def mean_utility(credits: Sequence[MemoryUtilityCredit]) -> float:
+            if not credits:
+                return 0.0
+            return sum(float(credit.utility) for credit in credits) / float(len(credits))
+
+        return {
+            "memory_utility_credit_count": len(self.utility_credits),
+            "memory_utility_positive_count": sum(1 for credit in self.utility_credits if credit.utility > 0.0),
+            "memory_utility_negative_count": sum(1 for credit in self.utility_credits if credit.utility <= 0.0),
+            "memory_utility_mean": mean_utility(self.utility_credits),
+            "memory_utility_exact_count": mode_count(MemoryMode.EXACT),
+            "memory_utility_latent_count": mode_count(MemoryMode.LATENT),
+            "memory_utility_drop_count": mode_count(None),
+            "learned_memory_utility_credit_count": len(learned_credits),
+            "learned_memory_utility_positive_count": sum(1 for credit in learned_credits if credit.utility > 0.0),
+            "learned_memory_utility_negative_count": sum(1 for credit in learned_credits if credit.utility <= 0.0),
+            "learned_memory_utility_mean": mean_utility(learned_credits),
+            "learned_memory_utility_exact_count": mode_count(MemoryMode.EXACT, learned=True),
+            "learned_memory_utility_latent_count": mode_count(MemoryMode.LATENT, learned=True),
+            "learned_memory_utility_drop_count": mode_count(None, learned=True),
+            "learned_memory_utility_credits": [credit.to_dict() for credit in learned_credits[-16:]],
+            "memory_utility_credits": [credit.to_dict() for credit in self.utility_credits[-16:]],
+        }
+
     def compression_report(self) -> dict[str, Any]:
         latent = self.latent.segments
         original = sum(segment.original_token_count for segment in latent)
@@ -708,4 +838,5 @@ class CognitiveMemory:
                 for binding in self.compiled_circuit_bindings.values()
             ],
             "compiled_circuit_memory_binding_count": len(self.compiled_circuit_bindings),
+            **self.utility_report(),
         }

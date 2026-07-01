@@ -92,6 +92,49 @@ class CognitiveMemoryTest(unittest.TestCase):
         self.assertEqual(report["learned_retention_applied_exact"], 1)
         self.assertEqual(report["learned_retention_anchor_overrides"], 1)
 
+    def test_memory_utility_credit_links_reconstruction_to_learned_retention(self):
+        memory = CognitiveMemory(CognitiveMemoryConfig(recent_exact_limit=1, embedding_dim=32))
+        required = Anchor("identifier", "C3-UTILITY-4242", "utility-latent")
+        memory.ingest(
+            "utility-latent",
+            "Segment important: la cle exacte est C3-UTILITY-4242.",
+            extra_anchors=(required,),
+            retention_decision=MemoryRetentionDecision(
+                segment_id="utility-latent",
+                requested_mode=MemoryMode.LATENT,
+                applied_mode=MemoryMode.LATENT,
+                exact_prob=0.11,
+                latent_prob=0.82,
+                drop_prob=0.07,
+                storage_ratio=0.30,
+                confidence=0.82,
+                source="learned_memory_policy",
+            ),
+        )
+
+        reconstruction = memory.reconstruct(
+            "retrouve la cle exacte",
+            required_anchors=(required,),
+        )
+        credits = memory.record_utility(
+            reconstruction,
+            phase="P4",
+            source="unit-reconstruction",
+            reason="anchor_fidelity",
+        )
+
+        self.assertTrue(reconstruction.fidelity.passed)
+        self.assertEqual(len(credits), 1)
+        self.assertEqual(credits[0].segment_id, "utility-latent")
+        self.assertEqual(credits[0].applied_mode, MemoryMode.LATENT)
+        self.assertEqual(credits[0].retention_source, "learned_memory_policy")
+        self.assertGreater(credits[0].utility, 0.0)
+        report = memory.compression_report()
+        self.assertEqual(report["learned_memory_utility_credit_count"], 1)
+        self.assertEqual(report["learned_memory_utility_positive_count"], 1)
+        self.assertEqual(report["learned_memory_utility_latent_count"], 1)
+        self.assertTrue(report["learned_memory_utility_credits"])
+
     def test_recent_exact_kv_eviction_creates_latent_old_kv(self):
         memory = CognitiveMemory(CognitiveMemoryConfig(recent_exact_limit=1, embedding_dim=32))
         memory.ingest("s1", "FAIT CRITIQUE: Mira a le code C3-1111-A et le montant 42,00 EUR.")
