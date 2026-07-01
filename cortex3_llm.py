@@ -10701,6 +10701,7 @@ def run_llm_batch_profile_autosize(
             candidate: Mapping[str, Any],
             *,
             selected_refinement_keys: set[str] | None = None,
+            report_selection_reason: str | None = None,
         ) -> Mapping[str, Any]:
             payload = {
                 "shape_key": str(candidate.get("shape_key", "")),
@@ -10718,7 +10719,95 @@ def run_llm_batch_profile_autosize(
             }
             if selected_refinement_keys is not None:
                 payload["selected_for_refinement"] = str(candidate.get("shape_key", "")) in selected_refinement_keys
+            if report_selection_reason is not None:
+                payload["report_selection_reason"] = str(report_selection_reason)
             return payload
+
+        def select_refinement_action_report_frontier(
+            frontier: Sequence[Mapping[str, Any]],
+            *,
+            selected_refinement_keys: set[str],
+            cap: int,
+        ) -> tuple[tuple[Mapping[str, Any], str], ...]:
+            if cap <= 0:
+                return tuple((candidate, "full_frontier") for candidate in frontier)
+            selected: list[tuple[Mapping[str, Any], str]] = []
+            seen_shape_keys: set[str] = set()
+
+            def add(candidate: Mapping[str, Any], reason: str) -> None:
+                shape_key = str(candidate.get("shape_key", ""))
+                if not shape_key or shape_key in seen_shape_keys or len(selected) >= cap:
+                    return
+                selected.append((candidate, reason))
+                seen_shape_keys.add(shape_key)
+
+            for candidate in frontier:
+                if str(candidate.get("shape_key", "")) in selected_refinement_keys:
+                    add(candidate, "selected_for_refinement")
+            buckets: tuple[tuple[str, Sequence[Mapping[str, Any]]], ...] = (
+                (
+                    "top_expected_gain",
+                    sorted(
+                        frontier,
+                        key=lambda candidate: (
+                            float(candidate.get("refinement_expected_gain", 0.0)),
+                            float(candidate.get("refinement_gain_per_cost", 0.0)),
+                            -int(candidate.get("estimated_rank", 0)),
+                            str(candidate.get("shape_key", "")),
+                        ),
+                        reverse=True,
+                    ),
+                ),
+                (
+                    "top_uncertainty_width",
+                    sorted(
+                        frontier,
+                        key=lambda candidate: (
+                            float(candidate.get("refinement_uncertainty_width", 0.0)),
+                            float(candidate.get("refinement_gain_per_cost", 0.0)),
+                            -int(candidate.get("estimated_rank", 0)),
+                            str(candidate.get("shape_key", "")),
+                        ),
+                        reverse=True,
+                    ),
+                ),
+                ("top_gain_per_cost", frontier),
+                (
+                    "selected_finalist",
+                    tuple(
+                        candidate
+                        for candidate in frontier
+                        if bool(candidate.get("refinement_is_selected_finalist"))
+                    ),
+                ),
+                (
+                    "lowest_measurement_cost",
+                    sorted(
+                        frontier,
+                        key=lambda candidate: (
+                            int(candidate.get("refinement_measurement_cost_tokens", 0)),
+                            -float(candidate.get("refinement_gain_per_cost", 0.0)),
+                            int(candidate.get("estimated_rank", 0)),
+                            str(candidate.get("shape_key", "")),
+                        ),
+                    ),
+                ),
+                ("frontier_order", frontier),
+            )
+            while len(selected) < cap:
+                progressed = False
+                for reason, bucket in buckets:
+                    for candidate in bucket:
+                        before_count = len(selected)
+                        add(candidate, reason)
+                        if len(selected) > before_count:
+                            progressed = True
+                            break
+                    if len(selected) >= cap:
+                        break
+                if not progressed:
+                    break
+            return tuple(selected)
 
         def refine_uncertain_candidates(*, round_index: int) -> None:
             nonlocal measurement_inputs, refinement_seeds, synthesized_refinement_seed_count
@@ -10835,12 +10924,11 @@ def run_llm_batch_profile_autosize(
                     for candidate in refinement_inputs
                 )
                 refinement_action_frontier_total_count = len(refinement_action_frontier)
-                if requested_refinement_budget_candidate_action_report_cap > 0:
-                    reported_refinement_action_frontier = tuple(
-                        refinement_action_frontier[:requested_refinement_budget_candidate_action_report_cap]
-                    )
-                else:
-                    reported_refinement_action_frontier = tuple(refinement_action_frontier)
+                reported_refinement_action_frontier = select_refinement_action_report_frontier(
+                    refinement_action_frontier,
+                    selected_refinement_keys=selected_refinement_keys,
+                    cap=requested_refinement_budget_candidate_action_report_cap,
+                )
                 refinement_action_frontier_truncated = (
                     len(reported_refinement_action_frontier) < refinement_action_frontier_total_count
                 )
@@ -10848,8 +10936,9 @@ def run_llm_batch_profile_autosize(
                     refinement_budget_action_payload(
                         candidate,
                         selected_refinement_keys=selected_refinement_keys,
+                        report_selection_reason=report_selection_reason,
                     )
-                    for candidate in reported_refinement_action_frontier
+                    for candidate, report_selection_reason in reported_refinement_action_frontier
                 )
                 refinement_budget_actions.extend(round_budget_actions)
                 refinement_budget_candidate_actions.extend(round_budget_candidate_actions)

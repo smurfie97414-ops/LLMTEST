@@ -1906,6 +1906,10 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
         self.assertTrue(refinement_round["refinement_budget_candidate_actions_truncated"])
         self.assertEqual(len(candidate_actions), 2)
         self.assertTrue(candidate_actions[0]["selected_for_refinement"])
+        self.assertEqual(candidate_actions[0]["report_selection_reason"], "selected_for_refinement")
+        self.assertFalse(candidate_actions[1]["selected_for_refinement"])
+        self.assertEqual(candidate_actions[1]["report_selection_reason"], "top_expected_gain")
+        self.assertGreaterEqual(candidate_actions[1]["expected_gain"], candidate_actions[0]["expected_gain"])
         self.assertEqual(
             report["measurement"]["refinement_budget_actions"][0]["shape_key"],
             candidate_actions[0]["shape_key"],
