@@ -119,6 +119,7 @@ extern "C" __global__ void ternary_matmul_bf16(
 #define C3_BLOCK_N 16
 #define C3_BLOCK_K 32
 #define C3_WARPS_PER_BLOCK 8
+#define C3_REQUANT_THREADS 256
 
 __device__ __forceinline__ float c3_decode_weight(
     const unsigned char* packed,
@@ -481,6 +482,228 @@ extern "C" __global__ void ternary_grad_input_warp_bf16(
     grad_x[output_index] = __float2bfloat16(acc);
   }
 }
+
+extern "C" __global__ void ternary_requantize_pack_fp32(
+    const float* weight,
+    float* signs,
+    float* mask,
+    float* scales,
+    float* residual,
+    unsigned char* packed,
+    int* row_active_counts,
+    int out_rows,
+    int k_cols,
+    int packed_stride,
+    int has_threshold,
+    float threshold_value,
+    float residual_threshold) {
+  int row = blockIdx.x;
+  int tid = threadIdx.x;
+  if (row >= out_rows) return;
+  __shared__ float sum_abs[C3_REQUANT_THREADS];
+  __shared__ int active_counts[C3_REQUANT_THREADS];
+  __shared__ float row_scale;
+  __shared__ float row_threshold;
+  float local_sum = 0.0f;
+  for (int k = tid; k < k_cols; k += blockDim.x) {
+    local_sum += fabsf(weight[row * k_cols + k]);
+  }
+  sum_abs[tid] = local_sum;
+  __syncthreads();
+  for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+    if (tid < stride) sum_abs[tid] += sum_abs[tid + stride];
+    __syncthreads();
+  }
+  if (tid == 0) {
+    row_scale = fmaxf(sum_abs[0] / fmaxf((float)k_cols, 1.0f), 1.0e-12f);
+    row_threshold = has_threshold ? threshold_value : 0.5f * row_scale;
+    scales[row] = row_scale;
+  }
+  __syncthreads();
+  int local_active = 0;
+  for (int k = tid; k < k_cols; k += blockDim.x) {
+    int idx = row * k_cols + k;
+    float value = weight[idx];
+    float sign = value >= 0.0f ? 1.0f : -1.0f;
+    int active = fabsf(value) >= row_threshold;
+    float quantized = active ? sign * row_scale : 0.0f;
+    float res = value - quantized;
+    if (residual_threshold > 0.0f && fabsf(res) <= residual_threshold) res = 0.0f;
+    signs[idx] = sign;
+    mask[idx] = active ? 1.0f : 0.0f;
+    residual[idx] = res;
+    local_active += active;
+  }
+  active_counts[tid] = local_active;
+  __syncthreads();
+  for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+    if (tid < stride) active_counts[tid] += active_counts[tid + stride];
+    __syncthreads();
+  }
+  if (tid == 0) row_active_counts[row] = active_counts[0];
+  for (int byte_index = tid; byte_index < packed_stride; byte_index += blockDim.x) {
+    unsigned int out = 0;
+    #pragma unroll
+    for (int offset = 0; offset < 4; ++offset) {
+      int k = byte_index * 4 + offset;
+      unsigned int code = 0;
+      if (k < k_cols) {
+        float value = weight[row * k_cols + k];
+        if (fabsf(value) >= row_threshold) code = value >= 0.0f ? 2u : 1u;
+      }
+      out |= code << (offset * 2);
+    }
+    packed[row * packed_stride + byte_index] = (unsigned char)out;
+  }
+}
+
+extern "C" __global__ void ternary_requantize_pack_fp16(
+    const __half* weight,
+    __half* signs,
+    __half* mask,
+    __half* scales,
+    __half* residual,
+    unsigned char* packed,
+    int* row_active_counts,
+    int out_rows,
+    int k_cols,
+    int packed_stride,
+    int has_threshold,
+    float threshold_value,
+    float residual_threshold) {
+  int row = blockIdx.x;
+  int tid = threadIdx.x;
+  if (row >= out_rows) return;
+  __shared__ float sum_abs[C3_REQUANT_THREADS];
+  __shared__ int active_counts[C3_REQUANT_THREADS];
+  __shared__ float row_scale;
+  __shared__ float row_threshold;
+  float local_sum = 0.0f;
+  for (int k = tid; k < k_cols; k += blockDim.x) {
+    local_sum += fabsf(__half2float(weight[row * k_cols + k]));
+  }
+  sum_abs[tid] = local_sum;
+  __syncthreads();
+  for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+    if (tid < stride) sum_abs[tid] += sum_abs[tid + stride];
+    __syncthreads();
+  }
+  if (tid == 0) {
+    row_scale = fmaxf(sum_abs[0] / fmaxf((float)k_cols, 1.0f), 1.0e-12f);
+    row_threshold = has_threshold ? threshold_value : 0.5f * row_scale;
+    scales[row] = __float2half(row_scale);
+  }
+  __syncthreads();
+  int local_active = 0;
+  for (int k = tid; k < k_cols; k += blockDim.x) {
+    int idx = row * k_cols + k;
+    float value = __half2float(weight[idx]);
+    float sign = value >= 0.0f ? 1.0f : -1.0f;
+    int active = fabsf(value) >= row_threshold;
+    float quantized = active ? sign * row_scale : 0.0f;
+    float res = value - quantized;
+    if (residual_threshold > 0.0f && fabsf(res) <= residual_threshold) res = 0.0f;
+    signs[idx] = __float2half(sign);
+    mask[idx] = __float2half(active ? 1.0f : 0.0f);
+    residual[idx] = __float2half(res);
+    local_active += active;
+  }
+  active_counts[tid] = local_active;
+  __syncthreads();
+  for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+    if (tid < stride) active_counts[tid] += active_counts[tid + stride];
+    __syncthreads();
+  }
+  if (tid == 0) row_active_counts[row] = active_counts[0];
+  for (int byte_index = tid; byte_index < packed_stride; byte_index += blockDim.x) {
+    unsigned int out = 0;
+    #pragma unroll
+    for (int offset = 0; offset < 4; ++offset) {
+      int k = byte_index * 4 + offset;
+      unsigned int code = 0;
+      if (k < k_cols) {
+        float value = __half2float(weight[row * k_cols + k]);
+        if (fabsf(value) >= row_threshold) code = value >= 0.0f ? 2u : 1u;
+      }
+      out |= code << (offset * 2);
+    }
+    packed[row * packed_stride + byte_index] = (unsigned char)out;
+  }
+}
+
+extern "C" __global__ void ternary_requantize_pack_bf16(
+    const __nv_bfloat16* weight,
+    __nv_bfloat16* signs,
+    __nv_bfloat16* mask,
+    __nv_bfloat16* scales,
+    __nv_bfloat16* residual,
+    unsigned char* packed,
+    int* row_active_counts,
+    int out_rows,
+    int k_cols,
+    int packed_stride,
+    int has_threshold,
+    float threshold_value,
+    float residual_threshold) {
+  int row = blockIdx.x;
+  int tid = threadIdx.x;
+  if (row >= out_rows) return;
+  __shared__ float sum_abs[C3_REQUANT_THREADS];
+  __shared__ int active_counts[C3_REQUANT_THREADS];
+  __shared__ float row_scale;
+  __shared__ float row_threshold;
+  float local_sum = 0.0f;
+  for (int k = tid; k < k_cols; k += blockDim.x) {
+    local_sum += fabsf(__bfloat162float(weight[row * k_cols + k]));
+  }
+  sum_abs[tid] = local_sum;
+  __syncthreads();
+  for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+    if (tid < stride) sum_abs[tid] += sum_abs[tid + stride];
+    __syncthreads();
+  }
+  if (tid == 0) {
+    row_scale = fmaxf(sum_abs[0] / fmaxf((float)k_cols, 1.0f), 1.0e-12f);
+    row_threshold = has_threshold ? threshold_value : 0.5f * row_scale;
+    scales[row] = __float2bfloat16(row_scale);
+  }
+  __syncthreads();
+  int local_active = 0;
+  for (int k = tid; k < k_cols; k += blockDim.x) {
+    int idx = row * k_cols + k;
+    float value = __bfloat162float(weight[idx]);
+    float sign = value >= 0.0f ? 1.0f : -1.0f;
+    int active = fabsf(value) >= row_threshold;
+    float quantized = active ? sign * row_scale : 0.0f;
+    float res = value - quantized;
+    if (residual_threshold > 0.0f && fabsf(res) <= residual_threshold) res = 0.0f;
+    signs[idx] = __float2bfloat16(sign);
+    mask[idx] = __float2bfloat16(active ? 1.0f : 0.0f);
+    residual[idx] = __float2bfloat16(res);
+    local_active += active;
+  }
+  active_counts[tid] = local_active;
+  __syncthreads();
+  for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+    if (tid < stride) active_counts[tid] += active_counts[tid + stride];
+    __syncthreads();
+  }
+  if (tid == 0) row_active_counts[row] = active_counts[0];
+  for (int byte_index = tid; byte_index < packed_stride; byte_index += blockDim.x) {
+    unsigned int out = 0;
+    #pragma unroll
+    for (int offset = 0; offset < 4; ++offset) {
+      int k = byte_index * 4 + offset;
+      unsigned int code = 0;
+      if (k < k_cols) {
+        float value = __bfloat162float(weight[row * k_cols + k]);
+        if (fabsf(value) >= row_threshold) code = value >= 0.0f ? 2u : 1u;
+      }
+      out |= code << (offset * 2);
+    }
+    packed[row * packed_stride + byte_index] = (unsigned char)out;
+  }
+}
 """
 
 _CUPY_TERNARY_KERNEL_NAMES = {
@@ -499,6 +722,11 @@ _CUPY_TERNARY_GRAD_INPUT_KERNEL_NAMES = {
     torch.float32: "ternary_grad_input_warp_fp32",
     torch.float16: "ternary_grad_input_warp_fp16",
     torch.bfloat16: "ternary_grad_input_warp_bf16",
+}
+_CUPY_TERNARY_REQUANTIZE_KERNEL_NAMES = {
+    torch.float32: "ternary_requantize_pack_fp32",
+    torch.float16: "ternary_requantize_pack_fp16",
+    torch.bfloat16: "ternary_requantize_pack_bf16",
 }
 _CUPY_TERNARY_KERNEL_CACHE: dict[Any, Any] = {}
 _NATIVE_TERNARY_AUTOTUNE_CACHE: dict[tuple[Any, ...], tuple[str, tuple[tuple[str, float], ...]]] = {}
@@ -650,6 +878,20 @@ def _cupy_ternary_grad_input_kernel(dtype: Any) -> tuple[Any, Any]:
     return cp, _CUPY_TERNARY_KERNEL_CACHE[key]
 
 
+def _cupy_ternary_requantize_kernel(dtype: Any) -> tuple[Any, Any]:
+    if dtype not in _CUPY_TERNARY_REQUANTIZE_KERNEL_NAMES:
+        raise RuntimeError(f"native ternary CUDA requantize kernel does not support dtype {dtype}")
+    cp = _load_cupy()
+    key = ("requantize_pack", dtype)
+    if key not in _CUPY_TERNARY_KERNEL_CACHE:
+        _CUPY_TERNARY_KERNEL_CACHE[key] = cp.RawKernel(
+            _CUPY_TERNARY_KERNEL_SOURCE,
+            _CUPY_TERNARY_REQUANTIZE_KERNEL_NAMES[dtype],
+            options=("--std=c++17",),
+        )
+    return cp, _CUPY_TERNARY_KERNEL_CACHE[key]
+
+
 def native_ternary_cuda_available() -> bool:
     if not torch.cuda.is_available():
         return False
@@ -657,6 +899,7 @@ def native_ternary_cuda_available() -> bool:
         _cupy_ternary_kernel(torch.float32, "tiled")
         _cupy_ternary_kernel(torch.float32, "warp")
         _cupy_ternary_grad_input_kernel(torch.float32)
+        _cupy_ternary_requantize_kernel(torch.float32)
     except Exception:
         return False
     return True
@@ -713,6 +956,53 @@ def _native_packed_ternary_grad_input_cuda(
             ),
         )
     return grad_x
+
+
+def _native_requantize_pack_cuda(
+    values: Any,
+    signs: Any,
+    mask: Any,
+    scales: Any,
+    residual_weight: Any,
+    packed_codes: Any,
+    *,
+    threshold: float | None,
+    residual_threshold: float,
+) -> Any:
+    if not values.is_cuda:
+        raise RuntimeError("native ternary CUDA requantize kernel requires CUDA weights")
+    if values.dtype not in _CUPY_TERNARY_REQUANTIZE_KERNEL_NAMES:
+        raise RuntimeError(f"native ternary CUDA requantize kernel does not support dtype {values.dtype}")
+    if signs.dtype != values.dtype or mask.dtype != values.dtype or scales.dtype != values.dtype or residual_weight.dtype != values.dtype:
+        raise RuntimeError("native ternary CUDA requantize kernel requires weight and ternary buffers to share dtype")
+    cp, kernel = _cupy_ternary_requantize_kernel(values.dtype)
+    row_active_counts = torch.empty((int(values.shape[0]),), device=values.device, dtype=torch.int32)
+    weights = values.detach().contiguous()
+    packed = packed_codes.contiguous()
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=DeprecationWarning, message="ExternalStream is deprecated.*")
+        stream = cp.cuda.ExternalStream(torch.cuda.current_stream(values.device).cuda_stream)
+    with stream:
+        kernel(
+            (int(weights.shape[0]),),
+            (256,),
+            (
+                cp.from_dlpack(weights),
+                cp.from_dlpack(signs),
+                cp.from_dlpack(mask),
+                cp.from_dlpack(scales.view(-1)),
+                cp.from_dlpack(residual_weight),
+                cp.from_dlpack(packed),
+                cp.from_dlpack(row_active_counts),
+                cp.int32(int(weights.shape[0])),
+                cp.int32(int(weights.shape[1])),
+                cp.int32(int(packed.shape[1])),
+                cp.int32(int(threshold is not None)),
+                cp.float32(float(threshold if threshold is not None else 0.0)),
+                cp.float32(float(residual_threshold)),
+            ),
+        )
+    return row_active_counts
 
 
 def _unpack_packed_ternary_weight(
@@ -1178,6 +1468,7 @@ class BitLinear(nn.Module):
         self._last_native_autotune_cache_hit = False
         self._last_native_autotune_candidate_ms: tuple[tuple[str, float], ...] = ()
         self._native_cuda_instance_variant_cache: dict[tuple[Any, ...], tuple[str, tuple[tuple[str, float], ...]]] = {}
+        self._last_requantize_backend = "torch_tensor_requantize"
         self._packed_weight_version = -1
         nn.init.kaiming_uniform_(self.float_weight, a=5 ** 0.5)
         self.requantize()
@@ -1243,22 +1534,53 @@ class BitLinear(nn.Module):
     def _sync_quantized_buffers_from_weight(self, *, certify_zeros: bool = False, record_decision: bool = False) -> None:
         with torch.no_grad():
             values = self.float_weight.detach()
-            scale = values.abs().mean(dim=1, keepdim=True).clamp_min(1e-12) if self.config.shared_scale else values.abs().mean().clamp_min(1e-12)
-            threshold = self.config.threshold if self.config.threshold is not None else 0.5 * scale
-            signs = torch.where(values >= 0, torch.ones_like(values), -torch.ones_like(values))
-            mask = (values.abs() >= threshold).to(values.dtype)
-            quantized = signs * mask * scale
-            residual = values - quantized
-            if self.config.residual_threshold > 0:
-                residual = torch.where(residual.abs() > self.config.residual_threshold, residual, torch.zeros_like(residual))
-            self.signs.copy_(signs)
-            self.mask.copy_(mask)
-            self.scales.copy_(scale if self.config.shared_scale else torch.ones_like(self.scales) * scale)
-            self.residual_weight.copy_(residual)
-            self.packed_codes.copy_(self._pack_codes(self._codes_from_sign_mask(signs, mask)).to(self.packed_codes.device))
-
-            active_count = int(mask.sum().item())
-            total_count = int(mask.numel())
+            row_active_counts = None
+            native_requantized = False
+            if (
+                values.is_cuda
+                and self.config.use_native_cuda_kernel
+                and self.config.shared_scale
+                and values.dtype in _CUPY_TERNARY_REQUANTIZE_KERNEL_NAMES
+            ):
+                try:
+                    row_active_counts = _native_requantize_pack_cuda(
+                        values,
+                        self.signs,
+                        self.mask,
+                        self.scales,
+                        self.residual_weight,
+                        self.packed_codes,
+                        threshold=self.config.threshold,
+                        residual_threshold=self.config.residual_threshold,
+                    )
+                    native_requantized = True
+                    self._last_requantize_backend = "native_cuda_requantize_pack"
+                except Exception as exc:
+                    if self.config.require_native_cuda_kernel:
+                        raise
+                    self._last_requantize_backend = f"torch_tensor_requantize_after_native_failure:{type(exc).__name__}"
+            if native_requantized:
+                active_count = int(row_active_counts.sum().item())
+                scale = self.scales.detach()
+                threshold = self.config.threshold if self.config.threshold is not None else 0.5 * scale
+                residual = self.residual_weight.detach()
+            else:
+                scale = values.abs().mean(dim=1, keepdim=True).clamp_min(1e-12) if self.config.shared_scale else values.abs().mean().clamp_min(1e-12)
+                threshold = self.config.threshold if self.config.threshold is not None else 0.5 * scale
+                signs = torch.where(values >= 0, torch.ones_like(values), -torch.ones_like(values))
+                mask = (values.abs() >= threshold).to(values.dtype)
+                quantized = signs * mask * scale
+                residual = values - quantized
+                if self.config.residual_threshold > 0:
+                    residual = torch.where(residual.abs() > self.config.residual_threshold, residual, torch.zeros_like(residual))
+                self.signs.copy_(signs)
+                self.mask.copy_(mask)
+                self.scales.copy_(scale if self.config.shared_scale else torch.ones_like(self.scales) * scale)
+                self.residual_weight.copy_(residual)
+                self.packed_codes.copy_(self._pack_codes(self._codes_from_sign_mask(signs, mask)).to(self.packed_codes.device))
+                self._last_requantize_backend = "torch_tensor_requantize"
+                active_count = int(mask.sum().item())
+            total_count = int(values.numel())
             zero_count = total_count - active_count
             scale_count = values.shape[0] if self.config.shared_scale else 1
             estimated_bits = float(

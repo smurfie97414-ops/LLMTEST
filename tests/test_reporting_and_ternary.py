@@ -345,6 +345,58 @@ class ReportingAndTernaryTest(unittest.TestCase):
         __import__("torch").cuda.is_available() and native_ternary_cuda_available(),
         "CUDA plus CuPy native ternary kernel is required",
     )
+    def test_native_ternary_cuda_requantize_pack_matches_torch_sync(self):
+        import torch
+
+        torch.manual_seed(37)
+        dtype_cases = ((torch.float32, 1e-6), (torch.float16, 2e-3), (torch.bfloat16, 2e-2))
+        config_cases = ((None, 0.0), (0.05, 0.01))
+        for dtype, atol in dtype_cases:
+            for threshold, residual_threshold in config_cases:
+                with self.subTest(dtype=str(dtype), threshold=threshold, residual_threshold=residual_threshold):
+                    native = BitLinear(BitLinearConfig(
+                        17,
+                        11,
+                        activation_bits=0,
+                        threshold=threshold,
+                        residual_threshold=residual_threshold,
+                        residual_runtime=True,
+                        require_native_cuda_kernel=True,
+                        native_cuda_autotune=False,
+                    )).to(device="cuda", dtype=dtype)
+                    reference = BitLinear(BitLinearConfig(
+                        17,
+                        11,
+                        activation_bits=0,
+                        threshold=threshold,
+                        residual_threshold=residual_threshold,
+                        residual_runtime=True,
+                        use_native_cuda_kernel=False,
+                        native_cuda_autotune=False,
+                    )).to(device="cuda", dtype=dtype)
+                    weight = torch.randn(11, 17, device="cuda", dtype=dtype) * 0.25
+                    with torch.no_grad():
+                        native.float_weight.copy_(weight)
+                        reference.float_weight.copy_(weight)
+
+                    native.requantize()
+                    reference.requantize()
+                    torch.cuda.synchronize()
+
+                    self.assertEqual(native._last_requantize_backend, "native_cuda_requantize_pack")
+                    self.assertEqual(reference._last_requantize_backend, "torch_tensor_requantize")
+                    self.assertTrue(torch.allclose(native.signs.float(), reference.signs.float(), atol=0.0, rtol=0.0))
+                    self.assertTrue(torch.allclose(native.mask.float(), reference.mask.float(), atol=0.0, rtol=0.0))
+                    self.assertTrue(torch.allclose(native.scales.float(), reference.scales.float(), atol=atol, rtol=atol))
+                    self.assertTrue(torch.allclose(native.residual_weight.float(), reference.residual_weight.float(), atol=atol, rtol=atol))
+                    self.assertTrue(torch.equal(native.packed_codes, reference.packed_codes))
+                    self.assertEqual(native.ledger.compression_decisions[-1].active_count, reference.ledger.compression_decisions[-1].active_count)
+                    self.assertEqual(native.ledger.compression_decisions[-1].zero_count, reference.ledger.compression_decisions[-1].zero_count)
+
+    @unittest.skipUnless(
+        __import__("torch").cuda.is_available() and native_ternary_cuda_available(),
+        "CUDA plus CuPy native ternary kernel is required",
+    )
     def test_native_ternary_auto_kernel_autotunes_and_reuses_cache(self):
         import torch
 

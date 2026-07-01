@@ -33,6 +33,7 @@ Preuve post-integration des deux nouvelles briques :
 - `test_bitlinear_native_packed_ternary_cuda_dispatch_runs_on_gpu` : backend natif `native_int2_cupy_cuda_*` execute sur le GPU local avec gradient STE non nul ;
 - `test_native_ternary_cuda_kernel_matches_packed_runtime_for_training_dtypes` : le kernel natif correspond au runtime packe en fp32, fp16 et bf16 ;
 - `test_native_ternary_cuda_fast_ste_backward_matches_dense_ste` : le backward fast STE CUDA correspond au dense STE en fp32, fp16 et bf16, avec `grad_input` calcule depuis les poids int2 packes ;
+- `test_native_ternary_cuda_requantize_pack_matches_torch_sync` : la requantization/packing CUDA fusionnee reproduit signs, mask, scales, residuals, packed codes et compte d'actifs du chemin PyTorch en fp32, fp16 et bf16 ;
 - `test_full_cortex_phase_controller_uses_all_modules_during_training` : mini training LLM complet avec audits exigeant `learned_cognitive_memory_policy`, `packed_ternary_hardware_runtime` et `native_ternary_cuda_kernel` quand CUDA est disponible.
 
 Le long run devra produire un nouveau sidecar sous le commit de cette integration pour remplacer l'ancien audit `22/22` par l'audit courant plus strict incluant `native_ternary_cuda_kernel`.
@@ -287,6 +288,7 @@ Quand `use_ternary_core=True`, les lineaires principaux deviennent des `BitLinea
 - `PackedTernaryDispatch` avec backend `packed_int2_torch`, `packed_int2_cuda`, `native_int2_cupy_cuda_tiled_shared_memory_int2` ou `native_int2_cupy_cuda_warp_reduction_int2`, plus les champs `autotuned`, `autotune_cache_hit` et `autotune_candidate_ms`.
 - `TransformerConfig.native_ternary_autotune_cache_path` peut brancher un profil JSON d'autotune dans les `BitLinear` du vrai training.
 - backward fast STE CUDA qui calcule `grad_input` directement depuis les codes int2 packes, les scales et le residual optionnel.
+- requantization/packing CUDA fusionnee apres optimizer step, P7 ou P10 quand la version du poids change.
 
 ### Interaction Avec Les Autres Phases
 
@@ -303,6 +305,8 @@ Le forward lit la valeur runtime depuis les codes ternaires packes, puis utilise
 ### Preuve Runtime
 
 Le checkpoint inspecte montre `P2=238652` evenements. Les tests ajoutes verifient en plus que `BitLinear` execute un dispatch CUDA natif tuilé ou warp-reduction sur GPU local, que les valeurs fp32/fp16/bf16 correspondent au runtime packe, que l'auto-selection choisit la variante attendue selon la forme, que le backward fast STE garde la meme semantique que le dense STE pour `grad_input`, `grad_weight` et `grad_bias`, et que le gradient STE reste non nul vers les poids entrainables.
+
+La boucle post-update est aussi native sur CUDA: apres un changement de poids, `_sync_quantized_buffers_from_weight` peut regenerer `signs`, `mask`, `scales`, `residual_weight` et `packed_codes` via un kernel fusionne. Le benchmark court RTX 5070 `128x256x256 fp16` mesure `0.2245 ms` pour le chemin fusionne contre `0.5901 ms` pour le chemin PyTorch tensoriel.
 
 ## Phase 3 - Future Contract / FSP / MTP
 

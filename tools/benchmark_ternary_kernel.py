@@ -92,10 +92,24 @@ def benchmark_case(
             log_prefix="bench-legacy-ste",
         )
     ).cuda()
+    torch_requant_layer = BitLinear(
+        BitLinearConfig(
+            in_features,
+            out_features,
+            activation_bits=0,
+            residual_runtime=False,
+            use_native_cuda_kernel=False,
+            native_cuda_autotune=False,
+            log_prefix="bench-torch-requantize",
+        )
+    ).cuda()
     with torch.no_grad():
         legacy_layer.float_weight.copy_(layer.float_weight)
+        torch_requant_layer.float_weight.copy_(layer.float_weight)
         if layer.bias is not None and legacy_layer.bias is not None:
             legacy_layer.bias.copy_(layer.bias)
+        if layer.bias is not None and torch_requant_layer.bias is not None:
+            torch_requant_layer.bias.copy_(layer.bias)
     x = torch.randn(batch, in_features, device="cuda", dtype=dtype)
     x_train = x.detach().clone().requires_grad_(True)
     legacy_x_train = x.detach().clone().requires_grad_(True)
@@ -136,6 +150,14 @@ def benchmark_case(
         loss.backward()
         return loss
 
+    def native_requantize_pack() -> torch.Tensor:
+        layer._sync_quantized_buffers_from_weight(record_decision=False)
+        return layer.scales
+
+    def torch_requantize_pack() -> torch.Tensor:
+        torch_requant_layer._sync_quantized_buffers_from_weight(record_decision=False)
+        return torch_requant_layer.scales
+
     native_out = native()
     unpacked_out = torch_unpacked()
     ste_out = ste_dense()
@@ -150,6 +172,8 @@ def benchmark_case(
     full_forward_ms = _time_cuda(bitlinear_forward, warmup=warmup, repeat=repeat)
     full_forward_backward_ms = _time_cuda(bitlinear_forward_backward, warmup=max(1, warmup // 2), repeat=max(1, repeat // 2))
     legacy_forward_backward_ms = _time_cuda(legacy_forward_backward, warmup=max(1, warmup // 2), repeat=max(1, repeat // 2))
+    native_requantize_pack_ms = _time_cuda(native_requantize_pack, warmup=warmup, repeat=repeat)
+    torch_requantize_pack_ms = _time_cuda(torch_requantize_pack, warmup=warmup, repeat=repeat)
     legacy_training_forward_ms = native_ms + ste_dense_ms
     return {
         "batch": int(batch),
@@ -169,6 +193,9 @@ def benchmark_case(
         "full_bitlinear_forward_ms": full_forward_ms,
         "full_bitlinear_forward_backward_ms": full_forward_backward_ms,
         "legacy_dense_ste_forward_backward_ms": legacy_forward_backward_ms,
+        "native_requantize_pack_ms": native_requantize_pack_ms,
+        "torch_requantize_pack_ms": torch_requantize_pack_ms,
+        "requantize_pack_speedup_vs_torch": torch_requantize_pack_ms / max(native_requantize_pack_ms, 1e-9),
         "legacy_training_forward_native_plus_ste_dense_ms": legacy_training_forward_ms,
         "estimated_training_forward_native_plus_ste_ms": legacy_training_forward_ms,
         "ste_dense_over_native_ratio": ste_dense_ms / max(native_ms, 1e-9),

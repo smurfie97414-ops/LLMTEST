@@ -1,6 +1,6 @@
 # Cortex-3 Architecture Self-Critique
 
-Etat: boucle d'audit 5 apres integration du kernel CUDA natif tuilé/warp, de l'autotune CUDA mesure/cache, des profils persistants, du fast STE autograd et du backward `grad_input` natif sur poids int2 packes.
+Etat: boucle d'audit 6 apres integration du kernel CUDA natif tuilé/warp, de l'autotune CUDA mesure/cache, des profils persistants, du fast STE autograd, du backward `grad_input` natif sur poids int2 packes et de la requantization/packing CUDA fusionnee post-update.
 
 Ce document sert de registre de critique et de correction. Il ne remplace pas les tests longs interdits pour cette iteration; il se limite aux preuves courtes disponibles, aux rapports du code et aux benchmarks GPU courts.
 
@@ -87,10 +87,18 @@ Ce document sert de registre de critique et de correction. Il ne remplace pas le
 
 - Critique: apres C9, le forward training ne payait plus le `F.linear` dense STE, mais le backward reconstruisait encore un poids dense pour calculer `grad_input`. Cela limitait la valeur "hardware-native ternary" pendant l'entrainement.
 - Correction: ajout de kernels `ternary_grad_input_warp_fp32/fp16/bf16`. Le backward CUDA de `_PackedTernarySTEFunction` calcule maintenant `grad_input = grad_output @ W_ternary` directement depuis les codes int2 packes, les scales et le residual optionnel, avec accumulation fp32 par warp.
-- Verification courte: `test_native_ternary_cuda_fast_ste_backward_matches_dense_ste` compare pertes, `grad_input`, `grad_weight` et `grad_bias` entre fast STE natif et dense STE en fp32/fp16/bf16, avec et sans residual runtime, sur GPU. Benchmark RTX 5070 `128x256x256 fp16`: forward+backward fast STE `1.0521 ms` contre dense STE legacy `1.3243 ms`, soit `1.26x`, erreur max `0.000976`.
+- Verification courte: `test_native_ternary_cuda_fast_ste_backward_matches_dense_ste` compare pertes, `grad_input`, `grad_weight` et `grad_bias` entre fast STE natif et dense STE en fp32/fp16/bf16, avec et sans residual runtime, sur GPU. Benchmark RTX 5070 `128x256x256 fp16`: forward+backward fast STE `0.9865 ms` contre dense STE legacy `1.3301 ms`, soit `1.35x`, erreur max `0.000976`.
 - Statut: corrige pour `grad_input`; `grad_weight = grad_output^T @ input` reste volontairement dense/exact dans PyTorch, et le packaging C++/CUDA bas niveau reste ouvert.
 
-## Critique phase par phase - boucle 5
+### C12. Requantization/packing post-optimizer encore tensorielle
+
+- Critique: C10 evitait le repack a chaque forward inutile, mais apres chaque optimizer step ou patch P7/P10 il fallait encore regenerer `signs`, `mask`, `scales`, `residual_weight` et `packed_codes`. Le chemin precedent etait une suite d'operations PyTorch tensorielles, donc pas un noyau ternaire fusionne de training.
+- Correction: ajout de `ternary_requantize_pack_fp32/fp16/bf16`, un RawKernel CUDA row-wise. Chaque block reduit `abs(weight)` pour calculer la scale, applique le seuil, ecrit signs/mask/residual, packe directement les codes int2 et retourne le compte d'actifs par ligne. `_sync_quantized_buffers_from_weight` l'utilise automatiquement sur CUDA/shared-scale et leve l'erreur si `require_native_cuda_kernel=True` mais que le kernel echoue.
+- Debug effectue: la premiere version activait trop de poids avec seuil fixe parce que les scalaires RawKernel etaient passes sans type explicite; les arguments sont maintenant forces en `cp.int32`/`cp.float32`.
+- Verification courte: `test_native_ternary_cuda_requantize_pack_matches_torch_sync` compare signs, mask, scales, residuals, packed codes et compte d'actifs contre le chemin PyTorch en fp32/fp16/bf16, avec threshold automatique et seuil fixe plus residual threshold. Benchmark RTX 5070 `128x256x256 fp16`: requantize/pack natif `0.2245 ms` contre PyTorch `0.5901 ms`, soit `2.63x`.
+- Statut: corrige pour le chemin post-update local; reste a profiler sur toutes les shapes LLM et a sortir de CuPy/NVRTC vers extension CUDA/C++.
+
+## Critique phase par phase - boucle 6
 
 ### P1 - Verifier OS
 
@@ -102,10 +110,10 @@ Ce document sert de registre de critique et de correction. Il ne remplace pas le
 
 ### P2 - Ternary Core
 
-- Ce qui est solide: poids ternaires packes int2, quantization activations, STE, sync versionnee des buffers packes pendant training, kernels CUDA natifs tuiles/warp, autotune CUDA-event par shape, profil JSON persistant, cache layer-local, fast STE autograd forward, backward CUDA `grad_input` depuis poids int2 packes, audit LLM exigeant native kernel autotune sur CUDA.
-- Preuve actuelle: tests CUDA courts, export/import profil, tests gradients fast-vs-dense STE en fp32/fp16/bf16, benchmark RTX 5070 avec full forward et forward+backward profile, full Cortex court avec `native_ternary_autotuned_dispatches`.
+- Ce qui est solide: poids ternaires packes int2, quantization activations, STE, sync versionnee des buffers packes pendant training, kernels CUDA natifs tuiles/warp, autotune CUDA-event par shape, profil JSON persistant, cache layer-local, fast STE autograd forward, backward CUDA `grad_input` depuis poids int2 packes, requantization/packing post-update fusionnee CUDA, audit LLM exigeant native kernel autotune sur CUDA.
+- Preuve actuelle: tests CUDA courts, export/import profil, tests gradients fast-vs-dense STE en fp32/fp16/bf16, test de parite requantize/pack fp32/fp16/bf16, benchmark RTX 5070 avec full forward, forward+backward et requantize/pack profile, full Cortex court avec `native_ternary_autotuned_dispatches`.
 - Faiblesse: kernels encore CuPy/NVRTC, pas extension C++/CUDA packagee; pas de mesure energie/VRAM longue; `grad_weight` STE reste dense pour conserver l'exactitude du gradient.
-- Risque architectural: le chemin training utilise maintenant les codes int2 en forward et pour `grad_input`, mais le gain hardware complet demandera un kernel backward plus complet ou une strategie d'optimisation qui evite/compresse le `grad_weight` dense.
+- Risque architectural: le chemin training utilise maintenant les codes int2 en forward, pour `grad_input`, et pendant le repack post-update, mais le gain hardware complet demandera un kernel backward plus complet ou une strategie d'optimisation qui evite/compresse le `grad_weight` dense.
 - Correction prioritaire restante: reduire ou fusionner le cout `grad_weight` STE sans casser la semantique d'apprentissage, puis profiler energie/VRAM.
 
 ### P3 - Future Contract / FSP / MTP
@@ -206,7 +214,7 @@ Ce document sert de registre de critique et de correction. Il ne remplace pas le
 
 ### Ternary Core W in {-1,0,+1}
 
-- Statut: le forward lit les codes packes int2 et lance CUDA natif sur GPU; le backward CUDA calcule aussi `grad_input` depuis les codes int2 packes.
+- Statut: le forward lit les codes packes int2 et lance CUDA natif sur GPU; le backward CUDA calcule aussi `grad_input` depuis les codes int2 packes; la resynchronisation post-update requantize et repack directement en CUDA.
 - Faiblesse: `grad_weight` STE reste dense et les kernels sont encore CuPy/NVRTC.
 - Correction restante: compresser/fusionner le calcul `grad_weight` et packager en extension CUDA/C++.
 
