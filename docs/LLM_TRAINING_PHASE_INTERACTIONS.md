@@ -721,7 +721,8 @@ Etat actuel :
 - `BitLinear` tourne dans le forward avec valeur runtime issue de buffers `packed_codes` int2 ;
 - sur CUDA, le forward peut lancer les kernels natifs CuPy RawKernel `tiled_shared_memory_int2` ou `warp_reduction_int2` via DLPack zero-copy ;
 - en mode `auto`, le forward mesure les deux variants sur la shape courante, cache le meilleur choix par device/dtype/shape, peut persister/recharger le profil et trace les temps candidats ;
-- le coeur est requantifie apres optimizer step et apres patchs P7/P10 ;
+- le chemin packe utilise un autograd custom : le forward retourne la valeur native/packee sans `F.linear` STE dense, et le backward conserve les gradients STE vers input, poids et bias ;
+- les buffers packes sont resynchronises par version de poids, donc pas repackes a chaque forward inutilement, puis explicitement requantifies apres optimizer step et apres patchs P7/P10 ;
 - les traces P2 prouvent une execution ternaire-compatible pendant le run ;
 - un smoke test CUDA verifie les backends natifs sur GPU local avec gradient STE non nul ;
 - `tools/benchmark_ternary_kernel.py` fournit un benchmark reproductible du kernel natif contre unpack+`F.linear`.

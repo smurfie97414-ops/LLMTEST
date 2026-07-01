@@ -143,6 +143,34 @@ class ReportingAndTernaryTest(unittest.TestCase):
         self.assertGreater(float(layer.float_weight.grad.abs().sum()), 0.0)
         self.assertEqual(layer.ledger.packed_ternary_dispatches[-1].packed_weight_bytes, layer.packed_codes.numel())
 
+    def test_bitlinear_fast_ste_autograd_matches_dense_ste_gradients(self):
+        import torch
+
+        torch.manual_seed(19)
+        fast = BitLinear(BitLinearConfig(5, 4, activation_bits=0, residual_runtime=False, use_fast_ste_autograd=True))
+        dense = BitLinear(BitLinearConfig(5, 4, activation_bits=0, residual_runtime=False, use_fast_ste_autograd=False))
+        with torch.no_grad():
+            dense.float_weight.copy_(fast.float_weight)
+            if fast.bias is not None and dense.bias is not None:
+                dense.bias.copy_(fast.bias)
+        fast.requantize()
+        dense.requantize()
+        x_fast = torch.randn(6, 5, requires_grad=True)
+        x_dense = x_fast.detach().clone().requires_grad_(True)
+
+        fast_loss = fast(x_fast).square().mean()
+        dense_loss = dense(x_dense).square().mean()
+        fast_loss.backward()
+        dense_loss.backward()
+
+        self.assertTrue(torch.allclose(fast_loss.detach(), dense_loss.detach(), atol=1e-7))
+        self.assertTrue(torch.allclose(x_fast.grad, x_dense.grad, atol=1e-6))
+        self.assertTrue(torch.allclose(fast.float_weight.grad, dense.float_weight.grad, atol=1e-6))
+        self.assertIsNotNone(fast.bias.grad)
+        self.assertIsNotNone(dense.bias.grad)
+        self.assertTrue(torch.allclose(fast.bias.grad, dense.bias.grad, atol=1e-6))
+        self.assertIn("custom autograd STE backward", fast.ledger.packed_ternary_dispatches[-1].note)
+
     def test_bitlinear_packed_runtime_syncs_after_weight_update_without_manual_requantize(self):
         import torch
         import torch.nn.functional as F
@@ -164,6 +192,30 @@ class ReportingAndTernaryTest(unittest.TestCase):
 
         self.assertTrue(torch.allclose(actual, expected, atol=1e-6))
         self.assertGreater(layer.ledger.total_packed_ternary_dispatches, 0)
+
+    def test_bitlinear_skips_repack_when_weight_version_is_unchanged(self):
+        import torch
+
+        torch.manual_seed(29)
+        layer = BitLinear(BitLinearConfig(4, 3, activation_bits=0, residual_runtime=False))
+        original_sync = layer._sync_quantized_buffers_from_weight
+        sync_calls = 0
+
+        def counted_sync(*args, **kwargs):
+            nonlocal sync_calls
+            sync_calls += 1
+            return original_sync(*args, **kwargs)
+
+        layer._sync_quantized_buffers_from_weight = counted_sync
+        x = torch.randn(5, 4)
+        layer(x)
+        layer(x)
+        self.assertEqual(sync_calls, 0)
+
+        with torch.no_grad():
+            layer.float_weight.add_(0.125)
+        layer(x)
+        self.assertEqual(sync_calls, 1)
 
     @unittest.skipUnless(
         __import__("torch").cuda.is_available() and native_ternary_cuda_available(),

@@ -109,7 +109,7 @@ def benchmark_case(
     unpacked_ms = _time_cuda(torch_unpacked, warmup=warmup, repeat=repeat)
     ste_dense_ms = _time_cuda(ste_dense, warmup=warmup, repeat=repeat)
     full_forward_ms = _time_cuda(bitlinear_forward, warmup=warmup, repeat=repeat)
-    estimated_training_forward_ms = native_ms + ste_dense_ms
+    legacy_training_forward_ms = native_ms + ste_dense_ms
     return {
         "batch": int(batch),
         "in_features": int(in_features),
@@ -126,8 +126,12 @@ def benchmark_case(
         "torch_unpack_linear_ms": unpacked_ms,
         "ste_dense_ms": ste_dense_ms,
         "full_bitlinear_forward_ms": full_forward_ms,
-        "estimated_training_forward_native_plus_ste_ms": estimated_training_forward_ms,
+        "legacy_training_forward_native_plus_ste_dense_ms": legacy_training_forward_ms,
+        "estimated_training_forward_native_plus_ste_ms": legacy_training_forward_ms,
         "ste_dense_over_native_ratio": ste_dense_ms / max(native_ms, 1e-9),
+        "fast_ste_autograd_enabled": bool(layer.config.use_fast_ste_autograd),
+        "full_forward_speedup_vs_legacy_native_plus_ste_dense": legacy_training_forward_ms / max(full_forward_ms, 1e-9),
+        "full_forward_over_native_ratio": full_forward_ms / max(native_ms, 1e-9),
         "speedup_vs_torch_unpack_linear": unpacked_ms / max(native_ms, 1e-9),
         "speedup_vs_ste_dense": ste_dense_ms / max(native_ms, 1e-9),
         "packed_weight_bytes": int(layer.packed_codes.numel()),

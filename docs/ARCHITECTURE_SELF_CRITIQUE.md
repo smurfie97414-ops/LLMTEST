@@ -1,6 +1,6 @@
 # Cortex-3 Architecture Self-Critique
 
-Etat: boucle d'audit 3 apres integration du kernel CUDA natif tuilé/warp, de l'autotune CUDA mesure/cache et des profils persistants.
+Etat: boucle d'audit 4 apres integration du kernel CUDA natif tuilé/warp, de l'autotune CUDA mesure/cache, des profils persistants et du fast STE autograd.
 
 Ce document sert de registre de critique et de correction. Il ne remplace pas les tests longs interdits pour cette iteration; il se limite aux preuves courtes disponibles, aux rapports du code et aux benchmarks GPU courts.
 
@@ -64,12 +64,26 @@ Ce document sert de registre de critique et de correction. Il ne remplace pas le
 
 ### C8. Cout STE dense rendu mesurable
 
-- Critique: le chemin training utilise encore le STE dense pour garder les gradients, mais on ne mesurait pas son cout separement.
+- Critique: a ce stade de la boucle, le chemin training utilisait encore le STE dense pour garder les gradients, mais on ne mesurait pas son cout separement.
 - Correction: `tools/benchmark_ternary_kernel.py` mesure maintenant `ste_dense_ms`, `full_bitlinear_forward_ms`, `estimated_training_forward_native_plus_ste_ms`, `speedup_vs_ste_dense` et les erreurs vs STE.
 - Verification courte: benchmark RTX 5070 `128x256x256 fp16`: natif `0.0971 ms`, STE dense `0.1963 ms`, estime natif+STE `0.2933 ms`.
 - Statut: instrumentation corrigee; optimisation du backward/STE reste ouverte.
 
-## Critique phase par phase - boucle 3
+### C9. Dense STE calcule dans le forward chaud
+
+- Critique: meme apres kernel natif, `BitLinear.forward` calculait encore `F.linear(x, ste_weight)` pour creer le graphe STE, ce qui ajoutait un cout dense au forward training.
+- Correction: ajout de `_PackedTernarySTEFunction`. Le forward retourne directement la valeur packee/native, sauvegarde les buffers packes, puis le backward reconstruit la contribution STE pour `grad_input`, `grad_weight` et `grad_bias`. Le chemin dense reste disponible via `use_fast_ste_autograd=False` pour debug.
+- Verification courte: test CPU compare pertes, `grad_input`, `grad_weight` et `grad_bias` entre fast-STE et dense-STE; test CUDA verifie native forward + backward; benchmark RTX 5070 `128x256x256 fp16` donne full `BitLinear` forward `0.1323 ms` contre ancien `native+STE dense` `0.3657 ms`, speedup `2.76x`.
+- Statut: corrige pour le forward; backward dense/reconstruction reste le prochain point dur.
+
+### C10. Repack/requantization inutile a chaque forward
+
+- Critique: le forward resynchronisait les buffers `packed_codes` depuis `float_weight` a chaque appel, meme sans changement de poids.
+- Correction: ajout de `_packed_weight_version` base sur la version PyTorch du parametre; repack seulement si la version change. Les modifications optimizer step, P7/P10 ou `copy_` restent detectees.
+- Verification courte: test dedie confirme zero repack sur deux forwards inchanges et un repack apres modification in-place du poids; le test existant de sync apres update reste passant.
+- Statut: corrige.
+
+## Critique phase par phase - boucle 4
 
 ### P1 - Verifier OS
 
@@ -81,11 +95,11 @@ Ce document sert de registre de critique et de correction. Il ne remplace pas le
 
 ### P2 - Ternary Core
 
-- Ce qui est solide: poids ternaires packes int2, quantization activations, STE, sync des buffers packes pendant training, kernels CUDA natifs tuiles/warp, autotune CUDA-event par shape, profil JSON persistant, cache layer-local, audit LLM exigeant native kernel autotune sur CUDA.
-- Preuve actuelle: tests CUDA courts, export/import profil, benchmark RTX 5070 avec STE profile, full Cortex court avec `native_ternary_autotuned_dispatches`.
+- Ce qui est solide: poids ternaires packes int2, quantization activations, STE, sync versionnee des buffers packes pendant training, kernels CUDA natifs tuiles/warp, autotune CUDA-event par shape, profil JSON persistant, cache layer-local, fast STE autograd forward, audit LLM exigeant native kernel autotune sur CUDA.
+- Preuve actuelle: tests CUDA courts, export/import profil, tests gradients fast-vs-dense STE, benchmark RTX 5070 avec full forward profile, full Cortex court avec `native_ternary_autotuned_dispatches`.
 - Faiblesse: kernels encore CuPy/NVRTC, pas extension C++/CUDA packagee; pas de mesure energie/VRAM longue; pas encore de backward kernel custom.
-- Risque architectural: le forward ternaire natif existe, mais le gradient passe encore par STE dense; le gain training total depend donc du cout supplementaire du chemin STE.
-- Correction prioritaire restante: reduire le cout gradient/STE sans enlever la semantique ternaire, puis profiler energie/VRAM.
+- Risque architectural: le forward ternaire natif est maintenant rapide, mais le backward STE reconstruit encore un poids dense et n'a pas de kernel custom.
+- Correction prioritaire restante: reduire le cout backward STE sans enlever la semantique ternaire, puis profiler energie/VRAM.
 
 ### P3 - Future Contract / FSP / MTP
 
@@ -186,8 +200,8 @@ Ce document sert de registre de critique et de correction. Il ne remplace pas le
 ### Ternary Core W in {-1,0,+1}
 
 - Statut: le forward lit les codes packes int2 et lance CUDA natif sur GPU.
-- Faiblesse: backward dense STE.
-- Correction restante: reduire le cout STE/backward.
+- Faiblesse: backward STE reconstruit encore une matrice dense.
+- Correction restante: reduire le cout backward STE.
 
 ### Skill-aware Experts
 
@@ -227,7 +241,7 @@ Ce document sert de registre de critique et de correction. Il ne remplace pas le
 
 ## File de correction priorisee apres boucle 1
 
-1. P2: reduire le cout STE dense/backward sans enlever la semantique ternaire.
+1. P2: reduire le cout backward STE sans enlever la semantique ternaire.
 2. P4: scaler l'ablation learned memory vs deterministic memory sur anchors long-context synthetiques puis held-out.
 3. P6/P7: afficher partout `repair_loss_before`, `repair_loss_after`, `protected_loss_before`, `protected_loss_after`, delta et convention.
 4. P8: aligner `TernaryKernelDispatcher` inference avec les variants `BitLinear` natifs.

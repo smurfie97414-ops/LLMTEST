@@ -555,6 +555,84 @@ def native_ternary_cuda_available() -> bool:
     return True
 
 
+def _unpack_packed_ternary_weight(
+    packed: Any,
+    scales: Any,
+    residual: Any,
+    in_features: int,
+    *,
+    dtype: Any,
+    device: Any,
+    residual_runtime: bool,
+) -> Any:
+    packed = packed.to(device=device, dtype=torch.uint8)
+    words = packed.to(torch.int64)
+    codes = torch.stack(
+        (
+            words & 0x03,
+            (words >> 2) & 0x03,
+            (words >> 4) & 0x03,
+            (words >> 6) & 0x03,
+        ),
+        dim=-1,
+    ).reshape(packed.shape[0], -1)[:, :in_features]
+    zeros = torch.zeros_like(codes, dtype=dtype, device=device)
+    neg = -torch.ones_like(codes, dtype=dtype, device=device)
+    pos = torch.ones_like(codes, dtype=dtype, device=device)
+    weight = torch.where(codes == 1, neg, torch.where(codes == 2, pos, zeros)) * scales.to(device=device, dtype=dtype)
+    if residual_runtime:
+        weight = weight + residual.to(device=device, dtype=dtype)
+    return weight
+
+
+class _PackedTernarySTEFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx: Any,
+        x: Any,
+        float_weight: Any,
+        bias: Any,
+        packed_output: Any,
+        packed_codes: Any,
+        scales: Any,
+        residual_weight: Any,
+        has_bias: bool,
+        in_features: int,
+        residual_runtime: bool,
+    ) -> Any:
+        ctx.input_shape = tuple(int(dim) for dim in x.shape)
+        ctx.has_bias = bool(has_bias)
+        ctx.in_features = int(in_features)
+        ctx.residual_runtime = bool(residual_runtime)
+        ctx.float_weight_dtype = float_weight.dtype
+        ctx.save_for_backward(x, packed_codes.detach(), scales.detach(), residual_weight.detach())
+        return packed_output.detach()
+
+    @staticmethod
+    def backward(ctx: Any, grad_output: Any) -> tuple[Any, ...]:
+        x, packed_codes, scales, residual_weight = ctx.saved_tensors
+        grad_output_flat = grad_output.reshape(-1, grad_output.shape[-1])
+        x_flat = x.reshape(-1, x.shape[-1])
+        grad_x = grad_weight = grad_bias = None
+        if ctx.needs_input_grad[0]:
+            input_weight = _unpack_packed_ternary_weight(
+                packed_codes,
+                scales,
+                residual_weight,
+                ctx.in_features,
+                dtype=grad_output_flat.dtype,
+                device=grad_output_flat.device,
+                residual_runtime=ctx.residual_runtime,
+            )
+            grad_x = grad_output_flat.matmul(input_weight).reshape(ctx.input_shape)
+        if ctx.needs_input_grad[1]:
+            weight_grad = grad_output_flat.transpose(0, 1).matmul(x_flat.to(dtype=grad_output_flat.dtype))
+            grad_weight = weight_grad.to(dtype=ctx.float_weight_dtype)
+        if ctx.has_bias and ctx.needs_input_grad[2]:
+            grad_bias = grad_output_flat.sum(dim=0)
+        return grad_x, grad_weight, grad_bias, None, None, None, None, None, None, None
+
+
 @dataclass(frozen=True)
 class ActivationQuantization:
     original: tuple[float, ...]
@@ -903,6 +981,7 @@ class BitLinearConfig:
     native_cuda_autotune_repeat: int = 3
     native_cuda_autotune_cache_path: str | None = None
     native_cuda_autotune_cache_write: bool = True
+    use_fast_ste_autograd: bool = True
 
 
 class BitLinear(nn.Module):
@@ -929,6 +1008,7 @@ class BitLinear(nn.Module):
         self._last_native_autotune_cache_hit = False
         self._last_native_autotune_candidate_ms: tuple[tuple[str, float], ...] = ()
         self._native_cuda_instance_variant_cache: dict[tuple[Any, ...], tuple[str, tuple[tuple[str, float], ...]]] = {}
+        self._packed_weight_version = -1
         nn.init.kaiming_uniform_(self.float_weight, a=5 ** 0.5)
         self.requantize()
 
@@ -975,21 +1055,20 @@ class BitLinear(nn.Module):
 
     @staticmethod
     def _unpack_codes(packed: Any, in_features: int, *, dtype: Any, device: Any) -> Any:
-        packed = packed.to(device=device, dtype=torch.uint8)
-        words = packed.to(torch.int64)
-        codes = torch.stack(
-            (
-                words & 0x03,
-                (words >> 2) & 0x03,
-                (words >> 4) & 0x03,
-                (words >> 6) & 0x03,
-            ),
-            dim=-1,
-        ).reshape(packed.shape[0], -1)[:, :in_features]
-        zeros = torch.zeros_like(codes, dtype=dtype, device=device)
-        neg = -torch.ones_like(codes, dtype=dtype, device=device)
-        pos = torch.ones_like(codes, dtype=dtype, device=device)
-        return torch.where(codes == 1, neg, torch.where(codes == 2, pos, zeros))
+        scales = torch.ones((packed.shape[0], 1), dtype=dtype, device=device)
+        residual = torch.empty((0,), dtype=dtype, device=device)
+        return _unpack_packed_ternary_weight(
+            packed,
+            scales,
+            residual,
+            in_features,
+            dtype=dtype,
+            device=device,
+            residual_runtime=False,
+        )
+
+    def _current_weight_version(self) -> int:
+        return int(getattr(self.float_weight, "_version", -1))
 
     def _sync_quantized_buffers_from_weight(self, *, certify_zeros: bool = False, record_decision: bool = False) -> None:
         with torch.no_grad():
@@ -1021,6 +1100,7 @@ class BitLinear(nn.Module):
             self._last_active_weights = active_count
             self._last_total_weights = total_count
             self._last_estimated_bits = estimated_bits
+            self._packed_weight_version = self._current_weight_version()
             if not record_decision:
                 return
             threshold_value = threshold.detach().mean() if isinstance(threshold, torch.Tensor) else torch.as_tensor(threshold)
@@ -1038,6 +1118,11 @@ class BitLinear(nn.Module):
                 note="packed int2 ternary requantize tensor-stats",
             )
             self.ledger.record_compression(decision)
+
+    def _ensure_quantized_buffers_current(self) -> None:
+        current_version = self._current_weight_version()
+        if current_version < 0 or current_version != self._packed_weight_version:
+            self._sync_quantized_buffers_from_weight(record_decision=False)
 
     def requantize(self, *, certify_zeros: bool = False) -> None:
         self._sync_quantized_buffers_from_weight(certify_zeros=certify_zeros, record_decision=True)
@@ -1287,10 +1372,9 @@ class BitLinear(nn.Module):
 
     def forward(self, x: Any) -> Any:
         xq = self._quantize_input(x)
-        ste_weight = self._runtime_weight_ste()
         output_note = "BitLinear packed int2 ternary forward"
         if self.config.use_packed_ternary_runtime:
-            self._sync_quantized_buffers_from_weight(record_decision=False)
+            self._ensure_quantized_buffers_current()
             native_kernel = False
             backend = "packed_int2_cuda" if xq.is_cuda else "packed_int2_torch"
             native_note = ""
@@ -1308,20 +1392,41 @@ class BitLinear(nn.Module):
                 except Exception as exc:
                     if self.config.require_native_cuda_kernel:
                         raise
-                    packed_weight = self._packed_runtime_weight(dtype=xq.dtype, device=xq.device)
-                    packed_output = F.linear(xq, packed_weight, self.bias.to(xq.dtype) if self.bias is not None and self.bias.dtype != xq.dtype else self.bias)
+                    with torch.no_grad():
+                        packed_weight = self._packed_runtime_weight(dtype=xq.dtype, device=xq.device)
+                        packed_output = F.linear(xq, packed_weight, self.bias.to(xq.dtype) if self.bias is not None and self.bias.dtype != xq.dtype else self.bias)
                     native_note = f"native kernel unavailable: {type(exc).__name__}: {exc}"
             else:
-                packed_weight = self._packed_runtime_weight(dtype=xq.dtype, device=xq.device)
-                packed_output = F.linear(xq, packed_weight, self.bias.to(xq.dtype) if self.bias is not None and self.bias.dtype != xq.dtype else self.bias)
-            ste_linear_weight = ste_weight
-            ste_linear_bias = self.bias
-            if xq.is_cuda and xq.dtype in {torch.float16, torch.bfloat16}:
-                ste_linear_weight = ste_weight.to(xq.dtype)
-                ste_linear_bias = self.bias.to(xq.dtype) if self.bias is not None else None
-            ste_output = F.linear(xq, ste_linear_weight, ste_linear_bias)
-            output = ste_output + (packed_output - ste_output).detach()
-            max_abs_error = float((packed_output.detach() - ste_output.detach()).abs().max().cpu()) if packed_output.numel() else 0.0
+                with torch.no_grad():
+                    packed_weight = self._packed_runtime_weight(dtype=xq.dtype, device=xq.device)
+                    packed_output = F.linear(xq, packed_weight, self.bias.to(xq.dtype) if self.bias is not None and self.bias.dtype != xq.dtype else self.bias)
+            if self.config.use_fast_ste_autograd:
+                bias_for_backward = self.bias if self.bias is not None else self.float_weight.new_empty(0)
+                output = _PackedTernarySTEFunction.apply(
+                    xq,
+                    self.float_weight,
+                    bias_for_backward,
+                    packed_output,
+                    self.packed_codes,
+                    self.scales,
+                    self.residual_weight,
+                    self.bias is not None,
+                    self.config.in_features,
+                    self.config.residual_runtime,
+                )
+                max_abs_error = 0.0
+                ste_note = "custom autograd STE backward skips dense STE forward"
+            else:
+                ste_weight = self._runtime_weight_ste()
+                ste_linear_weight = ste_weight
+                ste_linear_bias = self.bias
+                if xq.is_cuda and xq.dtype in {torch.float16, torch.bfloat16}:
+                    ste_linear_weight = ste_weight.to(xq.dtype)
+                    ste_linear_bias = self.bias.to(xq.dtype) if self.bias is not None else None
+                ste_output = F.linear(xq, ste_linear_weight, ste_linear_bias)
+                output = ste_output + (packed_output - ste_output).detach()
+                max_abs_error = float((packed_output.detach() - ste_output.detach()).abs().max().cpu()) if packed_output.numel() else 0.0
+                ste_note = "dense STE forward compatibility path"
             self.ledger.record_packed_ternary_dispatch(PackedTernaryDispatch(
                 layer_id=self.config.log_prefix,
                 backend=backend,
@@ -1334,6 +1439,7 @@ class BitLinear(nn.Module):
                 note=(
                     "forward value read from packed 2-bit ternary weight buffer; gradient uses STE"
                     + (f"; {native_note}" if native_note else "")
+                    + f"; {ste_note}"
                 ),
                 native_kernel=native_kernel,
                 kernel_variant=getattr(self, "_last_native_kernel_variant", "") if native_kernel else "torch_unpack_linear",
@@ -1346,6 +1452,7 @@ class BitLinear(nn.Module):
                 ),
             ))
         else:
+            ste_weight = self._runtime_weight_ste()
             output = F.linear(xq, ste_weight, self.bias)
             max_abs_error = 0.0
             output_note = "BitLinear STE ternary forward"
