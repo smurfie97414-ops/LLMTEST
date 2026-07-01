@@ -739,7 +739,7 @@ Etat actuel :
 - un smoke test CUDA verifie les backends natifs sur GPU local avec gradient STE non nul ;
 - `tools/train_llm.py profile-batch` lance un vrai batch training Cortex strict avec optimizer, backward, requantize, P1-P10, monitoring CPU/GPU/power/VRAM et snapshot memoire CUDA torch ;
 - `tools/train_llm.py profile-matrix` repete ce profil sur plusieurs shapes et seeds, ecrit JSON/CSV agreges, et rend bloquants `min_cases`, `require_multi_shape`, `require_multi_seed`, extension-only, all-phases-active et les seuils optionnels de throughput/GPU/VRAM/puissance ;
-- `tools/train_llm.py profile-autosize` estime les candidats avec la config Cortex complete, selectionne les shapes qui rentrent dans un budget memoire/VRAM, mesure les meilleurs candidats par defaut avec `--measure-candidate-count`, refuse les candidats dont la VRAM observee max depasse le budget quand le signal GPU existe, selectionne alors uniquement parmi les mesures passantes, puis lance `profile-matrix` sur les shapes choisies ;
+- `tools/train_llm.py profile-autosize` estime les candidats avec la config Cortex complete, selectionne les shapes et `gradient_accumulation_steps` qui rentrent dans un budget memoire/VRAM, mesure les meilleurs candidats par defaut avec `--measure-candidate-count`, refuse les candidats dont la VRAM observee max depasse le budget quand le signal GPU existe, selectionne alors uniquement parmi les mesures passantes, puis lance `profile-matrix` sur les shapes choisies ;
 - `tools/benchmark_ternary_kernel.py` fournit un benchmark reproductible du kernel natif contre unpack+`F.linear`.
 
 Limite restante :

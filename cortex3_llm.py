@@ -9034,6 +9034,10 @@ def _normalize_profile_shape_spec(spec: Mapping[str, Any], *, default_batch_size
         "n_layers": int(spec.get("n_layers", spec.get("layers", 0))),
         "batch_size": int(spec.get("batch_size", spec.get("batch", default_batch_size))),
     }
+    if "gradient_accumulation_steps" in spec or "grad_accum" in spec or "g" in spec:
+        normalized["gradient_accumulation_steps"] = int(
+            spec.get("gradient_accumulation_steps", spec.get("grad_accum", spec.get("g", 0)))
+        )
     for key, value in normalized.items():
         if value <= 0:
             raise ValueError(f"profile shape field {key} must be positive, got {value}")
@@ -9046,10 +9050,13 @@ def _normalize_profile_shape_spec(spec: Mapping[str, Any], *, default_batch_size
 
 
 def _profile_shape_key(shape: Mapping[str, int]) -> str:
-    return (
+    key = (
         f"seq{int(shape['seq_len'])}_d{int(shape['d_model'])}_"
         f"h{int(shape['n_heads'])}_l{int(shape['n_layers'])}_b{int(shape['batch_size'])}"
     )
+    if "gradient_accumulation_steps" in shape:
+        key += f"_g{int(shape['gradient_accumulation_steps'])}"
+    return key
 
 
 def _profile_shape_memory_estimate(
@@ -9162,21 +9169,23 @@ def _profile_autosize_candidate(
     native_ternary_backend: str,
     budget_bytes: int,
 ) -> Mapping[str, Any]:
+    shape_gradient_accumulation_steps = int(shape.get("gradient_accumulation_steps", gradient_accumulation_steps))
     estimate = _profile_shape_memory_estimate(
         shape,
         vocab_size=vocab_size,
         precision=precision,
         device=device,
         require_cuda=require_cuda,
-        gradient_accumulation_steps=gradient_accumulation_steps,
+        gradient_accumulation_steps=shape_gradient_accumulation_steps,
         native_ternary_backend=native_ternary_backend,
     )
     estimated_peak = int(estimate["estimated_peak_training_bytes"])
-    tokens_per_step = int(shape["seq_len"]) * int(shape["batch_size"]) * int(gradient_accumulation_steps)
+    tokens_per_step = int(shape["seq_len"]) * int(shape["batch_size"]) * shape_gradient_accumulation_steps
     score = float(estimated_peak) * math.log2(max(tokens_per_step, 2))
     return {
         "shape": dict(shape),
         "shape_key": _profile_shape_key(shape),
+        "gradient_accumulation_steps": shape_gradient_accumulation_steps,
         "memory_estimate": estimate,
         "estimated_peak_training_bytes": estimated_peak,
         "budget_bytes": int(budget_bytes),
@@ -9349,6 +9358,7 @@ def run_llm_batch_profile_matrix(
     case_index = 0
     for shape_index, shape in enumerate(normalized_shapes):
         shape_key = _profile_shape_key(shape)
+        shape_gradient_accumulation_steps = int(shape.get("gradient_accumulation_steps", gradient_accumulation_steps))
         for seed in normalized_seeds:
             case_id = f"case_{case_index:03d}_{shape_key}_seed{seed}"
             case_dir = output_dir / "cases" / case_id
@@ -9356,7 +9366,7 @@ def run_llm_batch_profile_matrix(
                 out_dir=case_dir,
                 steps=steps,
                 batch_size=int(shape["batch_size"]),
-                gradient_accumulation_steps=gradient_accumulation_steps,
+                gradient_accumulation_steps=shape_gradient_accumulation_steps,
                 seq_len=int(shape["seq_len"]),
                 d_model=int(shape["d_model"]),
                 n_heads=int(shape["n_heads"]),
@@ -9390,6 +9400,7 @@ def run_llm_batch_profile_matrix(
                 "n_heads": int(shape["n_heads"]),
                 "n_layers": int(shape["n_layers"]),
                 "batch_size": int(shape["batch_size"]),
+                "gradient_accumulation_steps": shape_gradient_accumulation_steps,
                 "passed": bool(profile.get("passed")),
                 "failed_checks": ";".join(case_failed),
                 "planned_train_tokens": int(profile.get("throughput", {}).get("planned_train_tokens", 0)),
@@ -9487,6 +9498,9 @@ def run_llm_batch_profile_matrix(
         "config": {
             "steps": int(steps),
             "gradient_accumulation_steps": int(gradient_accumulation_steps),
+            "shape_specific_gradient_accumulation_steps": any(
+                "gradient_accumulation_steps" in shape for shape in normalized_shapes
+            ),
             "vocab_size": int(vocab_size),
             "precision": precision,
             "device": device,
@@ -9526,6 +9540,7 @@ def run_llm_batch_profile_autosize(
     candidate_d_models: Sequence[int],
     candidate_n_layers: Sequence[int],
     candidate_batch_sizes: Sequence[int],
+    candidate_gradient_accumulation_steps: Sequence[int] | None = None,
     n_heads: int = 4,
     selected_shape_count: int = 2,
     min_selected_shapes: int = 1,
@@ -9575,6 +9590,19 @@ def run_llm_batch_profile_autosize(
     normalized_seeds = tuple(int(seed) for seed in seeds)
     if not normalized_seeds:
         raise ValueError("at least one autosize seed is required")
+    if candidate_gradient_accumulation_steps is None:
+        base_gradient_accumulation_steps = int(gradient_accumulation_steps)
+        normalized_candidate_gradient_accumulation_steps = tuple(
+            dict.fromkeys((base_gradient_accumulation_steps, max(2, base_gradient_accumulation_steps)))
+        )
+    else:
+        normalized_candidate_gradient_accumulation_steps = tuple(
+            dict.fromkeys(int(value) for value in candidate_gradient_accumulation_steps)
+        )
+    if not normalized_candidate_gradient_accumulation_steps:
+        raise ValueError("at least one candidate gradient accumulation value is required")
+    if any(int(value) <= 0 for value in normalized_candidate_gradient_accumulation_steps):
+        raise ValueError("candidate gradient accumulation values must be positive")
     budget = _profile_autosize_budget(
         memory_budget_mb=memory_budget_mb,
         memory_budget_fraction=memory_budget_fraction,
@@ -9589,38 +9617,52 @@ def run_llm_batch_profile_autosize(
         for d_model in candidate_d_models:
             for n_layers in candidate_n_layers:
                 for batch_size in candidate_batch_sizes:
-                    try:
-                        shape = _normalize_profile_shape_spec(
-                            {
-                                "seq_len": int(seq_len),
-                                "d_model": int(d_model),
-                                "n_heads": int(n_heads),
-                                "n_layers": int(n_layers),
-                                "batch_size": int(batch_size),
-                            },
-                            default_batch_size=int(batch_size),
+                    for candidate_gradient_accumulation_step in normalized_candidate_gradient_accumulation_steps:
+                        try:
+                            shape = _normalize_profile_shape_spec(
+                                {
+                                    "seq_len": int(seq_len),
+                                    "d_model": int(d_model),
+                                    "n_heads": int(n_heads),
+                                    "n_layers": int(n_layers),
+                                    "batch_size": int(batch_size),
+                                    "gradient_accumulation_steps": int(candidate_gradient_accumulation_step),
+                                },
+                                default_batch_size=int(batch_size),
+                            )
+                        except ValueError as exc:
+                            rejected.append(
+                                {
+                                    "shape": {
+                                        "seq_len": seq_len,
+                                        "d_model": d_model,
+                                        "n_heads": n_heads,
+                                        "n_layers": n_layers,
+                                        "batch_size": batch_size,
+                                        "gradient_accumulation_steps": candidate_gradient_accumulation_step,
+                                    },
+                                    "reason": str(exc),
+                                }
+                            )
+                            continue
+                        shape_key = _profile_shape_key(shape)
+                        if shape_key in seen_shapes:
+                            continue
+                        seen_shapes.add(shape_key)
+                        candidate = _profile_autosize_candidate(
+                            shape,
+                            vocab_size=vocab_size,
+                            precision=precision,
+                            device=device,
+                            require_cuda=require_cuda,
+                            gradient_accumulation_steps=gradient_accumulation_steps,
+                            native_ternary_backend=native_ternary_backend,
+                            budget_bytes=budget_bytes,
                         )
-                    except ValueError as exc:
-                        rejected.append({"shape": {"seq_len": seq_len, "d_model": d_model, "n_heads": n_heads, "n_layers": n_layers, "batch_size": batch_size}, "reason": str(exc)})
-                        continue
-                    shape_key = _profile_shape_key(shape)
-                    if shape_key in seen_shapes:
-                        continue
-                    seen_shapes.add(shape_key)
-                    candidate = _profile_autosize_candidate(
-                        shape,
-                        vocab_size=vocab_size,
-                        precision=precision,
-                        device=device,
-                        require_cuda=require_cuda,
-                        gradient_accumulation_steps=gradient_accumulation_steps,
-                        native_ternary_backend=native_ternary_backend,
-                        budget_bytes=budget_bytes,
-                    )
-                    if bool(candidate["fits_budget"]):
-                        candidates.append(candidate)
-                    else:
-                        rejected.append({**candidate, "reason": "estimated_peak_exceeds_budget"})
+                        if bool(candidate["fits_budget"]):
+                            candidates.append(candidate)
+                        else:
+                            rejected.append({**candidate, "reason": "estimated_peak_exceeds_budget"})
     ranked_candidates = sorted(
         candidates,
         key=lambda item: (
@@ -9659,7 +9701,7 @@ def run_llm_batch_profile_autosize(
                     out_dir=measure_dir,
                     steps=steps,
                     batch_size=int(shape["batch_size"]),
-                    gradient_accumulation_steps=gradient_accumulation_steps,
+                    gradient_accumulation_steps=int(shape.get("gradient_accumulation_steps", gradient_accumulation_steps)),
                     seq_len=int(shape["seq_len"]),
                     d_model=int(shape["d_model"]),
                     n_heads=int(shape["n_heads"]),
@@ -9761,6 +9803,7 @@ def run_llm_batch_profile_autosize(
             "candidate_d_models": tuple(int(value) for value in candidate_d_models),
             "candidate_n_layers": tuple(int(value) for value in candidate_n_layers),
             "candidate_batch_sizes": tuple(int(value) for value in candidate_batch_sizes),
+            "candidate_gradient_accumulation_steps": normalized_candidate_gradient_accumulation_steps,
             "n_heads": int(n_heads),
         },
         "selection": {
@@ -9856,23 +9899,29 @@ def _parse_profile_shape_specs(raw: str) -> tuple[Mapping[str, int], ...]:
     specs: list[Mapping[str, int]] = []
     for part in _parse_list(raw):
         tokens = tuple(token for token in part.lower().replace("*", "x").split("x") if token)
-        if len(tokens) != 5:
+        if len(tokens) not in (5, 6):
             raise ValueError(
                 f"invalid profile shape {part!r}; expected seq_lenxd_modelxn_headsxn_layersxbatch_size"
+                " or seq_lenxd_modelxn_headsxn_layersxbatch_sizexgradient_accumulation_steps"
             )
         try:
-            seq_len, d_model, n_heads, n_layers, batch_size = (int(token) for token in tokens)
+            parsed_tokens = tuple(int(token) for token in tokens)
         except ValueError as exc:
             raise ValueError(f"invalid profile shape {part!r}; all dimensions must be integers") from exc
+        seq_len, d_model, n_heads, n_layers, batch_size = parsed_tokens[:5]
+        gradient_accumulation_steps = parsed_tokens[5] if len(parsed_tokens) == 6 else None
+        shape_spec = {
+            "seq_len": seq_len,
+            "d_model": d_model,
+            "n_heads": n_heads,
+            "n_layers": n_layers,
+            "batch_size": batch_size,
+        }
+        if gradient_accumulation_steps is not None:
+            shape_spec["gradient_accumulation_steps"] = gradient_accumulation_steps
         specs.append(
             _normalize_profile_shape_spec(
-                {
-                    "seq_len": seq_len,
-                    "d_model": d_model,
-                    "n_heads": n_heads,
-                    "n_layers": n_layers,
-                    "batch_size": batch_size,
-                },
+                shape_spec,
                 default_batch_size=batch_size,
             )
         )
@@ -9974,7 +10023,7 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     profile_matrix = sub.add_parser("profile-matrix", help="profile strict Cortex LLM training across multiple shapes and seeds")
     profile_matrix.add_argument("--out-dir", default="runs/llm-batch-profile-matrix")
-    profile_matrix.add_argument("--profile-shapes", default="32x64x4x2x8,40x64x4x2x8", help="comma/space list of seq_lenxd_modelxn_headsxn_layersxbatch_size specs")
+    profile_matrix.add_argument("--profile-shapes", default="32x64x4x2x8,40x64x4x2x8", help="comma/space list of seq_lenxd_modelxn_headsxn_layersxbatch_size specs, optionally with xgradient_accumulation_steps")
     profile_matrix.add_argument("--seeds", default="71,73")
     profile_matrix.add_argument("--steps", type=int, default=1)
     profile_matrix.add_argument("--gradient-accumulation-steps", type=int, default=1)
@@ -10002,6 +10051,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     profile_autosize.add_argument("--candidate-d-models", default="64,96")
     profile_autosize.add_argument("--candidate-n-layers", default="2")
     profile_autosize.add_argument("--candidate-batch-sizes", default="4,8")
+    profile_autosize.add_argument("--candidate-gradient-accumulation-steps", default=None, help="comma/space list of gradient accumulation values to search; default searches the requested value and at least 2")
     profile_autosize.add_argument("--n-heads", type=int, default=4)
     profile_autosize.add_argument("--selected-shape-count", type=int, default=2)
     profile_autosize.add_argument("--min-selected-shapes", type=int, default=1)
@@ -10381,6 +10431,11 @@ def main(argv: Sequence[str] | None = None) -> None:
             candidate_d_models=_parse_positive_int_list(args.candidate_d_models, name="candidate-d-models"),
             candidate_n_layers=_parse_positive_int_list(args.candidate_n_layers, name="candidate-n-layers"),
             candidate_batch_sizes=_parse_positive_int_list(args.candidate_batch_sizes, name="candidate-batch-sizes"),
+            candidate_gradient_accumulation_steps=(
+                None
+                if args.candidate_gradient_accumulation_steps is None
+                else _parse_positive_int_list(args.candidate_gradient_accumulation_steps, name="candidate-gradient-accumulation-steps")
+            ),
             n_heads=args.n_heads,
             selected_shape_count=args.selected_shape_count,
             min_selected_shapes=args.min_selected_shapes,
