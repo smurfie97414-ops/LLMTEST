@@ -332,6 +332,44 @@ class ReportingAndTernaryTest(unittest.TestCase):
         self.assertGreater(payload["total_event_counts"].get("native_ternary_extension_requantize_dispatches", 0), 0)
         self.assertGreater(payload["total_event_counts"].get("native_ternary_extension_grad_weight_dispatches", 0), 0)
 
+    def test_bitlinear_native_extension_cuda_forward_wmma_matches_packed_runtime(self):
+        import torch
+        import torch.nn.functional as F
+
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA is required")
+        if not native_ternary_cuda_extension_available():
+            self.skipTest("Cortex ternary CUDA extension is not buildable in this environment")
+
+        cases = [(torch.float16, 32, 32, 32, 2e-3)]
+        if torch.cuda.is_bf16_supported():
+            cases.append((torch.bfloat16, 31, 33, 35, 2e-2))
+        for dtype, rows, in_features, out_features, atol in cases:
+            with self.subTest(dtype=str(dtype), shape=(rows, in_features, out_features)):
+                torch.manual_seed(440 + rows + in_features + out_features)
+                layer = BitLinear(BitLinearConfig(
+                    in_features,
+                    out_features,
+                    activation_bits=0,
+                    residual_runtime=True,
+                    require_native_cuda_kernel=True,
+                    native_cuda_backend="extension",
+                    native_cuda_kernel_variant="wmma",
+                    native_cuda_autotune=False,
+                    log_prefix="cuda-extension-wmma-forward",
+                )).cuda()
+                layer.requantize()
+                x = torch.randn(rows, in_features, device="cuda", dtype=dtype)
+
+                native = layer._native_cuda_packed_output(x)
+                packed_weight = layer._packed_runtime_weight(dtype=dtype, device=x.device)
+                reference = F.linear(x, packed_weight, layer.bias.to(device=x.device, dtype=dtype))
+                torch.cuda.synchronize()
+
+                self.assertEqual(tuple(native.shape), (rows, out_features))
+                self.assertEqual(layer._last_native_kernel_variant, "wmma_tensor_core_int2")
+                self.assertTrue(torch.allclose(native.float(), reference.float(), atol=atol, rtol=atol))
+
     def test_bitlinear_native_extension_cuda_grad_weight_uses_wmma_when_aligned(self):
         import torch
 
@@ -662,6 +700,35 @@ class ReportingAndTernaryTest(unittest.TestCase):
         self.assertTrue(layer._last_native_autotune_cache_hit)
         self.assertEqual(tuple(layer._last_native_autotune_candidate_ms), first_candidates)
         self.assertEqual(layer._last_native_kernel_family, selected)
+
+    def test_native_ternary_auto_kernel_includes_wmma_for_large_cuda_shapes(self):
+        import torch
+
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA is required")
+        if not native_ternary_cuda_extension_available():
+            self.skipTest("Cortex ternary CUDA extension is not buildable in this environment")
+        clear_native_ternary_autotune_cache()
+        layer = BitLinear(BitLinearConfig(
+            512,
+            512,
+            activation_bits=0,
+            require_native_cuda_kernel=True,
+            native_cuda_backend="extension",
+            native_cuda_kernel_variant="auto",
+            native_cuda_autotune_warmup=0,
+            native_cuda_autotune_repeat=1,
+        )).cuda()
+        x = torch.randn(32, 512, device="cuda", dtype=torch.float16)
+
+        output = layer._native_cuda_packed_output(x)
+        torch.cuda.synchronize()
+        candidates = tuple(layer._last_native_autotune_candidate_ms)
+        self.assertEqual(tuple(output.shape), (32, 512))
+        self.assertEqual({name for name, _ in candidates}, {"tiled", "warp", "wmma"})
+        selected = min(candidates, key=lambda item: item[1])[0]
+        self.assertEqual(layer._last_native_kernel_family, selected)
+        self.assertEqual(layer._last_native_kernel_variant, layer._native_cuda_variant_label(selected))
 
     @unittest.skipUnless(
         __import__("torch").cuda.is_available() and native_ternary_cuda_available(),

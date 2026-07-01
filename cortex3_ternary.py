@@ -533,6 +533,142 @@ extern "C" __global__ void ternary_matmul_tiled_bf16(
   }
 }
 
+extern "C" __global__ void ternary_matmul_wmma_fp16(
+    const __half* x,
+    const unsigned char* packed,
+    const float* scales,
+    const float* residual,
+    const float* bias,
+    __half* out,
+    int m_rows,
+    int n_cols,
+    int k_cols,
+    int packed_stride,
+    int use_residual,
+    int has_bias) {
+  using namespace nvcuda;
+  int tile_n = blockIdx.x;
+  int tile_m = blockIdx.y;
+  int m0 = tile_m * 16;
+  int n0 = tile_n * 16;
+
+  __shared__ __half x_tile[16 * 16];
+  __shared__ __half weight_tile[16 * 16];
+  __shared__ float output_tile[16 * 16];
+
+  wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> x_frag;
+  wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::row_major> weight_frag;
+  wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc_frag;
+  wmma::fill_fragment(acc_frag, 0.0f);
+
+  for (int k0 = 0; k0 < k_cols; k0 += 16) {
+    for (int offset = threadIdx.x; offset < 16 * 16; offset += blockDim.x) {
+      int local_m_or_k = offset / 16;
+      int local_k_or_n = offset - local_m_or_k * 16;
+
+      int m = m0 + local_m_or_k;
+      int x_k = k0 + local_k_or_n;
+      x_tile[offset] = (m < m_rows && x_k < k_cols)
+          ? x[m * k_cols + x_k]
+          : __float2half_rn(0.0f);
+
+      int weight_k = k0 + local_m_or_k;
+      int n = n0 + local_k_or_n;
+      float w = (weight_k < k_cols && n < n_cols)
+          ? c3_decode_weight(packed, scales, residual, n, weight_k, packed_stride, k_cols, use_residual)
+          : 0.0f;
+      weight_tile[offset] = __float2half_rn(w);
+    }
+    __syncthreads();
+    wmma::load_matrix_sync(x_frag, x_tile, 16);
+    wmma::load_matrix_sync(weight_frag, weight_tile, 16);
+    wmma::mma_sync(acc_frag, x_frag, weight_frag, acc_frag);
+    __syncthreads();
+  }
+
+  wmma::store_matrix_sync(output_tile, acc_frag, 16, wmma::mem_row_major);
+  __syncthreads();
+  for (int offset = threadIdx.x; offset < 16 * 16; offset += blockDim.x) {
+    int local_m = offset / 16;
+    int local_n = offset - local_m * 16;
+    int m = m0 + local_m;
+    int n = n0 + local_n;
+    if (m < m_rows && n < n_cols) {
+      float value = output_tile[offset];
+      if (has_bias) value += bias[n];
+      out[m * n_cols + n] = __float2half_rn(value);
+    }
+  }
+}
+
+extern "C" __global__ void ternary_matmul_wmma_bf16(
+    const __nv_bfloat16* x,
+    const unsigned char* packed,
+    const float* scales,
+    const float* residual,
+    const float* bias,
+    __nv_bfloat16* out,
+    int m_rows,
+    int n_cols,
+    int k_cols,
+    int packed_stride,
+    int use_residual,
+    int has_bias) {
+  using namespace nvcuda;
+  int tile_n = blockIdx.x;
+  int tile_m = blockIdx.y;
+  int m0 = tile_m * 16;
+  int n0 = tile_n * 16;
+
+  __shared__ __nv_bfloat16 x_tile[16 * 16];
+  __shared__ __nv_bfloat16 weight_tile[16 * 16];
+  __shared__ float output_tile[16 * 16];
+
+  wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> x_frag;
+  wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::row_major> weight_frag;
+  wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc_frag;
+  wmma::fill_fragment(acc_frag, 0.0f);
+
+  for (int k0 = 0; k0 < k_cols; k0 += 16) {
+    for (int offset = threadIdx.x; offset < 16 * 16; offset += blockDim.x) {
+      int local_m_or_k = offset / 16;
+      int local_k_or_n = offset - local_m_or_k * 16;
+
+      int m = m0 + local_m_or_k;
+      int x_k = k0 + local_k_or_n;
+      x_tile[offset] = (m < m_rows && x_k < k_cols)
+          ? x[m * k_cols + x_k]
+          : __float2bfloat16(0.0f);
+
+      int weight_k = k0 + local_m_or_k;
+      int n = n0 + local_k_or_n;
+      float w = (weight_k < k_cols && n < n_cols)
+          ? c3_decode_weight(packed, scales, residual, n, weight_k, packed_stride, k_cols, use_residual)
+          : 0.0f;
+      weight_tile[offset] = __float2bfloat16(w);
+    }
+    __syncthreads();
+    wmma::load_matrix_sync(x_frag, x_tile, 16);
+    wmma::load_matrix_sync(weight_frag, weight_tile, 16);
+    wmma::mma_sync(acc_frag, x_frag, weight_frag, acc_frag);
+    __syncthreads();
+  }
+
+  wmma::store_matrix_sync(output_tile, acc_frag, 16, wmma::mem_row_major);
+  __syncthreads();
+  for (int offset = threadIdx.x; offset < 16 * 16; offset += blockDim.x) {
+    int local_m = offset / 16;
+    int local_n = offset - local_m * 16;
+    int m = m0 + local_m;
+    int n = n0 + local_n;
+    if (m < m_rows && n < n_cols) {
+      float value = output_tile[offset];
+      if (has_bias) value += bias[n];
+      out[m * n_cols + n] = __float2bfloat16(value);
+    }
+  }
+}
+
 extern "C" __global__ void ternary_matmul_warp_fp32(
     const float* x,
     const unsigned char* packed,
@@ -1255,7 +1391,7 @@ torch::Tensor ternary_forward(
     int64_t packed_stride,
     bool use_residual,
     bool has_bias,
-    bool use_warp) {
+    int64_t variant_code) {
   c3_check_cuda_contiguous(x, "x");
   c3_check_cuda_contiguous(packed, "packed");
   c3_check_cuda_contiguous(scales, "scales");
@@ -1279,7 +1415,7 @@ torch::Tensor ternary_forward(
       has_bias ? bias.data_ptr<float>() : nullptr,
       out.data_ptr(),
       c3_dtype_code(x),
-      use_warp ? 1 : 0,
+      static_cast<int>(variant_code),
       static_cast<int>(m_rows),
       static_cast<int>(n_cols),
       static_cast<int>(k_cols),
@@ -1423,6 +1559,22 @@ extern "C" void launch_ternary_forward_dispatch(
     int use_residual,
     int has_bias,
     cudaStream_t stream) {
+  if (variant_code == 2) {
+    dim3 blocks((n_cols + 15) / 16, (m_rows + 15) / 16);
+    dim3 threads(32);
+    if (dtype_code == 1) {
+      ternary_matmul_wmma_fp16<<<blocks, threads, 0, stream>>>(
+          static_cast<const __half*>(x), packed, scales, residual, bias,
+          static_cast<__half*>(out), m_rows, n_cols, k_cols, packed_stride, use_residual, has_bias);
+      return;
+    }
+    if (dtype_code == 2) {
+      ternary_matmul_wmma_bf16<<<blocks, threads, 0, stream>>>(
+          static_cast<const __nv_bfloat16*>(x), packed, scales, residual, bias,
+          static_cast<__nv_bfloat16*>(out), m_rows, n_cols, k_cols, packed_stride, use_residual, has_bias);
+      return;
+    }
+  }
   if (variant_code == 1) {
     const int warps_per_block = C3_WARPS_PER_BLOCK;
     int total_outputs = m_rows * n_cols;
@@ -1901,7 +2053,7 @@ def _load_ternary_cuda_extension() -> Any:
         if target_include.exists():
             extra_include_paths.append(str(target_include))
         module = load_inline(
-            name="cortex3_ternary_cuda_extension_v6",
+            name="cortex3_ternary_cuda_extension_v7",
             cpp_sources=[_TERNARY_EXTENSION_CPP_SOURCE],
             cuda_sources=[_CUPY_TERNARY_KERNEL_SOURCE + "\n" + _TERNARY_EXTENSION_CUDA_WRAPPERS],
             functions=["ternary_forward", "ternary_grad_input", "ternary_grad_weight_bias", "ternary_requantize_pack"],
@@ -2011,10 +2163,12 @@ def _extension_ternary_forward_cuda(
     residual_runtime: bool,
     variant: str,
 ) -> Any:
-    if variant not in {"tiled", "warp"}:
+    if variant not in {"tiled", "warp", "wmma"}:
         raise RuntimeError(f"CUDA extension forward variant {variant!r} is not supported")
     if x.dtype not in _CUPY_TERNARY_KERNEL_NAMES["tiled"]:
         raise RuntimeError(f"CUDA extension forward does not support dtype {x.dtype}")
+    if variant == "wmma" and x.dtype not in {torch.float16, torch.bfloat16}:
+        raise RuntimeError(f"CUDA extension WMMA forward does not support dtype {x.dtype}")
     module = _load_ternary_cuda_extension()
     x_flat = x.detach().contiguous().view(-1, int(in_features))
     packed = packed_codes.to(device=x.device, dtype=torch.uint8).contiguous()
@@ -2041,7 +2195,7 @@ def _extension_ternary_forward_cuda(
         int(packed.shape[1]),
         bool(residual_runtime),
         bool(bias is not None),
-        bool(variant == "warp"),
+        {"tiled": 0, "warp": 1, "wmma": 2}[variant],
     )
     return output_flat.view(*x.shape[:-1], int(out_features))
 
@@ -3070,10 +3224,38 @@ class BitLinear(nn.Module):
 
     @staticmethod
     def _native_cuda_variant_label(variant: str) -> str:
-        return f"{variant}_shared_memory_int2" if variant == "tiled" else "warp_reduction_int2"
+        if variant == "tiled":
+            return "tiled_shared_memory_int2"
+        if variant == "warp":
+            return "warp_reduction_int2"
+        if variant == "wmma":
+            return "wmma_tensor_core_int2"
+        raise RuntimeError(f"unsupported native CUDA variant {variant!r}")
+
+    def _native_cuda_forward_wmma_candidate(self, x: Any) -> bool:
+        rows = int(x.numel() // self.config.in_features)
+        return (
+            x.dtype in {torch.float16, torch.bfloat16}
+            and rows >= 16
+            and int(self.config.in_features) >= 16
+            and int(self.config.out_features) >= 16
+            and _normalize_native_cuda_backend(self.config.native_cuda_backend) in {"auto", "extension"}
+        )
+
+    def _native_cuda_forward_candidates(self, x: Any) -> tuple[str, ...]:
+        candidates = ["tiled", "warp"]
+        if self._native_cuda_forward_wmma_candidate(x):
+            candidates.append("wmma")
+        return tuple(candidates)
 
     def _heuristic_native_cuda_variant(self, x: Any) -> str:
         flattened_rows = int(x.numel() // self.config.in_features)
+        if (
+            self._native_cuda_forward_wmma_candidate(x)
+            and self.config.in_features >= 512
+            and flattened_rows * self.config.out_features >= 65536
+        ):
+            return "wmma"
         return "warp" if self.config.in_features >= 384 and flattened_rows * self.config.out_features >= 16384 else "tiled"
 
     def _native_cuda_autotune_key(self, x: Any) -> tuple[Any, ...]:
@@ -3225,8 +3407,10 @@ class BitLinear(nn.Module):
         self._last_native_autotune_cache_hit = False
         self._last_native_autotune_candidate_ms = ()
         if variant != "auto":
-            if variant not in {"tiled", "warp"}:
+            if variant not in {"tiled", "warp", "wmma"}:
                 raise RuntimeError(f"unsupported native_cuda_kernel_variant={self.config.native_cuda_kernel_variant!r}")
+            if variant == "wmma" and not self._native_cuda_forward_wmma_candidate(x):
+                raise RuntimeError("native CUDA WMMA forward requires extension backend, fp16/bf16 input and non-empty tile dimensions")
             return variant
         if not self.config.native_cuda_autotune:
             return self._heuristic_native_cuda_variant(x)
@@ -3249,7 +3433,8 @@ class BitLinear(nn.Module):
             self._last_native_autotune_candidate_ms = candidates
             return selected
         prewarm_failures: list[str] = []
-        for candidate in ("tiled", "warp"):
+        forward_candidates = self._native_cuda_forward_candidates(x)
+        for candidate in forward_candidates:
             try:
                 self._launch_native_cuda_kernel(x, candidate)
             except Exception as exc:
@@ -3257,7 +3442,7 @@ class BitLinear(nn.Module):
         torch.cuda.synchronize(x.device)
         candidates: list[tuple[str, float]] = []
         failures: list[str] = list(prewarm_failures)
-        for candidate in ("tiled", "warp"):
+        for candidate in forward_candidates:
             try:
                 candidates.append((candidate, self._time_native_cuda_variant(x, candidate)))
             except Exception as exc:

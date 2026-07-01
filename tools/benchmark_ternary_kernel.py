@@ -389,7 +389,7 @@ def main() -> None:
     parser.add_argument("--shape", action="append", type=_parse_shape, default=[], help="matrix case as BATCHxIN_FEATURESxOUT_FEATURES; may be repeated")
     parser.add_argument("--dtype", choices=tuple(DTYPES), default="fp16")
     parser.add_argument("--native-backend", choices=("auto", "extension", "rawkernel"), default="extension")
-    parser.add_argument("--kernel-variant", choices=("auto", "tiled", "warp"), default="auto")
+    parser.add_argument("--kernel-variant", choices=("auto", "tiled", "warp", "wmma"), default="auto")
     parser.add_argument("--disable-autotune", action="store_true")
     parser.add_argument("--autotune-warmup", type=int, default=1)
     parser.add_argument("--autotune-repeat", type=int, default=3)
