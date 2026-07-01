@@ -41,6 +41,7 @@ Preuve post-integration des deux nouvelles briques :
 - `test_cortex_phase_state_survives_checkpoint_resume` : reprise checkpoint avec restauration des decisions output-goal dans la ledger P3, maintien des evenements P5 algebra/code et maintien des audits architecture/livrables.
 - Le rapport final full-Cortex est maintenant gate par `validate_cortex_phase_report_contract` et le schema publie `docs/CORTEX_PHASE_REPORT_SCHEMA.json`: P1-P10, les composants architecture, les livrables, les replay des phases causales et les termes de l'objectif final doivent etre presents avant l'ecriture disque.
 - `test_local_external_provenance_adapter_streams_deduplicates_and_oracle_verifies` et `test_phase_controller_ingests_configured_external_provenance_into_p9_reservoir` prouvent que P9 consomme des sources externes locales `.txt/.jsonl`, deduplique par hash, rejette les records non valides par oracle et les branche dans le reservoir `REAL_EXOGENOUS` du controleur LLM avant training.
+- `test_resume_selects_highest_complete_checkpoint_over_stale_final` prouve que l'auto-resume choisit le checkpoint complet au step le plus eleve entre `checkpoint_final.pt` et `checkpoint_step_*.pt`, et ignore un final au sidecar corrompu si un intermediaire complet plus recent existe.
 
 Le long run devra produire un nouveau sidecar sous le commit de cette integration pour remplacer l'ancien audit `22/22` par l'audit courant plus strict incluant `native_ternary_cuda_kernel` et `future_output_goal_contracts`.
 
@@ -104,7 +105,8 @@ Le pipeline d'entrainement Cortex-3 part d'un vrai flux LLM :
 7. Le loss Cortex ajoute multi-horizon, temporal consistency, confidence, variable input, learned memory policy, certificate et pression `L_future_contract` issue aussi des contrats output-goal.
 8. Le controleur P1-P10 observe les batchs, lance les phases, produit replay, ledgers, audits, patchs P7/P10 et objectif final.
 9. Les checkpoints persistent modele, optimizer, scaler, RNG, replay, ledgers, phase state et sidecars d'audit.
-10. A la reprise checkpoint, le controleur restaure d'abord la memoire P4, recharge ensuite le registre Frontier persiste, execute une FastSolve restauree avec binding P4 restaure, output-goal et certificat `compiled_circuit`, puis echoue durement si le checkpoint annonce des circuits mais que le registre manque.
+10. L'auto-resume selectionne le checkpoint complet au step le plus eleve, qu'il soit final ou intermediaire, en validant sidecar, taille et step.
+11. A la reprise checkpoint, le controleur restaure d'abord la memoire P4, recharge ensuite le registre Frontier persiste, execute une FastSolve restauree avec binding P4 restaure, output-goal et certificat `compiled_circuit`, puis echoue durement si le checkpoint annonce des circuits mais que le registre manque.
 
 Les points d'integration importants sont :
 
@@ -582,7 +584,7 @@ P8 utilise :
 
 ### Impact Apprentissage
 
-P8 fournit des exemples verifies par route et mesure la capacite par cout effectif. Il aide le modele a apprendre une politique ou la qualite verifiee compte plus que le debit brut. Depuis C71, les rapports exigent aussi `inference_model_backed_events` et `inference_model_backed_generated_tokens`, ce qui prouve que P8 ne s'appuie plus seulement sur une reponse symbolique externe. Depuis C72, ces generations model-backed deviennent aussi du replay P8 verifie ou correctif (`inference_model_backed_replay_events`), donc elles influencent directement `replay_loss`. Depuis C75, le chemin model-backed n'est plus un greedy loop isole : il produit des propositions de blocs MTP/FSP, les gate via le meme `FutureContractEngine` que P3, compte propositions/checks/acceptations/rejets dans `inference_model_backed_adaptive_mtp_*`, et l'audit architecture echoue si cette jonction P3/P8 n'a pas tourne.
+P8 fournit des exemples verifies par route et mesure la capacite par cout effectif. Il aide le modele a apprendre une politique ou la qualite verifiee compte plus que le debit brut. Depuis C71, les rapports exigent aussi `inference_model_backed_events` et `inference_model_backed_generated_tokens`, ce qui prouve que P8 ne s'appuie plus seulement sur une reponse symbolique externe. Depuis C72, ces generations model-backed deviennent aussi du replay P8 verifie ou correctif (`inference_model_backed_replay_events`), donc elles influencent directement `replay_loss`. Depuis C75, le chemin model-backed n'est plus un greedy loop isole : il produit des propositions de blocs MTP/FSP, les gate via le meme `FutureContractEngine` que P3, compte propositions/checks/acceptations/rejets dans `inference_model_backed_adaptive_mtp_*`, et l'audit architecture echoue si cette jonction P3/P8 n'a pas tourne. Depuis C82, la reprise ne peut plus perdre cette progression en repartant d'un `checkpoint_final.pt` stale quand un checkpoint intermediaire complet plus recent porte deja les etats P4/P8/P9/P10.
 
 ## Phase 9 - Sleep / Consolidation
 

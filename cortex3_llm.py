@@ -9407,21 +9407,25 @@ class LLMTrainer:
             return checkpoint
         if not (self.config.resume or self.config.resume_if_exists):
             return None
+        candidates: list[tuple[int, int, Path]] = []
+        skipped: list[str] = []
         final_checkpoint = self.run_dir / "checkpoint_final.pt"
         if final_checkpoint.exists():
-            return final_checkpoint
-        candidates: list[tuple[int, Path]] = []
-        skipped: list[str] = []
+            final_payload = self._checkpoint_sidecar_payload(final_checkpoint)
+            if final_payload is None:
+                skipped.append(final_checkpoint.name)
+            else:
+                candidates.append((int(final_payload["step"]), 1, final_checkpoint))
         for path in self.run_dir.glob("checkpoint_step_*.pt"):
             raw_step = path.stem.removeprefix("checkpoint_step_")
             if raw_step.isdigit():
                 step = int(raw_step)
                 if self._checkpoint_sidecar_is_complete(path, expected_step=step):
-                    candidates.append((step, path))
+                    candidates.append((step, 0, path))
                 else:
                     skipped.append(path.name)
         if candidates:
-            return sorted(candidates)[-1][1]
+            return sorted(candidates)[-1][2]
         if self.config.resume_if_exists:
             return None
         if skipped:
@@ -9430,18 +9434,30 @@ class LLMTrainer:
             )
         raise FileNotFoundError(f"resume=True but no checkpoint was found in {self.run_dir}")
 
-    def _checkpoint_sidecar_is_complete(self, checkpoint: Path, *, expected_step: int | None = None) -> bool:
+    def _checkpoint_sidecar_payload(self, checkpoint: Path, *, expected_step: int | None = None) -> Mapping[str, Any] | None:
         sidecar = checkpoint.with_name(checkpoint.name + ".json")
         if not checkpoint.exists() or not sidecar.exists():
-            return False
+            return None
         try:
             payload = json.loads(sidecar.read_text(encoding="utf-8"))
         except Exception:
-            return False
+            return None
         recorded_size = payload.get("checkpoint_size_bytes")
         if recorded_size is None or int(recorded_size) != int(checkpoint.stat().st_size):
-            return False
+            return None
+        try:
+            step = int(payload.get("step", -1))
+        except (TypeError, ValueError):
+            return None
+        if step < 0:
+            return None
         if expected_step is not None and int(payload.get("step", -1)) != int(expected_step):
+            return None
+        return payload
+
+    def _checkpoint_sidecar_is_complete(self, checkpoint: Path, *, expected_step: int | None = None) -> bool:
+        payload = self._checkpoint_sidecar_payload(checkpoint, expected_step=expected_step)
+        if payload is None:
             return False
         return True
 

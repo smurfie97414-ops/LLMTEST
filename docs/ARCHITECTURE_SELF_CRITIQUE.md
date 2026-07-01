@@ -1,6 +1,6 @@
 # Cortex-3 Architecture Self-Critique
 
-Etat: boucle d'audit 81 apres relecture P1-P10 hors profiling/observabilite. La critique repart des 10 phases et vise les briques structurantes: SlowSolve -> verification -> attribution -> regrowth -> compilation -> selection runtime -> reutilisation persistante -> evolution recursive. Le dernier correctif structurel donne a P9 un pont de provenance externe locale reel: des sources `.txt/.jsonl` configurees sont streamees, dedupliquees, verifiees par oracle et ingerees dans le reservoir exogene avant training, avec echec dur si une source configuree ne produit aucun exemple oracle-verifie.
+Etat: boucle d'audit 82 apres relecture P1-P10 hors profiling/observabilite. La critique repart des 10 phases et vise les briques structurantes: SlowSolve -> verification -> attribution -> regrowth -> compilation -> selection runtime -> reutilisation persistante -> evolution recursive. Le dernier correctif structurel durcit la reprise P8/training: l'auto-resume choisit maintenant le checkpoint complet au step le plus eleve parmi `checkpoint_final.pt` et les checkpoints intermediaires, au lieu de laisser un final stale masquer une progression plus recente.
 
 Ce document sert de registre de critique et de correction. Il ne remplace pas les tests longs interdits pour cette iteration; il se limite aux preuves courtes disponibles, aux rapports du code et aux tests courts.
 
@@ -28,6 +28,7 @@ Mise a jour C78: P5 ne limite plus la verification outillee a `algebra_linear` e
 Mise a jour C79: P10 ne restaure plus d'archive incomplete avec `fallback_score`. Les records persistants exigent `baseline_report`, `trial_report`, `robustness_report`, deltas, flags, rollback token et schema d'archive/rollback valides; une archive acceptee sans `rollback.json` est rejetee.
 Mise a jour C80: P1 ne laisse plus les gates aval inferer implicitement la forme du rapport Cortex. `docs/CORTEX_PHASE_REPORT_SCHEMA.json` publie le contrat JSON Schema, `validate_cortex_phase_report_contract` le valide avec `jsonschema`, puis ajoute des checks semantiques P1-P10/architecture/livrables/replay des phases causales/objectifs avant l'ecriture finale de `training_report.json` et `cortex_phase_report.json`.
 Mise a jour C81: P9 ne depend plus uniquement des spans du dataloader pour dire "exogene". `LocalExternalProvenanceAdapter` ingere des sources locales `.txt/.jsonl`, `RealExogenousReservoir` deduplique par hash, verifie chaque record par oracle, separe rejet oracle, doublon et plafond, puis `TrainingConfig.cortex_external_provenance_paths` branche ces records dans le controleur LLM avec gate dur si rien n'est accepte.
+Mise a jour C82: P8/training ne reprend plus aveuglement `checkpoint_final.pt` quand un run repris a avance plus loin avant interruption. `_resolve_resume_checkpoint` valide le sidecar de chaque candidat, compare les steps de `checkpoint_final.pt` et `checkpoint_step_*.pt`, prefere le step complet le plus haut, et ignore un final au sidecar corrompu si un checkpoint intermediaire complet existe.
 
 ## Audit transversal haut enjeu apres C55
 

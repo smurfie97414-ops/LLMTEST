@@ -2988,6 +2988,10 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 ):
                     legacy_checkpoint["model_config"].pop(key, None)
                 torch.save(legacy_checkpoint, run_dir / "checkpoint_final.pt")
+                final_sidecar_path = run_dir / "checkpoint_final.pt.json"
+                final_sidecar = json.loads(final_sidecar_path.read_text(encoding="utf-8"))
+                final_sidecar["checkpoint_size_bytes"] = (run_dir / "checkpoint_final.pt").stat().st_size
+                final_sidecar_path.write_text(json.dumps(final_sidecar), encoding="utf-8")
 
                 resumed_config = TrainingConfig(
                     steps=4,
@@ -3153,6 +3157,93 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             self.assertEqual(sidecar["checkpoint_retention"]["checkpoint_interval"], 1)
             self.assertEqual(sidecar["checkpoint_retention"]["max_intermediate_checkpoints"], 2)
             self.assertEqual(sidecar["training_config"]["max_intermediate_checkpoints"], 2)
+
+    def test_resume_selects_highest_complete_checkpoint_over_stale_final(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            corpus = self._corpus(root, repeats=40)
+            tokenizer = LLMTokenizer.train(corpus, vocab_size=128, min_frequency=1)
+            manifest = TokenizedCorpusBuilder(corpus, tokenizer).build(
+                root / "prepared",
+                seq_len=16,
+                max_horizon=2,
+            )
+            train = MemmapCausalDataset(manifest, split="train")
+            val = MemmapCausalDataset(manifest, split="val")
+            run_dir = root / "resume-select"
+            model_config = TransformerConfig(
+                vocab_size=manifest.vocab_size,
+                seq_len=16,
+                d_model=32,
+                n_heads=4,
+                n_layers=1,
+                dropout=0.0,
+                horizons=(1, 2),
+                use_cortex_heads=False,
+                use_ternary_core=False,
+            )
+            try:
+                writer = LLMTrainer(
+                    CortexTransformerLM(model_config),
+                    train,
+                    val,
+                    TrainingConfig(
+                        steps=3,
+                        batch_size=2,
+                        eval_interval=1,
+                        eval_batches=1,
+                        checkpoint_interval=1,
+                        seed=19,
+                        num_threads=1,
+                    ),
+                    run_dir=run_dir,
+                    model_kind="baseline_next_token",
+                    corpus_identity=manifest.identity(),
+                )
+                optimizer = torch.optim.AdamW(writer.model.parameters(), lr=1e-3)
+                curve = (
+                    TrainingPoint(step=2, split="train", loss=1.0, next_token_loss=1.0, token_accuracy=0.0),
+                    TrainingPoint(step=3, split="val", loss=0.9, next_token_loss=0.9, token_accuracy=0.1),
+                )
+                writer.save_checkpoint(optimizer, run_dir / "checkpoint_final.pt", step=2, curve=curve)
+                writer.save_checkpoint(optimizer, run_dir / "checkpoint_step_3.pt", step=3, curve=curve)
+
+                resolver = LLMTrainer(
+                    CortexTransformerLM(model_config),
+                    train,
+                    val,
+                    TrainingConfig(
+                        steps=4,
+                        batch_size=2,
+                        eval_interval=1,
+                        eval_batches=1,
+                        checkpoint_interval=1,
+                        resume=True,
+                        seed=19,
+                        num_threads=1,
+                    ),
+                    run_dir=run_dir,
+                    model_kind="baseline_next_token",
+                    corpus_identity=manifest.identity(),
+                )
+                selected = resolver._resolve_resume_checkpoint()
+                self.assertIsNotNone(selected)
+                self.assertEqual(Path(selected).name, "checkpoint_step_3.pt")
+                start_step, _ = resolver.load_checkpoint(
+                    selected,
+                    optimizer=torch.optim.AdamW(resolver.model.parameters(), lr=1e-3),
+                    scaler=None,
+                )
+                self.assertEqual(start_step, 3)
+                final_sidecar = json.loads((run_dir / "checkpoint_final.pt.json").read_text(encoding="utf-8"))
+                final_sidecar["checkpoint_size_bytes"] = -1
+                (run_dir / "checkpoint_final.pt.json").write_text(json.dumps(final_sidecar), encoding="utf-8")
+                selected_after_corrupt_final = resolver._resolve_resume_checkpoint()
+                self.assertIsNotNone(selected_after_corrupt_final)
+                self.assertEqual(Path(selected_after_corrupt_final).name, "checkpoint_step_3.pt")
+            finally:
+                train.close()
+                val.close()
 
     def test_resume_skips_incomplete_intermediate_checkpoint_and_rewrites_atomically(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -206,6 +206,7 @@ Current executable coverage:
 - P8 model-backed outputs now feed verified replay: a passing generation is replayed as-is, while a failing generation creates an oracle-corrective P8 replay example carrying the failed model answer and generated token ids. The audit requires nonzero `inference_model_backed_replay_events`, so the real Transformer-backed route must influence `replay_loss`.
 - When a compiled Frontier circuit is available and shared P4 memory is supplied, `UltraFastInferenceEngine` only uses the compiled FastSolve answer after the circuit memory binding is established and reconstructed.
 - On checkpoint resume, the full LLM controller validates restored P8 FastSolve before continuing: selected compiled circuit, oracle verification, P4 binding fidelity, output-goal contract and compiled-circuit certificate must all pass.
+- Auto-resume now selects the highest-step complete checkpoint across `checkpoint_final.pt` and `checkpoint_step_*.pt`, using the sidecar size and step contract for every candidate; a stale or corrupt final checkpoint can no longer hide a newer complete intermediate checkpoint after an interrupted continuation run.
 - Fast-path tasks can skip runtime level-0 verification cost, but their reported verified-capability score is still audited by the oracle; confident wrong fast answers receive zero verified capability.
 - `write_cycle_run` can persist inference results into `summary.json`.
 - Tests cover route selection, cost ordering, early exit/depth differences, fast-path false-confidence rejection, normal-path light certificates, latent KV anchor fidelity, self-speculative horizon caps, careful-path strong verification, certificate validation, expert traces, ternary kernel dispatch records and JSON persistence.
@@ -221,10 +222,10 @@ Evidence:
 - `.\.venv\Scripts\python.exe -m py_compile cortex3.py cortex3_analysis.py cortex3_cycle.py cortex3_ledgers.py cortex3_phases.py cortex3_selection.py cortex3_reporting.py cortex3_ternary.py cortex3_future.py cortex3_memory.py cortex3_certificates.py cortex3_attribution.py cortex3_regrowth.py cortex3_inference.py cortex3_sleep.py cortex3_improvement.py cortex3_objective.py cortex3_experiments.py cortex3_microtrain.py cortex3_autoregressive.py tools\run_cycle_report.py`
 - `.\.venv\Scripts\python.exe tools\run_cycle_report.py --seed 3 --n-per-skill 1 --no-write`
 - Temporary artifact write with `tools\run_cycle_report.py --out-dir <temp> --run-id final-smoke`: `InferenceCount=4`, `SleepAccepted=35`, `ImprovementProposals=4`, `ImprovementAccepted=4`.
+- `tests/test_llm_pretraining.py::LLMPretrainingHarnessTest::test_resume_selects_highest_complete_checkpoint_over_stale_final` verifies that resume chooses a newer complete intermediate checkpoint over an older complete final checkpoint, and keeps doing so when the final sidecar is corrupt.
 
 Remaining:
 
-- Add persistent checkpoint selection across runs instead of training a fresh smoke checkpoint per report.
 - Calibrate early-exit confidence and adaptive model-backed MTP block acceptance on real generated distributions.
 - Replace the current packed int2 CUDA dispatch path with fused hardware-specific kernels once the reference packed path has stable quality/gradient evidence.
 - Benchmark fast/normal/careful choices across larger verified suites and report path Pareto fronts.
