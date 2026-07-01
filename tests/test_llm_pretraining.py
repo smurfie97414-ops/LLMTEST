@@ -3305,6 +3305,7 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             self.assertGreater(influence["frontier_compiled_fastsolve_events"], 0)
             self.assertGreater(influence["frontier_repair_candidate_count"], 0)
             self.assertGreater(influence["frontier_repair_accepted_events"], 0)
+            self.assertGreater(influence["recursive_frontier_proposal_events"], 0)
             self.assertTrue((Path(influence["frontier_registry_path"]) / "frontier_registry.json").exists())
             self.assertTrue(phase_report["frontier_repair_candidates"], phase_report)
             latest_frontier_repair = phase_report["frontier_repair_candidates"][-1]
@@ -3334,6 +3335,9 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             self.assertTrue(phase_report["recursive_model_applications"], phase_report)
             latest_recursive = phase_report["recursive_model_applications"][-1]
             self.assertTrue(latest_recursive["non_regression_passed"], latest_recursive)
+            self.assertEqual(latest_recursive["proposal_kind"], "compiled_frontier", latest_recursive)
+            self.assertEqual(latest_recursive["proposal_patch_payload"]["action"], "compile_frontier_repair", latest_recursive)
+            self.assertTrue(latest_recursive["proposal_patch_payload"]["frontier_compiled_verified"], latest_recursive)
             self.assertTrue(latest_recursive["signed_patch_id"], latest_recursive)
             self.assertTrue(latest_recursive["rollback_token"], latest_recursive)
             self.assertGreater(latest_recursive["parameter_delta_l1"], 0.0)

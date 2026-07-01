@@ -239,7 +239,7 @@ Remaining:
 
 Current executable coverage:
 
-- `ProposalGenerator` converts cycle actions and regressions into typed proposals for tests, compression, router changes, MTP heads, regrowth strategies and new skill/test families.
+- `ProposalGenerator` converts cycle actions and regressions into typed proposals for tests, compression, router changes, MTP heads, regrowth strategies and new skill/test families; it also converts accepted compiled Frontier repairs into `compiled_frontier` proposals with source/frontier task lineage.
 - `ImprovementProposal` carries affected skills, expected quality/cost/robustness deltas, risk, diversity tags and patch payload metadata.
 - `SandboxTrainer` first applies proposals as in-memory sandbox agents; it records no touched repo files and creates rollback tokens for verifier-gated evaluation.
 - `ProposalPatchedAgent` simulates repair, protected-skill degradation, reward-hacking behavior and calibration regression for verifier-gated evaluation.
@@ -249,16 +249,18 @@ Current executable coverage:
 - `PatchAcceptanceGate` requires Pareto improvement, no protected-skill regression, no calibration regression, no reward hacking and no diversity/collapse failure.
 - `EvolutionaryArchive` records accepted and rejected decisions with proposal lineage and kind counts.
 - `RollbackSystem` records rollback events from accepted proposal tokens.
-- `RecursiveImprovementEngine` orchestrates proposal generation, sandbox training, dynamic evaluation, acceptance and archive recording from a `CycleReport`.
+- `RecursiveImprovementEngine` orchestrates proposal generation, prioritized external proposals, sandbox training, dynamic evaluation, acceptance and archive recording from a `CycleReport`.
 - `write_cycle_run` can persist recursive improvement reports into `summary.json`.
 - `tools/run_cycle_report.py` writes Phase 10 traces by default unless `--skip-improvement` is passed.
-- The full LLM Cortex phase controller converts verifier-approved recursive-improvement gate decisions into causal replay examples, applies accepted proposals as signed bounded patches to real Transformer parameters, and persists patch id, rollback token, parameter deltas, repair-loss improvement and protected-loss non-regression in checkpoints.
+- The full LLM Cortex phase controller converts verifier-approved recursive-improvement gate decisions into causal replay examples, feeds accepted P7 compiled Frontier repairs into P10 before generic proposals, applies accepted proposals as signed bounded patches to real Transformer parameters, and persists patch id, rollback token, parameter deltas, repair-loss improvement, protected-loss non-regression and proposal payload in checkpoints.
 
 Evidence:
 
 - `.\.venv\Scripts\python.exe -m unittest tests.test_recursive_improvement`
 - `.\.venv\Scripts\python.exe -m unittest discover -s tests`
+- `tests.test_recursive_improvement.RecursiveImprovementTest.test_engine_prioritizes_accepted_frontier_repair_proposals` verifies that a Frontier repair becomes the first P10 proposal and is accepted under the normal gates.
 - `tests/test_llm_pretraining.py::LLMPretrainingHarnessTest::test_cortex_phase_state_survives_checkpoint_resume` verifies that P1-P10 replay state plus P2/P3 internal ledgers persist through a checkpoint resume and keep influencing optimizer steps.
+- `tests.test_llm_pretraining.LLMPretrainingHarnessTest.test_full_cortex_phase_controller_uses_all_modules_during_training` verifies the applied recursive model patch has `proposal_kind == "compiled_frontier"` and carries the Frontier repair payload.
 - Smoke: `RecursiveImprovementEngine(...).run(..., max_proposals=3)` accepted Pareto-improving sandbox proposals with no touched files.
 - Temporary artifact write with `tools\run_cycle_report.py --out-dir <temp> --run-id final-smoke` includes `recursive_improvement` with accepted sandbox proposals and rollback data.
 
@@ -282,7 +284,7 @@ Current executable coverage:
 - Frontier registries persist to `frontier_registry.json` plus per-circuit micro-model checkpoints and reload through `CheckpointManager`, so a compiled skill can survive process boundaries.
 - `UltraFastInferenceEngine` accepts a `compiled_frontier_registry` and uses a selected compiled frontier circuit as the answer source before fast/normal/careful route execution.
 - `FrontierSkillDiscovery` distills both source regressions slow-solved by the reference solver and their frontier variants, so a compiled circuit can repair the original failing task rather than only nearby adversarial variants.
-- `CortexTrainingPhaseController` now runs a bounded Frontier Skill Discovery pass during phase audit, persists the registry under the run directory, routes a covered P8 task through the compiled FastSolve circuit, evaluates the same registry as a P7 repair candidate before parameter regrowth, and reports `frontier_compiled_*` plus `frontier_repair_*` fields in `cortex_phase_report.json`.
+- `CortexTrainingPhaseController` now runs a bounded Frontier Skill Discovery pass during phase audit, persists the registry under the run directory, routes a covered P8 task through the compiled FastSolve circuit, evaluates the same registry as a P7 repair candidate before parameter regrowth, feeds accepted compiled repairs into P10 as prioritized `compiled_frontier` proposals, and reports `frontier_compiled_*`, `frontier_repair_*` and `recursive_frontier_proposal_events` fields in `cortex_phase_report.json`.
 - P10 resume hardening: after checkpoint restore, the LLM controller searches a small archive-aware proposal budget so recursive improvement does not fail only because the first restored-context proposal is rejected by strict gates.
 - `write_cycle_run` persists frontier discovery reports under `summary.json["frontier_discovery"]`.
 - `tools/run_cycle_report.py` writes Frontier Skill Discovery by default unless `--skip-frontier` is passed.
@@ -292,12 +294,12 @@ Evidence:
 - `.\.venv\Scripts\python.exe -m unittest tests.test_frontier_discovery`
 - Smoke: fragile-skill frontier tasks are slow-solved, verified, distilled and compiled into a DSV-passing micro-circuit.
 - Short runtime proof: `python -m unittest tests.test_frontier_discovery` now asserts a compiled frontier circuit is registered, selected, used by `CompiledFrontierAgent`, oracle-verified, saved to `frontier_registry.json`, reloaded, used again, and consumed by `UltraFastInferenceEngine` on a forced fast path.
-- LLM controller proof: `tests.test_llm_pretraining.LLMPretrainingHarnessTest.test_full_cortex_phase_controller_uses_all_modules_during_training` asserts nonzero `frontier_compiled_circuit_count`, `frontier_compiled_skill_count`, `frontier_compiled_fastsolve_events`, nonzero accepted P7 `frontier_repair_*` evidence, and an on-disk `frontier_registry.json`; `test_cortex_phase_state_survives_checkpoint_resume` passes after restoring the frontier/P10 state.
+- LLM controller proof: `tests.test_llm_pretraining.LLMPretrainingHarnessTest.test_full_cortex_phase_controller_uses_all_modules_during_training` asserts nonzero `frontier_compiled_circuit_count`, `frontier_compiled_skill_count`, `frontier_compiled_fastsolve_events`, nonzero accepted P7 `frontier_repair_*` evidence, nonzero P10 `recursive_frontier_proposal_events`, a P10 model patch whose `proposal_kind` is `compiled_frontier`, and an on-disk `frontier_registry.json`; `test_cortex_phase_state_survives_checkpoint_resume` passes after restoring the frontier/P10 state.
 
 Remaining:
 
 - Run frontier discovery over larger held-out frontier suites.
-- Feed accepted compiled frontier repairs into P10 proposal generation and extend P5 certificates to bind compiled-circuit contracts.
+- Extend P5 certificates to bind compiled-circuit contracts and run larger held-out frontier generalization suites.
 
 ## Cross-phase final objective and metrics
 

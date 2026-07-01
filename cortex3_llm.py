@@ -4477,6 +4477,8 @@ class CortexTrainingPhaseController:
             prefixes = ("skill_experts.", "variable_in.", "lm_head.", "token_embedding.")
         elif proposal_kind == ProposalKind.MTP_HEAD:
             prefixes = ("mtp_heads.", "confidence_head.")
+        elif proposal_kind == ProposalKind.COMPILED_FRONTIER:
+            prefixes = ("skill_experts.", "certificate_head.", "lm_head.", "token_embedding.")
         elif proposal_kind in {ProposalKind.TEST, ProposalKind.SKILL_SPEC}:
             prefixes = ("certificate_head.", "confidence_head.", "lm_head.", "token_embedding.")
         else:
@@ -4511,7 +4513,14 @@ class CortexTrainingPhaseController:
             raise ValueError(f"P10 cannot apply rejected proposal {decision.evaluation.proposal.proposal_id}: {decision.reason}")
         proposal = decision.evaluation.proposal
         task = self._recursive_improvement_task(decision, cycle_report, step=step)
-        repair_batch = self._batch_from_task(task, self.reference_agent(task))
+        task_id = str(proposal.patch_payload.get("task_id") or "")
+        if task_id:
+            for failure in cycle_report.regressions:
+                if failure.task.task_id == task_id:
+                    task = failure.task
+                    break
+        proposal_answer = self.reference_agent(task)
+        repair_batch = self._batch_from_task(task, proposal_answer)
         protected_batches = tuple(self.replay_batches[-4:])
         if not protected_batches:
             protected_task = Task(
@@ -4571,6 +4580,7 @@ class CortexTrainingPhaseController:
                 parameter_names = tuple(name for name, _ in parameters)
                 signed_payload = {
                     "proposal_id": proposal.proposal_id,
+                    "proposal_payload": dict(proposal.patch_payload),
                     "rollback_token": decision.evaluation.sandbox.rollback_token,
                     "parameter_names": parameter_names,
                     "repair_loss_delta": repair_delta,
@@ -4581,6 +4591,7 @@ class CortexTrainingPhaseController:
                     "proposal_id": proposal.proposal_id,
                     "proposal_kind": proposal.kind.value,
                     "affected_skills": tuple(proposal.affected_skills),
+                    "proposal_patch_payload": dict(proposal.patch_payload),
                     "rollback_token": decision.evaluation.sandbox.rollback_token,
                     "signed_patch_id": _sha256_json(signed_payload),
                     "updated_parameter_count": len(parameters),
@@ -5309,6 +5320,10 @@ class CortexTrainingPhaseController:
         improvement_report = None
         try:
             if cycle_report is not None and self.config.cortex_phase_max_proposals > 0:
+                frontier_improvement_proposals = self.improvement.generator.from_frontier_repairs(
+                    self.frontier_repair_candidates,
+                    max_proposals=max(1, int(self.config.cortex_phase_max_proposals)),
+                )
                 p10_proposal_budget = max(
                     int(self.config.cortex_phase_max_proposals),
                     min(
@@ -5325,10 +5340,13 @@ class CortexTrainingPhaseController:
                     max_proposals=p10_proposal_budget,
                     seed=self.config.seed + step,
                     n_per_skill=self.config.cortex_phase_probe_tasks,
+                    extra_proposals=frontier_improvement_proposals,
                 )
                 self._touch("P10")
                 audit["recursive_improvement"] = improvement_report.to_dict()
                 audit["recursive_improvement"]["proposal_budget"] = p10_proposal_budget
+                audit["recursive_improvement"]["frontier_proposal_count"] = len(frontier_improvement_proposals)
+                self._count("recursive_frontier_proposal_events", len(frontier_improvement_proposals))
                 self._count("recursive_proposal_events", len(improvement_report.proposals))
                 self._count("recursive_sandbox_trials", len(improvement_report.decisions))
                 self._count("recursive_dynamic_evaluations", len(improvement_report.decisions))
@@ -5554,6 +5572,7 @@ class CortexTrainingPhaseController:
                 "frontier_compiled_fastsolve_events": int(self.frontier_compiled_fastsolve_events),
                 "frontier_repair_candidate_count": len(self.frontier_repair_candidates),
                 "frontier_repair_accepted_events": int(self.frontier_repair_accepted_events),
+                "recursive_frontier_proposal_events": int(self.integration_counts.get("recursive_frontier_proposal_events", 0)),
                 "frontier_registry_path": str(self.run_dir / "frontier_registry"),
                 "regrowth_model_application_count": len(self.regrowth_model_applications),
                 "regrowth_model_parameter_delta_l1": float(self.regrowth_model_parameter_delta_l1),
@@ -5635,6 +5654,7 @@ class CortexTrainingPhaseController:
                     "frontier_compiled_fastsolve_events": int(self.frontier_compiled_fastsolve_events),
                     "frontier_repair_candidate_count": len(self.frontier_repair_candidates),
                     "frontier_repair_accepted_events": int(self.frontier_repair_accepted_events),
+                    "recursive_frontier_proposal_events": int(self.integration_counts.get("recursive_frontier_proposal_events", 0)),
                     "regrowth_model_application_count": len(self.regrowth_model_applications),
                     "regrowth_model_parameter_delta_l1": float(self.regrowth_model_parameter_delta_l1),
                     "regrowth_model_repair_loss_delta": float(self.regrowth_model_repair_loss_delta),

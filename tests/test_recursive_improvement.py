@@ -94,6 +94,37 @@ class RecursiveImprovementTest(unittest.TestCase):
             self.assertFalse(record.decision.evaluation.collapse_flags)
             self.assertLessEqual(record.decision.evaluation.calibration_delta, 0.0)
 
+    def test_engine_prioritizes_accepted_frontier_repair_proposals(self):
+        verifier, report = _cycle()
+        failure = report.regressions[0]
+        frontier_proposals = ProposalGenerator().from_frontier_repairs((
+            {
+                "accepted": True,
+                "task_id": failure.task.task_id,
+                "skill": failure.task.skill,
+                "source_failure_ids": (failure.task.task_id,),
+                "frontier_task_ids": (failure.task.task_id, f"{failure.task.task_id}-frontier"),
+                "repair_score_delta": 1.0,
+                "protected_checked": 2,
+                "frontier_compiled_verified": True,
+            },
+        ))
+
+        improvement = RecursiveImprovementEngine(verifier).run(
+            report,
+            max_proposals=1,
+            seed=3,
+            n_per_skill=1,
+            extra_proposals=frontier_proposals,
+        )
+
+        self.assertEqual(len(improvement.proposals), 1)
+        proposal = improvement.proposals[0]
+        self.assertEqual(proposal.kind, ProposalKind.COMPILED_FRONTIER)
+        self.assertEqual(proposal.patch_payload["action"], "compile_frontier_repair")
+        self.assertEqual(proposal.patch_payload["task_id"], failure.task.task_id)
+        self.assertTrue(improvement.decisions[0].accepted, improvement.decisions[0].reason)
+
     def test_gate_rejects_protected_skill_regression(self):
         verifier = _verifier()
         proposal = ImprovementProposal(

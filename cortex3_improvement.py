@@ -30,6 +30,7 @@ class ProposalKind(str, Enum):
     REGROWTH_STRATEGY = "regrowth_strategy"
     HARDWARE_GRAMMAR = "hardware_grammar"
     KERNEL = "kernel"
+    COMPILED_FRONTIER = "compiled_frontier"
 
 
 @dataclass(frozen=True)
@@ -118,6 +119,53 @@ class ProposalGenerator:
                 patch_payload={"action": "add_replay_case", "target": skill, "task_id": failure.task.task_id, "mode": "repair_skill"},
             ))
         return tuple(proposals[:max_proposals])
+
+    def from_frontier_repairs(
+        self,
+        repairs: Iterable[Mapping[str, Any]],
+        *,
+        max_proposals: int = 4,
+    ) -> tuple[ImprovementProposal, ...]:
+        proposals: list[ImprovementProposal] = []
+        seen: set[str] = set()
+        for repair in repairs:
+            payload = dict(repair)
+            if not bool(payload.get("accepted")):
+                continue
+            task_id = str(payload.get("task_id") or "")
+            skill = str(payload.get("skill") or payload.get("circuit_skill") or "")
+            if not task_id or not skill:
+                continue
+            proposal_id = f"frontier-repair-{skill}-{task_id}"
+            if proposal_id in seen:
+                continue
+            seen.add(proposal_id)
+            score_delta = max(0.01, float(payload.get("repair_score_delta", 0.0)))
+            proposals.append(ImprovementProposal(
+                proposal_id=proposal_id,
+                title=f"compile accepted frontier repair for {skill}",
+                kind=ProposalKind.COMPILED_FRONTIER,
+                affected_skills=(skill,),
+                expected_quality_delta=score_delta,
+                expected_cost_delta=-max(0.01, score_delta * 0.25),
+                expected_robustness_delta=max(0.01, score_delta * 0.50),
+                risk=0.05,
+                diversity_tags=("compiled_frontier", skill, task_id),
+                patch_payload={
+                    "action": "compile_frontier_repair",
+                    "mode": "repair_skill",
+                    "target": skill,
+                    "task_id": task_id,
+                    "source_failure_ids": tuple(str(item) for item in payload.get("source_failure_ids", ())),
+                    "frontier_task_ids": tuple(str(item) for item in payload.get("frontier_task_ids", ())),
+                    "repair_score_delta": float(payload.get("repair_score_delta", 0.0)),
+                    "protected_checked": int(payload.get("protected_checked", 0)),
+                    "frontier_compiled_verified": bool(payload.get("frontier_compiled_verified")),
+                },
+            ))
+            if len(proposals) >= max_proposals:
+                break
+        return tuple(proposals)
 
 
 class ProposalPatchedAgent:
@@ -543,11 +591,29 @@ class RecursiveImprovementEngine:
         max_proposals: int = 6,
         seed: int = 0,
         n_per_skill: int = 1,
+        extra_proposals: Iterable[ImprovementProposal] = (),
     ) -> RecursiveImprovementReport:
         baseline = baseline_agent or CorruptedCompressedAgent()
         reference = reference_agent or ReferenceRuleAgent()
         protected = tuple(state.skill for state in report.skill_ledger.fragile_skills())
-        proposals = self.generator.generate(report, max_proposals=max_proposals)
+        proposals_list: list[ImprovementProposal] = []
+        seen: set[str] = set()
+        for proposal in extra_proposals:
+            if proposal.proposal_id in seen:
+                continue
+            proposals_list.append(proposal)
+            seen.add(proposal.proposal_id)
+            if len(proposals_list) >= max_proposals:
+                break
+        if len(proposals_list) < max_proposals:
+            for proposal in self.generator.generate(report, max_proposals=max_proposals):
+                if proposal.proposal_id in seen:
+                    continue
+                proposals_list.append(proposal)
+                seen.add(proposal.proposal_id)
+                if len(proposals_list) >= max_proposals:
+                    break
+        proposals = tuple(proposals_list)
         decisions: list[AcceptanceDecision] = []
         for proposal in proposals:
             sandbox = self.trainer.train(proposal, baseline_agent=baseline, reference_agent=reference)

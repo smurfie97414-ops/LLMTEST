@@ -775,11 +775,14 @@ Critere de fermeture :
 Etat actuel :
 
 - P1/P6/P7/P9/P10 creent detection lente, attribution, reparation, replay, consolidation et patchs ;
-- P8 mesure fast/normal/careful paths avec couts et verification.
+- Frontier Skill Discovery compile les regressions sources slow-solvees plus leurs variantes en micro-circuits `BitLinear` persistants ;
+- P8 consomme le registre compile pour repondre en FastSolve sur les taches couvertes ;
+- P7 evalue le meme circuit comme candidat de reparation avant regrowth parametrique ;
+- P10 promeut les reparations compilees acceptees en propositions `compiled_frontier` prioritaires avant son patch modele signe.
 
 Limite actuelle :
 
-- la preuve finale manque encore : une competence resolue lentement et verifiee doit devenir rapide, moins chere, stable et generalisable a des taches nouvelles.
+- la preuve finale manque encore a grande echelle : une competence resolue lentement et verifiee doit devenir rapide, moins chere, stable et generalisable a des taches nouvelles sur suites held-out larges.
 
 Critere de fermeture :
 
