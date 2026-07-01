@@ -10202,6 +10202,7 @@ def run_llm_batch_profile_autosize(
     confirm_selected_extra_seed_count: int = 1,
     confirm_selected_step_multiplier: int = 2,
     confirm_selected_repeat_count: int = 2,
+    confirm_selected_max_rounds: int | None = None,
     measured_selection_metric: str = "throughput_gpu",
     min_cases: int = 1,
     require_multi_shape: bool = False,
@@ -10256,6 +10257,13 @@ def run_llm_batch_profile_autosize(
     requested_confirm_selected_repeat_count = int(confirm_selected_repeat_count)
     if requested_confirm_selected_repeat_count < 1:
         raise ValueError("confirm_selected_repeat_count must be positive")
+    requested_confirm_selected_max_rounds = (
+        max(1, int(selected_shape_count) + 1)
+        if confirm_selected_max_rounds is None
+        else int(confirm_selected_max_rounds)
+    )
+    if requested_confirm_selected_max_rounds < 1:
+        raise ValueError("confirm_selected_max_rounds must be positive")
     if measure_candidate_strategy not in PROFILE_AUTOSIZE_MEASUREMENT_STRATEGIES:
         raise ValueError(
             f"unknown measure_candidate_strategy {measure_candidate_strategy!r}; "
@@ -10393,6 +10401,7 @@ def run_llm_batch_profile_autosize(
     confirmation_seeds: tuple[int, ...] = ()
     synthesized_refinement_seed_count = 0
     synthesized_confirmation_seed_count = 0
+    confirmation_complete = False
     effective_measure_candidate_count = (
         max(requested_measure_candidate_count, int(selected_shape_count))
         if requested_measure_candidate_count > 0
@@ -10401,6 +10410,7 @@ def run_llm_batch_profile_autosize(
     if effective_measure_candidate_count > 0:
         aggregated_measurement_rows: list[Mapping[str, Any]] = []
         already_measured_shape_keys: set[str] = set()
+        confirmed_shape_keys: set[str] = set()
 
         def rank_measured_passed_candidates(
             rows: Sequence[Mapping[str, Any]],
@@ -10679,26 +10689,25 @@ def run_llm_batch_profile_autosize(
                     }
                 )
 
-        def confirm_selected_candidates(*, round_index: int) -> None:
+        def selected_confirmation_missing() -> tuple[Mapping[str, Any], ...]:
+            passed = rank_measured_passed_candidates(aggregated_measurement_rows)
+            return tuple(
+                candidate
+                for candidate in passed[: int(selected_shape_count)]
+                if str(candidate["shape_key"]) not in confirmed_shape_keys
+            )
+
+        def confirm_selected_candidates(*, round_index: int) -> int:
             nonlocal measurement_inputs, confirmation_seeds, synthesized_confirmation_seed_count
             if (
                 requested_confirm_selected_candidate_count <= 0
                 or requested_confirm_selected_extra_seed_count <= 0
                 or not aggregated_measurement_rows
             ):
-                return
-            passed = rank_measured_passed_candidates(aggregated_measurement_rows)
-            if not passed:
-                return
-            confirmation_inputs = passed[
-                : min(
-                    int(requested_confirm_selected_candidate_count),
-                    int(selected_shape_count),
-                    len(passed),
-                )
-            ]
+                return 0
+            confirmation_inputs = selected_confirmation_missing()[: int(requested_confirm_selected_candidate_count)]
             if not confirmation_inputs:
-                return
+                return 0
             used_seed_set = {
                 int(row.get("seed", 0))
                 for candidate in aggregated_measurement_rows
@@ -10709,7 +10718,7 @@ def run_llm_batch_profile_autosize(
                 requested_count=requested_confirm_selected_extra_seed_count,
             )
             if not extra_seeds:
-                return
+                return 0
 
             confirmed_rows: list[Mapping[str, Any]] = []
             confirmation_details: list[Mapping[str, Any]] = []
@@ -10754,6 +10763,7 @@ def run_llm_batch_profile_autosize(
                     metric=measured_selection_metric,
                 )
                 aggregated_measurement_rows[row_index] = confirmed
+                confirmed_shape_keys.add(shape_key)
                 confirmed_rows.append(confirmed)
                 confirmation_details.append(
                     {
@@ -10776,7 +10786,7 @@ def run_llm_batch_profile_autosize(
                 )
             if confirmed_rows:
                 measurement_inputs = tuple(aggregated_measurement_rows)
-                confirmation_seeds = extra_seeds
+                confirmation_seeds = tuple(dict.fromkeys(confirmation_seeds + extra_seeds))
                 synthesized_confirmation_seed_count = sum(1 for seed in confirmation_seeds if seed not in provided_seed_set)
                 confirmation_rounds.append(
                     {
@@ -10792,6 +10802,7 @@ def run_llm_batch_profile_autosize(
                         "details": tuple(confirmation_details),
                     }
                 )
+            return len(confirmed_rows)
 
         use_adaptive = (
             requested_measure_candidate_adaptive_rounds > 1
@@ -10840,7 +10851,18 @@ def run_llm_batch_profile_autosize(
             )
             measure_round(remaining_inputs, round_index=round_index, round_kind=f"fill_{measure_candidate_strategy}")
         refine_uncertain_candidates(round_index=round_index + 1)
-        confirm_selected_candidates(round_index=round_index + 2)
+        if requested_confirm_selected_candidate_count > 0 and requested_confirm_selected_extra_seed_count > 0:
+            for confirm_round_offset in range(requested_confirm_selected_max_rounds):
+                if not selected_confirmation_missing():
+                    confirmation_complete = True
+                    break
+                confirmed_count = confirm_selected_candidates(
+                    round_index=round_index + 2 + confirm_round_offset,
+                )
+                if confirmed_count <= 0:
+                    break
+            if not selected_confirmation_missing():
+                confirmation_complete = True
         measured_candidates = tuple(aggregated_measurement_rows)
         measured_candidate_profile_count = sum(
             len(tuple(item.get("seed_measurements", ()))) for item in measured_candidates
@@ -10879,6 +10901,15 @@ def run_llm_batch_profile_autosize(
         and any(bool(item.get("measurement_profile_passed")) and not bool(item.get("measured_budget_passed")) for item in measured_candidates)
     ):
         failed_checks.append("measured_budget_exceeded")
+    if (
+        effective_measure_candidate_count > 0
+        and measured_candidates
+        and selected
+        and requested_confirm_selected_candidate_count > 0
+        and requested_confirm_selected_extra_seed_count > 0
+        and not confirmation_complete
+    ):
+        failed_checks.append("selected_confirmation_incomplete")
     matrix_report: Mapping[str, Any] | None = None
     if selected:
         selected_shapes = tuple(dict(item["shape"]) for item in selected)
@@ -10985,6 +11016,7 @@ def run_llm_batch_profile_autosize(
             "confirm_selected_extra_seed_count": requested_confirm_selected_extra_seed_count,
             "confirm_selected_step_multiplier": requested_confirm_selected_step_multiplier,
             "confirm_selected_repeat_count": requested_confirm_selected_repeat_count,
+            "confirm_selected_max_rounds": requested_confirm_selected_max_rounds,
             "confirmation_rounds_used": len(confirmation_rounds),
             "confirmed_candidate_count": sum(int(round_["candidate_count"]) for round_ in confirmation_rounds),
             "confirmation_profile_count": sum(
@@ -10993,6 +11025,8 @@ def run_llm_batch_profile_autosize(
             ),
             "confirmation_seed_count": len(confirmation_seeds),
             "confirmation_seeds": confirmation_seeds,
+            "confirmation_complete": confirmation_complete,
+            "confirmed_shape_keys": tuple(sorted(confirmed_shape_keys)) if effective_measure_candidate_count > 0 else (),
             "synthesized_confirmation_seed_count": synthesized_confirmation_seed_count,
             "confirmation_rounds": tuple(confirmation_rounds),
             "measurement_input_shape_keys": tuple(str(item["shape_key"]) for item in measurement_inputs),
@@ -11252,6 +11286,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     profile_autosize.add_argument("--confirm-selected-extra-seed-count", type=int, default=1, help="fresh confirmation seeds per final selected candidate before final ranking")
     profile_autosize.add_argument("--confirm-selected-step-multiplier", type=int, default=2, help="multiply profile steps for final selected candidate confirmation")
     profile_autosize.add_argument("--confirm-selected-repeat-count", type=int, default=2, help="repeat each final selected confirmation seed profile to reduce runtime jitter")
+    profile_autosize.add_argument("--confirm-selected-max-rounds", type=int, default=None, help="maximum final-selection confirmation rounds; default allows the winner to change once and still be confirmed")
     profile_autosize.add_argument("--measured-selection-metric", choices=PROFILE_AUTOSIZE_MEASURED_SELECTION_METRICS, default="throughput_gpu")
     profile_autosize.add_argument("--min-cases", type=int, default=1)
     profile_autosize.add_argument("--require-multi-shape", action="store_true")
@@ -11649,6 +11684,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             confirm_selected_extra_seed_count=args.confirm_selected_extra_seed_count,
             confirm_selected_step_multiplier=args.confirm_selected_step_multiplier,
             confirm_selected_repeat_count=args.confirm_selected_repeat_count,
+            confirm_selected_max_rounds=args.confirm_selected_max_rounds,
             measured_selection_metric=args.measured_selection_metric,
             min_cases=args.min_cases,
             require_multi_shape=args.require_multi_shape,
