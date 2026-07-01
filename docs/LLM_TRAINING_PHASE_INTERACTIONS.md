@@ -776,6 +776,7 @@ Etat actuel :
 
 - P1/P6/P7/P9/P10 creent detection lente, attribution, reparation, replay, consolidation et patchs ;
 - Frontier Skill Discovery compile les regressions sources slow-solvees plus leurs variantes en micro-circuits `BitLinear` persistants ;
+- P5 certifie l'origine compilee avec un contrat `compiled_circuit` verifie par checksum, lineage source/frontier, DSV et verification runtime ;
 - P8 consomme le registre compile pour repondre en FastSolve sur les taches couvertes ;
 - P7 evalue le meme circuit comme candidat de reparation avant regrowth parametrique ;
 - P10 promeut les reparations compilees acceptees en propositions `compiled_frontier` prioritaires avant son patch modele signe.

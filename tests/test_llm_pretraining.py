@@ -3312,6 +3312,8 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             self.assertTrue(latest_frontier_repair["accepted"], latest_frontier_repair)
             self.assertTrue(latest_frontier_repair["frontier_compiled_selected"], latest_frontier_repair)
             self.assertTrue(latest_frontier_repair["frontier_compiled_verified"], latest_frontier_repair)
+            self.assertTrue(latest_frontier_repair["frontier_compiled_contract_verified"], latest_frontier_repair)
+            self.assertTrue(latest_frontier_repair["frontier_compiled_contract_checksum"], latest_frontier_repair)
             self.assertTrue(latest_frontier_repair["repair_passed"], latest_frontier_repair)
             self.assertTrue(latest_frontier_repair["non_regression_passed"], latest_frontier_repair)
             self.assertGreater(latest_frontier_repair["repair_score_delta"], 0.0)

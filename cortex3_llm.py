@@ -4344,6 +4344,8 @@ class CortexTrainingPhaseController:
             "accepted": accepted,
             "frontier_compiled_selected": bool(answer.raw.get("frontier_compiled_selected")),
             "frontier_compiled_verified": bool(answer.raw.get("frontier_compiled_verified")),
+            "frontier_compiled_contract_verified": bool(answer.certificate.get("frontier_compiled_contract_verified")),
+            "frontier_compiled_contract_checksum": str(answer.certificate.get("frontier_compiled_contract_checksum", "")),
             "certificate_fields": tuple(sorted(str(key) for key in answer.certificate)),
             "cost": asdict(total_cost),
         }

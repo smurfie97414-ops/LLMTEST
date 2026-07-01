@@ -2,10 +2,14 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import asdict, dataclass
+import hashlib
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
+import torch
+
 from cortex3 import Anchor, CandidateAnswer, CompressionAdversary, CostTrace, DynamicSkillVerifier, ReferenceRuleAgent, Task
+from cortex3_certificates import CertificateVerifier, LatentProofState, build_compiled_circuit_certificate
 from cortex3_cycle import CycleReport
 from cortex3_microtrain import CheckpointManager, CortexMicroModel, CortexMicroTrainer, MicroModelAgent, examples_from_tasks
 
@@ -292,6 +296,71 @@ class CompiledFrontierAgent:
         self.fallback = fallback
         self.verifier = verifier
         self.verify_outputs = verify_outputs
+        self.certificate_verifier = CertificateVerifier()
+
+    def _compiled_contract_certificate(
+        self,
+        circuit: RuntimeFrontierCircuit,
+        task: Task,
+        answer: CandidateAnswer,
+        *,
+        output_verified: bool,
+    ) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
+        report_payload = circuit.report.to_dict()
+        circuit_id = hashlib.blake2b(json_dumps(report_payload).encode("utf-8"), digest_size=16).hexdigest()
+        invariant_checksum = hashlib.blake2b(
+            json_dumps(circuit.report.invariants.to_dict()).encode("utf-8"),
+            digest_size=16,
+        ).hexdigest()
+        contract = {
+            "schema_version": 1,
+            "circuit_id": circuit_id,
+            "skill": circuit.skill,
+            "task_id": task.task_id,
+            "source_failure_ids": tuple(circuit.report.source_failure_ids),
+            "frontier_task_ids": tuple(circuit.report.frontier_task_ids),
+            "verified_slow_solutions": int(circuit.report.verified_slow_solutions),
+            "prompt_obligations": tuple(circuit.report.invariants.prompt_obligations),
+            "invariant_checksum": invariant_checksum,
+            "compiled_weight_bits": float(circuit.report.compiled_weight_bits),
+            "active_weights": int(circuit.report.active_weights),
+            "total_weights": int(circuit.report.total_weights),
+            "dsv_passed": bool(circuit.report.passed),
+            "dsv_verified": int(circuit.report.dsv.get("passed", 0)),
+            "dsv_total": int(circuit.report.dsv.get("total", 0)),
+            "output_verified": bool(output_verified),
+        }
+        latent_state = LatentProofState(
+            state_id=f"compiled-frontier-{circuit_id}-{task.task_id}",
+            task_id=task.task_id,
+            skill=task.skill,
+            tensor=torch.tensor(
+                [[
+                    float(circuit.report.verified_slow_solutions),
+                    float(circuit.report.active_weights),
+                    float(max(circuit.report.total_weights, 1)),
+                    1.0 if output_verified else 0.0,
+                ]],
+                dtype=torch.float32,
+            ),
+            latent_steps=1,
+            visible_reasoning_tokens=0,
+        )
+        compiled_certificate = build_compiled_circuit_certificate(
+            certificate_id=f"frontier-contract-{task.task_id}-{circuit_id}",
+            task=task,
+            answer=answer.text,
+            claims={
+                "frontier_compiled_circuit": True,
+                "frontier_skill": circuit.skill,
+                "frontier_circuit_id": circuit_id,
+            },
+            uncertainty=max(0.0, min(1.0, 1.0 - answer.confidence)),
+            latent_state=latent_state,
+            contract=contract,
+        )
+        verification = self.certificate_verifier.verify(compiled_certificate, latent_state)
+        return compiled_certificate.to_dict(), verification.to_dict()
 
     def __call__(self, task: Task) -> CandidateAnswer:
         circuit = self.registry.select(task)
@@ -324,12 +393,24 @@ class CompiledFrontierAgent:
         }
         cost = answer.cost.merge(CostTrace(verifier_steps=1 if self.verifier is not None and self.verify_outputs else 0))
         confidence = answer.confidence
+        output_verified = True
         if self.verifier is not None and self.verify_outputs:
             verification = self.verifier.oracle_registry.verify(task.skill, task, answer)
             raw["frontier_compiled_verified"] = verification.passed
             raw["frontier_compiled_verification_reason"] = verification.reason
             certificate["frontier_verification_passed"] = verification.passed
             confidence = min(confidence, verification.score)
+            output_verified = verification.passed
+        contract_certificate, contract_verification = self._compiled_contract_certificate(
+            circuit,
+            task,
+            answer,
+            output_verified=output_verified,
+        )
+        certificate["frontier_compiled_contract"] = contract_certificate
+        certificate["frontier_compiled_contract_checksum"] = contract_certificate["checksum"]
+        certificate["frontier_compiled_contract_verified"] = bool(contract_verification["passed"])
+        raw["frontier_compiled_contract_verification"] = contract_verification
         return CandidateAnswer(answer.text, confidence=confidence, certificate=certificate, cost=cost, raw=raw)
 
 

@@ -4,7 +4,7 @@ import tempfile
 
 import torch
 
-from cortex3 import Anchor
+from cortex3 import Anchor, Task
 from cortex3 import CorruptedCompressedAgent, DynamicSkillVerifier, ReferenceRuleAgent, default_skill_specs
 from cortex3_certificates import (
     CertificateAnswerVocabulary,
@@ -18,8 +18,10 @@ from cortex3_certificates import (
     RandomDelatentizer,
     ShortCertificate,
     build_certificate,
+    build_compiled_circuit_certificate,
     certificate_examples_from_tasks,
     code_unit_test_tool,
+    compiled_circuit_tool,
     default_tool_registry,
     evaluate_certificate_efficiency,
 )
@@ -151,6 +153,56 @@ class CertificatesTest(unittest.TestCase):
         )
         self.assertFalse(code_unit_test_tool(bad).passed)
 
+    def test_compiled_circuit_certificate_binds_contract_and_lineage(self):
+        state = _latent_state()
+        anchor = Anchor("identifier", "frontier-anchor", "frontier-source")
+        contract = {
+            "circuit_id": "circuit-1",
+            "skill": "arithmetic",
+            "task_id": "task-1",
+            "source_failure_ids": ("task-1",),
+            "frontier_task_ids": ("task-1", "task-1-frontier"),
+            "verified_slow_solutions": 2,
+            "prompt_obligations": ("exact_output",),
+            "invariant_checksum": "invariant-1",
+            "compiled_weight_bits": 128.0,
+            "active_weights": 8,
+            "total_weights": 16,
+            "dsv_passed": True,
+            "dsv_verified": 2,
+            "dsv_total": 2,
+            "output_verified": True,
+        }
+        cert = build_compiled_circuit_certificate(
+            certificate_id="cert-compiled",
+            task=Task("task-1", "arithmetic", "Compute exactly: 2 + 2.", 4, anchors=(anchor,)),
+            answer="4",
+            claims={"frontier_compiled_circuit": True},
+            uncertainty=0.03,
+            latent_state=state,
+            contract=contract,
+        )
+
+        result = CertificateVerifier().verify(cert, state)
+        self.assertTrue(result.passed, result.reason)
+        self.assertTrue(compiled_circuit_tool(cert).passed)
+        tampered_contract = dict(cert.claims["compiled_circuit_contract"])
+        tampered_contract["output_verified"] = False
+        tampered = ShortCertificate(
+            certificate_id=cert.certificate_id,
+            task_id=cert.task_id,
+            skill=cert.skill,
+            certificate_type=cert.certificate_type,
+            answer=cert.answer,
+            claims={**dict(cert.claims), "compiled_circuit_contract": tampered_contract},
+            uncertainty=cert.uncertainty,
+            latent_state_checksum=cert.latent_state_checksum,
+            anchors=cert.anchors,
+            tool=cert.tool,
+            tool_args=cert.tool_args,
+        )
+        self.assertFalse(compiled_circuit_tool(tampered).passed)
+
     def test_proof_carrying_answer_maps_to_candidate_answer(self):
         state = _latent_state()
         cert = build_certificate(
@@ -217,7 +269,7 @@ class CertificatesTest(unittest.TestCase):
 
     def test_default_registry_contains_required_tools(self):
         registry = default_tool_registry()
-        self.assertEqual(set(registry.names), {"anchor_fidelity", "arithmetic", "code_tests", "exact_match"})
+        self.assertEqual(set(registry.names), {"anchor_fidelity", "arithmetic", "code_tests", "compiled_circuit", "exact_match"})
 
     def test_cycle_run_artifacts_can_include_short_certificates(self):
         state = _latent_state()

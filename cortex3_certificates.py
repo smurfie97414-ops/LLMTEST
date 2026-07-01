@@ -22,6 +22,7 @@ class CertificateType(str, Enum):
     CODE_TESTS = "code_tests"
     ANCHOR_FIDELITY = "anchor_fidelity"
     FORMAT = "format"
+    COMPILED_CIRCUIT = "compiled_circuit"
     UNKNOWN = "unknown"
 
 
@@ -351,10 +352,47 @@ def code_unit_test_tool(certificate: ShortCertificate) -> ToolVerification:
     return ToolVerification("code_tests", True, 1.0, "all certificate unit tests passed")
 
 
+def compiled_circuit_contract_checksum(contract: Mapping[str, Any]) -> str:
+    encoded = json.dumps(dict(contract), sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return hashlib.blake2b(encoded, digest_size=16).hexdigest()
+
+
+def compiled_circuit_tool(certificate: ShortCertificate) -> ToolVerification:
+    contract = dict(certificate.claims.get("compiled_circuit_contract") or {})
+    if not contract:
+        return ToolVerification("compiled_circuit", False, 0.0, "missing compiled circuit contract")
+    checksum = str(contract.get("contract_checksum") or "")
+    payload = {key: value for key, value in contract.items() if key != "contract_checksum"}
+    expected_checksum = compiled_circuit_contract_checksum(payload)
+    if checksum != expected_checksum:
+        return ToolVerification("compiled_circuit", False, 0.0, "compiled circuit contract checksum mismatch")
+    if certificate.certificate_type != CertificateType.COMPILED_CIRCUIT:
+        return ToolVerification("compiled_circuit", False, 0.0, "certificate type is not compiled_circuit")
+    if str(contract.get("skill")) != certificate.skill:
+        return ToolVerification("compiled_circuit", False, 0.0, "compiled circuit skill mismatch")
+    if str(contract.get("task_id")) != certificate.task_id:
+        return ToolVerification("compiled_circuit", False, 0.0, "compiled circuit task mismatch")
+    if str(contract.get("answer_checksum")) != hashlib.blake2b(certificate.answer.encode("utf-8"), digest_size=16).hexdigest():
+        return ToolVerification("compiled_circuit", False, 0.0, "compiled circuit answer checksum mismatch")
+    if not bool(contract.get("dsv_passed")):
+        return ToolVerification("compiled_circuit", False, 0.0, "compiled circuit did not pass DSV")
+    if not bool(contract.get("output_verified")):
+        return ToolVerification("compiled_circuit", False, 0.0, "compiled circuit output was not verified")
+    if not tuple(contract.get("source_failure_ids") or ()):
+        return ToolVerification("compiled_circuit", False, 0.0, "missing source failure lineage")
+    if not tuple(contract.get("frontier_task_ids") or ()):
+        return ToolVerification("compiled_circuit", False, 0.0, "missing frontier task lineage")
+    expected_tool_checksum = str(certificate.tool_args.get("expected_contract_checksum") or "")
+    if expected_tool_checksum and expected_tool_checksum != checksum:
+        return ToolVerification("compiled_circuit", False, 0.0, "compiled circuit tool checksum mismatch")
+    return ToolVerification("compiled_circuit", True, 1.0, "compiled circuit contract verified")
+
+
 def default_tool_registry() -> ToolVerifierRegistry:
     registry = ToolVerifierRegistry()
     registry.register("arithmetic", arithmetic_tool)
     registry.register("anchor_fidelity", anchor_tool)
+    registry.register("compiled_circuit", compiled_circuit_tool)
     registry.register("exact_match", exact_match_tool)
     registry.register("code_tests", code_unit_test_tool)
     return registry
@@ -524,6 +562,41 @@ def build_certificate(
         tool_args=dict(tool_args or {}),
         visible_reasoning_tokens=latent_state.visible_reasoning_tokens,
         latent_steps=latent_state.latent_steps,
+    )
+
+
+def build_compiled_circuit_certificate(
+    *,
+    certificate_id: str,
+    task: Task,
+    answer: str,
+    claims: Mapping[str, Any],
+    uncertainty: float,
+    latent_state: LatentProofState,
+    contract: Mapping[str, Any],
+) -> ShortCertificate:
+    payload = dict(contract)
+    payload.setdefault("schema_version", 1)
+    payload.setdefault("task_id", task.task_id)
+    payload.setdefault("skill", task.skill)
+    payload.setdefault("answer_checksum", hashlib.blake2b(str(answer).encode("utf-8"), digest_size=16).hexdigest())
+    payload["contract_checksum"] = compiled_circuit_contract_checksum(payload)
+    return build_certificate(
+        certificate_id=certificate_id,
+        task_id=task.task_id,
+        skill=task.skill,
+        certificate_type=CertificateType.COMPILED_CIRCUIT,
+        answer=str(answer),
+        claims={
+            **dict(claims),
+            "compiled_circuit": True,
+            "compiled_circuit_contract": payload,
+        },
+        uncertainty=uncertainty,
+        latent_state=latent_state,
+        anchors=task.anchors,
+        tool="compiled_circuit",
+        tool_args={"expected_contract_checksum": payload["contract_checksum"]},
     )
 
 

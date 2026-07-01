@@ -114,12 +114,14 @@ Current executable coverage:
 - `CertificateVerifier` checks uncertainty bounds, latent checksum and tool-backed verification.
 - `CertificateVerifier` accepts explicitly calibrated high-uncertainty certificates, so `UNKNOWN` can stay low-confidence without being treated as proof corruption.
 - `RandomDelatentizer` samples latent dimensions deterministically for audit probes and detects tampering.
-- Tool-backed checks include arithmetic, exact match, anchor fidelity and executable code unit tests.
+- Tool-backed checks include arithmetic, exact match, anchor fidelity, compiled-circuit contracts and executable code unit tests.
+- `CertificateType.COMPILED_CIRCUIT`, `build_compiled_circuit_certificate` and the `compiled_circuit` tool bind compiled skill reuse to a canonical contract checksum, source/frontier task lineage, DSV pass state, runtime output verification and answer checksum.
 - `ProofCarryingAnswer` converts answer + certificate + uncertainty into `CandidateAnswer` with a serializable latent proof payload.
 - `ProofCarryingGenerator` connects a calibrated certificate head to DSV-compatible answer generation and verifies every emitted certificate.
 - `evaluate_certificate_efficiency` measures token reduction, quality preservation and calibration preservation.
 - `write_cycle_run` can persist short certificates into `summary.json`.
 - `UltraFastInferenceEngine` treats proof-carrying certificate verification as a gate; a tampered latent proof makes `InferenceResult.passed` false and zeroes verified capability per cost.
+- `CompiledFrontierAgent` attaches a verified P5 compiled-circuit certificate to every selected Frontier circuit answer; the LLM phase report persists `frontier_compiled_contract_verified` and the contract checksum for accepted P7 repairs.
 - `tools/run_cycle_report.py` writes a trained proof-carrying certificate smoke by default; `--skip-certificates` disables it.
 
 Remaining:
@@ -261,6 +263,7 @@ Evidence:
 - `tests.test_recursive_improvement.RecursiveImprovementTest.test_engine_prioritizes_accepted_frontier_repair_proposals` verifies that a Frontier repair becomes the first P10 proposal and is accepted under the normal gates.
 - `tests/test_llm_pretraining.py::LLMPretrainingHarnessTest::test_cortex_phase_state_survives_checkpoint_resume` verifies that P1-P10 replay state plus P2/P3 internal ledgers persist through a checkpoint resume and keep influencing optimizer steps.
 - `tests.test_llm_pretraining.LLMPretrainingHarnessTest.test_full_cortex_phase_controller_uses_all_modules_during_training` verifies the applied recursive model patch has `proposal_kind == "compiled_frontier"` and carries the Frontier repair payload.
+- `tests.test_certificates.CertificatesTest.test_compiled_circuit_certificate_binds_contract_and_lineage` verifies the compiled-circuit certificate tool accepts valid lineage and rejects a tampered contract.
 - Smoke: `RecursiveImprovementEngine(...).run(..., max_proposals=3)` accepted Pareto-improving sandbox proposals with no touched files.
 - Temporary artifact write with `tools\run_cycle_report.py --out-dir <temp> --run-id final-smoke` includes `recursive_improvement` with accepted sandbox proposals and rollback data.
 
@@ -299,7 +302,7 @@ Evidence:
 Remaining:
 
 - Run frontier discovery over larger held-out frontier suites.
-- Extend P5 certificates to bind compiled-circuit contracts and run larger held-out frontier generalization suites.
+- Run larger held-out frontier generalization suites and expand certificate tools to multi-step algebra and richer code tests.
 
 ## Cross-phase final objective and metrics
 
