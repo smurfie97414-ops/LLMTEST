@@ -2369,6 +2369,7 @@ class TrainingConfig:
     cortex_phase_interval: int = 0
     cortex_phase_probe_tasks: int = 1
     cortex_phase_max_proposals: int = 1
+    cortex_phase_improvement_generations: int = 2
     cortex_phase_regrowth_budget: float = 32.0
     cortex_phase_frontier_max_skills: int = 1
     cortex_phase_frontier_per_failure: int = 1
@@ -2402,6 +2403,8 @@ class TrainingConfig:
             raise ValueError("cortex_phase_probe_tasks must be positive")
         if self.cortex_phase_max_proposals < 0:
             raise ValueError("cortex_phase_max_proposals must be non-negative")
+        if self.cortex_phase_improvement_generations < 1:
+            raise ValueError("cortex_phase_improvement_generations must be positive")
         if self.cortex_phase_regrowth_budget <= 0:
             raise ValueError("cortex_phase_regrowth_budget must be positive")
         if self.cortex_phase_frontier_max_skills < 0:
@@ -3827,6 +3830,11 @@ def _cortex_phase_deliverable_audit_from_summary(summary: Mapping[str, Any]) -> 
         and count("recursive_pareto_gate_decisions") > 0
         and count("recursive_rollback_tokens") > 0
         and count("recursive_diversity_checks") > 0
+        and count("recursive_generation_events") > 0
+        and (
+            int(number("recursive_improvement_generations_configured")) <= 1
+            or count("recursive_evolved_proposal_events") > 0
+        )
         and count("recursive_persistent_archive_saves") > 0
         and int(number("improvement_persistent_archive_decisions")) > 0
         and int(number("recursive_model_application_count")) > 0
@@ -3840,6 +3848,9 @@ def _cortex_phase_deliverable_audit_from_summary(summary: Mapping[str, Any]) -> 
             "recursive_pareto_gate_decisions": count("recursive_pareto_gate_decisions"),
             "recursive_rollback_tokens": count("recursive_rollback_tokens"),
             "recursive_diversity_checks": count("recursive_diversity_checks"),
+            "recursive_improvement_generations_configured": int(number("recursive_improvement_generations_configured")),
+            "recursive_generation_events": count("recursive_generation_events"),
+            "recursive_evolved_proposal_events": count("recursive_evolved_proposal_events"),
             "recursive_persistent_archive_saves": count("recursive_persistent_archive_saves"),
             "improvement_persistent_archive_decisions": int(number("improvement_persistent_archive_decisions")),
             "improvement_persistent_rollback_events": int(number("improvement_persistent_rollback_events")),
@@ -3848,7 +3859,7 @@ def _cortex_phase_deliverable_audit_from_summary(summary: Mapping[str, Any]) -> 
             "recursive_model_repair_loss_delta": number("recursive_model_repair_loss_delta"),
             "recursive_model_non_regressing": recursive_model_non_regressing,
         },
-        "recursive improvement must propose, sandbox, evaluate, gate, persist evolutionary and rollback archives, apply a signed model patch, preserve rollback tokens and run diversity checks",
+        "recursive improvement must propose, sandbox, evolve across generations, evaluate, gate, persist evolutionary and rollback archives, apply a signed model patch, preserve rollback tokens and run diversity checks",
     )
 
     failed_checks = tuple(f"{check['phase']}:{check['deliverable']}" for check in checks if not check["passed"])
@@ -5416,6 +5427,9 @@ class CortexTrainingPhaseController:
             "frontier_repair_candidates": _last_items(self.frontier_repair_candidates, 3),
             "improvement_archive_accepted": self.improvement.archive.accepted_count,
             "improvement_archive_rejected": self.improvement.archive.rejected_count,
+            "recursive_improvement_generations_configured": int(self.config.cortex_phase_improvement_generations),
+            "recursive_generation_events": int(self.integration_counts.get("recursive_generation_events", 0)),
+            "recursive_evolved_proposal_events": int(self.integration_counts.get("recursive_evolved_proposal_events", 0)),
             "regrowth_model_application_count": len(self.regrowth_model_applications),
             "regrowth_model_parameter_delta_l1": float(self.regrowth_model_parameter_delta_l1),
             "regrowth_model_repair_loss_delta": float(self.regrowth_model_repair_loss_delta),
@@ -5918,6 +5932,7 @@ class CortexTrainingPhaseController:
                     baseline_agent=self.trial_agent,
                     reference_agent=self.reference_agent,
                     max_proposals=p10_proposal_budget,
+                    generations=int(self.config.cortex_phase_improvement_generations),
                     seed=self.config.seed + step,
                     n_per_skill=self.config.cortex_phase_probe_tasks,
                     extra_proposals=compiled_frontier_proposals,
@@ -5925,11 +5940,14 @@ class CortexTrainingPhaseController:
                 self._touch("P10")
                 audit["recursive_improvement"] = improvement_report.to_dict()
                 audit["recursive_improvement"]["proposal_budget"] = p10_proposal_budget
+                audit["recursive_improvement"]["configured_generations"] = int(self.config.cortex_phase_improvement_generations)
                 audit["recursive_improvement"]["frontier_proposal_count"] = len(compiled_frontier_proposals)
                 audit["recursive_improvement"]["frontier_repair_proposal_count"] = len(frontier_improvement_proposals)
                 audit["recursive_improvement"]["sleep_frontier_proposal_count"] = len(sleep_frontier_proposals)
                 self._count("recursive_frontier_proposal_events", len(compiled_frontier_proposals))
                 self._count("recursive_sleep_frontier_proposal_events", len(sleep_frontier_proposals))
+                self._count("recursive_generation_events", len(improvement_report.generations))
+                self._count("recursive_evolved_proposal_events", int(improvement_report.to_dict().get("evolved_proposal_count", 0)))
                 self._count("recursive_proposal_events", len(improvement_report.proposals))
                 self._count("recursive_sandbox_trials", len(improvement_report.decisions))
                 self._count("recursive_dynamic_evaluations", len(improvement_report.decisions))
@@ -6186,6 +6204,9 @@ class CortexTrainingPhaseController:
                 "recursive_model_applications": _last_items(self.recursive_model_applications, 5),
                 "improvement_archive_accepted": self.improvement.archive.accepted_count,
                 "improvement_archive_rejected": self.improvement.archive.rejected_count,
+                "recursive_improvement_generations_configured": int(self.config.cortex_phase_improvement_generations),
+                "recursive_generation_events": int(self.integration_counts.get("recursive_generation_events", 0)),
+                "recursive_evolved_proposal_events": int(self.integration_counts.get("recursive_evolved_proposal_events", 0)),
                 "improvement_archive_dir": str(self.improvement_archive_dir),
                 "improvement_persistent_archive_state": dict(self.improvement_persistent_archive_state),
                 "improvement_persistent_archive_decisions": int(
@@ -6285,6 +6306,9 @@ class CortexTrainingPhaseController:
                     "recursive_model_applications": _last_items(self.recursive_model_applications, 5),
                     "improvement_archive_accepted": self.improvement.archive.accepted_count,
                     "improvement_archive_rejected": self.improvement.archive.rejected_count,
+                    "recursive_improvement_generations_configured": int(self.config.cortex_phase_improvement_generations),
+                    "recursive_generation_events": int(self.integration_counts.get("recursive_generation_events", 0)),
+                    "recursive_evolved_proposal_events": int(self.integration_counts.get("recursive_evolved_proposal_events", 0)),
                     "improvement_persistent_archive_decisions": int(
                         self.improvement_persistent_archive_state.get("decision_count", 0) or 0
                     ),
@@ -6364,6 +6388,9 @@ class CortexTrainingPhaseController:
                     "recursive_model_applications": _last_items(self.recursive_model_applications, 5),
                     "improvement_archive_accepted": self.improvement.archive.accepted_count,
                     "improvement_archive_rejected": self.improvement.archive.rejected_count,
+                    "recursive_improvement_generations_configured": int(self.config.cortex_phase_improvement_generations),
+                    "recursive_generation_events": int(self.integration_counts.get("recursive_generation_events", 0)),
+                    "recursive_evolved_proposal_events": int(self.integration_counts.get("recursive_evolved_proposal_events", 0)),
                     "improvement_persistent_archive_decisions": int(
                         self.improvement_persistent_archive_state.get("decision_count", 0) or 0
                     ),

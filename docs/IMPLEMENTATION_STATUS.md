@@ -252,6 +252,7 @@ Remaining:
 Current executable coverage:
 
 - `ProposalGenerator` converts cycle actions and regressions into typed proposals for tests, compression, router changes, MTP heads, regrowth strategies and new skill/test families; it also converts accepted compiled Frontier repairs into `compiled_frontier` proposals with source/frontier task lineage.
+- `ProposalGenerator.evolve_from_archive` creates semantically compatible child proposals from accepted archive records, preserves parent ids, records the parent kind/action, and applies diversity pressure by choosing underrepresented proposal kinds from the persistent archive counts.
 - `ImprovementProposal` carries affected skills, expected quality/cost/robustness deltas, risk, diversity tags and patch payload metadata.
 - `SandboxTrainer` first applies proposals as in-memory sandbox agents; it records no touched repo files and creates rollback tokens for verifier-gated evaluation.
 - `ProposalPatchedAgent` simulates repair, protected-skill degradation, reward-hacking behavior and calibration regression for verifier-gated evaluation.
@@ -261,27 +262,29 @@ Current executable coverage:
 - `PatchAcceptanceGate` requires Pareto improvement, no protected-skill regression, no calibration regression, no reward hacking and no diversity/collapse failure.
 - `EvolutionaryArchive` records accepted and rejected decisions with proposal lineage, full sandbox/evaluation payloads and kind counts; it can save/load the complete archive as `archive.json` instead of only restoring counters.
 - `RollbackSystem` records rollback events from accepted proposal tokens and can save/load them as `rollback.json`.
-- `RecursiveImprovementEngine` orchestrates proposal generation, prioritized external proposals, sandbox training, dynamic evaluation, acceptance and archive recording from a `CycleReport`; it also writes a persistent manifest for the archive/rollback pair.
+- `RecursiveImprovementEngine` orchestrates proposal generation, prioritized external proposals, bounded multi-generation archive evolution, sandbox training, dynamic evaluation, acceptance and archive recording from a `CycleReport`; it also writes a persistent manifest for the archive/rollback pair.
+- `RecursiveImprovementReport` now carries per-generation summaries with proposal ids, accepted/rejected ids, evolved proposal counts and archive kind counts before/after each generation.
 - `write_cycle_run` can persist recursive improvement reports into `summary.json`.
 - `tools/run_cycle_report.py` writes Phase 10 traces by default unless `--skip-improvement` is passed.
-- The full LLM Cortex phase controller converts verifier-approved recursive-improvement gate decisions into causal replay examples, feeds accepted P7 compiled Frontier repairs into P10 before generic proposals, applies accepted proposals as signed bounded patches to real Transformer parameters, persists patch id, rollback token, parameter deltas, repair-loss improvement, protected-loss non-regression and proposal payload in checkpoints, and loads/saves reusable P10 archives through `TrainingConfig.cortex_improvement_archive_dir` even when a later run does not resume the checkpoint.
+- The full LLM Cortex phase controller converts verifier-approved recursive-improvement gate decisions into causal replay examples, feeds accepted P7 compiled Frontier repairs into P10 before generic proposals, runs bounded multi-generation P10 evolution by default through `TrainingConfig.cortex_phase_improvement_generations`, applies accepted proposals as signed bounded patches to real Transformer parameters, persists patch id, rollback token, parameter deltas, repair-loss improvement, protected-loss non-regression and proposal payload in checkpoints, and loads/saves reusable P10 archives through `TrainingConfig.cortex_improvement_archive_dir` even when a later run does not resume the checkpoint.
 
 Evidence:
 
 - `.\.venv\Scripts\python.exe -m unittest tests.test_recursive_improvement`
+- `tests.test_recursive_improvement.RecursiveImprovementTest.test_engine_evolves_accepted_proposals_across_generations` verifies that generation 1 creates a child proposal from a generation 0 accepted parent and records diversity-pressure archive counts.
 - `.\.venv\Scripts\python.exe -m unittest discover -s tests`
 - `tests.test_recursive_improvement.RecursiveImprovementTest.test_engine_prioritizes_accepted_frontier_repair_proposals` verifies that a Frontier repair becomes the first P10 proposal and is accepted under the normal gates.
 - `tests.test_recursive_improvement.RecursiveImprovementTest.test_persistent_archive_round_trips_full_decisions_and_rollbacks` verifies full accepted/rejected decisions, evaluation reports and rollback tokens round-trip through persistent archive files.
-- `tests/test_llm_pretraining.py::LLMPretrainingHarnessTest::test_cortex_phase_state_survives_checkpoint_resume` verifies that P1-P10 replay state plus P2/P3 internal ledgers persist through a checkpoint resume and keep influencing optimizer steps.
+- `tests/test_llm_pretraining.py::LLMPretrainingHarnessTest::test_cortex_phase_state_survives_checkpoint_resume` verifies that P1-P10 replay state plus P2/P3 internal ledgers persist through a checkpoint resume and keep influencing optimizer steps, including multi-generation recursive-improvement events and evolved child proposals.
 - The same LLM resume test now also verifies that a fresh independent `CortexTrainingPhaseController` with a different run directory reloads the shared P10 archive from `cortex_improvement_archive_dir` without using the checkpoint.
-- `tests.test_llm_pretraining.LLMPretrainingHarnessTest.test_full_cortex_phase_controller_uses_all_modules_during_training` verifies the applied recursive model patch has `proposal_kind == "compiled_frontier"` and carries the Frontier repair payload.
+- `tests.test_llm_pretraining.LLMPretrainingHarnessTest.test_full_cortex_phase_controller_uses_all_modules_during_training` verifies the applied recursive model patch has `proposal_kind == "compiled_frontier"`, carries the Frontier repair payload, and records at least two recursive-improvement generations with evolved proposal events.
 - `tests.test_certificates.CertificatesTest.test_compiled_circuit_certificate_binds_contract_and_lineage` verifies the compiled-circuit certificate tool accepts valid lineage and rejects a tampered contract.
 - Smoke: `RecursiveImprovementEngine(...).run(..., max_proposals=3)` accepted Pareto-improving sandbox proposals with no touched files.
 - Temporary artifact write with `tools\run_cycle_report.py --out-dir <temp> --run-id final-smoke` includes `recursive_improvement` with accepted sandbox proposals and rollback data.
 
 Remaining:
 
-- Run multi-generation proposal evolution with diversity pressure.
+- Scale multi-generation proposal evolution over long shared archives, larger proposal budgets, real corpora and repeated wake/sleep cycles.
 
 ## Frontier Skill Discovery
 

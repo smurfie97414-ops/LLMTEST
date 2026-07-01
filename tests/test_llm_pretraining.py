@@ -3335,6 +3335,9 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             self.assertGreater(influence["frontier_repair_candidate_count"], 0)
             self.assertGreater(influence["frontier_repair_accepted_events"], 0)
             self.assertGreater(influence["recursive_frontier_proposal_events"], 0)
+            self.assertGreaterEqual(influence["recursive_improvement_generations_configured"], 2)
+            self.assertGreaterEqual(influence["recursive_generation_events"], 2)
+            self.assertGreater(influence["recursive_evolved_proposal_events"], 0)
             self.assertGreater(phase_report["integration_counts"]["recursive_sleep_frontier_proposal_events"], 0)
             self.assertTrue((Path(influence["frontier_registry_path"]) / "frontier_registry.json").exists())
             self.assertTrue(phase_report["sleep_frontier_reports"], phase_report)
@@ -3543,6 +3546,9 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 self.assertGreater(first_influence["ternary_core_forward_events"], 0)
                 self.assertGreater(first_influence["sleep_frontier_compiled_circuit_count"], 0)
                 self.assertGreater(first_influence["sleep_frontier_fastsolve_events"], 0)
+                self.assertGreaterEqual(first_influence["recursive_improvement_generations_configured"], 2)
+                self.assertGreaterEqual(first_influence["recursive_generation_events"], 2)
+                self.assertGreater(first_influence["recursive_evolved_proposal_events"], 0)
                 checkpoint = torch.load(run_dir / "checkpoint_final.pt", map_location="cpu", weights_only=False)
                 self.assertIn("cortex_phase_state", checkpoint)
                 self.assertGreater(len(checkpoint["cortex_phase_state"]["replay_batches"]), 0)
@@ -3641,6 +3647,8 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 self.assertGreater(sidecar["cortex_phase_state_summary"]["regrowth_model_repair_loss_delta"], 0.0)
                 self.assertTrue(sidecar["cortex_phase_state_summary"]["regrowth_model_applications"])
                 self.assertGreater(sidecar["cortex_phase_state_summary"]["recursive_model_application_count"], 0)
+                self.assertGreaterEqual(sidecar["cortex_phase_state_summary"]["recursive_generation_events"], 2)
+                self.assertGreater(sidecar["cortex_phase_state_summary"]["recursive_evolved_proposal_events"], 0)
                 self.assertGreater(sidecar["cortex_phase_state_summary"]["recursive_model_parameter_delta_l1"], 0.0)
                 self.assertGreater(sidecar["cortex_phase_state_summary"]["recursive_model_repair_loss_delta"], 0.0)
                 self.assertTrue(sidecar["cortex_phase_state_summary"]["recursive_model_applications"])
@@ -3747,6 +3755,14 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             self.assertGreaterEqual(
                 resumed_influence["recursive_model_application_count"],
                 first_influence["recursive_model_application_count"],
+            )
+            self.assertGreaterEqual(
+                resumed_influence["recursive_generation_events"],
+                first_influence["recursive_generation_events"],
+            )
+            self.assertGreaterEqual(
+                resumed_influence["recursive_evolved_proposal_events"],
+                first_influence["recursive_evolved_proposal_events"],
             )
             self.assertGreater(
                 resumed_influence["recursive_model_parameter_delta_l1"],

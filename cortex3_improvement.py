@@ -209,6 +209,19 @@ class ProposalKind(str, Enum):
     COMPILED_FRONTIER = "compiled_frontier"
 
 
+EVOLUTION_KIND_ORDER = (
+    ProposalKind.COMPILED_FRONTIER,
+    ProposalKind.REGROWTH_STRATEGY,
+    ProposalKind.MTP_HEAD,
+    ProposalKind.ROUTER,
+    ProposalKind.COMPRESSION,
+    ProposalKind.TEST,
+    ProposalKind.SKILL_SPEC,
+    ProposalKind.KERNEL,
+    ProposalKind.HARDWARE_GRAMMAR,
+)
+
+
 @dataclass(frozen=True)
 class ImprovementProposal:
     proposal_id: str
@@ -432,6 +445,154 @@ class ProposalGenerator:
             if len(proposals) >= max_proposals:
                 break
         return tuple(proposals)
+
+    def evolve_from_archive(
+        self,
+        archive: "EvolutionaryArchive",
+        *,
+        max_proposals: int = 4,
+        generation_index: int = 1,
+        seen_ids: Iterable[str] = (),
+    ) -> tuple[ImprovementProposal, ...]:
+        if max_proposals <= 0:
+            return tuple()
+        seen = set(str(item) for item in seen_ids)
+        counts = archive.accepted_kind_counts()
+        accepted = tuple(reversed(archive.accepted))
+        proposals: list[ImprovementProposal] = []
+        projected_counts = Counter(counts)
+        for parent_index, record in enumerate(accepted):
+            parent = record.proposal
+            if not parent.affected_skills:
+                continue
+            compatible_kinds = self._compatible_evolution_kinds(parent)
+            kind = self._least_represented_kind(projected_counts, parent.kind, compatible_kinds)
+            skill = parent.affected_skills[0]
+            proposal_id = f"evolve-g{generation_index}-{kind.value}-{parent.proposal_id}"
+            if proposal_id in seen:
+                continue
+            seen.add(proposal_id)
+            projected_counts[kind] += 1
+            parent_payload = dict(parent.patch_payload)
+            parent_action = str(parent_payload.get("action", parent.kind.value))
+            proposals.append(ImprovementProposal(
+                proposal_id=proposal_id,
+                title=f"evolve {parent.proposal_id} into {kind.value} for {skill}",
+                kind=kind,
+                affected_skills=parent.affected_skills,
+                expected_quality_delta=max(0.01, parent.expected_quality_delta * 0.75 + 0.02),
+                expected_cost_delta=min(parent.expected_cost_delta, -0.01),
+                expected_robustness_delta=max(0.01, parent.expected_robustness_delta * 0.75 + 0.01),
+                risk=min(0.14, max(0.02, parent.risk * 0.70 + 0.01)),
+                diversity_tags=(
+                    "evolved",
+                    f"generation_{generation_index}",
+                    kind.value,
+                    skill,
+                    parent.kind.value,
+                ),
+                patch_payload={
+                    **parent_payload,
+                    "action": f"evolve_{kind.value}_{parent_action}",
+                    "parent_action": parent_action,
+                    "parent_kind": parent.kind.value,
+                    "parent_proposal_id": parent.proposal_id,
+                    "mode": "repair_skill",
+                    "target": skill,
+                    "generation": generation_index,
+                    "diversity_pressure_kind_counts": {
+                        proposal_kind.value: int(count)
+                        for proposal_kind, count in counts.items()
+                    },
+                },
+                parent_ids=tuple(dict.fromkeys((*parent.parent_ids, parent.proposal_id))),
+            ))
+            if len(proposals) >= max_proposals:
+                break
+        return tuple(proposals)
+
+    def _compatible_evolution_kinds(self, parent: ImprovementProposal) -> tuple[ProposalKind, ...]:
+        payload = dict(parent.patch_payload)
+        action = str(payload.get("action", parent.kind.value)).lower()
+        frontier_keys = {
+            "frontier_task_ids",
+            "frontier_task_id",
+            "source_failure_ids",
+            "source_task_id",
+            "compiled_circuit_id",
+            "heldout_task_ids",
+            "sleep_source_example_ids",
+        }
+        if parent.kind == ProposalKind.COMPILED_FRONTIER or any(key in payload for key in frontier_keys):
+            return (
+                ProposalKind.COMPILED_FRONTIER,
+                ProposalKind.REGROWTH_STRATEGY,
+                ProposalKind.ROUTER,
+                ProposalKind.TEST,
+                ProposalKind.SKILL_SPEC,
+            )
+        if parent.kind in {ProposalKind.KERNEL, ProposalKind.HARDWARE_GRAMMAR} or any(
+            token in action
+            for token in ("kernel", "cuda", "ternary", "bitlinear", "wmma", "int2", "pack")
+        ):
+            return (
+                ProposalKind.KERNEL,
+                ProposalKind.HARDWARE_GRAMMAR,
+                ProposalKind.COMPRESSION,
+                ProposalKind.REGROWTH_STRATEGY,
+                ProposalKind.TEST,
+            )
+        if parent.kind == ProposalKind.MTP_HEAD:
+            return (
+                ProposalKind.MTP_HEAD,
+                ProposalKind.ROUTER,
+                ProposalKind.TEST,
+                ProposalKind.SKILL_SPEC,
+            )
+        if parent.kind == ProposalKind.COMPRESSION:
+            return (
+                ProposalKind.COMPRESSION,
+                ProposalKind.ROUTER,
+                ProposalKind.REGROWTH_STRATEGY,
+                ProposalKind.TEST,
+                ProposalKind.SKILL_SPEC,
+            )
+        if parent.kind == ProposalKind.ROUTER:
+            return (
+                ProposalKind.ROUTER,
+                ProposalKind.REGROWTH_STRATEGY,
+                ProposalKind.TEST,
+                ProposalKind.SKILL_SPEC,
+            )
+        if parent.kind in {ProposalKind.TEST, ProposalKind.SKILL_SPEC}:
+            return (
+                ProposalKind.TEST,
+                ProposalKind.SKILL_SPEC,
+                ProposalKind.ROUTER,
+                ProposalKind.REGROWTH_STRATEGY,
+            )
+        return tuple(
+            kind
+            for kind in EVOLUTION_KIND_ORDER
+            if kind not in {ProposalKind.COMPILED_FRONTIER, ProposalKind.KERNEL, ProposalKind.HARDWARE_GRAMMAR}
+        )
+
+    def _least_represented_kind(
+        self,
+        counts: Counter[ProposalKind],
+        parent_kind: ProposalKind,
+        candidates: Iterable[ProposalKind] = EVOLUTION_KIND_ORDER,
+    ) -> ProposalKind:
+        ordered_candidates = tuple(candidates) or EVOLUTION_KIND_ORDER
+        candidates = sorted(
+            ordered_candidates,
+            key=lambda kind: (
+                int(counts.get(kind, 0)),
+                1 if kind == parent_kind else 0,
+                EVOLUTION_KIND_ORDER.index(kind),
+            ),
+        )
+        return candidates[0]
 
 
 class ProposalPatchedAgent:
@@ -939,11 +1100,34 @@ class RollbackSystem:
 
 
 @dataclass(frozen=True)
+class ImprovementGenerationReport:
+    generation_index: int
+    proposal_ids: tuple[str, ...]
+    accepted_ids: tuple[str, ...]
+    rejected_ids: tuple[str, ...]
+    evolved_proposal_count: int
+    archive_kind_counts_before: Mapping[str, int]
+    archive_kind_counts_after: Mapping[str, int]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "generation_index": self.generation_index,
+            "proposal_ids": list(self.proposal_ids),
+            "accepted_ids": list(self.accepted_ids),
+            "rejected_ids": list(self.rejected_ids),
+            "evolved_proposal_count": int(self.evolved_proposal_count),
+            "archive_kind_counts_before": dict(self.archive_kind_counts_before),
+            "archive_kind_counts_after": dict(self.archive_kind_counts_after),
+        }
+
+
+@dataclass(frozen=True)
 class RecursiveImprovementReport:
     proposals: tuple[ImprovementProposal, ...]
     decisions: tuple[AcceptanceDecision, ...]
     archive: EvolutionaryArchive
     rollback: RollbackSystem
+    generations: tuple[ImprovementGenerationReport, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -951,6 +1135,9 @@ class RecursiveImprovementReport:
             "decisions": [decision.to_dict() for decision in self.decisions],
             "archive": self.archive.to_dict(),
             "rollback": self.rollback.to_dict(),
+            "generations": [generation.to_dict() for generation in self.generations],
+            "generation_count": len(self.generations),
+            "evolved_proposal_count": sum(generation.evolved_proposal_count for generation in self.generations),
         }
 
 
@@ -1032,6 +1219,7 @@ class RecursiveImprovementEngine:
         baseline_agent: Agent | None = None,
         reference_agent: Agent | None = None,
         max_proposals: int = 6,
+        generations: int = 1,
         seed: int = 0,
         n_per_skill: int = 1,
         extra_proposals: Iterable[ImprovementProposal] = (),
@@ -1039,37 +1227,92 @@ class RecursiveImprovementEngine:
         baseline = baseline_agent or CorruptedCompressedAgent()
         reference = reference_agent or ReferenceRuleAgent()
         protected = tuple(state.skill for state in report.skill_ledger.fragile_skills())
-        proposals_list: list[ImprovementProposal] = []
+        all_proposals: list[ImprovementProposal] = []
+        all_decisions: list[AcceptanceDecision] = []
+        generation_reports: list[ImprovementGenerationReport] = []
         seen: set[str] = set()
-        for proposal in extra_proposals:
-            if proposal.proposal_id in seen:
-                continue
-            proposals_list.append(proposal)
-            seen.add(proposal.proposal_id)
-            if len(proposals_list) >= max_proposals:
+        remaining_budget = max(0, int(max_proposals))
+        generation_total = max(1, int(generations))
+        extra_tuple = tuple(extra_proposals)
+        for generation_index in range(generation_total):
+            if remaining_budget <= 0:
                 break
-        if len(proposals_list) < max_proposals:
-            for proposal in self.generator.generate(report, max_proposals=max_proposals):
-                if proposal.proposal_id in seen:
-                    continue
-                proposals_list.append(proposal)
-                seen.add(proposal.proposal_id)
-                if len(proposals_list) >= max_proposals:
-                    break
-        proposals = tuple(proposals_list)
-        decisions: list[AcceptanceDecision] = []
-        for proposal in proposals:
-            sandbox = self.trainer.train(proposal, baseline_agent=baseline, reference_agent=reference)
-            evaluation = self.evaluator.evaluate(
-                proposal,
-                sandbox,
-                baseline_agent=baseline,
-                reference_agent=reference,
-                protected_skills=protected,
-                seed=seed,
-                n_per_skill=n_per_skill,
-            )
-            decision = self.gate.decide(evaluation, self.archive, protected_skills=protected)
-            decisions.append(decision)
-            self.archive.record(decision)
-        return RecursiveImprovementReport(proposals, tuple(decisions), self.archive, self.rollback)
+            remaining_generations = generation_total - generation_index
+            generation_budget = max(1, (remaining_budget + remaining_generations - 1) // remaining_generations)
+            if generation_index == 0:
+                candidates: list[ImprovementProposal] = []
+                for proposal in extra_tuple:
+                    if proposal.proposal_id in seen:
+                        continue
+                    candidates.append(proposal)
+                    seen.add(proposal.proposal_id)
+                    if len(candidates) >= generation_budget:
+                        break
+                if len(candidates) < generation_budget:
+                    for proposal in self.generator.generate(report, max_proposals=max_proposals):
+                        if proposal.proposal_id in seen:
+                            continue
+                        candidates.append(proposal)
+                        seen.add(proposal.proposal_id)
+                        if len(candidates) >= generation_budget:
+                            break
+            else:
+                candidates = []
+                for proposal in self.generator.evolve_from_archive(
+                    self.archive,
+                    max_proposals=generation_budget,
+                    generation_index=generation_index,
+                    seen_ids=seen,
+                ):
+                    if proposal.proposal_id in seen:
+                        continue
+                    candidates.append(proposal)
+                    seen.add(proposal.proposal_id)
+                    if len(candidates) >= generation_budget:
+                        break
+            if not candidates:
+                continue
+            kind_counts_before = {
+                kind.value: int(count)
+                for kind, count in self.archive.accepted_kind_counts().items()
+            }
+            generation_decisions: list[AcceptanceDecision] = []
+            for proposal in candidates:
+                sandbox = self.trainer.train(proposal, baseline_agent=baseline, reference_agent=reference)
+                evaluation = self.evaluator.evaluate(
+                    proposal,
+                    sandbox,
+                    baseline_agent=baseline,
+                    reference_agent=reference,
+                    protected_skills=protected,
+                    seed=seed + generation_index,
+                    n_per_skill=n_per_skill,
+                )
+                decision = self.gate.decide(evaluation, self.archive, protected_skills=protected)
+                generation_decisions.append(decision)
+                self.archive.record(decision)
+            kind_counts_after = {
+                kind.value: int(count)
+                for kind, count in self.archive.accepted_kind_counts().items()
+            }
+            generation_reports.append(ImprovementGenerationReport(
+                generation_index=generation_index,
+                proposal_ids=tuple(proposal.proposal_id for proposal in candidates),
+                accepted_ids=tuple(
+                    decision.evaluation.proposal.proposal_id
+                    for decision in generation_decisions
+                    if decision.accepted
+                ),
+                rejected_ids=tuple(
+                    decision.evaluation.proposal.proposal_id
+                    for decision in generation_decisions
+                    if not decision.accepted
+                ),
+                evolved_proposal_count=sum(1 for proposal in candidates if proposal.parent_ids),
+                archive_kind_counts_before=kind_counts_before,
+                archive_kind_counts_after=kind_counts_after,
+            ))
+            all_proposals.extend(candidates)
+            all_decisions.extend(generation_decisions)
+            remaining_budget -= len(candidates)
+        return RecursiveImprovementReport(tuple(all_proposals), tuple(all_decisions), self.archive, self.rollback, tuple(generation_reports))

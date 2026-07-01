@@ -599,8 +599,8 @@ P10 part du `CycleReport`, des actions et regressions.
 
 P10 :
 
-1. genere des propositions ;
-2. les teste en sandbox ;
+1. genere des propositions initiales ;
+2. teste chaque generation en sandbox ;
 3. evalue qualite, cout, robustesse ;
 4. verifie protected skills ;
 5. detecte calibration regression ;
@@ -608,11 +608,12 @@ P10 :
 7. verifie diversite/collapse ;
 8. accepte ou rejette ;
 9. archive la decision ;
-10. persiste l'archive evolutive complete dans `archive.json` et les evenements rollback dans `rollback.json` ;
-11. recharge ces archives via `cortex_improvement_archive_dir` quand un run independant partage le meme dossier ;
-12. cree rollback token ;
-13. applique une proposition acceptee comme patch signe sur vrais poids Transformer ;
-14. mesure repair loss, protected loss et delta de poids.
+10. cree des propositions descendantes depuis les parents acceptes de l'archive, avec filiation et pression de diversite ;
+11. persiste l'archive evolutive complete dans `archive.json` et les evenements rollback dans `rollback.json` ;
+12. recharge ces archives via `cortex_improvement_archive_dir` quand un run independant partage le meme dossier ;
+13. cree rollback token ;
+14. applique une proposition acceptee comme patch signe sur vrais poids Transformer ;
+15. mesure repair loss, protected loss et delta de poids.
 
 ### Interaction Avec Les Autres Phases
 
@@ -633,6 +634,7 @@ P10 agit par :
 - replay P10 ;
 - patch direct des poids ;
 - archive evolutive durable qui influence les gates de diversite des runs suivants ;
+- evolution multi-generation bornee depuis des parents acceptes, avec lineage et pression vers les types de propositions sous-representes ;
 - signaux vers `L_recursive_improvement_validity`.
 
 ### Preuve Runtime

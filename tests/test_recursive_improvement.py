@@ -94,6 +94,33 @@ class RecursiveImprovementTest(unittest.TestCase):
             self.assertFalse(record.decision.evaluation.collapse_flags)
             self.assertLessEqual(record.decision.evaluation.calibration_delta, 0.0)
 
+    def test_engine_evolves_accepted_proposals_across_generations(self):
+        verifier, report = _cycle()
+        improvement = RecursiveImprovementEngine(verifier).run(
+            report,
+            max_proposals=4,
+            generations=2,
+            seed=3,
+            n_per_skill=1,
+        )
+
+        self.assertEqual(len(improvement.generations), 2)
+        self.assertGreater(len(improvement.generations[0].accepted_ids), 0)
+        self.assertGreater(improvement.generations[1].evolved_proposal_count, 0)
+        evolved = [proposal for proposal in improvement.proposals if proposal.parent_ids]
+        self.assertTrue(evolved)
+        child = evolved[0]
+        self.assertEqual(child.patch_payload["generation"], 1)
+        self.assertIn(child.parent_ids[-1], improvement.generations[0].accepted_ids)
+        self.assertIn("diversity_pressure_kind_counts", child.patch_payload)
+        parent_by_id = {proposal.proposal_id: proposal for proposal in improvement.proposals}
+        parent = parent_by_id[child.parent_ids[-1]]
+        if parent.kind != ProposalKind.COMPILED_FRONTIER:
+            self.assertNotEqual(child.kind, ProposalKind.COMPILED_FRONTIER)
+        payload = improvement.to_dict()
+        self.assertEqual(payload["generation_count"], 2)
+        self.assertGreater(payload["evolved_proposal_count"], 0)
+
     def test_engine_prioritizes_accepted_frontier_repair_proposals(self):
         verifier, report = _cycle()
         failure = report.regressions[0]
