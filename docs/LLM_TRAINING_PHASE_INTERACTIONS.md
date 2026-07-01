@@ -36,7 +36,8 @@ Preuve post-integration des deux nouvelles briques :
 - `test_native_ternary_cuda_fast_ste_backward_matches_dense_ste` : le backward fast STE CUDA correspond au dense STE en fp32, fp16 et bf16, avec `grad_input` calcule depuis les poids int2 packes et `grad_weight` + `grad_bias` calcules par extension ;
 - `test_native_ternary_cuda_requantize_pack_matches_torch_sync` : la requantization/packing CUDA fusionnee reproduit signs, mask, scales, residuals, packed codes et compte d'actifs du chemin PyTorch en fp32, fp16 et bf16 ;
 - `test_full_cortex_phase_controller_uses_all_modules_during_training` : mini training LLM complet avec audits exigeant `learned_cognitive_memory_policy`, `packed_ternary_hardware_runtime`, `native_ternary_cuda_kernel` quand CUDA est disponible et le nouveau composant `future_output_goal_contracts`.
-- `test_cortex_phase_state_survives_checkpoint_resume` : reprise checkpoint avec restauration des decisions output-goal dans la ledger P3 et maintien des audits architecture/livrables.
+- `test_full_cortex_phase_controller_uses_all_modules_during_training` verifie aussi que P5 execute les nouveaux certificats `algebra_linear` et code visible/cache/proprietes pendant le controleur P1-P10.
+- `test_cortex_phase_state_survives_checkpoint_resume` : reprise checkpoint avec restauration des decisions output-goal dans la ledger P3, maintien des evenements P5 algebra/code et maintien des audits architecture/livrables.
 
 Le long run devra produire un nouveau sidecar sous le commit de cette integration pour remplacer l'ancien audit `22/22` par l'audit courant plus strict incluant `native_ternary_cuda_kernel` et `future_output_goal_contracts`.
 

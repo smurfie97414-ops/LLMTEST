@@ -90,7 +90,7 @@ Cette base contient maintenant :
 - `cortex3_ternary.py` : instrumentation Phase 2 avec quantization d'activations 8→4 bit, residual synapse buffer, compression logs, `BitLinear` sign+mask, buffers ternaires packes int2 et kernels CUDA natifs extension/RawKernel tuilé/warp/WMMA avec gradient STE ;
 - `cortex3_future.py` : Phase 3 MTP/FSP sous contrat avec têtes PyTorch horizons 1/2/4/8, calibration autonome, confidence head, temporal consistency loss, Future Contract, contrats output-goal au-delà des token ids, révision et accept/reject gates ;
 - `cortex3_memory.py` : Phase 4 mémoire cognitive avec KV récent exact, KV ancien latent compact, Exact Anchor Ledger, reconstruction conditionnée par requête, récupération de réponse augmentée par mémoire et vérificateur de fidélité aux ancres ;
-- `cortex3_certificates.py` : Phase 5 raisonnement latent avec `latent proof state`, tête PyTorch de certificat calibrée, génération proof-carrying, certificats courts vérifiables dont contrats `compiled_circuit`, dé-latentisation aléatoire et vérification par outils ;
+- `cortex3_certificates.py` : Phase 5 raisonnement latent avec `latent proof state`, tête PyTorch de certificat calibrée, génération proof-carrying, certificats courts vérifiables dont contrats `compiled_circuit`, certificats algèbre multi-step, code visible+hidden/propriétés, dé-latentisation aléatoire et vérification par outils ;
 - `cortex3_attribution.py` : Phase 6 attribution causale avec ablations par blocs, experts, KV mode, horizon MTP, précision d'activation, contrat FSP, routage counterfactual et clustering de régressions ;
 - `cortex3_regrowth.py` : Phase 7 regrowth minimal exécutable avec action space de réparation, simulation gain/coût, gate de non-régression et annealing vers re-cristallisation ;
 - `cortex3_inference.py` : Phase 8 inférence fast/normal/careful avec routeur de difficulté, prédicteur de budget, early exit, Mixture-of-Depths `BitLinear`, KV latent, self-speculative MTP, certificats et dispatch kernel ternaire ;
@@ -374,7 +374,7 @@ python -m pytest tests/test_llm_pretraining.py -q
 2. Durcir Phase 2 au-delà de l'auto-sizing court déjà mesuré, diversifié, adaptatif, raffiné et confirmé : élargir les candidats, les batchs LLM, la durée des profils et les seuils GPU/throughput, en conservant la sélection multi-seed sous budget VRAM observé.
 3. Étendre Phase 3 vers des suites held-out plus larges et benchmarks MTP/output-goal vs NTP sur coût vérifié.
 4. Étendre Phase 4 au-delà de l'ablation courte actuelle avec benchmarks coût/qualité de la politique mémoire apprise exact/latent/drop sur long contexte et held-out anchors.
-5. Étendre Phase 5 avec vérification algébrique multi-étapes, tests code plus riches et mesure held-out des économies de tokens de certificat.
+5. Étendre Phase 5 au-delà de l'algèbre linéaire multi-étapes et des tests code visibles/cachés/propriétés vers des solveurs/domaines certifiés plus larges, puis mesurer en held-out les économies de tokens de certificat.
 6. Étendre la boucle générative autoregressive vers held-out suites, benchmarks coût/qualité plus larges et calibration de confiance.
 7. Étendre le banc MTP vs NTP en faible précision sur variantes de checkpoints autoregressifs et LLM.
 8. Durcir Phase 6 avec ablations branchées sur de vrais forward passes multi-couches.

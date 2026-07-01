@@ -17,8 +17,10 @@ from cortex3_certificates import (
     ProofCarryingGenerator,
     RandomDelatentizer,
     ShortCertificate,
+    algebra_linear_tool,
     build_certificate,
     build_compiled_circuit_certificate,
+    certificate_contract_for_task,
     certificate_examples_from_tasks,
     code_unit_test_tool,
     compiled_circuit_tool,
@@ -153,6 +155,123 @@ class CertificatesTest(unittest.TestCase):
         )
         self.assertFalse(code_unit_test_tool(bad).passed)
 
+    def test_algebra_certificate_requires_multi_step_linear_proof(self):
+        state = _latent_state()
+        task = Task(
+            "task-algebra",
+            "algebra",
+            "Solve exactly for x: 7x + -3 = 25. Return only the integer value of x.",
+            4,
+            {"variable": "x", "a": 7, "b": -3, "c": 25, "solution": 4, "kind": "linear"},
+        )
+        claims, tool, tool_args, anchors = certificate_contract_for_task(task, "4")
+        cert = build_certificate(
+            certificate_id="cert-algebra",
+            task_id=task.task_id,
+            skill=task.skill,
+            certificate_type=CertificateType.ALGEBRA,
+            answer="4",
+            claims=claims,
+            uncertainty=0.04,
+            latent_state=state,
+            anchors=anchors,
+            tool=tool,
+            tool_args=tool_args,
+        )
+
+        self.assertTrue(CertificateVerifier().verify(cert, state).passed)
+        self.assertTrue(algebra_linear_tool(cert).passed)
+        bad_steps = list(claims["algebra_steps"])
+        bad_steps[1] = {**dict(bad_steps[1]), "result": 5}
+        bad = ShortCertificate(
+            certificate_id=cert.certificate_id,
+            task_id=cert.task_id,
+            skill=cert.skill,
+            certificate_type=cert.certificate_type,
+            answer=cert.answer,
+            claims={**dict(cert.claims), "algebra_steps": tuple(bad_steps)},
+            uncertainty=cert.uncertainty,
+            latent_state_checksum=cert.latent_state_checksum,
+            tool=cert.tool,
+            tool_args=cert.tool_args,
+        )
+        extra_text = ShortCertificate(
+            certificate_id=cert.certificate_id,
+            task_id=cert.task_id,
+            skill=cert.skill,
+            certificate_type=cert.certificate_type,
+            answer="x = 4",
+            claims=cert.claims,
+            uncertainty=cert.uncertainty,
+            latent_state_checksum=cert.latent_state_checksum,
+            tool=cert.tool,
+            tool_args=cert.tool_args,
+        )
+        self.assertFalse(algebra_linear_tool(bad).passed)
+        self.assertFalse(algebra_linear_tool(extra_text).passed)
+
+    def test_code_certificate_requires_hidden_tests_and_properties_when_declared(self):
+        state = _latent_state()
+        cert = build_certificate(
+            certificate_id="cert-code-rich",
+            task_id="task-code-rich",
+            skill="code_unit_tests",
+            certificate_type=CertificateType.CODE_TESTS,
+            answer="def solve(values):\n    return values[0] if values else None\n",
+            claims={"function": "solve", "hidden_tests": 1, "properties": ("deterministic", "no_argument_mutation")},
+            uncertainty=0.05,
+            latent_state=state,
+            tool="code_tests",
+            tool_args={
+                "function_name": "solve",
+                "tests": [(([1, 2],), 1)],
+                "hidden_tests": [(([],), None)],
+                "require_hidden_tests": True,
+                "min_tests": 2,
+                "properties": ("deterministic", "no_argument_mutation"),
+            },
+        )
+        missing_hidden = build_certificate(
+            certificate_id="cert-code-no-hidden",
+            task_id="task-code-rich",
+            skill="code_unit_tests",
+            certificate_type=CertificateType.CODE_TESTS,
+            answer=cert.answer,
+            claims=cert.claims,
+            uncertainty=0.05,
+            latent_state=state,
+            tool="code_tests",
+            tool_args={
+                "function_name": "solve",
+                "tests": [(([1, 2],), 1)],
+                "require_hidden_tests": True,
+                "min_tests": 2,
+            },
+        )
+        mutating = build_certificate(
+            certificate_id="cert-code-mutating",
+            task_id="task-code-rich",
+            skill="code_unit_tests",
+            certificate_type=CertificateType.CODE_TESTS,
+            answer="def solve(values):\n    values.append(99)\n    return values[0]\n",
+            claims=cert.claims,
+            uncertainty=0.05,
+            latent_state=state,
+            tool="code_tests",
+            tool_args={
+                "function_name": "solve",
+                "tests": [(([1, 2],), 1)],
+                "hidden_tests": [(([3],), 3)],
+                "require_hidden_tests": True,
+                "min_tests": 2,
+                "properties": ("no_argument_mutation",),
+            },
+        )
+
+        self.assertTrue(CertificateVerifier().verify(cert, state).passed)
+        self.assertFalse(code_unit_test_tool(missing_hidden).passed)
+        self.assertFalse(code_unit_test_tool(mutating).passed)
+
     def test_compiled_circuit_certificate_binds_contract_and_lineage(self):
         state = _latent_state()
         anchor = Anchor("identifier", "frontier-anchor", "frontier-source")
@@ -269,7 +388,7 @@ class CertificatesTest(unittest.TestCase):
 
     def test_default_registry_contains_required_tools(self):
         registry = default_tool_registry()
-        self.assertEqual(set(registry.names), {"anchor_fidelity", "arithmetic", "code_tests", "compiled_circuit", "exact_match"})
+        self.assertEqual(set(registry.names), {"algebra_linear", "anchor_fidelity", "arithmetic", "code_tests", "compiled_circuit", "exact_match"})
 
     def test_cycle_run_artifacts_can_include_short_certificates(self):
         state = _latent_state()

@@ -4,6 +4,7 @@ import hashlib
 import json
 import random
 import re
+from copy import deepcopy
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from typing import Any, Callable, Iterable, Mapping, Sequence
@@ -19,6 +20,7 @@ from cortex3_memory import embed_text
 class CertificateType(str, Enum):
     EXACT_MATCH = "exact_match"
     ARITHMETIC = "arithmetic"
+    ALGEBRA = "algebra"
     CODE_TESTS = "code_tests"
     ANCHOR_FIDELITY = "anchor_fidelity"
     FORMAT = "format"
@@ -299,6 +301,72 @@ def arithmetic_tool(certificate: ShortCertificate) -> ToolVerification:
     return ToolVerification("arithmetic", passed, 1.0 if passed else 0.0, "arithmetic certificate verified" if passed else f"expected {expected}, got {answer}")
 
 
+def _exact_int_from_answer(text: str) -> int | None:
+    normalized = text.strip().replace("−", "-")
+    return int(normalized) if re.fullmatch(r"[-+]?\d+", normalized) else None
+
+
+def _linear_algebra_steps(a: int, b: int, c: int, variable: str, solution: int) -> tuple[dict[str, Any], ...]:
+    isolated = c - b
+    return (
+        {
+            "step": "subtract_constant",
+            "from": f"{a}{variable} + {b} = {c}",
+            "operation": f"{c} - ({b})",
+            "result": isolated,
+        },
+        {
+            "step": "divide_coefficient",
+            "operation": f"{isolated} / {a}",
+            "result": solution,
+        },
+        {
+            "step": "substitute_solution",
+            "operation": f"{a} * {solution} + {b}",
+            "result": a * solution + b,
+        },
+    )
+
+
+def algebra_linear_tool(certificate: ShortCertificate) -> ToolVerification:
+    if certificate.certificate_type != CertificateType.ALGEBRA:
+        return ToolVerification("algebra_linear", False, 0.0, "certificate type is not algebra")
+    args = dict(certificate.tool_args)
+    try:
+        a = int(args["a"])
+        b = int(args["b"])
+        c = int(args["c"])
+        expected = int(args.get("expected", (c - b) // a))
+    except Exception as exc:
+        return ToolVerification("algebra_linear", False, 0.0, f"invalid algebra tool args: {exc!r}")
+    if a == 0:
+        return ToolVerification("algebra_linear", False, 0.0, "linear coefficient cannot be zero")
+    if (c - b) % a != 0:
+        return ToolVerification("algebra_linear", False, 0.0, "linear equation has non-integer solution")
+    answer = _exact_int_from_answer(certificate.answer)
+    if answer is None:
+        return ToolVerification("algebra_linear", False, 0.0, "answer is not exactly one integer")
+    computed = (c - b) // a
+    if answer != expected or computed != expected or a * answer + b != c:
+        return ToolVerification("algebra_linear", False, 0.0, f"expected {expected}, got {answer}")
+    variable = str(args.get("variable", "x"))
+    expected_steps = _linear_algebra_steps(a, b, c, variable, expected)
+    provided_steps = tuple(certificate.claims.get("algebra_steps") or ())
+    if len(provided_steps) < len(expected_steps):
+        return ToolVerification("algebra_linear", False, 0.0, "missing multi-step algebra proof")
+    for expected_step, provided in zip(expected_steps, provided_steps):
+        data = dict(provided)
+        if str(data.get("step")) != str(expected_step["step"]):
+            return ToolVerification("algebra_linear", False, 0.0, f"missing step {expected_step['step']!r}")
+        try:
+            provided_result = int(data.get("result"))
+        except Exception:
+            return ToolVerification("algebra_linear", False, 0.0, f"step {expected_step['step']!r} missing integer result")
+        if provided_result != int(expected_step["result"]):
+            return ToolVerification("algebra_linear", False, 0.0, f"step {expected_step['step']!r} has wrong result")
+    return ToolVerification("algebra_linear", True, 1.0, "multi-step algebra certificate verified")
+
+
 def _safe_eval_arithmetic(expression: str) -> int:
     if not re.fullmatch(r"[\d\s+\-*/()%]+", expression):
         raise ValueError("unsupported arithmetic expression")
@@ -335,8 +403,15 @@ def code_unit_test_tool(certificate: ShortCertificate) -> ToolVerification:
     lowered = source.lower()
     if any(token in lowered for token in _BANNED_CODE_TOKENS):
         return ToolVerification("code_tests", False, 0.0, "unsafe code token")
-    tests = tuple(certificate.tool_args.get("tests", ()))
+    visible_tests = tuple(certificate.tool_args.get("tests", ()))
+    hidden_tests = tuple(certificate.tool_args.get("hidden_tests", ()))
+    tests = visible_tests + hidden_tests
+    if int(certificate.tool_args.get("min_tests", 0) or 0) > len(tests):
+        return ToolVerification("code_tests", False, 0.0, "insufficient code certificate tests")
+    if bool(certificate.tool_args.get("require_hidden_tests", False)) and not hidden_tests:
+        return ToolVerification("code_tests", False, 0.0, "missing required hidden code tests")
     function_name = str(certificate.tool_args.get("function_name", "solve"))
+    properties = set(str(item) for item in certificate.tool_args.get("properties", ()))
     namespace: dict[str, Any] = {"__builtins__": _SAFE_BUILTINS}
     try:
         exec(compile(source, "<certificate-code>", "exec"), namespace, namespace)
@@ -344,12 +419,20 @@ def code_unit_test_tool(certificate: ShortCertificate) -> ToolVerification:
         if not callable(fn):
             return ToolVerification("code_tests", False, 0.0, f"function {function_name!r} not defined")
         for args, expected in tests:
-            actual = fn(*args)
+            call_args = deepcopy(args)
+            frozen_before = repr(call_args)
+            actual = fn(*call_args)
             if actual != expected:
                 return ToolVerification("code_tests", False, 0.0, f"args={args!r}: expected {expected!r}, got {actual!r}")
+            if "no_argument_mutation" in properties and repr(call_args) != frozen_before:
+                return ToolVerification("code_tests", False, 0.0, f"args={args!r}: function mutated input arguments")
+            if "deterministic" in properties:
+                second_actual = fn(*deepcopy(args))
+                if second_actual != actual:
+                    return ToolVerification("code_tests", False, 0.0, f"args={args!r}: function is not deterministic")
     except Exception as exc:
         return ToolVerification("code_tests", False, 0.0, f"code test failed: {exc!r}")
-    return ToolVerification("code_tests", True, 1.0, "all certificate unit tests passed")
+    return ToolVerification("code_tests", True, 1.0, "all visible, hidden and property code tests passed")
 
 
 def compiled_circuit_contract_checksum(contract: Mapping[str, Any]) -> str:
@@ -390,6 +473,7 @@ def compiled_circuit_tool(certificate: ShortCertificate) -> ToolVerification:
 
 def default_tool_registry() -> ToolVerifierRegistry:
     registry = ToolVerifierRegistry()
+    registry.register("algebra_linear", algebra_linear_tool)
     registry.register("arithmetic", arithmetic_tool)
     registry.register("anchor_fidelity", anchor_tool)
     registry.register("compiled_circuit", compiled_circuit_tool)
@@ -601,8 +685,10 @@ def build_compiled_circuit_certificate(
 
 
 def certificate_type_for_task(task: Task) -> CertificateType:
-    if task.skill in {"arithmetic", "algebra"}:
+    if task.skill == "arithmetic":
         return CertificateType.ARITHMETIC
+    if task.skill == "algebra":
+        return CertificateType.ALGEBRA
     if task.skill == "code_unit_tests":
         return CertificateType.CODE_TESTS
     if task.skill in {"long_context_anchor", "entity_tracking"}:
@@ -644,15 +730,27 @@ def _arithmetic_expression_from_task(task: Task) -> str | None:
 def certificate_contract_for_task(task: Task, answer: str, certificate_type: CertificateType | None = None) -> tuple[Mapping[str, Any], str, Mapping[str, Any], tuple[Anchor, ...]]:
     cert_type = certificate_type or certificate_type_for_task(task)
     if task.skill == "code_unit_tests":
-        tests = tuple(task.metadata.get("tests", ())) + tuple(task.metadata.get("hidden_tests", ()))
+        visible_tests = tuple(task.metadata.get("tests", ()))
+        hidden_tests = tuple(task.metadata.get("hidden_tests", ()))
+        all_tests = visible_tests + hidden_tests
         return (
             {
                 "specification": str(task.metadata.get("prompt", task.prompt)),
-                "invariant": "generated function must satisfy visible and hidden unit tests",
-                "minimal_tests": len(tests),
+                "invariant": "generated function must satisfy visible, hidden and property tests",
+                "visible_tests": len(visible_tests),
+                "hidden_tests": len(hidden_tests),
+                "properties": ("deterministic", "no_argument_mutation"),
+                "minimal_tests": len(all_tests),
             },
             "code_tests",
-            {"function_name": str(task.metadata.get("function_name", "solve")), "tests": tests},
+            {
+                "function_name": str(task.metadata.get("function_name", "solve")),
+                "tests": visible_tests,
+                "hidden_tests": hidden_tests,
+                "require_hidden_tests": True,
+                "min_tests": len(all_tests),
+                "properties": ("deterministic", "no_argument_mutation"),
+            },
             tuple(task.anchors),
         )
     if task.skill in {"long_context_anchor", "entity_tracking"}:
@@ -664,6 +762,25 @@ def certificate_contract_for_task(task: Task, answer: str, certificate_type: Cer
             },
             "anchor_fidelity",
             {},
+            tuple(task.anchors),
+        )
+    if cert_type == CertificateType.ALGEBRA:
+        meta = dict(task.metadata)
+        a = int(meta["a"])
+        b = int(meta["b"])
+        c = int(meta["c"])
+        variable = str(meta.get("variable", "x"))
+        solution = int(task.expected)
+        return (
+            {
+                "variable": variable,
+                "equation": f"{a}{variable} + {b} = {c}",
+                "constraint": "integer linear equation",
+                "algebra_steps": _linear_algebra_steps(a, b, c, variable, solution),
+                "verification": "tool checks isolation, division and substitution",
+            },
+            "algebra_linear",
+            {"a": a, "b": b, "c": c, "variable": variable, "expected": solution},
             tuple(task.anchors),
         )
     if cert_type == CertificateType.ARITHMETIC:

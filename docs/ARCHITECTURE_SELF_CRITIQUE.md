@@ -4,7 +4,7 @@ Etat: boucle d'audit 50 apres recentrage hors profiling/observabilite. La critiq
 
 Ce document sert de registre de critique et de correction. Il ne remplace pas les tests longs interdits pour cette iteration; il se limite aux preuves courtes disponibles, aux rapports du code et aux tests courts.
 
-Mise a jour C57: P3 ne se limite plus aux contrats de blocs de tokens. Les contrats output-goal verifient maintenant la sortie complete, les obligations exact/no-extra-text et les ancres requises; ils sont branches dans P8, Frontier, P5, P7, P10, l'objectif final et les audits LLM.
+Mise a jour C58: P5 ne se limite plus a exact/arithmetic/code visible. Les certificats savent maintenant verifier une preuve algebrique lineaire multi-step et des certificats code avec tests visibles, caches et proprietes.
 
 ## Audit transversal haut enjeu apres C55
 
@@ -12,7 +12,7 @@ Mise a jour C57: P3 ne se limite plus aux contrats de blocs de tokens. Les contr
 - P2 Ternary Core: le backend ternaire natif est deja fortement travaille. Le risque haut enjeu restant est son emploi comme substrat de circuits compiles reutilisables, pas de nouvelles metriques de profiling.
 - P3 MTP/FSP: les contrats token-horizon sont branches dans le training, et les nouveaux contrats output-goal protegent maintenant les objectifs de sortie/skill au-dela du prochain token.
 - P4 Cognitive Memory: la memoire apprise existe dans le Transformer LLM et la memoire autonome conserve les ancres. Le manque majeur reste d'attacher la retention memoire aux competences compilees et aux circuits persistants, pas seulement aux batches observes.
-- P5 Certificates: les certificats prouvent des sorties et des traces latentes. Ils certifient maintenant aussi l'origine compilee d'une competence reutilisee via un contrat `compiled_circuit` a checksum, incluant le passage du contrat output-goal, afin qu'un FastSolve ne soit pas une boite noire.
+- P5 Certificates: les certificats prouvent des sorties et des traces latentes. Ils certifient maintenant aussi l'origine compilee d'une competence reutilisee via un contrat `compiled_circuit` a checksum, incluant le passage du contrat output-goal, et couvrent une premiere preuve algebrique multi-step plus des tests code visibles/caches/proprietes.
 - P6 Attribution: les ablations savent localiser des causes. Le point fort enjeu est de transformer ces causes en selection de circuit compile ou regrowth cible, pas seulement en estimation.
 - P7 Minimal Regrowth: le LLM sait appliquer un patch borne aux vrais parametres. Le pont ajoute ici teste maintenant une competence compilee comme candidat de reparation verifie avant d'acheter du regrowth parametrique, puis conserve le regrowth existant sous gate stricte.
 - P8 Fast/Normal/Careful Inference: les routes existent, le chemin FastSolve consomme maintenant un registre frontier, et chaque reponse inferee porte aussi un contrat output-goal qui peut faire echouer le gate si la sortie finale ne respecte pas l'objectif.
@@ -26,7 +26,7 @@ Mise a jour C57: P3 ne se limite plus aux contrats de blocs de tokens. Les contr
 - Correction P10 associee: apres restauration checkpoint, une archive evolutive peut rejeter la premiere proposition pour protection/diversite. Le controleur LLM utilise maintenant un budget borne derive de l'archive restauree pour chercher une proposition acceptee sans relacher le gate; l'application de patch reste exigee uniquement apres acceptation stricte. Le meme chemin accepte maintenant des propositions externes dedupliquees, ce qui permet a P10 de consommer une reparation compilee deja verifiee au lieu de repartir uniquement d'une action abstraite.
 - Gate de qualite: pour une tache couverte par un circuit, `CompiledFrontierAgent` utilise le circuit compile par defaut. Il ne masque pas un echec de circuit par un fallback quand un circuit a ete selectionne; la verification DSV optionnelle est attachee a la reponse via certificat/raw.
 - Verification courte: `python -m py_compile cortex3_llm.py cortex3_frontier.py cortex3_inference.py tests\test_llm_pretraining.py tests\test_frontier_discovery.py`, `python -m unittest tests.test_certificates`, `python -m unittest tests.test_frontier_discovery`, `python -m unittest tests.test_inference`, `python -m unittest tests.test_recursive_improvement.RecursiveImprovementTest.test_engine_prioritizes_accepted_frontier_repair_proposals`, `python -m unittest tests.test_llm_pretraining.LLMPretrainingHarnessTest.test_full_cortex_phase_controller_uses_all_modules_during_training` et `python -m unittest tests.test_llm_pretraining.LLMPretrainingHarnessTest.test_cortex_phase_state_survives_checkpoint_resume` passent. Les tests prouvent que le circuit compile est selectionne, repond, porte `frontier_compiled_circuit`, passe l'oracle, reste utilisable apres sauvegarde/rechargement, est consomme par `UltraFastInferenceEngine` en chemin `FAST`, puis apparait dans le `cortex_phase_report` LLM avec `frontier_compiled_fastsolve_events > 0`. Ils verifient aussi que P5 accepte un contrat compile valide et rejette un contrat falsifie, que P7 produit au moins un `frontier_repair_candidate` accepte avec `frontier_compiled_contract_verified`, `frontier_compiled_verified`, `repair_passed`, non-regressant et `repair_score_delta > 0`, puis que P10 applique un patch modele dont `proposal_kind` vaut `compiled_frontier` et dont le payload provient de cette reparation.
-- Statut: corrige pour le premier pont executable SlowSolve -> Compile -> Certificate -> FastSolve -> Repair -> Recursive Improvement dans Frontier, P5, P7, P8, P10 et le controleur LLM. Prochaine cible haut enjeu: tester la generalisation frontier held-out puis enrichir les certificats multi-step algebra/code.
+- Statut: corrige pour le premier pont executable SlowSolve -> Compile -> Certificate -> FastSolve -> Repair -> Recursive Improvement dans Frontier, P5, P7, P8, P10 et le controleur LLM. Prochaine cible haut enjeu: tester la generalisation Frontier held-out et elargir les domaines certifies au-dela du lineaire/code local.
 
 ### C57. Les contrats FSP etaient encore token-level, pas output-goal
 
@@ -36,7 +36,16 @@ Mise a jour C57: P3 ne se limite plus aux contrats de blocs de tokens. Les contr
 - Correction P7/P10: `_evaluate_frontier_repair_candidate` exige maintenant `frontier_output_goal_contract_passed` et `frontier_compiled_contract_verified` avant d'accepter une reparation Frontier. `ProposalGenerator.from_frontier_repairs` transporte ensuite le contrat output-goal dans le payload `compiled_frontier` signe par P10.
 - Correction objectif/audit: `L_future_contract` prend maintenant le maximum entre rejet MTP token-level et rejet output-goal. L'audit d'architecture ajoute le composant `future_output_goal_contracts`, et l'audit de livrables P3 exige des checks output-goal en plus des checks de tokens observes.
 - Verification courte: `py_compile`, `tests.test_future_contracts`, `tests.test_inference`, `tests.test_frontier_discovery`, `tests.test_recursive_improvement.RecursiveImprovementTest.test_engine_prioritizes_accepted_frontier_repair_proposals`, `tests.test_llm_pretraining.LLMPretrainingHarnessTest.test_full_cortex_phase_controller_uses_all_modules_during_training`, `tests.test_llm_pretraining.LLMPretrainingHarnessTest.test_cortex_phase_state_survives_checkpoint_resume` et `tests.test_objective_metrics` passent.
-- Statut: corrige pour le pont P3 output-goal -> P8 inference -> Frontier FastSolve -> P5 certificate -> P7 repair -> P10 compiled_frontier -> objectif final/audit. Prochaine cible haut enjeu: generalisation Frontier held-out et certificats multi-step algebra/code, sans revenir a de simples ajouts d'observabilite.
+- Statut: corrige pour le pont P3 output-goal -> P8 inference -> Frontier FastSolve -> P5 certificate -> P7 repair -> P10 compiled_frontier -> objectif final/audit. Prochaine cible haut enjeu: generalisation Frontier held-out et solveurs/certificats sur domaines plus larges, sans revenir a de simples ajouts d'observabilite.
+
+### C58. Les certificats P5 etaient trop peu outilles pour algebra/code
+
+- Critique: P5 savait verifier arithmetic, exact match, anchor fidelity, code unit tests et compiled circuits, mais l'algebre etait encore repliee sur un match exact ou arithmetic-like. Le code pouvait executer des tests, mais le contrat ne distinguait pas explicitement tests visibles, tests caches et proprietes de comportement. Cela laissait le Certificate Generator trop faible pour soutenir des competences compilees plus complexes.
+- Correction: ajout de `CertificateType.ALGEBRA` et du tool `algebra_linear`. Le certificat doit maintenant porter `algebra_steps` et le tool verifie trois obligations: soustraire la constante, diviser par le coefficient, puis substituer la solution dans l'equation originale. Une reponse du type `x = 4`, une etape manquante ou une etape avec mauvais resultat sont rejetees.
+- Correction code: `code_tests` separe maintenant `tests` et `hidden_tests`, peut exiger des tests caches avec `require_hidden_tests`, exige un nombre minimal de tests avec `min_tests`, et peut verifier les proprietes `deterministic` et `no_argument_mutation`. `certificate_contract_for_task` produit ces contrats riches depuis les taches `code_unit_tests`.
+- Integration LLM: la phase P5 du `CortexTrainingPhaseController` ne se limite plus a un certificat `FORMAT`; elle construit et verifie aussi un certificat algebrique multi-step et un certificat code avec tests visibles/caches/proprietes. L'audit de livrables P5 exige maintenant `certificate_algebra_tool_events` et `certificate_code_hidden_property_events`.
+- Verification courte: `py_compile`, `tests.test_certificates`, `tests.test_llm_pretraining.LLMPretrainingHarnessTest.test_full_cortex_phase_controller_uses_all_modules_during_training` et `tests.test_llm_pretraining.LLMPretrainingHarnessTest.test_cortex_phase_state_survives_checkpoint_resume` passent.
+- Statut: corrige pour la premiere extension structurelle P5 algebra/code. Prochaine cible haut enjeu: generalisation Frontier held-out ou extension des certificats a des solveurs/domaines multi-step plus larges.
 
 ## Boucle 1 - Corrections executees maintenant
 
@@ -560,11 +569,11 @@ Mise a jour C57: P3 ne se limite plus aux contrats de blocs de tokens. Les contr
 
 ### P5 - Certificate Generator
 
-- Ce qui est solide: latent proof state, certificate head, checksum, tool verification, exact/code/arithmetic/anchor tools.
-- Preuve actuelle: tests certificates et inference gates.
-- Faiblesse: certificats encore courts et outils limites; peu de preuves multi-etapes; calibration depend de micro-distributions.
-- Risque architectural: le certificat peut verifier des reponses simples sans prouver compression de raisonnement complexe.
-- Correction prioritaire restante: ajouter cas algebra multi-step et code tests plus riches.
+- Ce qui est solide: latent proof state, certificate head, checksum, tool verification, exact/code/arithmetic/anchor/compiled-circuit/algebra/code-rich tools.
+- Preuve actuelle: tests certificates, inference gates et audit LLM P5 qui exigent algebra multi-step plus code visible/cache/proprietes.
+- Faiblesse: domaines certifies encore limites au lineaire, aux tests Python locaux et aux contrats compiles internes; calibration depend de micro-distributions.
+- Risque architectural: le certificat prouve maintenant plus que du matching simple, mais pas encore une chaine de raisonnement large avec solveur externe et generalisation held-out.
+- Correction prioritaire restante: connecter des solveurs/domaines certifies plus larges et mesurer les economies de raisonnement certifie sur suites held-out.
 
 ### P6 - Causal Attribution
 
@@ -670,9 +679,9 @@ Mise a jour C57: P3 ne se limite plus aux contrats de blocs de tokens. Les contr
 
 ### Certificate Generator
 
-- Statut: head + tools + checksum.
-- Faiblesse: domaines outils limites.
-- Correction restante: algebra/code multi-step.
+- Statut: head + tools + checksum + algebra lineaire multi-step + code visible/cache/proprietes.
+- Faiblesse: domaines outils encore limites a une premiere classe lineaire et a des tests Python locaux.
+- Correction restante: external solver hooks et domaines multi-step plus larges.
 
 ### Hierarchical Dynamic Verifier
 
@@ -688,8 +697,7 @@ Mise a jour C57: P3 ne se limite plus aux contrats de blocs de tokens. Les contr
 4. P6/P7: afficher partout `repair_loss_before`, `repair_loss_after`, `protected_loss_before`, `protected_loss_after`, delta et convention.
 5. P8: aligner `TernaryKernelDispatcher` inference avec les variants `BitLinear` natifs.
 6. P1: ajouter un audit de couverture oracle/generateur par famille.
-7. P5: ajouter certificats algebra multi-step.
-8. P9: audit diversity drift replay/sleep court.
-9. P10: renforcer reward-hacking probes.
-10. Training: produire un nouveau sidecar sous le commit courant quand les tests longs seront autorises.
-11. Proof: relancer une comparaison 48+ ou large corpus afin que `baseline_score_passed=true` et que la victoire Cortex ne depende pas d'une baseline nulle.
+7. P9: audit diversity drift replay/sleep court.
+8. P10: renforcer reward-hacking probes.
+9. Training: produire un nouveau sidecar sous le commit courant quand les tests longs seront autorises.
+10. Proof: relancer une comparaison 48+ ou large corpus afin que `baseline_score_passed=true` et que la victoire Cortex ne depende pas d'une baseline nulle.

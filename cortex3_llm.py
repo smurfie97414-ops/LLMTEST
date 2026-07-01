@@ -42,7 +42,7 @@ from cortex3 import (
     default_skill_specs,
 )
 from cortex3_attribution import CausalAttributionEngine
-from cortex3_certificates import CertificateHead, CertificateHeadOutput, CertificateType, CertificateVerifier, LatentProofState, RandomDelatentizer, build_certificate, evaluate_certificate_efficiency
+from cortex3_certificates import CertificateHead, CertificateHeadOutput, CertificateType, CertificateVerifier, LatentProofState, RandomDelatentizer, build_certificate, certificate_contract_for_task, evaluate_certificate_efficiency
 from cortex3_cycle import CortexCycle
 from cortex3_frontier import CompiledFrontierAgent, FrontierCircuitRegistry, FrontierSkillDiscovery
 from cortex3_future import (
@@ -3320,12 +3320,17 @@ def _cortex_architecture_audit_from_summary(summary: Mapping[str, Any]) -> dict[
     )
     add(
         "certificate_generator",
-        phase_count("P5") > 0 and integer("certificate_head_forward_events") > 0,
+        phase_count("P5") > 0
+        and integer("certificate_head_forward_events") > 0
+        and integer("certificate_algebra_tool_events") > 0
+        and integer("certificate_code_hidden_property_events") > 0,
         {
             "P5": phase_count("P5"),
             "certificate_head_forward_events": integer("certificate_head_forward_events"),
+            "certificate_algebra_tool_events": integer("certificate_algebra_tool_events"),
+            "certificate_code_hidden_property_events": integer("certificate_code_hidden_property_events"),
         },
-        "certificate generator/head must run in training",
+        "certificate generator/head must run with multi-step algebra and richer code tool contracts in training",
     )
     add(
         "hierarchical_dynamic_verifier",
@@ -3627,14 +3632,18 @@ def _cortex_phase_deliverable_audit_from_summary(summary: Mapping[str, Any]) -> 
         count("certificate_efficiency_events") > 0
         and count("delatentization_probe_events") > 0
         and count("delatentization_probe_failures") == 0
-        and count("certificate_tool_verification_events") > 0,
+        and count("certificate_tool_verification_events") > 0
+        and count("certificate_algebra_tool_events") > 0
+        and count("certificate_code_hidden_property_events") > 0,
         {
             "certificate_efficiency_events": count("certificate_efficiency_events"),
             "delatentization_probe_events": count("delatentization_probe_events"),
             "delatentization_probe_failures": count("delatentization_probe_failures"),
             "certificate_tool_verification_events": count("certificate_tool_verification_events"),
+            "certificate_algebra_tool_events": count("certificate_algebra_tool_events"),
+            "certificate_code_hidden_property_events": count("certificate_code_hidden_property_events"),
         },
-        "latent proof state must be audited by random de-latentization and tool verification",
+        "latent proof state must be audited by random de-latentization, multi-step algebra and richer code tool verification",
     )
     add(
         "P6",
@@ -4776,6 +4785,8 @@ class CortexTrainingPhaseController:
             "recursive_model_repair_loss_delta": float(self.recursive_model_repair_loss_delta),
             "recursive_model_protected_loss_delta": float(self.recursive_model_protected_loss_delta),
             "certificate_head_forward_events": int(self.model.certificate_forward_events),
+            "certificate_algebra_tool_events": int(self.integration_counts.get("certificate_algebra_tool_events", 0)),
+            "certificate_code_hidden_property_events": int(self.integration_counts.get("certificate_code_hidden_property_events", 0)),
             "input_anchor_observations": int(self.input_anchor_observations),
             "input_anchor_count": int(self.input_anchor_count),
             "input_anchor_fidelity_failures": int(self.input_anchor_fidelity_failures),
@@ -5025,6 +5036,8 @@ class CortexTrainingPhaseController:
             ),
             "variable_input_compression_events": compression_trace_counts.get("kv_events", 0),
             "certificate_head_forward_events": int(self.model.certificate_forward_events),
+            "certificate_algebra_tool_events": int(self.integration_counts.get("certificate_algebra_tool_events", 0)),
+            "certificate_code_hidden_property_events": int(self.integration_counts.get("certificate_code_hidden_property_events", 0)),
             "input_anchor_observations": int(self.input_anchor_observations),
             "input_anchor_count": int(self.input_anchor_count),
             "input_anchor_fidelity_failures": int(self.input_anchor_fidelity_failures),
@@ -5216,25 +5229,101 @@ class CortexTrainingPhaseController:
                 tool_args={"expected": answer_text},
             )
             verification = self.certificate_verifier.verify(certificate, latent_state)
+            algebra_task = Task(
+                f"phase-p5-algebra-{step}",
+                "algebra",
+                "Solve exactly for x: 7x + -3 = 25. Return only the integer value of x.",
+                4,
+                {"variable": "x", "a": 7, "b": -3, "c": 25, "solution": 4, "kind": "linear"},
+            )
+            algebra_answer = "4"
+            algebra_claims, algebra_tool, algebra_tool_args, algebra_anchors = certificate_contract_for_task(algebra_task, algebra_answer)
+            algebra_state = LatentProofState(
+                state_id=f"llm-phase-{step}-algebra",
+                task_id=algebra_task.task_id,
+                skill=algebra_task.skill,
+                tensor=torch.tensor([[float(step), 2.0, 4.0]], dtype=torch.float32),
+                latent_steps=3,
+                visible_reasoning_tokens=0,
+            )
+            algebra_certificate = build_certificate(
+                certificate_id=f"llm-cert-algebra-{step}",
+                task_id=algebra_task.task_id,
+                skill=algebra_task.skill,
+                certificate_type=CertificateType.ALGEBRA,
+                answer=algebra_answer,
+                claims=algebra_claims,
+                uncertainty=0.04,
+                latent_state=algebra_state,
+                anchors=algebra_anchors,
+                tool=algebra_tool,
+                tool_args=algebra_tool_args,
+            )
+            algebra_verification = self.certificate_verifier.verify(algebra_certificate, algebra_state)
+            code_source = "def solve(x):\n    return x + 1\n"
+            code_task = Task(
+                f"phase-p5-code-{step}",
+                "code_unit_tests",
+                "Write Python function solve(x) that returns x + 1. Return only code.",
+                code_source,
+                {
+                    "function_name": "solve",
+                    "tests": (((1,), 2), ((-2,), -1)),
+                    "hidden_tests": (((41,), 42), ((0,), 1)),
+                },
+            )
+            code_claims, code_tool, code_tool_args, code_anchors = certificate_contract_for_task(code_task, code_source)
+            code_state = LatentProofState(
+                state_id=f"llm-phase-{step}-code",
+                task_id=code_task.task_id,
+                skill=code_task.skill,
+                tensor=torch.tensor([[float(step), 3.0, 1.0]], dtype=torch.float32),
+                latent_steps=2,
+                visible_reasoning_tokens=0,
+            )
+            code_certificate = build_certificate(
+                certificate_id=f"llm-cert-code-{step}",
+                task_id=code_task.task_id,
+                skill=code_task.skill,
+                certificate_type=CertificateType.CODE_TESTS,
+                answer=code_source,
+                claims=code_claims,
+                uncertainty=0.05,
+                latent_state=code_state,
+                anchors=code_anchors,
+                tool=code_tool,
+                tool_args=code_tool_args,
+            )
+            code_verification = self.certificate_verifier.verify(code_certificate, code_state)
             delatentizer = RandomDelatentizer(probes=2)
             probe = delatentizer.probe(latent_state, seed=self.config.seed + step)
             probe_ok = delatentizer.verify_probe(latent_state, probe)
             self._count("delatentization_probe_events")
             if not probe_ok:
                 self._count("delatentization_probe_failures")
+            if not algebra_verification.passed:
+                self._record_error("P5", ValueError(f"multi-step algebra certificate failed: {algebra_verification.reason}"))
+            if not code_verification.passed:
+                self._record_error("P5", ValueError(f"rich code certificate failed: {code_verification.reason}"))
             efficiency = evaluate_certificate_efficiency(
                 "slow visible reasoning " * 32,
                 certificate,
                 verification,
                 reference_uncertainty=0.05,
             )
-            self._count("certificate_tool_verification_events")
+            self._count("certificate_tool_verification_events", 3)
+            self._count("certificate_algebra_tool_events")
+            self._count("certificate_code_hidden_property_events")
             self._count("certificate_efficiency_events")
             self._touch("P5")
             audit["certificate"] = {
                 "verified": verification.to_dict(),
                 "efficiency": asdict(efficiency),
                 "certificate": certificate.to_dict(),
+                "algebra_verified": algebra_verification.to_dict(),
+                "algebra_certificate": algebra_certificate.to_dict(),
+                "code_verified": code_verification.to_dict(),
+                "code_certificate": code_certificate.to_dict(),
                 "delatentization_probe": asdict(probe),
                 "delatentization_probe_verified": probe_ok,
             }
@@ -5242,12 +5331,21 @@ class CortexTrainingPhaseController:
                 self._record_error("P5", ValueError(f"random de-latentization probe failed for {latent_state.state_id}"))
             if verification.passed:
                 self.bit_ledger.add_certificate(certificate.to_dict())
+            if algebra_verification.passed:
+                self.bit_ledger.add_certificate(algebra_certificate.to_dict())
+            if code_verification.passed:
+                self.bit_ledger.add_certificate(code_certificate.to_dict())
+            if verification.passed and algebra_verification.passed and code_verification.passed:
                 self._add_verified_phase_replay(
                     "P5",
-                    task,
+                    algebra_task,
+                    answer=CandidateAnswer(algebra_answer, confidence=0.96, certificate=algebra_certificate.to_dict()),
                     metadata={
-                        "certificate_id": certificate.certificate_id,
+                        "certificate_id": algebra_certificate.certificate_id,
+                        "code_certificate_id": code_certificate.certificate_id,
                         "reduction_ratio": efficiency.reduction_ratio,
+                        "multi_step_algebra": True,
+                        "rich_code_tests": True,
                     },
                 )
         except Exception as exc:
@@ -5645,6 +5743,8 @@ class CortexTrainingPhaseController:
                 "variable_input_compression_events": trace_counts.get("kv_events", 0),
                 "skill_expert_activations": trace_counts.get("expert_activations", 0),
                 "certificate_head_forward_events": int(self.model.certificate_forward_events),
+                "certificate_algebra_tool_events": int(self.integration_counts.get("certificate_algebra_tool_events", 0)),
+                "certificate_code_hidden_property_events": int(self.integration_counts.get("certificate_code_hidden_property_events", 0)),
                 "input_anchor_observations": int(self.input_anchor_observations),
                 "input_anchor_count": int(self.input_anchor_count),
                 "input_anchor_fidelity_failures": int(self.input_anchor_fidelity_failures),
@@ -5736,6 +5836,8 @@ class CortexTrainingPhaseController:
                     ),
                     "variable_input_compression_events": trace_counts.get("kv_events", 0),
                     "certificate_head_forward_events": int(self.model.certificate_forward_events),
+                    "certificate_algebra_tool_events": int(self.integration_counts.get("certificate_algebra_tool_events", 0)),
+                    "certificate_code_hidden_property_events": int(self.integration_counts.get("certificate_code_hidden_property_events", 0)),
                     "input_anchor_observations": int(self.input_anchor_observations),
                     "input_anchor_count": int(self.input_anchor_count),
                     "input_anchor_fidelity_failures": int(self.input_anchor_fidelity_failures),
@@ -5807,6 +5909,8 @@ class CortexTrainingPhaseController:
                     ),
                     "variable_input_compression_events": trace_counts.get("kv_events", 0),
                     "certificate_head_forward_events": int(self.model.certificate_forward_events),
+                    "certificate_algebra_tool_events": int(self.integration_counts.get("certificate_algebra_tool_events", 0)),
+                    "certificate_code_hidden_property_events": int(self.integration_counts.get("certificate_code_hidden_property_events", 0)),
                     "input_anchor_observations": int(self.input_anchor_observations),
                     "input_anchor_count": int(self.input_anchor_count),
                     "input_anchor_fidelity_failures": int(self.input_anchor_fidelity_failures),

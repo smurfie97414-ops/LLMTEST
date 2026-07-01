@@ -115,7 +115,7 @@ Current executable coverage:
 - `CertificateVerifier` checks uncertainty bounds, latent checksum and tool-backed verification.
 - `CertificateVerifier` accepts explicitly calibrated high-uncertainty certificates, so `UNKNOWN` can stay low-confidence without being treated as proof corruption.
 - `RandomDelatentizer` samples latent dimensions deterministically for audit probes and detects tampering.
-- Tool-backed checks include arithmetic, exact match, anchor fidelity, compiled-circuit contracts and executable code unit tests.
+- Tool-backed checks include arithmetic, exact match, anchor fidelity, multi-step linear algebra, richer executable code unit tests and compiled-circuit contracts.
 - `CertificateType.COMPILED_CIRCUIT`, `build_compiled_circuit_certificate` and the `compiled_circuit` tool bind compiled skill reuse to a canonical contract checksum, source/frontier task lineage, DSV pass state, runtime output verification and answer checksum.
 - `ProofCarryingAnswer` converts answer + certificate + uncertainty into `CandidateAnswer` with a serializable latent proof payload.
 - `ProofCarryingGenerator` connects a calibrated certificate head to DSV-compatible answer generation and verifies every emitted certificate.
@@ -123,11 +123,12 @@ Current executable coverage:
 - `write_cycle_run` can persist short certificates into `summary.json`.
 - `UltraFastInferenceEngine` treats proof-carrying certificate verification as a gate; a tampered latent proof makes `InferenceResult.passed` false and zeroes verified capability per cost.
 - `CompiledFrontierAgent` attaches a verified P5 compiled-circuit certificate to every selected Frontier circuit answer; the compiled-circuit contract now also binds the P3 output-goal contract id, obligations, pass state and violations. The LLM phase report persists `frontier_compiled_contract_verified`, `frontier_output_goal_contract_passed` and the contract checksum for accepted P7 repairs.
+- `CertificateType.ALGEBRA` and the `algebra_linear` tool require a multi-step proof for integer linear equations: subtract constant, divide by coefficient and substitute the result back into the equation. `code_tests` now separates visible and hidden tests, can require hidden tests, and checks deterministic/no-argument-mutation properties when requested. The full LLM P5 audit runs both tools and fails the deliverable if either rejects.
 - `tools/run_cycle_report.py` writes a trained proof-carrying certificate smoke by default; `--skip-certificates` disables it.
 
 Remaining:
 
-- Expand tool verification to multi-step algebra, richer code tests and external solver hooks.
+- Expand tool verification to external solver hooks and broader multi-step domains beyond current linear algebra/rich code cases.
 - Benchmark certificate-token savings over held-out reasoning traces.
 
 ## Phase 6 - Causal regression attribution
@@ -303,7 +304,7 @@ Evidence:
 Remaining:
 
 - Run frontier discovery over larger held-out frontier suites.
-- Run larger held-out frontier generalization suites and expand certificate tools to multi-step algebra and richer code tests.
+- Run larger held-out frontier generalization suites and expand certificate tools beyond the current linear algebra and local rich-code domains.
 
 ## Cross-phase final objective and metrics
 
