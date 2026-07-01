@@ -9634,6 +9634,9 @@ def _profile_autosize_aggregate_measurements(
         values = [float(row.get(name, 0.0)) for row in rows]
         return float(statistics.fmean(values)) if values else 0.0
 
+    def _float_values(name: str) -> tuple[float, ...]:
+        return tuple(float(row.get(name, 0.0)) for row in rows)
+
     def _max_float(name: str) -> float:
         return float(max((float(row.get(name, 0.0)) for row in rows), default=0.0))
 
@@ -9682,6 +9685,17 @@ def _profile_autosize_aggregate_measurements(
     all_phases_active = all(bool(row.get("all_phases_active")) for row in rows)
     estimated_peak_training_bytes = int(candidate["estimated_peak_training_bytes"])
     torch_cuda_peak_allocated_bytes = _max_int("torch_cuda_peak_allocated_bytes")
+    measured_score_values = _float_values("measured_score")
+    measured_score_mean = float(statistics.fmean(measured_score_values)) if measured_score_values else 0.0
+    measured_score_min = float(min(measured_score_values, default=0.0))
+    measured_score_max = float(max(measured_score_values, default=0.0))
+    measured_score_stddev = float(statistics.stdev(measured_score_values)) if len(measured_score_values) > 1 else 0.0
+    measured_score_lower_confidence = max(0.0, measured_score_mean - measured_score_stddev)
+    measured_score_stability_ratio = (
+        float(measured_score_lower_confidence / measured_score_mean)
+        if measured_score_mean > 0.0
+        else 0.0
+    )
     return {
         "shape": dict(candidate["shape"]),
         "shape_key": str(candidate["shape_key"]),
@@ -9709,7 +9723,13 @@ def _profile_autosize_aggregate_measurements(
         "measurement_failed_checks": failed_checks,
         "measurement_failed_checks_by_seed": failed_checks_by_seed,
         "measurement_errors": measurement_errors,
-        "measured_score": _mean_float("measured_score"),
+        "measured_score": measured_score_lower_confidence,
+        "measured_score_mean": measured_score_mean,
+        "measured_score_min": measured_score_min,
+        "measured_score_max": measured_score_max,
+        "measured_score_stddev": measured_score_stddev,
+        "measured_score_lower_confidence": measured_score_lower_confidence,
+        "measured_score_stability_ratio": measured_score_stability_ratio,
         "train_tokens_per_second_wall": _mean_float("train_tokens_per_second_wall"),
         "planned_train_tokens": sum(int(row.get("planned_train_tokens", 0)) for row in rows),
         "gpu_utilization_percent_avg": _mean_float("gpu_utilization_percent_avg"),
