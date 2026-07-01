@@ -15,7 +15,17 @@ import torch
 import torch.nn.functional as F
 
 from cortex3_llm import ResourceUsageMonitor
-from cortex3_ternary import BitLinear, BitLinearConfig, native_ternary_cuda_available, native_ternary_cuda_extension_available
+from cortex3_ternary import (
+    BitLinear,
+    BitLinearConfig,
+    clear_native_grad_kernel_counts,
+    last_native_grad_input_kernel,
+    last_native_grad_weight_kernel,
+    native_grad_input_kernel_counts,
+    native_grad_weight_kernel_counts,
+    native_ternary_cuda_available,
+    native_ternary_cuda_extension_available,
+)
 from cortex3_ternary import (
     clear_native_ternary_autotune_cache,
     load_native_ternary_autotune_cache,
@@ -65,6 +75,7 @@ def benchmark_case(
     sustain_op: str,
     sustain_sync_every: int,
 ) -> dict[str, Any]:
+    clear_native_grad_kernel_counts()
     layer = BitLinear(
         BitLinearConfig(
             in_features,
@@ -242,6 +253,10 @@ def benchmark_case(
         "torch_requantize_pack_ms": torch_requantize_pack_ms,
         "sustained_workload": sustained,
         "native_grad_weight_backend_counts": dict(layer.ledger.native_ternary_grad_weight_backend_counts),
+        "native_grad_input_kernel": last_native_grad_input_kernel(),
+        "native_grad_weight_kernel": last_native_grad_weight_kernel(),
+        "native_grad_input_kernel_counts": native_grad_input_kernel_counts(),
+        "native_grad_weight_kernel_counts": native_grad_weight_kernel_counts(),
         "native_extension_grad_weight_dispatches": int(
             layer.ledger.native_ternary_grad_weight_backend_counts.get("extension", 0)
         ),

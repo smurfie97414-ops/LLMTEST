@@ -14,8 +14,12 @@ from cortex3_ternary import (
     CompressionTraceLedger,
     ResidualSynapseBuffer,
     clear_native_ternary_autotune_cache,
+    last_native_grad_input_kernel,
+    last_native_grad_weight_kernel,
     load_native_ternary_autotune_cache,
     make_compression_decision,
+    native_grad_input_kernel_counts,
+    native_grad_weight_kernel_counts,
     native_ternary_cuda_available,
     native_ternary_cuda_extension_available,
     native_ternary_autotune_cache_snapshot,
@@ -327,6 +331,41 @@ class ReportingAndTernaryTest(unittest.TestCase):
         self.assertGreater(payload["total_event_counts"].get("native_ternary_extension_kernel_dispatches", 0), 0)
         self.assertGreater(payload["total_event_counts"].get("native_ternary_extension_requantize_dispatches", 0), 0)
         self.assertGreater(payload["total_event_counts"].get("native_ternary_extension_grad_weight_dispatches", 0), 0)
+
+    def test_bitlinear_native_extension_cuda_grad_weight_uses_wmma_when_aligned(self):
+        import torch
+
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA is required")
+        if not native_ternary_cuda_extension_available():
+            self.skipTest("Cortex ternary CUDA extension is not buildable in this environment")
+
+        torch.manual_seed(43)
+        layer = BitLinear(BitLinearConfig(
+            32,
+            32,
+            activation_bits=0,
+            residual_runtime=False,
+            require_native_cuda_kernel=True,
+            native_cuda_backend="extension",
+            native_cuda_kernel_variant="warp",
+            native_cuda_autotune=False,
+            log_prefix="cuda-extension-wmma-grad-weight",
+        )).cuda()
+        layer.requantize()
+        x = torch.randn(32, 32, device="cuda", dtype=torch.float16, requires_grad=True)
+        loss = layer(x).float().square().mean()
+        loss.backward()
+        torch.cuda.synchronize()
+
+        self.assertIsNotNone(layer.float_weight.grad)
+        self.assertGreater(float(layer.float_weight.grad.abs().sum().detach().cpu()), 0.0)
+        self.assertEqual(last_native_grad_input_kernel(), "wmma_fp16")
+        self.assertEqual(last_native_grad_weight_kernel(), "wmma_fp16_float")
+        self.assertGreater(native_grad_input_kernel_counts().get("wmma_fp16", 0), 0)
+        self.assertGreater(native_grad_weight_kernel_counts().get("wmma_fp16_float", 0), 0)
+        payload = layer.ledger.to_dict()
+        self.assertGreater(payload["native_ternary_grad_weight_backend_counts"].get("extension", 0), 0)
 
     @unittest.skipUnless(
         __import__("torch").cuda.is_available() and native_ternary_cuda_available(),

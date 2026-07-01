@@ -22,6 +22,7 @@ import torch.nn.functional as F
 _CUPY_TERNARY_KERNEL_SOURCE = r"""
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
+#include <mma.h>
 
 extern "C" __global__ void ternary_matmul_fp32(
     const float* x,
@@ -235,6 +236,46 @@ __global__ void ternary_grad_weight_bias_tiled(
   }
   if (has_bias && local_k == 0 && global_n < n_cols) {
     c3_store_scalar<output_t>(grad_bias, global_n, bias_acc);
+  }
+}
+
+__global__ void ternary_grad_weight_bias_wmma_fp16_float(
+    const __half* grad_out,
+    const __half* x,
+    float* grad_weight,
+    float* grad_bias,
+    int m_rows,
+    int n_cols,
+    int k_cols,
+    int has_bias) {
+  using namespace nvcuda;
+  int tile_k = blockIdx.x;
+  int tile_n = blockIdx.y;
+  int n0 = tile_n * 16;
+  int k0 = tile_k * 16;
+
+  wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::col_major> grad_frag;
+  wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::row_major> x_frag;
+  wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc_frag;
+  wmma::fill_fragment(acc_frag, 0.0f);
+
+  for (int m0 = 0; m0 < m_rows; m0 += 16) {
+    const __half* grad_tile = grad_out + m0 * n_cols + n0;
+    const __half* x_tile = x + m0 * k_cols + k0;
+    wmma::load_matrix_sync(grad_frag, grad_tile, n_cols);
+    wmma::load_matrix_sync(x_frag, x_tile, k_cols);
+    wmma::mma_sync(acc_frag, grad_frag, x_frag, acc_frag);
+  }
+
+  wmma::store_matrix_sync(grad_weight + n0 * k_cols + k0, acc_frag, k_cols, wmma::mem_row_major);
+
+  if (has_bias && tile_k == 0 && threadIdx.x < 16) {
+    int n = n0 + threadIdx.x;
+    float bias_acc = 0.0f;
+    for (int m = 0; m < m_rows; ++m) {
+      bias_acc += __half2float(grad_out[m * n_cols + n]);
+    }
+    grad_bias[n] = bias_acc;
   }
 }
 
@@ -574,6 +615,56 @@ extern "C" __global__ void ternary_grad_input_warp_bf16(
   }
 }
 
+__global__ void ternary_grad_input_wmma_fp16(
+    const __half* grad_out,
+    const unsigned char* packed,
+    const float* scales,
+    const float* residual,
+    __half* grad_x,
+    int m_rows,
+    int n_cols,
+    int k_cols,
+    int packed_stride,
+    int use_residual) {
+  using namespace nvcuda;
+  int tile_k = blockIdx.x;
+  int tile_m = blockIdx.y;
+  int m0 = tile_m * 16;
+  int k0 = tile_k * 16;
+
+  __shared__ __half weight_tile[16 * 16];
+  __shared__ float output_tile[16 * 16];
+
+  wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> grad_frag;
+  wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::row_major> weight_frag;
+  wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc_frag;
+  wmma::fill_fragment(acc_frag, 0.0f);
+
+  for (int n0 = 0; n0 < n_cols; n0 += 16) {
+    for (int offset = threadIdx.x; offset < 16 * 16; offset += blockDim.x) {
+      int local_n = offset / 16;
+      int local_k = offset - local_n * 16;
+      int n = n0 + local_n;
+      int k = k0 + local_k;
+      float w = c3_decode_weight(packed, scales, residual, n, k, packed_stride, k_cols, use_residual);
+      weight_tile[offset] = __float2half_rn(w);
+    }
+    __syncthreads();
+    wmma::load_matrix_sync(grad_frag, grad_out + m0 * n_cols + n0, n_cols);
+    wmma::load_matrix_sync(weight_frag, weight_tile, 16);
+    wmma::mma_sync(acc_frag, grad_frag, weight_frag, acc_frag);
+    __syncthreads();
+  }
+
+  wmma::store_matrix_sync(output_tile, acc_frag, 16, wmma::mem_row_major);
+  __syncthreads();
+  for (int offset = threadIdx.x; offset < 16 * 16; offset += blockDim.x) {
+    int local_m = offset / 16;
+    int local_k = offset - local_m * 16;
+    grad_x[(m0 + local_m) * k_cols + k0 + local_k] = __float2half_rn(output_tile[offset]);
+  }
+}
+
 extern "C" __global__ void ternary_requantize_pack_fp32(
     const float* weight,
     float* signs,
@@ -828,7 +919,11 @@ _TERNARY_EXTENSION_ERROR: Exception | None = None
 _TERNARY_EXTENSION_BUILD_ATTEMPTED = False
 _NATIVE_CUDA_BACKENDS = {"auto", "extension", "rawkernel"}
 _LAST_NATIVE_REQUANTIZE_BACKEND = ""
+_LAST_NATIVE_GRAD_INPUT_KERNEL = ""
 _LAST_NATIVE_GRAD_WEIGHT_BACKEND = ""
+_LAST_NATIVE_GRAD_WEIGHT_KERNEL = ""
+_NATIVE_GRAD_INPUT_KERNEL_COUNTS: dict[str, int] = {}
+_NATIVE_GRAD_WEIGHT_KERNEL_COUNTS: dict[str, int] = {}
 
 
 def native_backend_from_runtime_label(label: str, default: str = "") -> str:
@@ -842,6 +937,35 @@ def native_backend_from_runtime_label(label: str, default: str = "") -> str:
     if text.startswith("native_"):
         return "unknown"
     return default
+
+
+def last_native_grad_weight_kernel() -> str:
+    return _LAST_NATIVE_GRAD_WEIGHT_KERNEL
+
+
+def last_native_grad_input_kernel() -> str:
+    return _LAST_NATIVE_GRAD_INPUT_KERNEL
+
+
+def native_grad_input_kernel_counts() -> dict[str, int]:
+    return dict(sorted(_NATIVE_GRAD_INPUT_KERNEL_COUNTS.items()))
+
+
+def native_grad_weight_kernel_counts() -> dict[str, int]:
+    return dict(sorted(_NATIVE_GRAD_WEIGHT_KERNEL_COUNTS.items()))
+
+
+def clear_native_grad_kernel_counts() -> None:
+    _NATIVE_GRAD_INPUT_KERNEL_COUNTS.clear()
+    _NATIVE_GRAD_WEIGHT_KERNEL_COUNTS.clear()
+
+
+def _record_native_grad_input_kernel(kernel: str) -> None:
+    _NATIVE_GRAD_INPUT_KERNEL_COUNTS[kernel] = _NATIVE_GRAD_INPUT_KERNEL_COUNTS.get(kernel, 0) + 1
+
+
+def _record_native_grad_weight_kernel(kernel: str) -> None:
+    _NATIVE_GRAD_WEIGHT_KERNEL_COUNTS[kernel] = _NATIVE_GRAD_WEIGHT_KERNEL_COUNTS.get(kernel, 0) + 1
 
 
 _TERNARY_EXTENSION_CPP_SOURCE = r"""
@@ -1173,6 +1297,26 @@ extern "C" void launch_ternary_grad_input_dispatch(
     int packed_stride,
     int use_residual,
     cudaStream_t stream) {
+  if (
+      dtype_code == 1 &&
+      (m_rows % 16) == 0 &&
+      (n_cols % 16) == 0 &&
+      (k_cols % 16) == 0) {
+    dim3 blocks(k_cols / 16, m_rows / 16);
+    dim3 threads(32);
+    ternary_grad_input_wmma_fp16<<<blocks, threads, 0, stream>>>(
+        static_cast<const __half*>(grad_out),
+        packed,
+        scales,
+        residual,
+        static_cast<__half*>(grad_x),
+        m_rows,
+        n_cols,
+        k_cols,
+        packed_stride,
+        use_residual);
+    return;
+  }
   const int warps_per_block = C3_WARPS_PER_BLOCK;
   int total_outputs = m_rows * k_cols;
   dim3 blocks((total_outputs + warps_per_block - 1) / warps_per_block);
@@ -1237,6 +1381,25 @@ extern "C" void launch_ternary_grad_weight_bias_dispatch(
     int k_cols,
     int has_bias,
     cudaStream_t stream) {
+  if (
+      input_dtype_code == 1 &&
+      output_dtype_code == 0 &&
+      (m_rows % 16) == 0 &&
+      (n_cols % 16) == 0 &&
+      (k_cols % 16) == 0) {
+    dim3 blocks(k_cols / 16, n_cols / 16);
+    dim3 threads(32);
+    ternary_grad_weight_bias_wmma_fp16_float<<<blocks, threads, 0, stream>>>(
+        static_cast<const __half*>(grad_out),
+        static_cast<const __half*>(x),
+        static_cast<float*>(grad_weight),
+        static_cast<float*>(grad_bias),
+        m_rows,
+        n_cols,
+        k_cols,
+        has_bias);
+    return;
+  }
   if (input_dtype_code == 0) {
     c3_launch_grad_weight_bias_for_input<float>(
         grad_out, x, grad_weight, grad_bias, output_dtype_code, m_rows, n_cols, k_cols, has_bias, stream);
@@ -1523,7 +1686,7 @@ def _load_ternary_cuda_extension() -> Any:
         if target_include.exists():
             extra_include_paths.append(str(target_include))
         module = load_inline(
-            name="cortex3_ternary_cuda_extension_v2",
+            name="cortex3_ternary_cuda_extension_v4",
             cpp_sources=[_TERNARY_EXTENSION_CPP_SOURCE],
             cuda_sources=[_CUPY_TERNARY_KERNEL_SOURCE + "\n" + _TERNARY_EXTENSION_CUDA_WRAPPERS],
             functions=["ternary_forward", "ternary_grad_input", "ternary_grad_weight_bias", "ternary_requantize_pack"],
@@ -1677,10 +1840,20 @@ def _extension_ternary_grad_input_cuda(
     *,
     residual_runtime: bool,
 ) -> Any:
+    global _LAST_NATIVE_GRAD_INPUT_KERNEL
     if grad_output_flat.dtype not in _CUPY_TERNARY_GRAD_INPUT_KERNEL_NAMES:
         raise RuntimeError(f"CUDA extension grad-input does not support dtype {grad_output_flat.dtype}")
     module = _load_ternary_cuda_extension()
     grad_out = grad_output_flat.detach().contiguous()
+    _LAST_NATIVE_GRAD_INPUT_KERNEL = (
+        "wmma_fp16"
+        if grad_out.dtype == torch.float16
+        and int(grad_out.shape[0]) % 16 == 0
+        and int(grad_out.shape[1]) % 16 == 0
+        and int(in_features) % 16 == 0
+        else "warp"
+    )
+    _record_native_grad_input_kernel(_LAST_NATIVE_GRAD_INPUT_KERNEL)
     packed = packed_codes.to(device=grad_out.device, dtype=torch.uint8).contiguous()
     scale_values = scales.detach().to(device=grad_out.device, dtype=torch.float32).contiguous().view(-1)
     residual = (
@@ -1707,19 +1880,28 @@ def _extension_ternary_grad_weight_bias_cuda(
     float_weight_dtype: Any,
     *,
     has_bias: bool,
-) -> tuple[Any, Any]:
+) -> tuple[Any, Any, str]:
     if grad_output_flat.dtype not in _CUPY_TERNARY_GRAD_INPUT_KERNEL_NAMES:
         raise RuntimeError(f"CUDA extension grad-weight does not support dtype {grad_output_flat.dtype}")
     module = _load_ternary_cuda_extension()
     grad_out = grad_output_flat.detach().contiguous()
     x_values = x_flat.detach().to(dtype=grad_out.dtype).contiguous()
+    kernel = (
+        "wmma_fp16_float"
+        if grad_out.dtype == torch.float16
+        and float_weight_dtype == torch.float32
+        and int(grad_out.shape[0]) % 16 == 0
+        and int(grad_out.shape[1]) % 16 == 0
+        and int(x_values.shape[1]) % 16 == 0
+        else "tiled"
+    )
     grad_weight, grad_bias = module.ternary_grad_weight_bias(
         grad_out,
         x_values,
         int(_extension_dtype_code(float_weight_dtype)),
         bool(has_bias),
     )
-    return grad_weight, grad_bias
+    return grad_weight, grad_bias, kernel
 
 
 def _extension_requantize_pack_cuda(
@@ -1760,6 +1942,7 @@ def _native_packed_ternary_grad_input_cuda(
     residual_runtime: bool,
     backend: str = "auto",
 ) -> Any:
+    global _LAST_NATIVE_GRAD_INPUT_KERNEL
     if not grad_output_flat.is_cuda:
         raise RuntimeError("native ternary CUDA grad-input kernel requires CUDA grad_output")
     if grad_output_flat.dtype not in _CUPY_TERNARY_GRAD_INPUT_KERNEL_NAMES:
@@ -1815,6 +1998,8 @@ def _native_packed_ternary_grad_input_cuda(
                 int(bool(residual_runtime)),
             ),
         )
+    _LAST_NATIVE_GRAD_INPUT_KERNEL = "rawkernel_warp"
+    _record_native_grad_input_kernel(_LAST_NATIVE_GRAD_INPUT_KERNEL)
     return grad_x
 
 
@@ -1826,24 +2011,28 @@ def _native_packed_ternary_grad_weight_bias_cuda(
     has_bias: bool,
     backend: str = "auto",
 ) -> tuple[Any, Any, str]:
-    global _LAST_NATIVE_GRAD_WEIGHT_BACKEND
+    global _LAST_NATIVE_GRAD_WEIGHT_BACKEND, _LAST_NATIVE_GRAD_WEIGHT_KERNEL
     backend = _normalize_native_cuda_backend(backend)
     if not grad_output_flat.is_cuda:
         weight_grad = grad_output_flat.transpose(0, 1).matmul(x_flat.to(dtype=grad_output_flat.dtype))
         grad_weight = weight_grad.to(dtype=float_weight_dtype)
         grad_bias = grad_output_flat.sum(dim=0).to(dtype=float_weight_dtype) if has_bias else grad_output_flat.new_empty((0,), dtype=float_weight_dtype)
         _LAST_NATIVE_GRAD_WEIGHT_BACKEND = "torch_cpu_dense"
+        _LAST_NATIVE_GRAD_WEIGHT_KERNEL = "torch_cpu_dense"
+        _record_native_grad_weight_kernel(_LAST_NATIVE_GRAD_WEIGHT_KERNEL)
         return grad_weight, grad_bias, "torch_cpu_dense"
     if grad_output_flat.is_cuda and grad_output_flat.dtype in _CUPY_TERNARY_GRAD_INPUT_KERNEL_NAMES:
         if backend in {"auto", "extension"}:
             try:
-                grad_weight, grad_bias = _extension_ternary_grad_weight_bias_cuda(
+                grad_weight, grad_bias, grad_kernel = _extension_ternary_grad_weight_bias_cuda(
                     grad_output_flat,
                     x_flat,
                     float_weight_dtype,
                     has_bias=has_bias,
                 )
                 _LAST_NATIVE_GRAD_WEIGHT_BACKEND = "extension"
+                _LAST_NATIVE_GRAD_WEIGHT_KERNEL = grad_kernel
+                _record_native_grad_weight_kernel(grad_kernel)
                 return grad_weight, grad_bias, "extension"
             except Exception:
                 if backend == "extension":
@@ -1854,6 +2043,8 @@ def _native_packed_ternary_grad_weight_bias_cuda(
     grad_weight = weight_grad.to(dtype=float_weight_dtype)
     grad_bias = grad_output_flat.sum(dim=0).to(dtype=float_weight_dtype) if has_bias else grad_output_flat.new_empty((0,), dtype=float_weight_dtype)
     _LAST_NATIVE_GRAD_WEIGHT_BACKEND = "torch_dense"
+    _LAST_NATIVE_GRAD_WEIGHT_KERNEL = "torch_dense"
+    _record_native_grad_weight_kernel(_LAST_NATIVE_GRAD_WEIGHT_KERNEL)
     return grad_weight, grad_bias, "torch_dense"
 
 

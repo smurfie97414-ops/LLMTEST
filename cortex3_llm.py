@@ -64,7 +64,11 @@ from cortex3_ternary import (
     LayerForwardEvent,
     MTPFSPEvent,
     PackedTernaryDispatch,
+    last_native_grad_input_kernel,
+    last_native_grad_weight_kernel,
     native_backend_from_runtime_label,
+    native_grad_input_kernel_counts,
+    native_grad_weight_kernel_counts,
     native_ternary_cuda_available,
     native_ternary_cuda_extension_available,
 )
@@ -2385,6 +2389,23 @@ def _training_resolves_to_cuda(training: TrainingConfig) -> bool:
         return torch.device(device).type == "cuda"
     except (TypeError, RuntimeError):
         return device.startswith("cuda")
+
+
+def _resolve_cli_precision(precision: str, *, device: str, require_cuda: bool) -> str:
+    requested = str(precision)
+    if requested != "auto":
+        return requested
+    device_text = str(device)
+    resolves_to_cuda = bool(require_cuda)
+    if not resolves_to_cuda:
+        if device_text == "auto":
+            resolves_to_cuda = bool(torch.cuda.is_available())
+        else:
+            try:
+                resolves_to_cuda = torch.device(device_text).type == "cuda"
+            except (TypeError, RuntimeError):
+                resolves_to_cuda = device_text.startswith("cuda")
+    return "fp16" if resolves_to_cuda else "fp32"
 
 
 def _strict_native_ternary_required_for_training(training: TrainingConfig) -> bool:
@@ -4777,6 +4798,10 @@ class CortexTrainingPhaseController:
             "native_ternary_backend_counts": native_backend_counts,
             "native_ternary_requantize_backend_counts": native_requantize_backend_counts,
             "native_ternary_grad_weight_backend_counts": native_grad_weight_backend_counts,
+            "native_ternary_grad_input_kernel": last_native_grad_input_kernel(),
+            "native_ternary_grad_weight_kernel": last_native_grad_weight_kernel(),
+            "native_ternary_grad_input_kernel_counts": native_grad_input_kernel_counts(),
+            "native_ternary_grad_weight_kernel_counts": native_grad_weight_kernel_counts(),
             "native_ternary_kernel_required": bool(
                 torch.cuda.is_available()
                 and self.model.config.use_ternary_core
@@ -5287,6 +5312,10 @@ class CortexTrainingPhaseController:
             "native_ternary_backend_counts": native_backend_counts,
             "native_ternary_requantize_backend_counts": native_requantize_backend_counts,
             "native_ternary_grad_weight_backend_counts": native_grad_weight_backend_counts,
+            "native_ternary_grad_input_kernel": last_native_grad_input_kernel(),
+            "native_ternary_grad_weight_kernel": last_native_grad_weight_kernel(),
+            "native_ternary_grad_input_kernel_counts": native_grad_input_kernel_counts(),
+            "native_ternary_grad_weight_kernel_counts": native_grad_weight_kernel_counts(),
             "native_ternary_kernel_required": bool(
                 torch.cuda.is_available()
                 and self.model.config.use_ternary_core
@@ -5301,6 +5330,10 @@ class CortexTrainingPhaseController:
                 "native_ternary_backend_counts": native_backend_counts,
                 "native_ternary_requantize_backend_counts": native_requantize_backend_counts,
                 "native_ternary_grad_weight_backend_counts": native_grad_weight_backend_counts,
+                "native_ternary_grad_input_kernel": last_native_grad_input_kernel(),
+                "native_ternary_grad_weight_kernel": last_native_grad_weight_kernel(),
+                "native_ternary_grad_input_kernel_counts": native_grad_input_kernel_counts(),
+                "native_ternary_grad_weight_kernel_counts": native_grad_weight_kernel_counts(),
                 "native_ternary_extension_kernel_dispatches": trace_counts.get("native_ternary_extension_kernel_dispatches", 0),
                 "native_ternary_extension_requantize_dispatches": trace_counts.get("native_ternary_extension_requantize_dispatches", 0),
                 "native_ternary_extension_grad_weight_dispatches": trace_counts.get("native_ternary_extension_grad_weight_dispatches", 0),
@@ -8859,7 +8892,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     smoke.add_argument("--max-intermediate-checkpoints", type=int, default=0)
     smoke.add_argument("--resume", action="store_true")
     smoke.add_argument("--resume-if-exists", action="store_true", help="resume from existing verified artifacts if present, otherwise start fresh")
-    smoke.add_argument("--precision", choices=("fp32", "bf16", "fp16"), default="fp32")
+    smoke.add_argument("--precision", choices=("auto", "fp32", "bf16", "fp16"), default="auto")
     smoke.add_argument("--device", default="auto")
     smoke.add_argument("--require-cuda", action="store_true")
     smoke.add_argument("--distributed", action="store_true")
@@ -8886,7 +8919,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     compare.add_argument("--d-model", type=int, default=256)
     compare.add_argument("--n-heads", type=int, default=8)
     compare.add_argument("--n-layers", type=int, default=6)
-    compare.add_argument("--precision", choices=("fp32", "bf16", "fp16"), default="fp32")
+    compare.add_argument("--precision", choices=("auto", "fp32", "bf16", "fp16"), default="auto")
     compare.add_argument("--device", default="auto")
     compare.add_argument("--require-cuda", action="store_true")
     compare.add_argument("--distributed", action="store_true")
@@ -8914,7 +8947,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     compare_matrix.add_argument("--d-model", type=int, default=256)
     compare_matrix.add_argument("--n-heads", type=int, default=8)
     compare_matrix.add_argument("--n-layers", type=int, default=6)
-    compare_matrix.add_argument("--precision", choices=("fp32", "bf16", "fp16"), default="fp32")
+    compare_matrix.add_argument("--precision", choices=("auto", "fp32", "bf16", "fp16"), default="auto")
     compare_matrix.add_argument("--device", default="auto")
     compare_matrix.add_argument("--require-cuda", action="store_true")
     compare_matrix.add_argument("--distributed", action="store_true")
@@ -8942,7 +8975,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     corpus_matrix.add_argument("--d-model", type=int, default=256)
     corpus_matrix.add_argument("--n-heads", type=int, default=8)
     corpus_matrix.add_argument("--n-layers", type=int, default=6)
-    corpus_matrix.add_argument("--precision", choices=("fp32", "bf16", "fp16"), default="fp32")
+    corpus_matrix.add_argument("--precision", choices=("auto", "fp32", "bf16", "fp16"), default="auto")
     corpus_matrix.add_argument("--device", default="auto")
     corpus_matrix.add_argument("--require-cuda", action="store_true")
     corpus_matrix.add_argument("--distributed", action="store_true")
@@ -8970,7 +9003,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     benchmark.add_argument("--d-model", type=int, default=64)
     benchmark.add_argument("--n-heads", type=int, default=4)
     benchmark.add_argument("--n-layers", type=int, default=2)
-    benchmark.add_argument("--precision", choices=("fp32", "bf16", "fp16"), default="fp32")
+    benchmark.add_argument("--precision", choices=("auto", "fp32", "bf16", "fp16"), default="auto")
     benchmark.add_argument("--device", default="auto")
     benchmark.add_argument("--require-cuda", action="store_true")
     benchmark.add_argument("--distributed", action="store_true")
@@ -8999,7 +9032,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     benchmark_matrix.add_argument("--d-model", type=int, default=64)
     benchmark_matrix.add_argument("--n-heads", type=int, default=4)
     benchmark_matrix.add_argument("--n-layers", type=int, default=2)
-    benchmark_matrix.add_argument("--precision", choices=("fp32", "bf16", "fp16"), default="fp32")
+    benchmark_matrix.add_argument("--precision", choices=("auto", "fp32", "bf16", "fp16"), default="auto")
     benchmark_matrix.add_argument("--device", default="auto")
     benchmark_matrix.add_argument("--require-cuda", action="store_true")
     benchmark_matrix.add_argument("--distributed", action="store_true")
@@ -9041,7 +9074,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         report = llm_doctor_report(
             require_cuda=args.require_cuda,
             require_cuda_extension=args.require_cuda_extension,
-            precision=args.precision,
+            precision=_resolve_cli_precision(args.precision, device=args.device, require_cuda=args.require_cuda),
             device=args.device,
             distributed=args.distributed,
             gloo_interface=args.gloo_interface,
@@ -9123,7 +9156,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             eval_batches=3,
             seed=11,
             device=args.device,
-            precision=args.precision,
+            precision=_resolve_cli_precision(args.precision, device=args.device, require_cuda=args.require_cuda),
             require_cuda=args.require_cuda,
             distributed=args.distributed,
             gloo_interface=args.gloo_interface,
@@ -9244,7 +9277,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             eval_batches=3,
             seed=23,
             device=args.device,
-            precision=args.precision,
+            precision=_resolve_cli_precision(args.precision, device=args.device, require_cuda=args.require_cuda),
             require_cuda=args.require_cuda,
             distributed=args.distributed,
             gloo_interface=args.gloo_interface,
@@ -9294,7 +9327,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             eval_batches=3,
             seed=seeds[0],
             device=args.device,
-            precision=args.precision,
+            precision=_resolve_cli_precision(args.precision, device=args.device, require_cuda=args.require_cuda),
             require_cuda=args.require_cuda,
             distributed=args.distributed,
             gloo_interface=args.gloo_interface,
@@ -9342,7 +9375,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             gradient_accumulation_steps=args.gradient_accumulation_steps,
             eval_interval=max(1, args.steps // 10),
             device=args.device,
-            precision=args.precision,
+            precision=_resolve_cli_precision(args.precision, device=args.device, require_cuda=args.require_cuda),
             require_cuda=args.require_cuda,
             distributed=args.distributed,
             gloo_interface=args.gloo_interface,
@@ -9379,7 +9412,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             gradient_accumulation_steps=args.gradient_accumulation_steps,
             eval_interval=max(1, args.steps // 10),
             device=args.device,
-            precision=args.precision,
+            precision=_resolve_cli_precision(args.precision, device=args.device, require_cuda=args.require_cuda),
             require_cuda=args.require_cuda,
             distributed=args.distributed,
             gloo_interface=args.gloo_interface,
@@ -9414,7 +9447,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         eval_interval=max(1, args.steps // 10),
         device=args.device,
-        precision=args.precision,
+        precision=_resolve_cli_precision(args.precision, device=args.device, require_cuda=args.require_cuda),
         require_cuda=args.require_cuda,
         distributed=args.distributed,
         gloo_interface=args.gloo_interface,

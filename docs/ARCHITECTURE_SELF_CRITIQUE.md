@@ -1,6 +1,6 @@
 # Cortex-3 Architecture Self-Critique
 
-Etat: boucle d'audit 11 apres integration du backend PyTorch C++/CUDA extension strict par defaut dans le vrai training `BitLinear`, avec forward, backward `grad_input`, backward `grad_weight` + `grad_bias` tuilé/fusionné, requantization/packing post-update, compteurs backend/requantize/grad_weight explicites, doctor strict et smoke LLM CUDA sans fallback autorise.
+Etat: boucle d'audit 12 apres integration du backend PyTorch C++/CUDA extension strict par defaut dans le vrai training `BitLinear`, avec forward packe, backward `grad_input` WMMA fp16 quand la shape est alignee, backward `grad_weight` + `grad_bias` WMMA fp16->fp32 quand la shape est alignee, kernels warp/tiled hand-written pour les petites formes non alignees, requantization/packing post-update, compteurs backend/requantize/grad-input/grad-weight explicites, precision CLI `auto -> fp16` sur CUDA, doctor strict et smoke LLM CUDA sans fallback autorise.
 
 Ce document sert de registre de critique et de correction. Il ne remplace pas les tests longs interdits pour cette iteration; il se limite aux preuves courtes disponibles, aux rapports du code et aux benchmarks GPU courts.
 
@@ -129,7 +129,7 @@ Ce document sert de registre de critique et de correction. Il ne remplace pas le
 - Correction: `tools/benchmark_ternary_kernel.py` a maintenant un mode `--matrix`, des shapes repetables `--shape BATCHxINxOUT`, un backend `extension` par defaut, un `ResourceUsageMonitor` par cas, et un resume qui exige `strict_extension_only` + speedup forward/backward > 1 contre dense STE legacy.
 - Verification courte: matrice fp16 `64x128x128`, `128x256x256`, `256x512x512`, `warmup=2`, `repeat=8` passee avec `strict_extension_only=true`, speedup min `1.37x`, speedup moyen `1.70x`, GPU moyen `8.67%`, CPU process moyen `26.67%`.
 - Limite: les mesures `nvidia-smi` sont sub-seconde et n'ont souvent qu'un echantillon par cas; elles prouvent que le monitoring est branche, pas encore que l'occupation GPU finale est optimale.
-- Statut: corrige pour matrice courte + monitoring branche. Prochain point: fenetre soutenue courte mais plus stable, plus grandes shapes LLM, et eventuelle variante WMMA/Tensor Core si `grad_weight` tuilé devient limitant.
+- Statut: corrige pour matrice courte + monitoring branche. Le point "grandes shapes LLM + WMMA" est traite ensuite par C18.
 
 ### C17. Monitoring soutenu trop faible pour juger l'occupation GPU
 
@@ -138,6 +138,18 @@ Ce document sert de registre de critique et de correction. Il ne remplace pas le
 - Verification courte: matrice fp16 `64x128x128`, `128x256x256`, `256x512x512`, `--sustain-seconds 0.35`, `--min-resource-samples 2` passee avec `strict_extension_only=true`, `resource_samples_passed=true`, sample min `4`, speedup forward/backward min `1.02x`, moyen `1.41x`, GPU moyen `21.83%`, puissance moyenne `40.21 W`, CPU process moyen `25.28%`.
 - Limite: le GPU reste loin d'une saturation ambitieuse sur ces petites shapes; c'est maintenant mesure au lieu d'etre suppose. Le prochain durcissement doit viser des shapes plus grandes ou une variante kernel plus adaptée.
 - Statut: corrige pour monitoring soutenu court. Prochain point: remplir mieux le GPU sans retirer de composants, puis evaluer WMMA/Tensor Core pour `grad_weight`.
+
+### C18. Grandes shapes LLM bloquees par `grad_input` warp et `grad_weight` non Tensor Core
+
+- Critique: la matrice stricte large `256x768x768` + `512x1024x1024` fp16 a d'abord echoue le gate de speedup malgre `strict_extension_only=true`. Le cas `512x1024x1024` utilisait le GPU a `88%`, mais `full_bitlinear_forward_backward_ms=5.6812 ms` contre `1.5209 ms` dense STE legacy (`0.27x`). Le backend etait bien strict, donc le probleme etait un vrai goulet kernel, pas un fallback.
+- Debug precis: micro-timing separe sur `512x1024x1024` a isole `grad_input_native_ms=4.5866 ms`, alors que `grad_weight_native_ms=0.0809 ms`. Le noyau `grad_input` warp lisait les codes int2 mais faisait un produit scalaire par sortie; il saturait du travail sans utiliser Tensor Cores.
+- Correction: ajout de `ternary_grad_input_wmma_fp16`, qui calcule `grad_x = grad_out @ W_ternary` par tuiles 16x16, decode le poids int2 packe en shared memory, conserve les scales/residuals comme source runtime et accumule via WMMA fp16->fp32 avant conversion fp16. Ajout aussi de `ternary_grad_weight_bias_wmma_fp16_float`, selectionne pour `grad_weight = grad_out^T @ x` quand `M/N/K` sont multiples de 16 et que les poids entrainables restent fp32. L'extension est forcee en v4 pour eviter tout cache compile v2/v3.
+- Observabilite: `last_native_grad_input_kernel`, `last_native_grad_weight_kernel`, `native_grad_input_kernel_counts` et `native_grad_weight_kernel_counts` sont exposes dans le benchmark et dans les rapports LLM. Le "dernier kernel" seul est insuffisant, car les phases P1-P10 lancent aussi de petits micro-circuits non alignes; les counts prouvent maintenant les deux familles.
+- Verification courte: tests GPU ciblés passent, dont `test_bitlinear_native_extension_cuda_grad_weight_uses_wmma_when_aligned`, qui exige `wmma_fp16` pour `grad_input` et `wmma_fp16_float` pour `grad_weight`. Le micro-timing `512x1024x1024` passe de `grad_input_native_ms=4.5866` a `0.1194 ms`.
+- Benchmark strict final RTX 5070: `tools\benchmark_ternary_kernel.py --matrix --shape 256x768x768 --shape 512x1024x1024 --dtype fp16 --kernel-variant auto --autotune-warmup 1 --autotune-repeat 2 --warmup 1 --repeat 4 --sustain-seconds 0.25 --sustain-op forward_backward --sustain-sync-every 2 --resource-interval 0.05 --min-resource-samples 2` passe avec `strict_extension_only=true`, `resource_samples_passed=true`, speedup forward/backward moyen `1.83x`, min `1.75x`, `gradInputCounts={"wmma_fp16":471/213}` et `gradWeightCounts={"wmma_fp16_float":471/213}` selon la shape, GPU moyen `42.58%`.
+- Integration LLM: le smoke strict `tools\train_llm.py smoke --device cuda --require-cuda --steps 2` resout maintenant la precision CLI `auto` en `fp16`, garde `native_ternary_backend_counts={'extension': 2185}`, `native_ternary_requantize_backend_counts={'extension': 230}`, `native_ternary_grad_weight_backend_counts={'extension': 160}`, et rapporte `native_ternary_grad_input_kernel_counts={'warp': 152, 'wmma_fp16': 8}` + `native_ternary_grad_weight_kernel_counts={'tiled': 152, 'wmma_fp16_float': 8}`. Cela prouve que le Transformer aligne passe par WMMA, tandis que les petits micro-circuits des phases restent sur kernels hand-written sans fallback dense.
+- Limite assumee: le smoke 2 steps ne constitue pas une preuve Cortex > baseline, car le proof gate rejette volontairement une baseline `future_tokens_per_cost=0` via `baseline_score_passed=false`. Ce gate reste strict pour eviter une victoire par division par quasi-zero; la preuve comparative reste les runs 48+ deja documentes ou les futurs runs larges quand les tests longs seront autorises.
+- Statut: corrige pour le goulet large-shape fp16 et le branchement LLM strict. Restent a durcir: WMMA bf16, shapes non multiples de 16 sans repasser par warp lent, kernel forward Tensor Core pour grandes matrices, et preuve baseline longue sur corpus large.
 
 ## Critique phase par phase - boucle 11
 
@@ -151,11 +163,11 @@ Ce document sert de registre de critique et de correction. Il ne remplace pas le
 
 ### P2 - Ternary Core
 
-- Ce qui est solide: poids ternaires packes int2, quantization activations, STE, sync versionnee des buffers packes pendant training, kernels CUDA natifs tuiles/warp, autotune CUDA-event par shape, profil JSON persistant, cache layer-local, fast STE autograd forward, backward CUDA `grad_input` depuis poids int2 packes, backward CUDA tuilé `grad_weight` + `grad_bias`, requantization/packing post-update fusionnee CUDA, backend extension C++/CUDA strict par defaut, doctor CUDA distinguant RawKernel et extension runtime, audit LLM exigeant native forward/requantize/grad_weight exclusivement extension en training CUDA strict.
-- Preuve actuelle: tests CUDA courts, export/import profil, tests gradients fast-vs-dense STE en fp32/fp16/bf16, test de parite requantize/pack fp32/fp16/bf16, test extension forcee, doctor toolchain strict, benchmark RTX 5070 avec full forward/backward et requantize/pack profile, matrice strict extension 3 shapes avec monitoring soutenu GPU/CPU/power, smoke LLM extension avec 2185 dispatches forward extension, 230 requantize extension et 160 `grad_weight` extension.
-- Faiblesse: pas de mesure energie/VRAM longue; GPU moyen encore faible sur petites shapes soutenues; pas encore de kernel WMMA/Tensor Core specialise pour `grad_weight` si le tuilé fp32 devient limite a grande taille.
+- Ce qui est solide: poids ternaires packes int2, quantization activations, STE, sync versionnee des buffers packes pendant training, kernels CUDA natifs tuiles/warp, autotune CUDA-event par shape, profil JSON persistant, cache layer-local, fast STE autograd forward, backward CUDA `grad_input` depuis poids int2 packes, WMMA fp16 `grad_input` aligne, WMMA fp16->fp32 `grad_weight` + `grad_bias` aligne, requantization/packing post-update fusionnee CUDA, backend extension C++/CUDA strict par defaut, doctor CUDA distinguant RawKernel et extension runtime, audit LLM exigeant native forward/requantize/grad_weight exclusivement extension en training CUDA strict.
+- Preuve actuelle: tests CUDA courts, export/import profil, tests gradients fast-vs-dense STE en fp32/fp16/bf16, test de parite requantize/pack fp32/fp16/bf16, test extension forcee, doctor toolchain strict, benchmark RTX 5070 avec full forward/backward et requantize/pack profile, matrice strict extension 3 shapes avec monitoring soutenu GPU/CPU/power, matrice LLM-shape WMMA `256x768x768` + `512x1024x1024`, smoke LLM extension avec 2185 dispatches forward extension, 230 requantize extension, 160 `grad_weight` extension et compteurs WMMA `grad_input`/`grad_weight` positifs.
+- Faiblesse: pas de mesure energie/VRAM longue; GPU moyen encore faible sur petites shapes soutenues; WMMA ne couvre pas encore bf16 ni les bords non multiples de 16; le forward packe peut devenir le prochain goulet sur grandes shapes.
 - Risque architectural: le chemin training est maintenant completement branché en extension pour forward, `grad_input`, `grad_weight`, `grad_bias` et repack, mais une preuve de paradigme demandera que ce gain survive aux vrais batchs LLM et ne degrade pas la convergence.
-- Correction prioritaire restante: shapes LLM plus grandes + meilleur remplissage GPU, puis run long seulement quand autorise.
+- Correction prioritaire restante: bf16/edge tiles WMMA, profil forward large-shape, puis run long seulement quand autorise.
 
 ### P3 - Future Contract / FSP / MTP
 
@@ -255,9 +267,9 @@ Ce document sert de registre de critique et de correction. Il ne remplace pas le
 
 ### Ternary Core W in {-1,0,+1}
 
-- Statut: le forward lit les codes packes int2 et lance CUDA extension sur GPU; le backward CUDA calcule `grad_input` depuis les codes int2 packes; `grad_weight` et `grad_bias` passent par un kernel extension tuilé/fusionné; la resynchronisation post-update requantize et repack directement en CUDA extension.
-- Faiblesse: pas encore de profil energie/VRAM ni matrice large de shapes; le kernel `grad_weight` tuilé est hand-written mais pas encore compare a une variante WMMA/Tensor Core.
-- Correction restante: benchmarker multi-shapes et ajouter une variante specialisee si necessaire.
+- Statut: le forward lit les codes packes int2 et lance CUDA extension sur GPU; le backward CUDA calcule `grad_input` depuis les codes int2 packes avec WMMA fp16 quand la shape est alignee; `grad_weight` et `grad_bias` passent par WMMA fp16->fp32 quand la shape est alignee; la resynchronisation post-update requantize et repack directement en CUDA extension.
+- Faiblesse: pas encore de profil energie/VRAM long; WMMA ne couvre pas encore bf16 ni les bords non multiples de 16; le forward packe doit etre profile comme prochain goulet potentiel.
+- Correction restante: benchmarker les vrais batchs LLM, etendre WMMA aux dtypes/bords restants, puis specialiser le forward si necessaire.
 
 ### Skill-aware Experts
 
@@ -295,10 +307,10 @@ Ce document sert de registre de critique et de correction. Il ne remplace pas le
 - Faiblesse: hierarchie encore surtout orchestrateur de modules; pas de policy apprise de profondeur verifier.
 - Correction restante: verifier-depth policy and cost calibration.
 
-## File de correction priorisee apres boucle 11
+## File de correction priorisee apres boucle 12
 
-1. P2: augmenter le remplissage GPU sur shapes LLM plus grandes sans fallback ni retrait architectural.
-2. P2: etudier une variante `grad_weight` WMMA/Tensor Core si le kernel tuilé fp32 ne tient pas sur grandes shapes.
+1. P2: etendre le chemin WMMA a bf16 et aux bords non multiples de 16 sans fallback dense.
+2. P2: ajouter une variante forward Tensor Core/decode-shared pour grandes matrices si le forward packe warp devient le prochain goulet.
 3. P4: scaler l'ablation learned memory vs deterministic memory sur anchors long-context synthetiques puis held-out.
 4. P6/P7: afficher partout `repair_loss_before`, `repair_loss_after`, `protected_loss_before`, `protected_loss_after`, delta et convention.
 5. P8: aligner `TernaryKernelDispatcher` inference avec les variants `BitLinear` natifs.
@@ -308,3 +320,4 @@ Ce document sert de registre de critique et de correction. Il ne remplace pas le
 9. P9: audit diversity drift replay/sleep court.
 10. P10: renforcer reward-hacking probes.
 11. Training: produire un nouveau sidecar sous le commit courant quand les tests longs seront autorises.
+12. Proof: relancer une comparaison 48+ ou large corpus afin que `baseline_score_passed=true` et que la victoire Cortex ne depende pas d'une baseline nulle.

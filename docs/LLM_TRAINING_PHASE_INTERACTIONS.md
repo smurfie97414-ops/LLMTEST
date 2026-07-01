@@ -302,13 +302,15 @@ P2 fournit les traces de compression a :
 
 ### Impact Apprentissage
 
-Le forward lit la valeur runtime depuis les codes ternaires packes, puis utilise une estimation straight-through pour garder un gradient vers `float_weight`. Sur CUDA fp32/fp16/bf16, le fast STE calcule aussi `grad_input` depuis les codes int2 packes au lieu de reconstruire un poids dense pour cette partie. Le modele apprend donc avec une valeur avant ternaire packee et un morceau important du backward ternaire packe, pas seulement avec une couche float habillee par des logs.
+Le forward lit la valeur runtime depuis les codes ternaires packes, puis utilise une estimation straight-through pour garder un gradient vers `float_weight`. Sur CUDA fp32/fp16/bf16, le fast STE calcule aussi `grad_input` depuis les codes int2 packes au lieu de reconstruire un poids dense pour cette partie. Sur fp16 aligne, `grad_input` passe par WMMA avec decode int2 en shared memory, et `grad_weight` passe par WMMA fp16->fp32; les petites formes non alignees des micro-phases gardent les kernels hand-written warp/tiled. Le modele apprend donc avec une valeur avant ternaire packee et un backward ternaire packe observe, pas seulement avec une couche float habillee par des logs.
 
 ### Preuve Runtime
 
-Le checkpoint inspecte montre `P2=238652` evenements. Le smoke court extension `tools\train_llm.py smoke --device cuda --require-cuda --steps 2` utilise l'extension par defaut et montre aussi `native_ternary_backend_counts={'extension': 2185}`, `native_ternary_requantize_backend_counts={'extension': 230}`, `native_ternary_grad_weight_backend_counts={'extension': 160}`, `torch_packed_ternary_dispatches=0`, `strict_extension_only=true` et audits P2/architecture passants. Les tests ajoutes verifient en plus que `BitLinear` execute un dispatch CUDA natif tuilé ou warp-reduction sur GPU local, que les valeurs fp32/fp16/bf16 correspondent au runtime packe, que l'auto-selection choisit la variante attendue selon la forme, que le backward fast STE garde la meme semantique que le dense STE pour `grad_input`, `grad_weight` et `grad_bias`, et que le gradient STE reste non nul vers les poids entrainables.
+Le checkpoint inspecte montre `P2=238652` evenements. Le smoke court extension `tools\train_llm.py smoke --device cuda --require-cuda --steps 2` utilise l'extension par defaut, resout `precision=auto` en `fp16`, et montre aussi `native_ternary_backend_counts={'extension': 2185}`, `native_ternary_requantize_backend_counts={'extension': 230}`, `native_ternary_grad_weight_backend_counts={'extension': 160}`, `native_ternary_grad_input_kernel_counts={'warp': 152, 'wmma_fp16': 8}`, `native_ternary_grad_weight_kernel_counts={'tiled': 152, 'wmma_fp16_float': 8}`, `torch_packed_ternary_dispatches=0`, `strict_extension_only=true` et audits P2/architecture passants. Les tests ajoutes verifient en plus que `BitLinear` execute un dispatch CUDA natif tuilé ou warp-reduction sur GPU local, que les valeurs fp32/fp16/bf16 correspondent au runtime packe, que l'auto-selection choisit la variante attendue selon la forme, que le backward fast STE garde la meme semantique que le dense STE pour `grad_input`, `grad_weight` et `grad_bias`, que le chemin aligne utilise WMMA, et que le gradient STE reste non nul vers les poids entrainables.
 
 La matrice soutenue courte `tools\benchmark_ternary_kernel.py --matrix --dtype fp16 --kernel-variant auto --warmup 2 --repeat 6 --sustain-seconds 0.35 --sustain-op forward_backward --min-resource-samples 2` couvre `64x128x128`, `128x256x256` et `256x512x512`: `strict_extension_only=true`, `resource_samples_passed=true`, sample min `4`, speedup forward+backward min `1.02x`, moyen `1.41x`, GPU moyen `21.83%`, puissance GPU moyenne `40.21 W`, CPU process moyen `25.28%`. Ces compteurs prouvent que le monitoring est branche sur une fenetre courte mais soutenue; ils montrent aussi que les petites shapes ne saturent pas encore le GPU.
+
+La matrice LLM-shape courte `256x768x768` et `512x1024x1024` avec extension v4 corrige le goulet observe sur `grad_input`: `strict_extension_only=true`, `resource_samples_passed=true`, `gradInputCounts={"wmma_fp16":471/213}`, `gradWeightCounts={"wmma_fp16_float":471/213}`, speedup forward+backward moyen `1.83x`, min `1.75x`, GPU moyen `42.58%`. Le smoke 2 steps reste un test d'integration architecture; son proof comparatif global peut rester `false` si la baseline next-token a un score nul, car le gate refuse volontairement une victoire artificielle par division par quasi-zero.
 
 La boucle post-update est aussi native sur CUDA: apres un changement de poids, `_sync_quantized_buffers_from_weight` peut regenerer `signs`, `mask`, `scales`, `residual_weight` et `packed_codes` via un kernel fusionne. Le benchmark court RTX 5070 `128x256x256 fp16` mesure `0.2245 ms` pour le chemin fusionne contre `0.5901 ms` pour le chemin PyTorch tensoriel.
 
@@ -739,12 +741,12 @@ Etat actuel :
 
 Limite restante :
 
-- les kernels natifs actuels couvrent deja une variante tuilée shared-memory, une variante warp-reduction, un backend extension C++/CUDA strict, un autotune mesure/cache par shape et un profil JSON persistant, mais doivent encore reduire le cout STE/backward pour grands batchs LLM ;
+- les kernels natifs actuels couvrent deja une variante tuilée shared-memory, une variante warp-reduction, un backend extension C++/CUDA strict, un autotune mesure/cache par shape, un profil JSON persistant, WMMA fp16 pour `grad_input` aligne et WMMA fp16->fp32 pour `grad_weight` aligne, mais doivent encore couvrir bf16/bords non multiples et profiler le forward sur grands batchs LLM ;
 - les benchmarks doivent etre elargis a VRAM, energie estimee, tailles LLM reelles et qualite de convergence.
 
 Critere de fermeture :
 
-- augmenter le remplissage GPU sur shapes LLM plus grandes et eventuelle variante WMMA/Tensor Core si necessaire ;
+- etendre WMMA a bf16/bords non multiples, profiler le forward packe sur shapes LLM plus grandes et augmenter le remplissage GPU sans retirer de composants ;
 - benchmarker latence, VRAM, energie estimee, throughput et qualite face a une baseline dense sur runs LLM larges.
 
 ### Verifier Dynamique A Grande Echelle
