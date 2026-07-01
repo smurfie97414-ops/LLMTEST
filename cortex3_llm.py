@@ -10448,6 +10448,8 @@ def run_llm_batch_profile_autosize(
     confirmation_decision_resolution_margin_deficit = 0.0
     confirmation_decision_resolution_overlap_ratio = 0.0
     confirmation_decision_resolution_total_rounds = effective_confirm_selected_decision_resolution_extra_rounds
+    confirmation_decision_resolution_stop_reason = ""
+    confirmation_decision_resolution_budget_evaluations: list[Mapping[str, Any]] = []
     if effective_measure_candidate_count > 0:
         aggregated_measurement_rows: list[Mapping[str, Any]] = []
         already_measured_shape_keys: set[str] = set()
@@ -10847,7 +10849,8 @@ def run_llm_batch_profile_autosize(
                 for candidate in inputs
             )
             uncertainty = max(interval_widths, default=0.0)
-            margin_deficit = max(0.0, -float(state.get("decision_margin", 0.0)))
+            decision_margin = float(state.get("decision_margin", 0.0))
+            margin_deficit = max(1e-9, -decision_margin)
             if uncertainty <= 0.0 or margin_deficit <= 0.0:
                 adaptive_extra_rounds = 0
                 overlap_ratio = 0.0
@@ -11042,24 +11045,51 @@ def run_llm_batch_profile_autosize(
                 )
                 if confirmed_count <= 0:
                     break
-            adaptive_budget_state = decision_resolution_adaptive_budget(selected_confirmation_frontier_state())
-            confirmation_decision_resolution_adaptive_extra_rounds = int(
-                adaptive_budget_state["adaptive_extra_rounds"]
-            )
-            confirmation_decision_resolution_uncertainty = float(adaptive_budget_state["uncertainty"])
-            confirmation_decision_resolution_margin_deficit = float(adaptive_budget_state["margin_deficit"])
-            confirmation_decision_resolution_overlap_ratio = float(adaptive_budget_state["overlap_ratio"])
-            confirmation_decision_resolution_total_rounds = (
+            base_resolution_rounds_used = 0
+            adaptive_resolution_rounds_used = 0
+            resolution_round_offset = 0
+            max_resolution_rounds = (
                 effective_confirm_selected_decision_resolution_extra_rounds
-                + confirmation_decision_resolution_adaptive_extra_rounds
+                + requested_confirm_selected_decision_resolution_adaptive_extra_rounds
             )
-            for resolution_round_offset in range(confirmation_decision_resolution_total_rounds):
+            while resolution_round_offset < max_resolution_rounds:
                 confirmation_state = selected_confirmation_frontier_state()
                 if tuple(confirmation_state["pending_candidates"]):
+                    confirmation_decision_resolution_stop_reason = "frontier_pending"
                     break
                 if confirmation_decision_resolved(confirmation_state):
                     confirmation_complete = True
+                    confirmation_decision_resolution_stop_reason = "decision_resolved"
                     break
+                adaptive_budget_state = decision_resolution_adaptive_budget(confirmation_state)
+                confirmation_decision_resolution_uncertainty = float(adaptive_budget_state["uncertainty"])
+                confirmation_decision_resolution_margin_deficit = float(adaptive_budget_state["margin_deficit"])
+                confirmation_decision_resolution_overlap_ratio = float(adaptive_budget_state["overlap_ratio"])
+                if base_resolution_rounds_used < effective_confirm_selected_decision_resolution_extra_rounds:
+                    budget_kind = "base"
+                    base_resolution_rounds_used += 1
+                else:
+                    if adaptive_resolution_rounds_used >= requested_confirm_selected_decision_resolution_adaptive_extra_rounds:
+                        confirmation_decision_resolution_stop_reason = "adaptive_budget_exhausted"
+                        break
+                    if int(adaptive_budget_state["adaptive_extra_rounds"]) <= 0:
+                        confirmation_decision_resolution_stop_reason = "adaptive_not_indicated"
+                        break
+                    budget_kind = "adaptive"
+                    adaptive_resolution_rounds_used += 1
+                    confirmation_decision_resolution_adaptive_extra_rounds = adaptive_resolution_rounds_used
+                confirmation_decision_resolution_budget_evaluations.append(
+                    {
+                        "round_offset": resolution_round_offset,
+                        "budget_kind": budget_kind,
+                        "decision_margin": float(confirmation_state.get("decision_margin", 0.0)),
+                        "adaptive_extra_rounds_recommended": int(adaptive_budget_state["adaptive_extra_rounds"]),
+                        "adaptive_extra_rounds_used": adaptive_resolution_rounds_used,
+                        "uncertainty": confirmation_decision_resolution_uncertainty,
+                        "margin_deficit": confirmation_decision_resolution_margin_deficit,
+                        "overlap_ratio": confirmation_decision_resolution_overlap_ratio,
+                    }
+                )
                 confirmed_count = confirm_selected_candidates(
                     round_index=round_index
                     + 2
@@ -11069,7 +11099,20 @@ def run_llm_batch_profile_autosize(
                     round_kind="decision_margin_resolution",
                 )
                 if confirmed_count <= 0:
+                    confirmation_decision_resolution_stop_reason = "no_profiles"
                     break
+                resolution_round_offset += 1
+            confirmation_decision_resolution_total_rounds = (
+                effective_confirm_selected_decision_resolution_extra_rounds
+                + confirmation_decision_resolution_adaptive_extra_rounds
+            )
+            if not confirmation_decision_resolution_stop_reason:
+                final_confirmation_state = selected_confirmation_frontier_state()
+                if confirmation_decision_resolved(final_confirmation_state):
+                    confirmation_complete = True
+                    confirmation_decision_resolution_stop_reason = "decision_resolved"
+                else:
+                    confirmation_decision_resolution_stop_reason = "round_limit"
             if not selected_confirmation_missing():
                 confirmation_complete = True
             confirmation_frontier_state = {
@@ -11256,6 +11299,8 @@ def run_llm_batch_profile_autosize(
             "confirmation_decision_resolution_uncertainty": confirmation_decision_resolution_uncertainty,
             "confirmation_decision_resolution_margin_deficit": confirmation_decision_resolution_margin_deficit,
             "confirmation_decision_resolution_overlap_ratio": confirmation_decision_resolution_overlap_ratio,
+            "confirmation_decision_resolution_stop_reason": confirmation_decision_resolution_stop_reason,
+            "confirmation_decision_resolution_budget_evaluations": tuple(confirmation_decision_resolution_budget_evaluations),
             "confirmation_rounds_used": len(confirmation_rounds),
             "confirmation_decision_resolution_rounds_used": sum(
                 1 for round_ in confirmation_rounds if str(round_.get("round_kind", "")) == "decision_margin_resolution"

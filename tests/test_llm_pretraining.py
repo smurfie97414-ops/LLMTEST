@@ -1426,6 +1426,129 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
         self.assertEqual((profile_calls[16]["seed"], profile_calls[16]["seq_len"]), (418929, 64))
         self.assertIn("confirm_seed_418929", str(profile_calls[14]["out_dir"]))
 
+    def test_llm_batch_profile_autosize_reevaluates_margin_resolution_after_each_round(self):
+        profile_calls = []
+
+        def fake_profile(**kwargs):
+            profile_calls.append(dict(kwargs))
+            seq_len = int(kwargs["seq_len"])
+            seed = int(kwargs["seed"])
+            if seq_len == 64:
+                if seed == 11:
+                    train_tokens_per_second = 1300.0
+                elif seed == 314200:
+                    train_tokens_per_second = 900.0
+                else:
+                    train_tokens_per_second = 100.0
+            elif seq_len == 96:
+                train_tokens_per_second = 300.0
+            else:
+                train_tokens_per_second = 1000.0
+            planned = (
+                int(kwargs["steps"])
+                * int(kwargs["batch_size"])
+                * int(kwargs["gradient_accumulation_steps"])
+                * int(kwargs["seq_len"])
+            )
+            return {
+                "passed": True,
+                "failed_checks": (),
+                "throughput": {
+                    "train_tokens_per_second_wall": train_tokens_per_second,
+                    "planned_train_tokens": planned,
+                },
+                "resource_usage": {
+                    "sample_count": 1,
+                    "metrics": {
+                        "gpu_utilization_percent": {"avg": 10.0, "min": 10.0, "max": 10.0},
+                        "gpu_memory_used_mb": {"avg": 128.0, "min": 128.0, "max": 128.0},
+                        "gpu_power_draw_watts": {"avg": 45.0, "min": 45.0, "max": 45.0},
+                        "process_cpu_percent_of_total": {"avg": 1.0, "min": 1.0, "max": 1.0},
+                    },
+                },
+                "torch_cuda_memory": {
+                    "after": {
+                        "max_memory_allocated_bytes": 8 * 1024 * 1024,
+                    }
+                },
+                "kernel_evidence": {
+                    "native_ternary_kernel_required": False,
+                    "strict_extension_only": True,
+                },
+                "architecture": {"all_phases_active": True},
+            }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch("cortex3_llm.run_llm_batch_profile", side_effect=fake_profile):
+                report = run_llm_batch_profile_autosize(
+                    out_dir=root / "autosize-sequential-margin-resolution",
+                    candidate_seq_lens=(32, 64, 96),
+                    candidate_d_models=(32,),
+                    candidate_n_layers=(1,),
+                    candidate_batch_sizes=(2,),
+                    candidate_gradient_accumulation_steps=(1,),
+                    n_heads=4,
+                    selected_shape_count=1,
+                    min_selected_shapes=1,
+                    seeds=(11, 13),
+                    steps=1,
+                    gradient_accumulation_steps=1,
+                    vocab_size=128,
+                    precision="fp32",
+                    device="cpu",
+                    require_cuda=False,
+                    memory_budget_mb=512,
+                    measure_candidate_count=3,
+                    measure_candidate_adaptive_rounds=1,
+                    refine_uncertain_extra_seed_count=0,
+                    confirm_selected_max_rounds=2,
+                    confirm_selected_decision_resolution_extra_rounds=1,
+                    confirm_selected_decision_resolution_adaptive_extra_rounds=2,
+                    measured_selection_metric="throughput",
+                    min_cases=2,
+                    require_multi_seed=True,
+                    min_resource_samples=1,
+                )
+
+        selected_key = "seq32_d32_h4_l1_b2_g1"
+        challenger_key = "seq64_d32_h4_l1_b2_g1"
+        measured_by_key = {item["shape_key"]: item for item in report["measured_candidates"]}
+        budget_evaluations = report["measurement"]["confirmation_decision_resolution_budget_evaluations"]
+        self.assertTrue(report["passed"], report["failed_checks"])
+        self.assertEqual(report["selection"]["selected_shape_keys"], (selected_key,))
+        self.assertTrue(report["measurement"]["confirmation_decision_resolved"])
+        self.assertEqual(report["measurement"]["confirmation_decision_resolution_stop_reason"], "decision_resolved")
+        self.assertEqual(report["measurement"]["confirm_selected_decision_resolution_extra_rounds"], 1)
+        self.assertEqual(report["measurement"]["confirm_selected_decision_resolution_adaptive_extra_round_cap"], 2)
+        self.assertEqual(report["measurement"]["confirm_selected_decision_resolution_adaptive_extra_rounds"], 2)
+        self.assertEqual(report["measurement"]["confirm_selected_decision_resolution_total_rounds"], 3)
+        self.assertEqual(report["measurement"]["confirmation_decision_resolution_rounds_used"], 3)
+        self.assertEqual(report["measurement"]["confirmation_rounds_used"], 5)
+        self.assertEqual(report["measurement"]["confirmation_profile_count"], 16)
+        self.assertEqual(report["measurement"]["confirmation_seeds"], (104742, 209471, 314200, 418929, 523658))
+        self.assertEqual(tuple(item["budget_kind"] for item in budget_evaluations), ("base", "adaptive", "adaptive"))
+        self.assertEqual(tuple(item["adaptive_extra_rounds_used"] for item in budget_evaluations), (0, 1, 2))
+        self.assertTrue(all(float(item["overlap_ratio"]) > 0.0 for item in budget_evaluations))
+        self.assertEqual(
+            tuple(round_["round_kind"] for round_ in report["measurement"]["confirmation_rounds"]),
+            (
+                "selected_candidate_confirmation",
+                "selected_candidate_confirmation",
+                "decision_margin_resolution",
+                "decision_margin_resolution",
+                "decision_margin_resolution",
+            ),
+        )
+        self.assertEqual(measured_by_key[challenger_key]["measurement_seeds"], (11, 13, 209471, 314200, 418929, 523658))
+        self.assertEqual(measured_by_key[challenger_key]["measured_score_observation_values"], (1300.0, 100.0, 100.0, 900.0, 100.0, 100.0))
+        self.assertIsNotNone(report["matrix"])
+        self.assertTrue(report["matrix"]["passed"], report["matrix"]["failed_checks"])
+        self.assertEqual(len(profile_calls), 24)
+        self.assertEqual((profile_calls[18]["seed"], profile_calls[18]["seq_len"]), (523658, 32))
+        self.assertEqual((profile_calls[20]["seed"], profile_calls[20]["seq_len"]), (523658, 64))
+        self.assertIn("confirm_seed_523658", str(profile_calls[18]["out_dir"]))
+
     def test_llm_batch_profile_autosize_default_confirmation_rounds_cover_measured_frontier(self):
         profile_calls = []
 
