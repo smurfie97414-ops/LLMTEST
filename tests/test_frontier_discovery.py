@@ -1,6 +1,7 @@
 import json
 import tempfile
 import unittest
+from dataclasses import replace
 
 from cortex3 import CorruptedCompressedAgent, DynamicSkillVerifier, ReferenceRuleAgent, default_skill_specs
 from cortex3_cycle import CortexCycle
@@ -109,6 +110,78 @@ class FrontierSkillDiscoveryTest(unittest.TestCase):
         self.assertTrue(answer.certificate["frontier_heldout_gate_passed"])
         self.assertTrue(answer.certificate["frontier_output_goal_contract_passed"])
         self.assertTrue(verifier.oracle_registry.verify(task.skill, task, answer).passed)
+
+    def test_frontier_registry_prefers_exact_coverage_over_generic_high_score_circuit(self):
+        verifier = DynamicSkillVerifier(default_skill_specs())
+        cycle = CortexCycle(verifier).run(ReferenceRuleAgent(), CorruptedCompressedAgent(), seed=7, n_per_skill=1)
+        discovery_registry = FrontierCircuitRegistry()
+        frontier = FrontierSkillDiscovery(verifier).discover(
+            cycle,
+            seed=7,
+            max_skills=1,
+            epochs=120,
+            registry=discovery_registry,
+        )
+        self.assertTrue(frontier.passed)
+        source_runtime = discovery_registry.circuits_for_skill(frontier.circuits[0].skill)[0]
+        target = source_runtime.verified_tasks[0]
+        generic_task = replace(target, task_id=f"{target.task_id}-generic-neighbor")
+
+        generic_report = replace(
+            source_runtime.report,
+            frontier_task_ids=(generic_task.task_id,),
+            heldout_task_ids=tuple(task.task_id for task in source_runtime.heldout_tasks),
+            verified_slow_solutions=5000,
+            dsv={
+                **dict(source_runtime.report.dsv),
+                "verified_capability_per_cost": 1_000_000.0,
+                "passed": max(1, int(source_runtime.report.dsv.get("total", 1) or 1)),
+                "total": max(1, int(source_runtime.report.dsv.get("total", 1) or 1)),
+            },
+            heldout={
+                **dict(source_runtime.report.heldout),
+                "pass_rate": 1.0,
+                "aggregate_score": 1_000_000.0,
+            },
+            compiled_weight_bits=1.0,
+        )
+        exact_report = replace(
+            source_runtime.report,
+            frontier_task_ids=(target.task_id,),
+            heldout_task_ids=tuple(task.task_id for task in source_runtime.heldout_tasks),
+            verified_slow_solutions=1,
+            dsv={
+                **dict(source_runtime.report.dsv),
+                "verified_capability_per_cost": 0.0001,
+                "passed": max(1, int(source_runtime.report.dsv.get("total", 1) or 1)),
+                "total": max(1, int(source_runtime.report.dsv.get("total", 1) or 1)),
+            },
+            heldout={
+                **dict(source_runtime.report.heldout),
+                "pass_rate": 1.0,
+                "aggregate_score": 0.0,
+            },
+            compiled_weight_bits=1_000_000_000.0,
+        )
+        registry = FrontierCircuitRegistry()
+        generic = registry.register(
+            generic_report,
+            source_runtime.model,
+            (generic_task,),
+            heldout_tasks=source_runtime.heldout_tasks,
+        )
+        exact = registry.register(
+            exact_report,
+            source_runtime.model,
+            (target,),
+            heldout_tasks=source_runtime.heldout_tasks,
+        )
+
+        selected = registry.select(target)
+
+        self.assertIsNotNone(selected)
+        self.assertEqual(compiled_circuit_id(selected.report), compiled_circuit_id(exact.report))
+        self.assertNotEqual(compiled_circuit_id(selected.report), compiled_circuit_id(generic.report))
 
 
 if __name__ == "__main__":

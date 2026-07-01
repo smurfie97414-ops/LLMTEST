@@ -305,7 +305,7 @@ Current executable coverage:
 - The compiled circuit is re-evaluated by `DynamicSkillVerifier`; if a separate held-out metamorphic gate fails, the failing held-out tasks become verified support for the next bounded recompilation round and a fresh held-out suite is generated before promotion.
 - Reports include DSV score, held-out pass counts/rate/gate status, training deltas, active/total weights and packed compiled weight bits.
 - `FrontierCircuitRegistry` now keeps DSV-passing compiled circuits as runtime artifacts instead of dropping the trained model after report generation.
-- `CompiledFrontierAgent` selects a compiled circuit by covered task ids, group ids, numeric signatures, non-label metadata, anchors and invariants, not by skill name alone; if a circuit is selected, verifier failure is exposed on the answer rather than hidden behind a fallback.
+- `CompiledFrontierAgent` selects a compiled circuit by a lexicographic specialization key over covered task ids, group ids, numeric signatures, anchors and non-label metadata before using DSV/held-out/cost tie-breakers, not by skill name or additive global score alone; if a circuit is selected, verifier failure is exposed on the answer rather than hidden behind a fallback.
 - `CompiledFrontierAgent` establishes and verifies a P4 `CompiledCircuitMemoryBinding` before using a selected circuit when shared memory is provided; if binding establishment or fidelity fails, FastSolve raises instead of silently falling back.
 - Frontier registries persist to `frontier_registry.json` plus per-circuit micro-model checkpoints and reload through `CheckpointManager`, so a compiled skill can survive process boundaries.
 - `UltraFastInferenceEngine` accepts a `compiled_frontier_registry` and uses a selected compiled frontier circuit as the answer source before fast/normal/careful route execution.
@@ -321,12 +321,12 @@ Evidence:
 
 - `.\.venv\Scripts\python.exe -m unittest tests.test_frontier_discovery`
 - Smoke: fragile-skill frontier tasks are slow-solved, verified, distilled and compiled into a DSV-passing micro-circuit.
-- Short runtime proof: `python -m unittest tests.test_frontier_discovery` now asserts a compiled frontier circuit has nonzero held-out tasks, passes the held-out gate, is registered, selected by coverage, used by `CompiledFrontierAgent`, oracle-verified, saved to `frontier_registry.json`, reloaded with held-out tasks, used again, and consumed by `UltraFastInferenceEngine` on a forced fast path.
+- Short runtime proof: `python -m unittest tests.test_frontier_discovery` now asserts a compiled frontier circuit has nonzero held-out tasks, passes the held-out gate, is registered, selected by coverage, wins exact-coverage selection against an artificially high-scoring generic competing circuit, is used by `CompiledFrontierAgent`, oracle-verified, saved to `frontier_registry.json`, reloaded with held-out tasks, used again, and consumed by `UltraFastInferenceEngine` on a forced fast path.
 - LLM controller proof: `tests.test_llm_pretraining.LLMPretrainingHarnessTest.test_full_cortex_phase_controller_uses_all_modules_during_training` asserts nonzero `frontier_compiled_circuit_count`, `frontier_compiled_skill_count`, all compiled circuits passing `frontier_heldout_*`, nonzero `frontier_compiled_fastsolve_events`, accepted P7 `frontier_repair_*` evidence carrying held-out proof, nonzero P10 `recursive_frontier_proposal_events`, a P10 model patch whose `proposal_kind` is `compiled_frontier`, and an on-disk `frontier_registry.json`; `test_cortex_phase_state_survives_checkpoint_resume` now also proves restored Frontier FastSolve and restored P4 memory reuse before continuing from checkpoint.
 
 Remaining:
 
-- Scale the held-out frontier gate beyond the current short metamorphic suites.
+- Scale the held-out frontier gate and lexicographic multi-circuit selection beyond the current short metamorphic suites.
 - Expand certificate tools beyond the current linear algebra and local rich-code domains.
 
 ## Cross-phase final objective and metrics

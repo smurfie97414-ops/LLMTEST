@@ -275,9 +275,15 @@ class FrontierCircuitRegistry:
         score -= float(circuit.report.compiled_weight_bits) * 1e-9
         return score
 
-    def _coverage_score(self, circuit: RuntimeFrontierCircuit, task: Task) -> float:
+    def _coverage_features(self, circuit: RuntimeFrontierCircuit, task: Task) -> dict[str, float]:
         covered_tasks = tuple(circuit.verified_tasks) + tuple(circuit.heldout_tasks)
         best = 0.0
+        exact_task = 0.0
+        group_match = 0.0
+        metadata_matches_best = 0.0
+        numeric_exact = 0.0
+        numeric_overlap_best = 0.0
+        anchor_overlap_best = 0.0
         task_numbers = _numeric_signature(task)
         task_anchor_values = {anchor.value for anchor in task.anchors}
         task_metadata = {
@@ -289,8 +295,10 @@ class FrontierCircuitRegistry:
             score = 0.0
             if covered.task_id == task.task_id:
                 score += 1000.0
+                exact_task = 1.0
             if covered.group_id is not None and covered.group_id == task.group_id:
                 score += 50.0
+                group_match = 1.0
             covered_metadata = {
                 key: value
                 for key, value in covered.metadata.items()
@@ -298,24 +306,71 @@ class FrontierCircuitRegistry:
             }
             shared = set(task_metadata) & set(covered_metadata)
             matching_values = sum(1 for key in shared if task_metadata[key] == covered_metadata[key])
+            metadata_matches_best = max(metadata_matches_best, float(matching_values))
             score += float(matching_values) * 8.0
             covered_numbers = _numeric_signature(covered)
             if task_numbers and covered_numbers:
                 if task_numbers == covered_numbers:
                     score += 24.0
+                    numeric_exact = 1.0
                 else:
-                    score += float(len(set(task_numbers) & set(covered_numbers))) * 2.0
+                    numeric_overlap = float(len(set(task_numbers) & set(covered_numbers)))
+                    score += numeric_overlap * 2.0
+                    numeric_overlap_best = max(numeric_overlap_best, numeric_overlap)
             covered_anchor_values = {anchor.value for anchor in covered.anchors}
-            score += float(len(task_anchor_values & covered_anchor_values)) * 10.0
+            anchor_overlap = float(len(task_anchor_values & covered_anchor_values))
+            score += anchor_overlap * 10.0
+            anchor_overlap_best = max(anchor_overlap_best, anchor_overlap)
             best = max(best, score)
-        return best
+        return {
+            "coverage_score": best,
+            "exact_task": exact_task,
+            "group_match": group_match,
+            "metadata_matches": metadata_matches_best,
+            "numeric_exact": numeric_exact,
+            "numeric_overlap": numeric_overlap_best,
+            "anchor_overlap": anchor_overlap_best,
+        }
+
+    def _coverage_score(self, circuit: RuntimeFrontierCircuit, task: Task) -> float:
+        return self._coverage_features(circuit, task)["coverage_score"]
+
+    def _selection_key(self, circuit: RuntimeFrontierCircuit, task: Task) -> tuple[float, ...] | None:
+        if task.skill != circuit.skill:
+            return None
+        coverage = self._coverage_features(circuit, task)
+        if coverage["coverage_score"] <= 0.0:
+            return None
+        heldout_total = int(circuit.report.heldout.get("total", 0) or 0)
+        heldout_passed = int(circuit.report.heldout.get("passed", 0) or 0)
+        dsv_total = int(circuit.report.dsv.get("total", 0) or 0)
+        dsv_passed = int(circuit.report.dsv.get("passed", 0) or 0)
+        dsv_pass_rate = float(dsv_passed) / max(1, dsv_total)
+        return (
+            coverage["exact_task"],
+            coverage["group_match"],
+            coverage["numeric_exact"],
+            coverage["anchor_overlap"],
+            coverage["metadata_matches"],
+            coverage["numeric_overlap"],
+            coverage["coverage_score"],
+            float(circuit.report.heldout.get("pass_rate", 0.0)),
+            float(heldout_passed) / max(1, heldout_total),
+            dsv_pass_rate,
+            float(circuit.report.dsv.get("verified_capability_per_cost", 0.0)),
+            float(circuit.report.verified_slow_solutions),
+            -float(circuit.report.compiled_weight_bits),
+        )
 
     def select(self, task: Task) -> RuntimeFrontierCircuit | None:
         candidates = self.circuits_for_skill(task.skill)
         if not candidates:
             return None
-        scored = [(self._match_score(circuit, task), circuit) for circuit in candidates]
-        scored = [item for item in scored if item[0] != float("-inf")]
+        scored = [
+            (selection_key, circuit)
+            for circuit in candidates
+            if (selection_key := self._selection_key(circuit, task)) is not None
+        ]
         if not scored:
             return None
         scored.sort(key=lambda item: item[0], reverse=True)
