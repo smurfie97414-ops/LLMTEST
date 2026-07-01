@@ -4,11 +4,94 @@ import unittest
 
 from cortex3 import Anchor, CorruptedCompressedAgent, DynamicSkillVerifier, ReferenceRuleAgent, default_skill_specs
 from cortex3_cycle import CortexCycle
-from cortex3_memory import AnchorFidelityVerifier, CognitiveMemory, CognitiveMemoryConfig, MemoryMode, embed_text
+from cortex3_memory import AnchorFidelityVerifier, CognitiveMemory, CognitiveMemoryConfig, MemoryMode, MemoryRetentionDecision, embed_text
 from cortex3_reporting import write_cycle_run
 
 
 class CognitiveMemoryTest(unittest.TestCase):
+    def test_learned_retention_policy_can_store_segment_directly_as_latent(self):
+        memory = CognitiveMemory(CognitiveMemoryConfig(recent_exact_limit=2, embedding_dim=32))
+        segment = memory.ingest(
+            "learned-latent",
+            "Contexte appris: le prototype Sigma garde une synthese latente.",
+            retention_decision=MemoryRetentionDecision(
+                segment_id="learned-latent",
+                requested_mode=MemoryMode.LATENT,
+                applied_mode=MemoryMode.LATENT,
+                exact_prob=0.10,
+                latent_prob=0.84,
+                drop_prob=0.06,
+                storage_ratio=0.45,
+                confidence=0.84,
+                source="learned_memory_policy",
+            ),
+        )
+
+        self.assertIsNotNone(segment)
+        self.assertEqual(segment.mode, MemoryMode.LATENT)
+        self.assertEqual(memory.recent.segments, [])
+        self.assertEqual([item.segment_id for item in memory.latent.segments], ["learned-latent"])
+        report = memory.compression_report()
+        self.assertEqual(report["learned_retention_decision_count"], 1)
+        self.assertEqual(report["learned_retention_requested_latent"], 1)
+        self.assertEqual(report["learned_retention_applied_latent"], 1)
+
+    def test_learned_retention_policy_can_drop_non_anchored_segment(self):
+        memory = CognitiveMemory(CognitiveMemoryConfig(recent_exact_limit=2, embedding_dim=32))
+        segment = memory.ingest(
+            "learned-drop",
+            "Texte banal sans ancre critique ni obligation exacte.",
+            retention_decision=MemoryRetentionDecision(
+                segment_id="learned-drop",
+                requested_mode=MemoryMode.DROP,
+                applied_mode=None,
+                exact_prob=0.08,
+                latent_prob=0.12,
+                drop_prob=0.80,
+                storage_ratio=0.0,
+                confidence=0.80,
+                source="learned_memory_policy",
+            ),
+        )
+
+        self.assertIsNone(segment)
+        self.assertEqual(memory.recent.segments, [])
+        self.assertEqual(memory.latent.segments, [])
+        report = memory.compression_report()
+        self.assertEqual(report["learned_retention_requested_drop"], 1)
+        self.assertEqual(report["learned_retention_applied_drop"], 1)
+
+    def test_learned_retention_policy_cannot_drop_exact_anchor_obligation(self):
+        memory = CognitiveMemory(CognitiveMemoryConfig(recent_exact_limit=2, embedding_dim=32))
+        required = Anchor("identifier", "C3-3141-A", "learned-anchor")
+        segment = memory.ingest(
+            "learned-anchor",
+            "FAIT CRITIQUE: Ada conserve le code C3-3141-A.",
+            extra_anchors=(required,),
+            retention_decision=MemoryRetentionDecision(
+                segment_id="learned-anchor",
+                requested_mode=MemoryMode.DROP,
+                applied_mode=None,
+                exact_prob=0.03,
+                latent_prob=0.07,
+                drop_prob=0.90,
+                storage_ratio=0.0,
+                confidence=0.90,
+                source="learned_memory_policy",
+            ),
+        )
+
+        self.assertIsNotNone(segment)
+        self.assertEqual(segment.mode, MemoryMode.EXACT)
+        self.assertEqual([item.segment_id for item in memory.recent.segments], ["learned-anchor"])
+        reconstruction = memory.reconstruct("retrouve le code exact", required_anchors=(required,))
+        self.assertTrue(reconstruction.fidelity.passed)
+        self.assertIn("C3-3141-A", reconstruction.rendered_context)
+        report = memory.compression_report()
+        self.assertEqual(report["learned_retention_requested_drop"], 1)
+        self.assertEqual(report["learned_retention_applied_exact"], 1)
+        self.assertEqual(report["learned_retention_anchor_overrides"], 1)
+
     def test_recent_exact_kv_eviction_creates_latent_old_kv(self):
         memory = CognitiveMemory(CognitiveMemoryConfig(recent_exact_limit=1, embedding_dim=32))
         memory.ingest("s1", "FAIT CRITIQUE: Mira a le code C3-1111-A et le montant 42,00 EUR.")

@@ -361,12 +361,14 @@ P4 observe des tokens LLM reels, les decode en texte, puis cherche des ancres ex
 Le controleur :
 
 - decode un sous-ensemble du batch ;
-- cree des segments memoire ;
+- cree des segments memoire avec decision de retention apprise quand `LearnedMemoryPolicy` est disponible ;
 - extrait les anchors ;
+- applique la decision exact/latent/drop a la memoire P4 partagee ;
+- refuse le drop reel d'un segment porteur d'ancres en le promouvant en exact via l'Exact Anchor Ledger ;
 - reconstruit via memoire recent exact + latent old KV ;
 - verifie la fidelite des anchors ;
 - observe la politique `LearnedMemoryPolicy` du forward ;
-- compte les decisions/probabilites exact/latent/drop ;
+- compte les decisions/probabilites exact/latent/drop demandees et appliquees ;
 - ajoute une supervision d'ancre vers la memoire exacte quand des ancres sont detectees ;
 - enregistre erreurs si une ancre disparait.
 
@@ -382,7 +384,7 @@ P4 alimente :
 
 ### Impact Apprentissage
 
-La memoire n'est pas un stockage passif. `LearnedMemoryPolicy` modifie le hidden state avec un melange differentiable entre exact, latent local et drop vector, puis `CortexObjective` supervise cette politique avec les pertes token-level : les tokens difficiles tendent vers exact, les tokens intermediaires vers latent et les tokens faciles/corrects vers drop. Les exemples d'ancrage restent du replay et les echecs de fidelite peuvent faire echouer l'audit.
+La memoire n'est pas un stockage passif. `LearnedMemoryPolicy` modifie le hidden state avec un melange differentiable entre exact, latent local et drop vector, puis `CortexObjective` supervise cette politique avec les pertes token-level : les tokens difficiles tendent vers exact, les tokens intermediaires vers latent et les tokens faciles/corrects vers drop. Le controleur convertit maintenant cette politique en `MemoryRetentionDecision` pour la memoire partagee : exact reste en recent KV, latent va directement en KV latent compresse, drop oublie reellement un segment non-ancre, et les ancres critiques bloquent le drop par override. Les exemples d'ancrage restent du replay et les echecs de fidelite peuvent faire echouer l'audit.
 
 Une ablation courte reproductible existe avec `tools/benchmark_learned_memory_policy.py` : elle charge les memes poids partages dans un modele avec memoire apprise et un modele sans memoire apprise, fige tout sauf `learned_memory.*`, puis mesure gradient, decisions exact/latent/drop, ratio de stockage et delta de loss. Cette preuve montre que la politique peut modifier l'apprentissage sur un batch controle ; elle ne remplace pas encore une preuve long-contexte held-out.
 

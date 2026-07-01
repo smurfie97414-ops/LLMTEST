@@ -40,6 +40,68 @@ _ANCHOR_INTENT: Mapping[str, tuple[str, ...]] = {
 class MemoryMode(str, Enum):
     EXACT = "exact"
     LATENT = "latent"
+    DROP = "drop"
+
+
+def _coerce_memory_mode(value: Any, *, default: MemoryMode | None = None) -> MemoryMode | None:
+    try:
+        return MemoryMode(str(value))
+    except (TypeError, ValueError):
+        return default
+
+
+@dataclass(frozen=True)
+class MemoryRetentionDecision:
+    segment_id: str
+    requested_mode: MemoryMode
+    applied_mode: MemoryMode | None
+    exact_prob: float = 0.0
+    latent_prob: float = 0.0
+    drop_prob: float = 0.0
+    storage_ratio: float = 1.0
+    confidence: float = 1.0
+    source: str = "manual"
+    reason: str = ""
+    anchor_count: int = 0
+    anchor_safety_override: bool = False
+    stored: bool = True
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "segment_id": self.segment_id,
+            "requested_mode": self.requested_mode.value,
+            "applied_mode": self.applied_mode.value if self.applied_mode is not None else None,
+            "exact_prob": float(self.exact_prob),
+            "latent_prob": float(self.latent_prob),
+            "drop_prob": float(self.drop_prob),
+            "storage_ratio": float(self.storage_ratio),
+            "confidence": float(self.confidence),
+            "source": self.source,
+            "reason": self.reason,
+            "anchor_count": int(self.anchor_count),
+            "anchor_safety_override": bool(self.anchor_safety_override),
+            "stored": bool(self.stored),
+        }
+
+    @staticmethod
+    def from_dict(payload: Mapping[str, Any]) -> "MemoryRetentionDecision":
+        requested = _coerce_memory_mode(payload.get("requested_mode"), default=MemoryMode.EXACT) or MemoryMode.EXACT
+        applied = _coerce_memory_mode(payload.get("applied_mode"), default=None)
+        return MemoryRetentionDecision(
+            segment_id=str(payload.get("segment_id", "")),
+            requested_mode=requested,
+            applied_mode=applied,
+            exact_prob=float(payload.get("exact_prob", 0.0)),
+            latent_prob=float(payload.get("latent_prob", 0.0)),
+            drop_prob=float(payload.get("drop_prob", 0.0)),
+            storage_ratio=float(payload.get("storage_ratio", 1.0)),
+            confidence=float(payload.get("confidence", 1.0)),
+            source=str(payload.get("source", "manual")),
+            reason=str(payload.get("reason", "")),
+            anchor_count=int(payload.get("anchor_count", 0)),
+            anchor_safety_override=bool(payload.get("anchor_safety_override", False)),
+            stored=bool(payload.get("stored", applied is not None)),
+        )
 
 
 @dataclass(frozen=True)
@@ -320,6 +382,7 @@ class CognitiveMemory:
         self.latent = LatentKVStore(self.config)
         self.fidelity = AnchorFidelityVerifier()
         self.compiled_circuit_bindings: dict[str, CompiledCircuitMemoryBinding] = {}
+        self.retention_decisions: list[MemoryRetentionDecision] = []
 
     def _make_exact_segment(self, segment_id: str, text: str, metadata: Mapping[str, Any] | None = None, extra_anchors: Iterable[Anchor] = ()) -> MemorySegment:
         extracted = self.anchor_ledger.ingest(text, segment_id)
@@ -341,13 +404,71 @@ class CognitiveMemory:
             metadata=dict(metadata or {}),
         )
 
-    def ingest(self, segment_id: str, text: str, metadata: Mapping[str, Any] | None = None, extra_anchors: Iterable[Anchor] = ()) -> MemorySegment:
+    def _normalize_retention_decision(
+        self,
+        decision: MemoryRetentionDecision | Mapping[str, Any] | None,
+        exact: MemorySegment,
+    ) -> MemoryRetentionDecision | None:
+        if decision is None:
+            return None
+        if isinstance(decision, MemoryRetentionDecision):
+            payload = decision
+        else:
+            payload = MemoryRetentionDecision.from_dict(decision)
+        requested = payload.requested_mode
+        applied: MemoryMode | None = requested if requested != MemoryMode.DROP else None
+        stored = requested != MemoryMode.DROP
+        override = False
+        reason = payload.reason
+        if requested == MemoryMode.DROP and exact.anchors:
+            applied = MemoryMode.EXACT
+            stored = True
+            override = True
+            suffix = "anchor_safety_promoted_drop_to_exact"
+            reason = f"{reason};{suffix}" if reason else suffix
+        return MemoryRetentionDecision(
+            segment_id=exact.segment_id,
+            requested_mode=requested,
+            applied_mode=applied,
+            exact_prob=payload.exact_prob,
+            latent_prob=payload.latent_prob,
+            drop_prob=payload.drop_prob,
+            storage_ratio=payload.storage_ratio,
+            confidence=payload.confidence,
+            source=payload.source,
+            reason=reason,
+            anchor_count=len(exact.anchors),
+            anchor_safety_override=payload.anchor_safety_override or override,
+            stored=stored,
+        )
+
+    def _record_retention_decision(self, decision: MemoryRetentionDecision | None) -> None:
+        if decision is not None:
+            self.retention_decisions.append(decision)
+
+    def ingest(
+        self,
+        segment_id: str,
+        text: str,
+        metadata: Mapping[str, Any] | None = None,
+        extra_anchors: Iterable[Anchor] = (),
+        retention_decision: MemoryRetentionDecision | Mapping[str, Any] | None = None,
+    ) -> MemorySegment | None:
         if not segment_id:
             raise ValueError("segment_id cannot be empty")
         exact = self._make_exact_segment(segment_id, text, metadata, extra_anchors)
+        decision = self._normalize_retention_decision(retention_decision, exact)
+        if decision is not None and decision.applied_mode is None:
+            self._record_retention_decision(decision)
+            return None
+        if decision is not None and decision.applied_mode == MemoryMode.LATENT:
+            latent = self.latent.compress_from_exact(exact)
+            self._record_retention_decision(decision)
+            return latent
         evicted = self.recent.push(exact)
         if evicted is not None:
             self.latent.compress_from_exact(evicted)
+        self._record_retention_decision(decision)
         return exact
 
     def _query_anchor_kinds(self, query_tokens: set[str]) -> set[str]:
@@ -554,12 +675,33 @@ class CognitiveMemory:
         latent = self.latent.segments
         original = sum(segment.original_token_count for segment in latent)
         stored = sum(segment.stored_token_count for segment in latent)
+        learned_decisions = [
+            decision
+            for decision in self.retention_decisions
+            if decision.source.startswith("learned_memory")
+        ]
+
+        def decision_count(mode: MemoryMode | None, *, applied: bool) -> int:
+            if applied:
+                return sum(1 for decision in learned_decisions if decision.applied_mode == mode)
+            return sum(1 for decision in learned_decisions if decision.requested_mode == mode)
+
         return {
             "recent_exact_segments": len(self.recent.segments),
             "latent_segments": len(latent),
             "latent_original_tokens": original,
             "latent_stored_tokens": stored,
             "latent_compression_ratio": stored / max(original, 1),
+            "retention_decision_count": len(self.retention_decisions),
+            "learned_retention_decision_count": len(learned_decisions),
+            "learned_retention_requested_exact": decision_count(MemoryMode.EXACT, applied=False),
+            "learned_retention_requested_latent": decision_count(MemoryMode.LATENT, applied=False),
+            "learned_retention_requested_drop": decision_count(MemoryMode.DROP, applied=False),
+            "learned_retention_applied_exact": decision_count(MemoryMode.EXACT, applied=True),
+            "learned_retention_applied_latent": decision_count(MemoryMode.LATENT, applied=True),
+            "learned_retention_applied_drop": sum(1 for decision in learned_decisions if decision.applied_mode is None),
+            "learned_retention_anchor_overrides": sum(1 for decision in learned_decisions if decision.anchor_safety_override),
+            "learned_retention_decisions": [decision.to_dict() for decision in learned_decisions[-16:]],
             "anchors": [asdict(anchor) for anchor in self.anchor_ledger.anchors],
             "compiled_circuit_memory_bindings": [
                 binding.to_dict()

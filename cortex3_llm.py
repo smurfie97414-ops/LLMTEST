@@ -57,7 +57,7 @@ from cortex3_future import (
 from cortex3_improvement import AcceptanceDecision, ProposalKind, RecursiveImprovementEngine
 from cortex3_inference import InferenceConfig, InferencePath, UltraFastInferenceEngine
 from cortex3_ledgers import BitLedger, CausalLedger, CausalTrace, SkillLedger, SkillState, UncertaintyLedger
-from cortex3_memory import CognitiveMemory, CognitiveMemoryConfig, CompiledCircuitMemoryBinding, MemoryMode, MemorySegment
+from cortex3_memory import CognitiveMemory, CognitiveMemoryConfig, CompiledCircuitMemoryBinding, MemoryMode, MemoryRetentionDecision, MemorySegment
 from cortex3_objective import FINAL_LOSS_TERMS, build_objective_report
 from cortex3_phases import CORTEX3_PHASES
 from cortex3_regrowth import MinimalRegrowthEngine, RegrowthActionKind, RegrowthPlan
@@ -694,6 +694,10 @@ def _memory_state(memory: CognitiveMemory) -> dict[str, Any]:
         "recent": [_memory_segment_payload(segment) for segment in memory.recent.segments],
         "latent": [_memory_segment_payload(segment) for segment in memory.latent.segments],
         "anchors": [_anchor_payload(anchor) for anchor in memory.anchor_ledger.anchors],
+        "retention_decisions": [
+            decision.to_dict()
+            for decision in memory.retention_decisions
+        ],
         "compiled_circuit_bindings": [
             binding.to_dict()
             for binding in memory.compiled_circuit_bindings.values()
@@ -708,6 +712,10 @@ def _restore_memory_state(memory: CognitiveMemory, payload: Mapping[str, Any] | 
     memory.recent.segments = [_memory_segment_from_payload(item) for item in payload.get("recent", ())]
     memory.latent.segments = [_memory_segment_from_payload(item) for item in payload.get("latent", ())]
     memory.anchor_ledger.anchors = [_anchor_from_payload(item) for item in payload.get("anchors", ())]
+    memory.retention_decisions = [
+        MemoryRetentionDecision.from_dict(dict(item))
+        for item in payload.get("retention_decisions", ())
+    ]
     memory.compiled_circuit_bindings = {
         binding.circuit_id: binding
         for binding in (
@@ -3260,7 +3268,14 @@ def _cortex_architecture_audit_from_summary(summary: Mapping[str, Any]) -> dict[
         and integer("learned_memory_anchor_supervision_events") > 0
         and integer("learned_memory_exact_decisions") > 0
         and integer("learned_memory_latent_decisions") > 0
-        and number("learned_memory_storage_ratio_mean") > 0.0,
+        and number("learned_memory_storage_ratio_mean") > 0.0
+        and integer("learned_memory_retention_decisions") > 0
+        and (
+            integer("learned_memory_retention_applied_exact")
+            + integer("learned_memory_retention_applied_latent")
+            + integer("learned_memory_retention_applied_drop")
+        )
+        == integer("learned_memory_retention_decisions"),
         {
             "learned_memory_policy_events": integer("learned_memory_policy_events"),
             "learned_memory_anchor_supervision_events": integer("learned_memory_anchor_supervision_events"),
@@ -3268,8 +3283,13 @@ def _cortex_architecture_audit_from_summary(summary: Mapping[str, Any]) -> dict[
             "learned_memory_latent_decisions": integer("learned_memory_latent_decisions"),
             "learned_memory_drop_decisions": integer("learned_memory_drop_decisions"),
             "learned_memory_storage_ratio_mean": number("learned_memory_storage_ratio_mean"),
+            "learned_memory_retention_decisions": integer("learned_memory_retention_decisions"),
+            "learned_memory_retention_applied_exact": integer("learned_memory_retention_applied_exact"),
+            "learned_memory_retention_applied_latent": integer("learned_memory_retention_applied_latent"),
+            "learned_memory_retention_applied_drop": integer("learned_memory_retention_applied_drop"),
+            "learned_memory_retention_anchor_overrides": integer("learned_memory_retention_anchor_overrides"),
         },
-        "cognitive memory must learn exact/latent/drop retention decisions during LLM training, not only replay audited segments",
+        "cognitive memory must learn exact/latent/drop retention decisions and apply them to P4 storage during LLM training",
     )
     add(
         "compiled_circuit_memory_retention",
@@ -3759,6 +3779,7 @@ def _cortex_phase_deliverable_audit_from_summary(summary: Mapping[str, Any]) -> 
         and int(summary.get("input_anchor_fidelity_failures", 0) or 0) == 0
         and int(summary.get("learned_memory_policy_events", 0) or 0) > 0
         and int(summary.get("learned_memory_anchor_supervision_events", 0) or 0) > 0
+        and int(summary.get("learned_memory_retention_decisions", 0) or 0) > 0
         and int(summary.get("compiled_circuit_memory_binding_count", 0) or 0) > 0
         and int(summary.get("compiled_circuit_memory_binding_events", 0) or 0) > 0
         and int(summary.get("compiled_circuit_memory_fidelity_failures", 0) or 0) == 0
@@ -3776,6 +3797,10 @@ def _cortex_phase_deliverable_audit_from_summary(summary: Mapping[str, Any]) -> 
             "input_anchor_fidelity_failures": int(summary.get("input_anchor_fidelity_failures", 0) or 0),
             "learned_memory_policy_events": int(summary.get("learned_memory_policy_events", 0) or 0),
             "learned_memory_anchor_supervision_events": int(summary.get("learned_memory_anchor_supervision_events", 0) or 0),
+            "learned_memory_retention_decisions": int(summary.get("learned_memory_retention_decisions", 0) or 0),
+            "learned_memory_retention_applied_exact": int(summary.get("learned_memory_retention_applied_exact", 0) or 0),
+            "learned_memory_retention_applied_latent": int(summary.get("learned_memory_retention_applied_latent", 0) or 0),
+            "learned_memory_retention_applied_drop": int(summary.get("learned_memory_retention_applied_drop", 0) or 0),
             "compiled_circuit_memory_binding_count": int(summary.get("compiled_circuit_memory_binding_count", 0) or 0),
             "compiled_circuit_memory_binding_events": int(summary.get("compiled_circuit_memory_binding_events", 0) or 0),
             "compiled_circuit_memory_fidelity_failures": int(summary.get("compiled_circuit_memory_fidelity_failures", 0) or 0),
@@ -4192,6 +4217,50 @@ class CortexTrainingPhaseController:
             verifier_level=example.verification_level,
         )
 
+    def _learned_memory_retention_decision(
+        self,
+        policy: LearnedMemoryPolicyState | None,
+        *,
+        row_index: int,
+        segment_id: str,
+    ) -> MemoryRetentionDecision | None:
+        if policy is None or row_index >= int(policy.probs.shape[0]):
+            return None
+        with torch.no_grad():
+            exact_prob = float(policy.exact_prob[row_index].detach().mean().cpu())
+            latent_prob = float(policy.latent_prob[row_index].detach().mean().cpu())
+            drop_prob = float(policy.drop_prob[row_index].detach().mean().cpu())
+            storage_ratio = float(policy.storage_ratio[row_index].detach().mean().cpu())
+        mode_scores = (
+            (MemoryMode.EXACT, exact_prob),
+            (MemoryMode.LATENT, latent_prob),
+            (MemoryMode.DROP, drop_prob),
+        )
+        requested_mode, confidence = max(mode_scores, key=lambda item: item[1])
+        return MemoryRetentionDecision(
+            segment_id=segment_id,
+            requested_mode=requested_mode,
+            applied_mode=requested_mode if requested_mode != MemoryMode.DROP else None,
+            exact_prob=exact_prob,
+            latent_prob=latent_prob,
+            drop_prob=drop_prob,
+            storage_ratio=storage_ratio,
+            confidence=confidence,
+            source="learned_memory_policy",
+            reason="mean_row_probability_argmax",
+            stored=requested_mode != MemoryMode.DROP,
+        )
+
+    def _record_applied_memory_retention_decision(self, decision: MemoryRetentionDecision | None) -> None:
+        if decision is None:
+            return
+        self._count("learned_memory_retention_decisions")
+        self._count(f"learned_memory_retention_requested_{decision.requested_mode.value}")
+        applied = decision.applied_mode.value if decision.applied_mode is not None else "drop"
+        self._count(f"learned_memory_retention_applied_{applied}")
+        if decision.anchor_safety_override:
+            self._count("learned_memory_retention_anchor_overrides")
+
     def _ingest_cycle_ledgers(self, cycle_report: Any, *, step: int) -> dict[str, Any]:
         self.skill_ledger.update_from_report(cycle_report.trial)
         self._ingest_suite_ledgers(cycle_report.trial, step=step, source="trial")
@@ -4236,6 +4305,11 @@ class CortexTrainingPhaseController:
             if not text:
                 continue
             segment_id = f"llm-input-{source}-{step}-{self.input_anchor_observations}-{row_index}"
+            retention_decision = self._learned_memory_retention_decision(
+                policy,
+                row_index=row_index,
+                segment_id=segment_id,
+            )
             segment = self.memory.ingest(
                 segment_id,
                 text,
@@ -4246,8 +4320,15 @@ class CortexTrainingPhaseController:
                     "token_count": len(token_ids),
                     "from_llm_input_batch": True,
                 },
+                retention_decision=retention_decision,
             )
-            anchor_count = len(segment.anchors)
+            applied_decision = (
+                self.memory.retention_decisions[-1]
+                if self.memory.retention_decisions and self.memory.retention_decisions[-1].segment_id == segment_id
+                else None
+            )
+            self._record_applied_memory_retention_decision(applied_decision)
+            anchor_count = len(segment.anchors) if segment is not None else int(applied_decision.anchor_count if applied_decision else 0)
             self.input_anchor_observations += 1
             self.input_anchor_count += anchor_count
             text_bytes = float(len(text.encode("utf-8")))
@@ -4264,6 +4345,10 @@ class CortexTrainingPhaseController:
                     note="Exact Anchor Ledger observed decoded LLM input batch",
                 )
             if anchor_count:
+                if segment is None:
+                    self.input_anchor_fidelity_failures += 1
+                    self._record_error("P4", ValueError(f"anchored input was dropped by learned memory policy: {segment_id}"))
+                    continue
                 if policy is not None and row_index < policy.exact_prob.shape[0]:
                     exact_mean = float(policy.exact_prob[row_index].detach().mean().cpu())
                     latent_mean = float(policy.latent_prob[row_index].detach().mean().cpu())
@@ -5682,6 +5767,14 @@ class CortexTrainingPhaseController:
                 float(self.learned_memory_storage_ratio_total)
                 / max(1, int(self.learned_memory_policy_events))
             ),
+            "learned_memory_retention_decisions": int(memory_report.get("learned_retention_decision_count", 0) or 0),
+            "learned_memory_retention_requested_exact": int(memory_report.get("learned_retention_requested_exact", 0) or 0),
+            "learned_memory_retention_requested_latent": int(memory_report.get("learned_retention_requested_latent", 0) or 0),
+            "learned_memory_retention_requested_drop": int(memory_report.get("learned_retention_requested_drop", 0) or 0),
+            "learned_memory_retention_applied_exact": int(memory_report.get("learned_retention_applied_exact", 0) or 0),
+            "learned_memory_retention_applied_latent": int(memory_report.get("learned_retention_applied_latent", 0) or 0),
+            "learned_memory_retention_applied_drop": int(memory_report.get("learned_retention_applied_drop", 0) or 0),
+            "learned_memory_retention_anchor_overrides": int(memory_report.get("learned_retention_anchor_overrides", 0) or 0),
             "bit_ledger_total_effective_bits": self.bit_ledger.total_effective_bits,
             "skill_ledger_states": len(self.skill_ledger.states),
             "causal_ledger_traces": len(self.causal_ledger.traces),
@@ -6491,6 +6584,14 @@ class CortexTrainingPhaseController:
                     float(self.learned_memory_storage_ratio_total)
                     / max(1, int(self.learned_memory_policy_events))
                 ),
+                "learned_memory_retention_decisions": int(memory_report.get("learned_retention_decision_count", 0) or 0),
+                "learned_memory_retention_requested_exact": int(memory_report.get("learned_retention_requested_exact", 0) or 0),
+                "learned_memory_retention_requested_latent": int(memory_report.get("learned_retention_requested_latent", 0) or 0),
+                "learned_memory_retention_requested_drop": int(memory_report.get("learned_retention_requested_drop", 0) or 0),
+                "learned_memory_retention_applied_exact": int(memory_report.get("learned_retention_applied_exact", 0) or 0),
+                "learned_memory_retention_applied_latent": int(memory_report.get("learned_retention_applied_latent", 0) or 0),
+                "learned_memory_retention_applied_drop": int(memory_report.get("learned_retention_applied_drop", 0) or 0),
+                "learned_memory_retention_anchor_overrides": int(memory_report.get("learned_retention_anchor_overrides", 0) or 0),
                 "future_contract_decisions": len(self.future_ledger.decisions),
                 **output_goal_summary,
                 "bit_ledger_total_effective_bits": self.bit_ledger.total_effective_bits,
@@ -6616,6 +6717,14 @@ class CortexTrainingPhaseController:
                         float(self.learned_memory_storage_ratio_total)
                         / max(1, int(self.learned_memory_policy_events))
                     ),
+                    "learned_memory_retention_decisions": int(memory_report.get("learned_retention_decision_count", 0) or 0),
+                    "learned_memory_retention_requested_exact": int(memory_report.get("learned_retention_requested_exact", 0) or 0),
+                    "learned_memory_retention_requested_latent": int(memory_report.get("learned_retention_requested_latent", 0) or 0),
+                    "learned_memory_retention_requested_drop": int(memory_report.get("learned_retention_requested_drop", 0) or 0),
+                    "learned_memory_retention_applied_exact": int(memory_report.get("learned_retention_applied_exact", 0) or 0),
+                    "learned_memory_retention_applied_latent": int(memory_report.get("learned_retention_applied_latent", 0) or 0),
+                    "learned_memory_retention_applied_drop": int(memory_report.get("learned_retention_applied_drop", 0) or 0),
+                    "learned_memory_retention_anchor_overrides": int(memory_report.get("learned_retention_anchor_overrides", 0) or 0),
                     "bit_ledger_total_effective_bits": self.bit_ledger.total_effective_bits,
                     "skill_ledger_states": len(self.skill_ledger.states),
                     "causal_ledger_traces": len(self.causal_ledger.traces),
@@ -6717,6 +6826,14 @@ class CortexTrainingPhaseController:
                         float(self.learned_memory_storage_ratio_total)
                         / max(1, int(self.learned_memory_policy_events))
                     ),
+                    "learned_memory_retention_decisions": int(memory_report.get("learned_retention_decision_count", 0) or 0),
+                    "learned_memory_retention_requested_exact": int(memory_report.get("learned_retention_requested_exact", 0) or 0),
+                    "learned_memory_retention_requested_latent": int(memory_report.get("learned_retention_requested_latent", 0) or 0),
+                    "learned_memory_retention_requested_drop": int(memory_report.get("learned_retention_requested_drop", 0) or 0),
+                    "learned_memory_retention_applied_exact": int(memory_report.get("learned_retention_applied_exact", 0) or 0),
+                    "learned_memory_retention_applied_latent": int(memory_report.get("learned_retention_applied_latent", 0) or 0),
+                    "learned_memory_retention_applied_drop": int(memory_report.get("learned_retention_applied_drop", 0) or 0),
+                    "learned_memory_retention_anchor_overrides": int(memory_report.get("learned_retention_anchor_overrides", 0) or 0),
                     "bit_ledger_total_effective_bits": self.bit_ledger.total_effective_bits,
                     "skill_ledger_states": len(self.skill_ledger.states),
                     "causal_ledger_traces": len(self.causal_ledger.traces),

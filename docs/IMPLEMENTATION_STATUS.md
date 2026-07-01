@@ -94,6 +94,9 @@ Current executable coverage:
 - `UltraFastInferenceEngine` can convert a faithful reconstruction into a memory-augmented generated answer for long-context anchors and entity locations, replacing a weaker base answer without reading `expected`.
 - Memory-augmented answers carry certificate fields, selected segment ids, anchor fidelity and the displaced base answer in `raw`; inference JSON persists this audit trail.
 - `LearnedMemoryPolicy` is part of the Transformer forward, mixes exact/latent/drop states differentiably, receives the `learned_memory` loss and is audited by the full Cortex phase controller.
+- `CognitiveMemory.ingest` now consumes learned `MemoryRetentionDecision` objects from decoded LLM batches, so the shared P4 memory applies exact storage, direct latent KV compression or real non-anchored drop instead of only counting policy probabilities.
+- The Exact Anchor Ledger is a hard storage safety gate: learned `DROP` requests on anchored segments are promoted to exact storage, recorded as anchor-safety overrides, reconstructed and fidelity-checked.
+- Learned retention decisions are persisted through `memory_state`, restored on checkpoint resume, surfaced in `compression_report`, `training_influence`, architecture audit and phase-deliverable audit.
 - `tools/benchmark_learned_memory_policy.py` runs a short shared-weight ablation against disabled learned memory, freezes non-memory parameters, trains only `learned_memory.*`, and reports before/after losses, policy gradients, exact/latent/drop decisions and storage ratio.
 - `CompiledCircuitMemoryBinding` turns Frontier circuits into retained P4 memory objects with circuit id, source/frontier/held-out lineage, obligations, metadata keys, anchors, fidelity and selected segment ids.
 - `CompiledFrontierAgent`, P8 inference, P9 sleep-frontier FastSolve and P7 Frontier repair candidates require a reconstructible P4 memory binding whenever the full LLM controller supplies shared memory; the P5 compiled-circuit certificate carries memory-binding claims.
@@ -101,7 +104,7 @@ Current executable coverage:
 
 Remaining:
 
-- Run large long-context ablations proving the learned exact/latent/drop memory policy improves cost/quality over deterministic memory alone on held-out anchors.
+- Run large long-context ablations proving the learned exact/latent/drop storage policy improves cost/quality over deterministic memory alone on held-out anchors.
 - Scale compiled-skill memory retention across larger registries, competing circuits and multi-cycle restarts.
 - Measure memory cost/quality tradeoffs across exact KV vs latent KV in run reports.
 
