@@ -3227,6 +3227,7 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 "future_contract_fsp",
                 "future_output_goal_contracts",
                 "adaptive_multi_token_decoding",
+                "frontier_heldout_generalization_gate",
                 "latent_reasoning_workspace",
                 "certificate_generator",
                 "hierarchical_dynamic_verifier",
@@ -3307,6 +3308,12 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             self.assertGreater(influence["sleep_synthetic_examples"], 0)
             self.assertGreater(influence["frontier_compiled_circuit_count"], 0)
             self.assertGreater(influence["frontier_compiled_skill_count"], 0)
+            self.assertGreater(influence["frontier_heldout_total"], 0)
+            self.assertEqual(influence["frontier_heldout_passed"], influence["frontier_heldout_total"])
+            self.assertEqual(
+                influence["frontier_heldout_gate_passed_circuit_count"],
+                influence["frontier_compiled_circuit_count"],
+            )
             self.assertGreater(influence["frontier_compiled_fastsolve_events"], 0)
             self.assertGreater(influence["frontier_repair_candidate_count"], 0)
             self.assertGreater(influence["frontier_repair_accepted_events"], 0)
@@ -3317,6 +3324,8 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             self.assertTrue(latest_frontier_repair["accepted"], latest_frontier_repair)
             self.assertTrue(latest_frontier_repair["frontier_compiled_selected"], latest_frontier_repair)
             self.assertTrue(latest_frontier_repair["frontier_compiled_verified"], latest_frontier_repair)
+            self.assertTrue(latest_frontier_repair["frontier_heldout_gate_passed"], latest_frontier_repair)
+            self.assertEqual(latest_frontier_repair["frontier_heldout_passed"], latest_frontier_repair["frontier_heldout_total"], latest_frontier_repair)
             self.assertTrue(latest_frontier_repair["frontier_output_goal_contract_passed"], latest_frontier_repair)
             self.assertTrue(latest_frontier_repair["frontier_output_goal_contract"]["accepted"], latest_frontier_repair)
             self.assertTrue(latest_frontier_repair["frontier_compiled_contract_verified"], latest_frontier_repair)
@@ -3347,6 +3356,12 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             self.assertEqual(latest_recursive["proposal_kind"], "compiled_frontier", latest_recursive)
             self.assertEqual(latest_recursive["proposal_patch_payload"]["action"], "compile_frontier_repair", latest_recursive)
             self.assertTrue(latest_recursive["proposal_patch_payload"]["frontier_compiled_verified"], latest_recursive)
+            self.assertTrue(latest_recursive["proposal_patch_payload"]["frontier_heldout_gate_passed"], latest_recursive)
+            self.assertEqual(
+                latest_recursive["proposal_patch_payload"]["frontier_heldout_passed"],
+                latest_recursive["proposal_patch_payload"]["frontier_heldout_total"],
+                latest_recursive,
+            )
             self.assertTrue(latest_recursive["proposal_patch_payload"]["frontier_output_goal_contract_passed"], latest_recursive)
             self.assertTrue(latest_recursive["signed_patch_id"], latest_recursive)
             self.assertTrue(latest_recursive["rollback_token"], latest_recursive)
@@ -3387,6 +3402,14 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             )
             self.assertTrue(persisted["frontier_repair_candidates"], persisted)
             self.assertGreater(persisted["frontier_registry_summary"]["circuit_count"], 0)
+            persisted_circuit = persisted["frontier_registry_summary"]["circuits"][0]
+            self.assertTrue(persisted_circuit["heldout_tasks"], persisted_circuit)
+            self.assertTrue(persisted_circuit["report"]["heldout"]["gate_passed"], persisted_circuit)
+            self.assertEqual(
+                persisted_circuit["report"]["heldout"]["passed"],
+                persisted_circuit["report"]["heldout"]["total"],
+                persisted_circuit,
+            )
             self.assertEqual(
                 persisted["training_influence"]["objective_feedback_events"],
                 influence["objective_feedback_events"],

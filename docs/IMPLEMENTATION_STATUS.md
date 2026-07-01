@@ -282,14 +282,16 @@ Current executable coverage:
 - It expands real cycle failures through `CompressionAdversary` to produce frontier tasks just beyond the current weak area.
 - A slow/reference solver answers candidates, and only oracle-verified tasks are admitted.
 - `FrontierInvariantSet` extracts expected types, metadata keys, anchor kinds and prompt obligations.
-- Verified frontier tasks are distilled into `MicroTrainingExample` records and compiled with `CortexMicroTrainer` into an instrumented `BitLinear` micro-circuit.
-- The compiled circuit is re-evaluated by `DynamicSkillVerifier`; reports include DSV score, training deltas, active/total weights and packed compiled weight bits.
+- Verified frontier tasks are distilled into `MicroTrainingExample` records with text plus structured non-label task features and compiled with `CortexMicroTrainer` into an instrumented `BitLinear` micro-circuit.
+- The compiled circuit is re-evaluated by `DynamicSkillVerifier`; if a separate held-out metamorphic gate fails, the failing held-out tasks become verified support for the next bounded recompilation round and a fresh held-out suite is generated before promotion.
+- Reports include DSV score, held-out pass counts/rate/gate status, training deltas, active/total weights and packed compiled weight bits.
 - `FrontierCircuitRegistry` now keeps DSV-passing compiled circuits as runtime artifacts instead of dropping the trained model after report generation.
-- `CompiledFrontierAgent` selects a compiled circuit by skill/invariant overlap and executes it as the default path for covered tasks; if a circuit is selected, verifier failure is exposed on the answer rather than hidden behind a fallback.
+- `CompiledFrontierAgent` selects a compiled circuit by covered task ids, group ids, numeric signatures, non-label metadata, anchors and invariants, not by skill name alone; if a circuit is selected, verifier failure is exposed on the answer rather than hidden behind a fallback.
 - Frontier registries persist to `frontier_registry.json` plus per-circuit micro-model checkpoints and reload through `CheckpointManager`, so a compiled skill can survive process boundaries.
 - `UltraFastInferenceEngine` accepts a `compiled_frontier_registry` and uses a selected compiled frontier circuit as the answer source before fast/normal/careful route execution.
 - `FrontierSkillDiscovery` distills both source regressions slow-solved by the reference solver and their frontier variants, so a compiled circuit can repair the original failing task rather than only nearby adversarial variants.
-- `CortexTrainingPhaseController` now runs a bounded Frontier Skill Discovery pass during phase audit, persists the registry under the run directory, routes a covered P8 task through the compiled FastSolve circuit, evaluates the same registry as a P7 repair candidate before parameter regrowth, requires the Frontier output-goal contract and compiled-circuit certificate before accepting that repair, feeds accepted compiled repairs into P10 as prioritized `compiled_frontier` proposals, and reports `frontier_compiled_*`, `frontier_output_goal_*`, `frontier_repair_*` and `recursive_frontier_proposal_events` fields in `cortex_phase_report.json`.
+- P5 `compiled_circuit` certificates now require held-out task lineage and a passing held-out gate in addition to source/frontier lineage, DSV, output-goal and answer checksum.
+- `CortexTrainingPhaseController` now runs a bounded Frontier Skill Discovery pass during phase audit, persists the registry under the run directory, routes a covered P8 task through the compiled FastSolve circuit, evaluates the same registry as a P7 repair candidate before parameter regrowth, requires held-out gate pass, Frontier output-goal contract and compiled-circuit certificate before accepting that repair, feeds accepted compiled repairs into P10 as prioritized `compiled_frontier` proposals, and reports `frontier_compiled_*`, `frontier_heldout_*`, `frontier_output_goal_*`, `frontier_repair_*` and `recursive_frontier_proposal_events` fields in `cortex_phase_report.json`.
 - P10 resume hardening: after checkpoint restore, the LLM controller searches a small archive-aware proposal budget so recursive improvement does not fail only because the first restored-context proposal is rejected by strict gates.
 - `write_cycle_run` persists frontier discovery reports under `summary.json["frontier_discovery"]`.
 - `tools/run_cycle_report.py` writes Frontier Skill Discovery by default unless `--skip-frontier` is passed.
@@ -298,13 +300,13 @@ Evidence:
 
 - `.\.venv\Scripts\python.exe -m unittest tests.test_frontier_discovery`
 - Smoke: fragile-skill frontier tasks are slow-solved, verified, distilled and compiled into a DSV-passing micro-circuit.
-- Short runtime proof: `python -m unittest tests.test_frontier_discovery` now asserts a compiled frontier circuit is registered, selected, used by `CompiledFrontierAgent`, oracle-verified, saved to `frontier_registry.json`, reloaded, used again, and consumed by `UltraFastInferenceEngine` on a forced fast path.
-- LLM controller proof: `tests.test_llm_pretraining.LLMPretrainingHarnessTest.test_full_cortex_phase_controller_uses_all_modules_during_training` asserts nonzero `frontier_compiled_circuit_count`, `frontier_compiled_skill_count`, `frontier_compiled_fastsolve_events`, nonzero accepted P7 `frontier_repair_*` evidence, nonzero P10 `recursive_frontier_proposal_events`, a P10 model patch whose `proposal_kind` is `compiled_frontier`, and an on-disk `frontier_registry.json`; `test_cortex_phase_state_survives_checkpoint_resume` passes after restoring the frontier/P10 state.
+- Short runtime proof: `python -m unittest tests.test_frontier_discovery` now asserts a compiled frontier circuit has nonzero held-out tasks, passes the held-out gate, is registered, selected by coverage, used by `CompiledFrontierAgent`, oracle-verified, saved to `frontier_registry.json`, reloaded with held-out tasks, used again, and consumed by `UltraFastInferenceEngine` on a forced fast path.
+- LLM controller proof: `tests.test_llm_pretraining.LLMPretrainingHarnessTest.test_full_cortex_phase_controller_uses_all_modules_during_training` asserts nonzero `frontier_compiled_circuit_count`, `frontier_compiled_skill_count`, all compiled circuits passing `frontier_heldout_*`, nonzero `frontier_compiled_fastsolve_events`, accepted P7 `frontier_repair_*` evidence carrying held-out proof, nonzero P10 `recursive_frontier_proposal_events`, a P10 model patch whose `proposal_kind` is `compiled_frontier`, and an on-disk `frontier_registry.json`; `test_cortex_phase_state_survives_checkpoint_resume` passes after restoring the frontier/P10 state.
 
 Remaining:
 
-- Run frontier discovery over larger held-out frontier suites.
-- Run larger held-out frontier generalization suites and expand certificate tools beyond the current linear algebra and local rich-code domains.
+- Scale the held-out frontier gate beyond the current short metamorphic suites.
+- Expand certificate tools beyond the current linear algebra and local rich-code domains.
 
 ## Cross-phase final objective and metrics
 

@@ -3048,6 +3048,32 @@ def _last_items(items: Sequence[Any], limit: int = 3) -> list[Any]:
     return list(items[-limit:])
 
 
+def _frontier_heldout_summary(registry_payload: Mapping[str, Any]) -> dict[str, Any]:
+    circuits = tuple(
+        dict(item)
+        for item in registry_payload.get("circuits", ())
+        if isinstance(item, Mapping)
+    )
+    heldout_total = 0
+    heldout_passed = 0
+    gate_passed_circuits = 0
+    for circuit in circuits:
+        report = dict(circuit.get("report") or {})
+        heldout = dict(report.get("heldout") or {})
+        total = int(heldout.get("total", 0) or 0)
+        passed = int(heldout.get("passed", 0) or 0)
+        heldout_total += total
+        heldout_passed += passed
+        if total > 0 and passed >= total and bool(heldout.get("gate_passed", False)):
+            gate_passed_circuits += 1
+    return {
+        "frontier_heldout_circuit_count": len(circuits),
+        "frontier_heldout_gate_passed_circuit_count": gate_passed_circuits,
+        "frontier_heldout_total": heldout_total,
+        "frontier_heldout_passed": heldout_passed,
+    }
+
+
 def _cortex_architecture_audit_from_summary(summary: Mapping[str, Any]) -> dict[str, Any]:
     phase_counts = {str(key): int(value) for key, value in dict(summary.get("phase_event_counts") or {}).items()}
     trace_counts = {str(key): int(value) for key, value in dict(summary.get("compression_trace_counts") or {}).items()}
@@ -3307,6 +3333,21 @@ def _cortex_architecture_audit_from_summary(summary: Mapping[str, Any]) -> dict[
             "mtp_fsp_events": trace_count("mtp_fsp_events"),
         },
         "adaptive multi-token path must be active with MTP/FSP evidence",
+    )
+    add(
+        "frontier_heldout_generalization_gate",
+        integer("frontier_compiled_circuit_count") > 0
+        and integer("frontier_heldout_total") > 0
+        and integer("frontier_heldout_passed") == integer("frontier_heldout_total")
+        and integer("frontier_heldout_gate_passed_circuit_count") == integer("frontier_compiled_circuit_count"),
+        {
+            "frontier_compiled_circuit_count": integer("frontier_compiled_circuit_count"),
+            "frontier_heldout_circuit_count": integer("frontier_heldout_circuit_count"),
+            "frontier_heldout_gate_passed_circuit_count": integer("frontier_heldout_gate_passed_circuit_count"),
+            "frontier_heldout_passed": integer("frontier_heldout_passed"),
+            "frontier_heldout_total": integer("frontier_heldout_total"),
+        },
+        "compiled Frontier circuits must pass a separate held-out generalization gate before FastSolve/P7/P10 reuse",
     )
     add(
         "latent_reasoning_workspace",
@@ -4415,12 +4456,14 @@ class CortexTrainingPhaseController:
         total_cost = answer.cost.merge(repaired.verifier_cost)
         output_goal_passed = bool(answer.certificate.get("frontier_output_goal_contract_passed"))
         compiled_contract_verified = bool(answer.certificate.get("frontier_compiled_contract_verified"))
+        heldout_gate_passed = bool(answer.certificate.get("frontier_heldout_gate_passed"))
         accepted = bool(
             repaired.passed
             and repaired.score > failure.score
             and non_regression.passed
             and output_goal_passed
             and compiled_contract_verified
+            and heldout_gate_passed
         )
         report = {
             "task_id": failure.task.task_id,
@@ -4439,6 +4482,10 @@ class CortexTrainingPhaseController:
             "accepted": accepted,
             "frontier_compiled_selected": bool(answer.raw.get("frontier_compiled_selected")),
             "frontier_compiled_verified": bool(answer.raw.get("frontier_compiled_verified")),
+            "frontier_heldout_gate_passed": heldout_gate_passed,
+            "frontier_heldout_passed": int(answer.certificate.get("frontier_heldout_passed", 0) or 0),
+            "frontier_heldout_total": int(answer.certificate.get("frontier_heldout_total", 0) or 0),
+            "frontier_heldout_pass_rate": float(answer.certificate.get("frontier_heldout_pass_rate", 0.0) or 0.0),
             "frontier_output_goal_contract_passed": output_goal_passed,
             "frontier_output_goal_contract": dict(answer.certificate.get("frontier_output_goal_contract") or {}),
             "frontier_compiled_contract_verified": compiled_contract_verified,
@@ -4996,6 +5043,8 @@ class CortexTrainingPhaseController:
         if compression_trace_counts.get("layer_forward_events", 0) > 0:
             phase_counts["P2"] = max(phase_counts.get("P2", 0), compression_trace_counts["layer_forward_events"])
         output_goal_summary = self._output_goal_contract_summary()
+        frontier_registry_summary = self.frontier_registry.to_dict()
+        frontier_heldout_summary = _frontier_heldout_summary(frontier_registry_summary)
         summary = {
             "schema_version": 1,
             "phase_event_counts": phase_counts,
@@ -5060,8 +5109,9 @@ class CortexTrainingPhaseController:
             "sleep_replay_examples": len(self.sleep.replay.examples),
             "sleep_synthetic_examples": len(self.sleep.synthetic.examples),
             "sleep_reservoir_examples": len(self.sleep.reservoir.examples),
-            "frontier_compiled_circuit_count": int(self.frontier_registry.to_dict()["circuit_count"]),
-            "frontier_compiled_skill_count": int(self.frontier_registry.to_dict()["compiled_skill_count"]),
+            "frontier_compiled_circuit_count": int(frontier_registry_summary["circuit_count"]),
+            "frontier_compiled_skill_count": int(frontier_registry_summary["compiled_skill_count"]),
+            **frontier_heldout_summary,
             "frontier_compiled_fastsolve_events": int(self.frontier_compiled_fastsolve_events),
             "frontier_repair_candidate_count": len(self.frontier_repair_candidates),
             "frontier_repair_accepted_events": int(self.frontier_repair_accepted_events),
@@ -5701,6 +5751,8 @@ class CortexTrainingPhaseController:
                 "event_count": count,
             })
         output_goal_summary = self._output_goal_contract_summary()
+        frontier_registry_summary = self.frontier_registry.to_dict()
+        frontier_heldout_summary = _frontier_heldout_summary(frontier_registry_summary)
         return {
             "schema_version": 1,
             "enabled": True,
@@ -5774,8 +5826,9 @@ class CortexTrainingPhaseController:
                 "sleep_replay_examples": len(self.sleep.replay.examples),
                 "sleep_synthetic_examples": len(self.sleep.synthetic.examples),
                 "sleep_reservoir_examples": len(self.sleep.reservoir.examples),
-                "frontier_compiled_circuit_count": int(self.frontier_registry.to_dict()["circuit_count"]),
-                "frontier_compiled_skill_count": int(self.frontier_registry.to_dict()["compiled_skill_count"]),
+                "frontier_compiled_circuit_count": int(frontier_registry_summary["circuit_count"]),
+                "frontier_compiled_skill_count": int(frontier_registry_summary["compiled_skill_count"]),
+                **frontier_heldout_summary,
                 "frontier_compiled_fastsolve_events": int(self.frontier_compiled_fastsolve_events),
                 "frontier_repair_candidate_count": len(self.frontier_repair_candidates),
                 "frontier_repair_accepted_events": int(self.frontier_repair_accepted_events),
@@ -5838,6 +5891,7 @@ class CortexTrainingPhaseController:
                     "certificate_head_forward_events": int(self.model.certificate_forward_events),
                     "certificate_algebra_tool_events": int(self.integration_counts.get("certificate_algebra_tool_events", 0)),
                     "certificate_code_hidden_property_events": int(self.integration_counts.get("certificate_code_hidden_property_events", 0)),
+                    **frontier_heldout_summary,
                     "input_anchor_observations": int(self.input_anchor_observations),
                     "input_anchor_count": int(self.input_anchor_count),
                     "input_anchor_fidelity_failures": int(self.input_anchor_fidelity_failures),
@@ -5859,8 +5913,9 @@ class CortexTrainingPhaseController:
                     "sleep_replay_examples": len(self.sleep.replay.examples),
                     "sleep_synthetic_examples": len(self.sleep.synthetic.examples),
                     "sleep_reservoir_examples": len(self.sleep.reservoir.examples),
-                    "frontier_compiled_circuit_count": int(self.frontier_registry.to_dict()["circuit_count"]),
-                    "frontier_compiled_skill_count": int(self.frontier_registry.to_dict()["compiled_skill_count"]),
+                    "frontier_compiled_circuit_count": int(frontier_registry_summary["circuit_count"]),
+                    "frontier_compiled_skill_count": int(frontier_registry_summary["compiled_skill_count"]),
+                    **frontier_heldout_summary,
                     "frontier_compiled_fastsolve_events": int(self.frontier_compiled_fastsolve_events),
                     "frontier_repair_candidate_count": len(self.frontier_repair_candidates),
                     "frontier_repair_accepted_events": int(self.frontier_repair_accepted_events),

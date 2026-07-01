@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from pathlib import Path
+import re
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 import torch
@@ -11,6 +12,43 @@ import torch.nn.functional as F
 from cortex3 import CandidateAnswer, CostTrace, ReferenceRuleAgent, Task
 from cortex3_memory import embed_text
 from cortex3_ternary import BitLinear, BitLinearConfig, CompressionTraceLedger
+
+
+_NUMBER_RE = re.compile(r"-?\d+(?:\.\d+)?")
+_NON_LABEL_METADATA_KEYS = {
+    "a",
+    "b",
+    "c",
+    "low",
+    "high",
+    "repeat",
+    "value",
+}
+
+
+def _bounded_feature(value: float) -> float:
+    return max(-4.0, min(4.0, float(value) / 100.0))
+
+
+def task_features(task: Task, input_dim: int) -> torch.Tensor:
+    features = embed_text(task.prompt, input_dim).to(torch.float32).clone()
+    structured: list[float] = []
+    for match in _NUMBER_RE.finditer(task.prompt):
+        try:
+            structured.append(_bounded_feature(float(match.group(0))))
+        except ValueError:
+            continue
+        if len(structured) >= 16:
+            break
+    for key in sorted(_NON_LABEL_METADATA_KEYS & set(task.metadata)):
+        value = task.metadata.get(key)
+        if isinstance(value, bool):
+            structured.append(1.0 if value else -1.0)
+        elif isinstance(value, (int, float)):
+            structured.append(_bounded_feature(float(value)))
+    for idx, value in enumerate(structured[:input_dim]):
+        features[idx] = features[idx] + float(value)
+    return features
 
 
 @dataclass(frozen=True)
@@ -142,7 +180,7 @@ class MicroDataset:
         self.config = config
 
     def tensors(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        features = torch.stack([embed_text(example.task.prompt, self.config.input_dim) for example in self.examples]).to(torch.float32)
+        features = torch.stack([task_features(example.task, self.config.input_dim) for example in self.examples]).to(torch.float32)
         answer_targets = torch.tensor([self.vocabulary.answer_index(example.answer) for example in self.examples], dtype=torch.long)
         skill_targets = torch.tensor([self.vocabulary.skill_index(example.task.skill) for example in self.examples], dtype=torch.long)
         confidence_targets = torch.tensor([max(0.0, min(1.0, example.confidence)) for example in self.examples], dtype=torch.float32)
@@ -207,7 +245,7 @@ class MicroModelAgent:
 
     def __call__(self, task: Task) -> CandidateAnswer:
         with torch.no_grad():
-            features = embed_text(task.prompt, self.model.config.input_dim).view(1, self.model.config.input_dim)
+            features = task_features(task, self.model.config.input_dim).view(1, self.model.config.input_dim)
             output = self.model(features)
             index = int(output["answer_logits"].argmax(dim=-1).item())
             confidence = float(output["confidence"].item())

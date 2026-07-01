@@ -778,14 +778,15 @@ Etat actuel :
 
 - P1/P6/P7/P9/P10 creent detection lente, attribution, reparation, replay, consolidation et patchs ;
 - Frontier Skill Discovery compile les regressions sources slow-solvees plus leurs variantes en micro-circuits `BitLinear` persistants ;
-- P5 certifie l'origine compilee avec un contrat `compiled_circuit` verifie par checksum, lineage source/frontier, DSV et verification runtime ;
-- P8 consomme le registre compile pour repondre en FastSolve sur les taches couvertes ;
+- avant promotion, ces circuits passent maintenant un gate held-out court ; si ce gate echoue, le held-out verifie devient support metamorphique pour une recompilation bornee puis une nouvelle suite held-out est generee ;
+- P5 certifie l'origine compilee avec un contrat `compiled_circuit` verifie par checksum, lineage source/frontier/held-out, DSV, gate held-out et verification runtime ;
+- P8 consomme le registre compile pour repondre en FastSolve sur les taches couvertes par ids, signatures numeriques, metadonnees non-label ou ancres, pas seulement par nom de skill ;
 - P7 evalue le meme circuit comme candidat de reparation avant regrowth parametrique ;
 - P10 promeut les reparations compilees acceptees en propositions `compiled_frontier` prioritaires avant son patch modele signe.
 
 Limite actuelle :
 
-- la preuve finale manque encore a grande echelle : une competence resolue lentement et verifiee doit devenir rapide, moins chere, stable et generalisable a des taches nouvelles sur suites held-out larges.
+- la preuve finale manque encore a grande echelle : une competence resolue lentement et verifiee passe maintenant un held-out court bloquant, mais doit encore devenir rapide, moins chere, stable et generalisable a des taches nouvelles sur suites held-out larges.
 
 Critere de fermeture :
 

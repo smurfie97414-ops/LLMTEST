@@ -290,6 +290,11 @@ class CertificatesTest(unittest.TestCase):
             "dsv_passed": True,
             "dsv_verified": 2,
             "dsv_total": 2,
+            "heldout_task_ids": ("task-1-heldout",),
+            "heldout_passed": 1,
+            "heldout_total": 1,
+            "heldout_pass_rate": 1.0,
+            "heldout_gate_passed": True,
             "output_verified": True,
         }
         cert = build_compiled_circuit_certificate(
@@ -321,6 +326,16 @@ class CertificatesTest(unittest.TestCase):
             tool_args=cert.tool_args,
         )
         self.assertFalse(compiled_circuit_tool(tampered).passed)
+        heldout_failed = build_compiled_circuit_certificate(
+            certificate_id="cert-compiled-heldout-failed",
+            task=Task("task-1", "arithmetic", "Compute exactly: 2 + 2.", 4, anchors=(anchor,)),
+            answer="4",
+            claims={"frontier_compiled_circuit": True},
+            uncertainty=0.03,
+            latent_state=state,
+            contract={**contract, "heldout_passed": 0, "heldout_gate_passed": False},
+        )
+        self.assertFalse(compiled_circuit_tool(heldout_failed).passed)
 
     def test_proof_carrying_answer_maps_to_candidate_answer(self):
         state = _latent_state()

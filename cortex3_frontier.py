@@ -3,8 +3,10 @@ from __future__ import annotations
 from collections import Counter
 from dataclasses import asdict, dataclass
 import hashlib
+import random
+import re
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Mapping, Sequence
 
 import torch
 
@@ -13,6 +15,26 @@ from cortex3_certificates import CertificateVerifier, LatentProofState, build_co
 from cortex3_cycle import CycleReport
 from cortex3_future import FutureContractEngine, MTPFSPConfig, OutputGoalDecision
 from cortex3_microtrain import CheckpointManager, CortexMicroModel, CortexMicroTrainer, MicroModelAgent, examples_from_tasks
+
+
+_NUMBER_RE = re.compile(r"-?\d+(?:\.\d+)?")
+_LABEL_METADATA_KEYS = {
+    "solution",
+    "expected",
+    "reference_confidence",
+    "min_confidence",
+    "max_confidence",
+    "metamorphic",
+    "anti_metamorphic",
+    "adversarial",
+    "wrong_impl",
+    "tests",
+    "hidden_tests",
+}
+
+
+def _numeric_signature(task: Task) -> tuple[str, ...]:
+    return tuple(match.group(0) for match in _NUMBER_RE.finditer(task.prompt))
 
 
 @dataclass(frozen=True)
@@ -42,10 +64,12 @@ class FrontierCompiledCircuit:
     skill: str
     source_failure_ids: tuple[str, ...]
     frontier_task_ids: tuple[str, ...]
+    heldout_task_ids: tuple[str, ...]
     verified_slow_solutions: int
     invariants: FrontierInvariantSet
     training: Mapping[str, Any]
     dsv: Mapping[str, Any]
+    heldout: Mapping[str, Any]
     compiled_weight_bits: float
     active_weights: int
     total_weights: int
@@ -56,10 +80,12 @@ class FrontierCompiledCircuit:
             "skill": self.skill,
             "source_failure_ids": list(self.source_failure_ids),
             "frontier_task_ids": list(self.frontier_task_ids),
+            "heldout_task_ids": list(self.heldout_task_ids),
             "verified_slow_solutions": self.verified_slow_solutions,
             "invariants": self.invariants.to_dict(),
             "training": dict(self.training),
             "dsv": dict(self.dsv),
+            "heldout": dict(self.heldout),
             "compiled_weight_bits": self.compiled_weight_bits,
             "active_weights": self.active_weights,
             "total_weights": self.total_weights,
@@ -72,10 +98,12 @@ class FrontierCompiledCircuit:
             skill=str(payload["skill"]),
             source_failure_ids=tuple(str(item) for item in payload.get("source_failure_ids", ())),
             frontier_task_ids=tuple(str(item) for item in payload.get("frontier_task_ids", ())),
+            heldout_task_ids=tuple(str(item) for item in payload.get("heldout_task_ids", ())),
             verified_slow_solutions=int(payload.get("verified_slow_solutions", 0)),
             invariants=FrontierInvariantSet.from_dict(dict(payload.get("invariants") or {})),
             training=dict(payload.get("training") or {}),
             dsv=dict(payload.get("dsv") or {}),
+            heldout=dict(payload.get("heldout") or {}),
             compiled_weight_bits=float(payload.get("compiled_weight_bits", 0.0)),
             active_weights=int(payload.get("active_weights", 0)),
             total_weights=int(payload.get("total_weights", 0)),
@@ -139,6 +167,7 @@ class RuntimeFrontierCircuit:
     report: FrontierCompiledCircuit
     model: CortexMicroModel
     verified_tasks: tuple[Task, ...]
+    heldout_tasks: tuple[Task, ...] = ()
     checkpoint_path: str | None = None
 
     @property
@@ -153,6 +182,7 @@ class RuntimeFrontierCircuit:
         return {
             "report": self.report.to_dict(),
             "verified_tasks": [_task_to_dict(task) for task in self.verified_tasks],
+            "heldout_tasks": [_task_to_dict(task) for task in self.heldout_tasks],
             "checkpoint_path": self.checkpoint_path,
         }
 
@@ -167,20 +197,37 @@ class FrontierCircuitRegistry:
         model: CortexMicroModel,
         verified_tasks: Iterable[Task],
         *,
+        heldout_tasks: Iterable[Task] = (),
         checkpoint_path: str | None = None,
     ) -> RuntimeFrontierCircuit:
         if not report.passed:
             raise ValueError(f"cannot register failing frontier circuit for skill {report.skill!r}")
         tasks = tuple(verified_tasks)
+        heldout = tuple(heldout_tasks)
         if not tasks:
             raise ValueError("frontier circuit registration requires verified slow-solve tasks")
         if any(task.skill != report.skill for task in tasks):
             raise ValueError("all registered frontier tasks must match the compiled circuit skill")
-        circuit = RuntimeFrontierCircuit(report, model, tasks, checkpoint_path)
+        if any(task.skill != report.skill for task in heldout):
+            raise ValueError("all registered frontier held-out tasks must match the compiled circuit skill")
+        heldout_total = int(report.heldout.get("total", 0))
+        heldout_passed = int(report.heldout.get("passed", 0))
+        if heldout_total <= 0 or heldout_passed < heldout_total or not bool(report.heldout.get("gate_passed", False)):
+            raise ValueError("frontier circuit registration requires a passing held-out generalization gate")
+        if len(heldout) < heldout_total:
+            raise ValueError("frontier circuit registration requires persisted held-out tasks")
+        circuit = RuntimeFrontierCircuit(
+            report=report,
+            model=model,
+            verified_tasks=tasks,
+            heldout_tasks=heldout,
+            checkpoint_path=checkpoint_path,
+        )
         bucket = self._circuits.setdefault(report.skill, [])
         bucket.append(circuit)
         bucket.sort(
             key=lambda item: (
+                float(item.report.heldout.get("pass_rate", 0.0)),
                 float(item.report.dsv.get("verified_capability_per_cost", 0.0)),
                 int(item.report.verified_slow_solutions),
                 -float(item.report.compiled_weight_bits),
@@ -198,6 +245,9 @@ class FrontierCircuitRegistry:
     def _match_score(self, circuit: RuntimeFrontierCircuit, task: Task) -> float:
         if task.skill != circuit.skill:
             return float("-inf")
+        coverage_score = self._coverage_score(circuit, task)
+        if coverage_score <= 0.0:
+            return float("-inf")
         invariants = circuit.report.invariants
         task_anchor_kinds = {anchor.kind for anchor in task.anchors}
         invariant_anchor_kinds = set(invariants.anchor_kinds)
@@ -206,13 +256,51 @@ class FrontierCircuitRegistry:
         task_obligations = set(_prompt_obligations((task,)))
         invariant_obligations = set(invariants.prompt_obligations)
         score = 1.0
+        score += coverage_score
         score += float(circuit.report.verified_slow_solutions)
         score += float(len(task_anchor_kinds & invariant_anchor_kinds)) * 1.5
         score += float(len(task_metadata & invariant_metadata)) * 0.5
         score += float(len(task_obligations & invariant_obligations)) * 2.0
         score += float(circuit.report.dsv.get("verified_capability_per_cost", 0.0))
+        score += float(circuit.report.heldout.get("pass_rate", 0.0)) * 3.0
+        score += float(circuit.report.heldout.get("aggregate_score", 0.0))
         score -= float(circuit.report.compiled_weight_bits) * 1e-9
         return score
+
+    def _coverage_score(self, circuit: RuntimeFrontierCircuit, task: Task) -> float:
+        covered_tasks = tuple(circuit.verified_tasks) + tuple(circuit.heldout_tasks)
+        best = 0.0
+        task_numbers = _numeric_signature(task)
+        task_anchor_values = {anchor.value for anchor in task.anchors}
+        task_metadata = {
+            key: value
+            for key, value in task.metadata.items()
+            if key not in _LABEL_METADATA_KEYS
+        }
+        for covered in covered_tasks:
+            score = 0.0
+            if covered.task_id == task.task_id:
+                score += 1000.0
+            if covered.group_id is not None and covered.group_id == task.group_id:
+                score += 50.0
+            covered_metadata = {
+                key: value
+                for key, value in covered.metadata.items()
+                if key not in _LABEL_METADATA_KEYS
+            }
+            shared = set(task_metadata) & set(covered_metadata)
+            matching_values = sum(1 for key in shared if task_metadata[key] == covered_metadata[key])
+            score += float(matching_values) * 8.0
+            covered_numbers = _numeric_signature(covered)
+            if task_numbers and covered_numbers:
+                if task_numbers == covered_numbers:
+                    score += 24.0
+                else:
+                    score += float(len(set(task_numbers) & set(covered_numbers))) * 2.0
+            covered_anchor_values = {anchor.value for anchor in covered.anchors}
+            score += float(len(task_anchor_values & covered_anchor_values)) * 10.0
+            best = max(best, score)
+        return best
 
     def select(self, task: Task) -> RuntimeFrontierCircuit | None:
         candidates = self.circuits_for_skill(task.skill)
@@ -253,6 +341,7 @@ class FrontierCircuitRegistry:
                         "checkpoint_path": checkpoint.name,
                         "report": circuit.report.to_dict(),
                         "verified_tasks": [_task_to_dict(task) for task in circuit.verified_tasks],
+                        "heldout_tasks": [_task_to_dict(task) for task in circuit.heldout_tasks],
                     }
                 )
         path = root / "frontier_registry.json"
@@ -274,7 +363,14 @@ class FrontierCircuitRegistry:
             report = FrontierCompiledCircuit.from_dict(dict(payload["report"]))
             model = manager.load(root / str(payload["checkpoint_path"]))
             tasks = tuple(_task_from_dict(dict(task)) for task in payload.get("verified_tasks", ()))
-            registry.register(report, model, tasks, checkpoint_path=str(root / str(payload["checkpoint_path"])))
+            heldout_tasks = tuple(_task_from_dict(dict(task)) for task in payload.get("heldout_tasks", ()))
+            registry.register(
+                report,
+                model,
+                tasks,
+                heldout_tasks=heldout_tasks,
+                checkpoint_path=str(root / str(payload["checkpoint_path"])),
+            )
         return registry
 
 
@@ -322,6 +418,7 @@ class CompiledFrontierAgent:
             "task_id": task.task_id,
             "source_failure_ids": tuple(circuit.report.source_failure_ids),
             "frontier_task_ids": tuple(circuit.report.frontier_task_ids),
+            "heldout_task_ids": tuple(circuit.report.heldout_task_ids),
             "verified_slow_solutions": int(circuit.report.verified_slow_solutions),
             "prompt_obligations": tuple(circuit.report.invariants.prompt_obligations),
             "invariant_checksum": invariant_checksum,
@@ -331,6 +428,10 @@ class CompiledFrontierAgent:
             "dsv_passed": bool(circuit.report.passed),
             "dsv_verified": int(circuit.report.dsv.get("passed", 0)),
             "dsv_total": int(circuit.report.dsv.get("total", 0)),
+            "heldout_passed": int(circuit.report.heldout.get("passed", 0)),
+            "heldout_total": int(circuit.report.heldout.get("total", 0)),
+            "heldout_pass_rate": float(circuit.report.heldout.get("pass_rate", 0.0)),
+            "heldout_gate_passed": bool(circuit.report.heldout.get("gate_passed", False)),
             "output_verified": bool(output_verified),
             "output_goal_contract_id": output_goal.contract.contract_id,
             "output_goal_contract_passed": bool(output_goal.accepted),
@@ -390,6 +491,10 @@ class CompiledFrontierAgent:
             "frontier_verified_slow_solutions": circuit.report.verified_slow_solutions,
             "frontier_compiled_weight_bits": circuit.report.compiled_weight_bits,
             "frontier_prompt_obligations": circuit.report.invariants.prompt_obligations,
+            "frontier_heldout_passed": int(circuit.report.heldout.get("passed", 0)),
+            "frontier_heldout_total": int(circuit.report.heldout.get("total", 0)),
+            "frontier_heldout_pass_rate": float(circuit.report.heldout.get("pass_rate", 0.0)),
+            "frontier_heldout_gate_passed": bool(circuit.report.heldout.get("gate_passed", False)),
         }
         raw = {
             **dict(answer.raw),
@@ -397,6 +502,8 @@ class CompiledFrontierAgent:
             "frontier_skill": circuit.skill,
             "frontier_source_failure_ids": circuit.report.source_failure_ids,
             "frontier_task_ids": circuit.report.frontier_task_ids,
+            "frontier_heldout_task_ids": circuit.report.heldout_task_ids,
+            "frontier_heldout": dict(circuit.report.heldout),
         }
         cost = answer.cost.merge(CostTrace(verifier_steps=1 if self.verifier is not None and self.verify_outputs else 0))
         confidence = answer.confidence
@@ -485,6 +592,32 @@ class FrontierSkillDiscovery:
                 verified.append(task)
         return tuple(verified)
 
+    def _verified_metamorphic_variants(
+        self,
+        tasks: Sequence[Task],
+        *,
+        seed: int,
+        per_source: int,
+        excluded_task_ids: Iterable[str],
+    ) -> tuple[Task, ...]:
+        if per_source < 1:
+            raise ValueError("per_source must be positive for frontier generalization variants")
+        rng = random.Random(seed)
+        seen = set(str(task_id) for task_id in excluded_task_ids)
+        variants: list[Task] = []
+        for task in tasks:
+            spec = self.verifier.specs.get(task.skill)
+            if spec is None:
+                continue
+            for variant in spec.metamorphic(task, rng)[:per_source]:
+                if variant.task_id in seen:
+                    continue
+                answer = CandidateAnswer.coerce(self.solver(variant))
+                if self.verifier.oracle_registry.verify(variant.skill, variant, answer).passed:
+                    variants.append(variant)
+                    seen.add(variant.task_id)
+        return tuple(variants)
+
     def discover(
         self,
         report: CycleReport,
@@ -492,9 +625,21 @@ class FrontierSkillDiscovery:
         seed: int = 0,
         max_skills: int = 2,
         per_failure: int = 4,
+        support_per_verified: int = 2,
+        heldout_per_support: int = 1,
+        min_heldout_pass_rate: float = 1.0,
+        max_generalization_rounds: int = 2,
         epochs: int = 120,
         registry: FrontierCircuitRegistry | None = None,
     ) -> FrontierDiscoveryReport:
+        if support_per_verified < 1:
+            raise ValueError("support_per_verified must be positive")
+        if heldout_per_support < 1:
+            raise ValueError("heldout_per_support must be positive")
+        if max_generalization_rounds < 1:
+            raise ValueError("max_generalization_rounds must be positive")
+        if not 0.0 <= float(min_heldout_pass_rate) <= 1.0:
+            raise ValueError("min_heldout_pass_rate must be between 0 and 1")
         fragile = report.skill_ledger.fragile_skills()
         selected = tuple(state.skill for state in fragile[:max_skills])
         circuits: list[FrontierCompiledCircuit] = []
@@ -513,20 +658,76 @@ class FrontierSkillDiscovery:
                     continue
                 candidate_tasks.append(task)
                 seen_task_ids.add(task.task_id)
-            verified_tasks = self._verified_frontier_tasks(candidate_tasks)
-            if not verified_tasks:
+            base_verified_tasks = self._verified_frontier_tasks(candidate_tasks)
+            if not base_verified_tasks:
                 continue
-            examples = examples_from_tasks(verified_tasks, self.solver, source="frontier_slow_solve")
-            model, training = trainer.train(examples, epochs=epochs, lr=0.05)
-            agent = MicroModelAgent(model)
-            dsv = self.verifier.evaluate_tasks(agent, verified_tasks)
+            training_task_list = list(base_verified_tasks)
+            excluded_task_ids = {task.task_id for task in training_task_list}
+            model: CortexMicroModel | None = None
+            training = None
+            dsv = None
+            heldout_tasks: tuple[Task, ...] = ()
+            heldout_dsv = None
+            heldout_pass_rate = 0.0
+            heldout_gate_passed = False
+            generalization_rounds: list[dict[str, Any]] = []
+            for round_idx in range(max_generalization_rounds):
+                support_tasks = self._verified_metamorphic_variants(
+                    tuple(training_task_list),
+                    seed=seed + 4001 + index + round_idx * 997,
+                    per_source=support_per_verified,
+                    excluded_task_ids=excluded_task_ids,
+                )
+                training_task_list.extend(support_tasks)
+                excluded_task_ids.update(task.task_id for task in support_tasks)
+                training_tasks = tuple(training_task_list)
+                examples = examples_from_tasks(training_tasks, self.solver, source="frontier_slow_solve")
+                model, training = trainer.train(examples, epochs=epochs, lr=0.05)
+                agent = MicroModelAgent(model)
+                dsv = self.verifier.evaluate_tasks(agent, training_tasks)
+                heldout_seed_tasks = support_tasks or training_tasks
+                heldout_tasks = self._verified_metamorphic_variants(
+                    heldout_seed_tasks,
+                    seed=seed + 7919 + index + round_idx * 997,
+                    per_source=heldout_per_support,
+                    excluded_task_ids=excluded_task_ids,
+                )
+                heldout_dsv = self.verifier.evaluate_tasks(agent, heldout_tasks)
+                heldout_pass_rate = float(heldout_dsv.passed) / max(1, int(heldout_dsv.total))
+                heldout_gate_passed = bool(
+                    heldout_dsv.total > 0
+                    and heldout_dsv.passed == heldout_dsv.total
+                    and heldout_pass_rate >= float(min_heldout_pass_rate)
+                )
+                generalization_rounds.append(
+                    {
+                        "round": round_idx,
+                        "support_tasks": len(support_tasks),
+                        "training_tasks": len(training_tasks),
+                        "heldout_passed": heldout_dsv.passed,
+                        "heldout_total": heldout_dsv.total,
+                        "heldout_pass_rate": heldout_pass_rate,
+                        "gate_passed": heldout_gate_passed,
+                    }
+                )
+                if heldout_gate_passed:
+                    break
+                if round_idx + 1 < max_generalization_rounds:
+                    for task in heldout_tasks:
+                        if task.task_id not in excluded_task_ids:
+                            training_task_list.append(task)
+                            excluded_task_ids.add(task.task_id)
+            if model is None or training is None or dsv is None or heldout_dsv is None:
+                continue
+            training_tasks = tuple(training_task_list)
             compiled_bits, active_weights, total_weights = _compiled_weight_bits(model)
             compiled = FrontierCompiledCircuit(
                 skill=skill,
                 source_failure_ids=tuple(failure.task.task_id for failure in failures),
-                frontier_task_ids=tuple(task.task_id for task in verified_tasks),
-                verified_slow_solutions=len(verified_tasks),
-                invariants=_extract_invariants(skill, verified_tasks),
+                frontier_task_ids=tuple(task.task_id for task in training_tasks),
+                heldout_task_ids=tuple(task.task_id for task in heldout_tasks),
+                verified_slow_solutions=len(training_tasks),
+                invariants=_extract_invariants(skill, training_tasks),
                 training=training.to_dict(),
                 dsv={
                     "passed": dsv.passed,
@@ -534,12 +735,22 @@ class FrontierSkillDiscovery:
                     "aggregate_score": dsv.aggregate_score,
                     "verified_capability_per_cost": dsv.verified_capability_per_cost,
                 },
+                heldout={
+                    "passed": heldout_dsv.passed,
+                    "total": heldout_dsv.total,
+                    "pass_rate": heldout_pass_rate,
+                    "min_pass_rate": float(min_heldout_pass_rate),
+                    "aggregate_score": heldout_dsv.aggregate_score,
+                    "verified_capability_per_cost": heldout_dsv.verified_capability_per_cost,
+                    "gate_passed": heldout_gate_passed,
+                    "generalization_rounds": tuple(generalization_rounds),
+                },
                 compiled_weight_bits=compiled_bits,
                 active_weights=active_weights,
                 total_weights=total_weights,
-                passed=dsv.passed == dsv.total and training.after_accuracy >= training.before_accuracy,
+                passed=dsv.passed == dsv.total and training.after_accuracy >= training.before_accuracy and heldout_gate_passed,
             )
             circuits.append(compiled)
             if registry is not None and compiled.passed:
-                registry.register(compiled, model, verified_tasks)
+                registry.register(compiled, model, training_tasks, heldout_tasks=heldout_tasks)
         return FrontierDiscoveryReport(tuple(circuits), selected, bool(circuits) and all(circuit.passed for circuit in circuits))

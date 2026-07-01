@@ -465,6 +465,14 @@ def compiled_circuit_tool(certificate: ShortCertificate) -> ToolVerification:
         return ToolVerification("compiled_circuit", False, 0.0, "missing source failure lineage")
     if not tuple(contract.get("frontier_task_ids") or ()):
         return ToolVerification("compiled_circuit", False, 0.0, "missing frontier task lineage")
+    heldout_total = int(contract.get("heldout_total", 0) or 0)
+    heldout_passed = int(contract.get("heldout_passed", 0) or 0)
+    if not tuple(contract.get("heldout_task_ids") or ()):
+        return ToolVerification("compiled_circuit", False, 0.0, "missing held-out frontier lineage")
+    if heldout_total <= 0:
+        return ToolVerification("compiled_circuit", False, 0.0, "missing held-out frontier generalization gate")
+    if heldout_passed < heldout_total or not bool(contract.get("heldout_gate_passed", False)):
+        return ToolVerification("compiled_circuit", False, 0.0, "held-out frontier generalization gate failed")
     expected_tool_checksum = str(certificate.tool_args.get("expected_contract_checksum") or "")
     if expected_tool_checksum and expected_tool_checksum != checksum:
         return ToolVerification("compiled_circuit", False, 0.0, "compiled circuit tool checksum mismatch")

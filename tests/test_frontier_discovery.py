@@ -28,8 +28,13 @@ class FrontierSkillDiscoveryTest(unittest.TestCase):
         self.assertGreater(circuit.training["after_accuracy"], circuit.training["before_accuracy"])
         self.assertTrue(circuit.invariants.prompt_obligations)
         self.assertTrue(set(circuit.source_failure_ids).issubset(set(circuit.frontier_task_ids)))
+        self.assertTrue(circuit.heldout_task_ids)
+        self.assertGreater(circuit.heldout["total"], 0)
+        self.assertEqual(circuit.heldout["passed"], circuit.heldout["total"])
+        self.assertTrue(circuit.heldout["gate_passed"])
         self.assertEqual(registry.compiled_skills(), (circuit.skill,))
         runtime_circuit = registry.circuits_for_skill(circuit.skill)[0]
+        self.assertTrue(runtime_circuit.heldout_tasks)
         task = runtime_circuit.verified_tasks[0]
         selected = registry.select(task)
         self.assertIsNotNone(selected)
@@ -38,12 +43,17 @@ class FrontierSkillDiscoveryTest(unittest.TestCase):
         self.assertTrue(answer.raw["frontier_compiled_selected"])
         self.assertTrue(answer.certificate["frontier_compiled_circuit"])
         self.assertTrue(answer.certificate["frontier_verification_passed"])
+        self.assertTrue(answer.certificate["frontier_heldout_gate_passed"])
+        self.assertEqual(answer.certificate["frontier_heldout_passed"], answer.certificate["frontier_heldout_total"])
         self.assertTrue(answer.certificate["frontier_output_goal_contract_passed"])
         self.assertEqual(answer.certificate["frontier_output_goal_contract"]["contract"]["skill"], task.skill)
         self.assertTrue(answer.certificate["frontier_compiled_contract_verified"])
         self.assertEqual(answer.certificate["frontier_compiled_contract"]["certificate_type"], "compiled_circuit")
         compiled_contract = answer.certificate["frontier_compiled_contract"]["claims"]["compiled_circuit_contract"]
         self.assertTrue(compiled_contract["output_goal_contract_passed"])
+        self.assertTrue(compiled_contract["heldout_gate_passed"])
+        self.assertEqual(compiled_contract["heldout_passed"], compiled_contract["heldout_total"])
+        self.assertTrue(compiled_contract["heldout_task_ids"])
         self.assertEqual(compiled_contract["output_goal_contract_id"], answer.certificate["frontier_output_goal_contract"]["contract"]["contract_id"])
         self.assertTrue(answer.certificate["frontier_compiled_contract_checksum"])
         self.assertTrue(verifier.oracle_registry.verify(task.skill, task, answer).passed)
@@ -67,6 +77,7 @@ class FrontierSkillDiscoveryTest(unittest.TestCase):
             registry_path = registry.save(tmp)
             loaded_registry = FrontierCircuitRegistry.load(tmp)
             runtime_circuit = loaded_registry.circuits_for_skill(frontier.circuits[0].skill)[0]
+            self.assertTrue(runtime_circuit.heldout_tasks)
             task = runtime_circuit.verified_tasks[0]
             answer = CompiledFrontierAgent(loaded_registry, verifier=verifier)(task)
 
@@ -75,6 +86,7 @@ class FrontierSkillDiscoveryTest(unittest.TestCase):
         self.assertGreater(payload["frontier_discovery"]["circuits"][0]["compiled_weight_bits"], 0.0)
         self.assertEqual(registry_path.name, "frontier_registry.json")
         self.assertTrue(answer.raw["frontier_compiled_selected"])
+        self.assertTrue(answer.certificate["frontier_heldout_gate_passed"])
         self.assertTrue(answer.certificate["frontier_output_goal_contract_passed"])
         self.assertTrue(verifier.oracle_registry.verify(task.skill, task, answer).passed)
 
