@@ -4130,6 +4130,15 @@ def _cortex_architecture_audit_from_summary(summary: Mapping[str, Any]) -> dict[
         and float(item.get("protected_loss_delta", 0.0) or 0.0) <= float(item.get("protected_loss_tolerance", 0.0) or 0.0)
         for item in recursive_model_applications
     )
+    recursive_model_reward_hacking_cleared = any(
+        bool(item.get("p10_decision_accepted"))
+        and bool(str(item.get("p10_decision_reason", "")))
+        and not tuple(item.get("reward_hacking_flags") or ())
+        and not tuple(item.get("collapse_flags") or ())
+        and float(item.get("robustness_score", 0.0) or 0.0) > 0.0
+        and float(item.get("robustness_delta", 0.0) or 0.0) >= 0.0
+        for item in recursive_model_applications
+    )
     recursive_model_has_executable_rollback = any(
         bool(item.get("rollback_executable"))
         and bool(item.get("rollback_artifact_path"))
@@ -4544,6 +4553,7 @@ def _cortex_architecture_audit_from_summary(summary: Mapping[str, Any]) -> dict[
         and number("recursive_model_parameter_delta_l1") > 0.0
         and number("recursive_model_repair_loss_delta") > 0.0
         and recursive_model_non_regressing
+        and recursive_model_reward_hacking_cleared
         and recursive_artifact_verified,
         {
             "P10": phase_count("P10"),
@@ -4556,9 +4566,10 @@ def _cortex_architecture_audit_from_summary(summary: Mapping[str, Any]) -> dict[
             "recursive_model_repair_loss_delta": number("recursive_model_repair_loss_delta"),
             "recursive_model_protected_loss_delta": number("recursive_model_protected_loss_delta"),
             "recursive_model_non_regressing": recursive_model_non_regressing,
+            "recursive_model_reward_hacking_cleared": recursive_model_reward_hacking_cleared,
             "recursive_artifact_verified": recursive_artifact_verified,
         },
-        "recursive improvement sandbox must evaluate a proposal, apply an accepted signed non-regressing patch to real Transformer state, persist an executable rollback artifact, and materialize a verified replay artifact",
+        "recursive improvement sandbox must evaluate a proposal, apply an accepted signed non-regressing anti-reward-hacking-cleared patch to real Transformer state, persist an executable rollback artifact, and materialize a verified replay artifact",
     )
     add(
         "training_feedback_loop",
@@ -4683,6 +4694,15 @@ def _cortex_phase_deliverable_audit_from_summary(summary: Mapping[str, Any]) -> 
         and float(item.get("parameter_delta_l1", 0.0) or 0.0) > 0.0
         and float(item.get("repair_loss_delta", 0.0) or 0.0) > 0.0
         and float(item.get("protected_loss_delta", 0.0) or 0.0) <= float(item.get("protected_loss_tolerance", 0.0) or 0.0)
+        for item in recursive_model_applications
+    )
+    recursive_model_reward_hacking_cleared = any(
+        bool(item.get("p10_decision_accepted"))
+        and bool(str(item.get("p10_decision_reason", "")))
+        and not tuple(item.get("reward_hacking_flags") or ())
+        and not tuple(item.get("collapse_flags") or ())
+        and float(item.get("robustness_score", 0.0) or 0.0) > 0.0
+        and float(item.get("robustness_delta", 0.0) or 0.0) >= 0.0
         for item in recursive_model_applications
     )
     recursive_model_has_executable_rollback = any(
@@ -5004,6 +5024,7 @@ def _cortex_phase_deliverable_audit_from_summary(summary: Mapping[str, Any]) -> 
         and number("recursive_model_parameter_delta_l1") > 0.0
         and number("recursive_model_repair_loss_delta") > 0.0
         and recursive_model_non_regressing
+        and recursive_model_reward_hacking_cleared
         and recursive_artifact_verified,
         {
             "recursive_proposal_events": count("recursive_proposal_events"),
@@ -5025,9 +5046,10 @@ def _cortex_phase_deliverable_audit_from_summary(summary: Mapping[str, Any]) -> 
             "recursive_model_parameter_delta_l1": number("recursive_model_parameter_delta_l1"),
             "recursive_model_repair_loss_delta": number("recursive_model_repair_loss_delta"),
             "recursive_model_non_regressing": recursive_model_non_regressing,
+            "recursive_model_reward_hacking_cleared": recursive_model_reward_hacking_cleared,
             "recursive_artifact_verified": recursive_artifact_verified,
         },
-        "recursive improvement must propose, sandbox, evolve across generations, evaluate, gate, persist evolutionary and executable rollback archives, apply a signed model patch, preserve rollback tokens, run diversity checks and materialize a verified replay artifact",
+        "recursive improvement must propose, sandbox, evolve across generations, evaluate, gate against reward hacking, persist evolutionary and executable rollback archives, apply a signed model patch, preserve rollback tokens, run diversity checks and materialize a verified replay artifact",
     )
 
     failed_checks = tuple(f"{check['phase']}:{check['deliverable']}" for check in checks if not check["passed"])
@@ -7019,6 +7041,21 @@ class CortexTrainingPhaseController:
             )
             if repair_delta > 0.0 and protected_delta <= protected_tolerance and parameter_delta > 0.0:
                 parameter_names = tuple(name for name, _ in parameters)
+                decision_proof = {
+                    "p10_decision_accepted": bool(decision.accepted),
+                    "p10_decision_reason": decision.reason,
+                    "baseline_score": float(decision.evaluation.baseline_report.aggregate_score),
+                    "trial_score": float(decision.evaluation.trial_report.aggregate_score),
+                    "robustness_score": float(decision.evaluation.robustness_report.aggregate_score),
+                    "quality_delta": float(decision.evaluation.quality_delta),
+                    "cost_delta": float(decision.evaluation.cost_delta),
+                    "robustness_delta": float(decision.evaluation.robustness_delta),
+                    "calibration_delta": float(decision.evaluation.calibration_delta),
+                    "protected_losses": dict(decision.evaluation.protected_losses),
+                    "reward_hacking_flags": tuple(decision.evaluation.reward_hacking_flags),
+                    "collapse_flags": tuple(decision.evaluation.collapse_flags),
+                    "diversity_flags": tuple(decision.diversity_flags),
+                }
                 signed_payload = {
                     "proposal_id": proposal.proposal_id,
                     "proposal_payload": dict(proposal.patch_payload),
@@ -7026,6 +7063,7 @@ class CortexTrainingPhaseController:
                     "parameter_names": parameter_names,
                     "repair_loss_delta": repair_delta,
                     "protected_loss_delta": protected_delta,
+                    "decision_proof": decision_proof,
                 }
                 accepted_report = {
                     "step": step,
@@ -7049,6 +7087,7 @@ class CortexTrainingPhaseController:
                     "protected_loss_tolerance": protected_tolerance,
                     "non_regression_passed": True,
                     "requantized_ternary_core": bool(self.model.config.use_ternary_core),
+                    **decision_proof,
                 }
                 break
 

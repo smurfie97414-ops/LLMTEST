@@ -649,7 +649,8 @@ P10 :
 13. cree rollback token ;
 14. applique une proposition acceptee comme patch signe sur vrais poids Transformer ;
 15. ecrit un artefact rollback executable `model_patch_rollbacks/<signed_patch_id>.pt` contenant les tensors pre-patch et les checksums pre/post ;
-16. mesure repair loss, protected loss et delta de poids.
+16. embarque dans le patch signe la preuve de decision P10: acceptance, raison, scores baseline/trial/robustesse, deltas, protected losses et flags reward-hacking/collapse/diversite ;
+17. mesure repair loss, protected loss et delta de poids.
 
 ### Interaction Avec Les Autres Phases
 
