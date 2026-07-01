@@ -10205,6 +10205,8 @@ def run_llm_batch_profile_autosize(
     confirm_selected_max_rounds: int | None = None,
     confirm_selected_decision_resolution_extra_rounds: int | None = None,
     confirm_selected_decision_resolution_adaptive_extra_rounds: int = 2,
+    confirm_selected_runtime_step_multiplier_cap: int = 4,
+    confirm_selected_runtime_repeat_count_cap: int = 4,
     measured_selection_metric: str = "throughput_gpu",
     min_cases: int = 1,
     require_multi_shape: bool = False,
@@ -10281,6 +10283,20 @@ def run_llm_batch_profile_autosize(
     )
     if requested_confirm_selected_decision_resolution_adaptive_extra_rounds < 0:
         raise ValueError("confirm_selected_decision_resolution_adaptive_extra_rounds must be >= 0")
+    requested_confirm_selected_runtime_step_multiplier_cap = int(
+        confirm_selected_runtime_step_multiplier_cap
+    )
+    if requested_confirm_selected_runtime_step_multiplier_cap < requested_confirm_selected_step_multiplier:
+        raise ValueError(
+            "confirm_selected_runtime_step_multiplier_cap must be >= confirm_selected_step_multiplier"
+        )
+    requested_confirm_selected_runtime_repeat_count_cap = int(
+        confirm_selected_runtime_repeat_count_cap
+    )
+    if requested_confirm_selected_runtime_repeat_count_cap < requested_confirm_selected_repeat_count:
+        raise ValueError(
+            "confirm_selected_runtime_repeat_count_cap must be >= confirm_selected_repeat_count"
+        )
     if measure_candidate_strategy not in PROFILE_AUTOSIZE_MEASUREMENT_STRATEGIES:
         raise ValueError(
             f"unknown measure_candidate_strategy {measure_candidate_strategy!r}; "
@@ -10450,6 +10466,7 @@ def run_llm_batch_profile_autosize(
     confirmation_decision_resolution_total_rounds = effective_confirm_selected_decision_resolution_extra_rounds
     confirmation_decision_resolution_stop_reason = ""
     confirmation_decision_resolution_budget_evaluations: list[Mapping[str, Any]] = []
+    confirmation_runtime_escalations: list[Mapping[str, Any]] = []
     if effective_measure_candidate_count > 0:
         aggregated_measurement_rows: list[Mapping[str, Any]] = []
         already_measured_shape_keys: set[str] = set()
@@ -10867,6 +10884,81 @@ def run_llm_batch_profile_autosize(
                 "overlap_ratio": overlap_ratio,
             }
 
+        def confirmation_runtime_plan(
+            *,
+            confirmation_inputs: Sequence[Mapping[str, Any]],
+            state: Mapping[str, Any],
+            round_kind: str,
+        ) -> Mapping[str, Any]:
+            candidates = tuple(confirmation_inputs)
+            interval_widths = tuple(
+                max(
+                    0.0,
+                    float(candidate.get("measured_score_upper_confidence", candidate.get("measured_score", 0.0)))
+                    - float(candidate.get("measured_score_lower_confidence", candidate.get("measured_score", 0.0))),
+                )
+                for candidate in candidates
+            )
+            score_values = [
+                abs(float(candidate.get(key, 0.0)))
+                for candidate in candidates
+                for key in (
+                    "measured_score",
+                    "measured_score_mean",
+                    "measured_score_lower_confidence",
+                    "measured_score_upper_confidence",
+                )
+            ]
+            uncertainty = max(interval_widths, default=0.0)
+            score_scale = max((1.0, *score_values))
+            uncertainty_ratio = uncertainty / score_scale
+            decision_margin = float(state.get("decision_margin", 0.0))
+            margin_deficit = max(0.0, -decision_margin)
+            overlap_ratio = margin_deficit / max(1e-9, uncertainty) if uncertainty > 0.0 else 0.0
+            runtime_signal = max(uncertainty_ratio, overlap_ratio)
+            escalation_level = 0
+            step_multiplier = requested_confirm_selected_step_multiplier
+            repeat_count = requested_confirm_selected_repeat_count
+            if runtime_signal > 0.0:
+                max_level = max(
+                    requested_confirm_selected_runtime_repeat_count_cap
+                    - requested_confirm_selected_repeat_count,
+                    requested_confirm_selected_runtime_step_multiplier_cap
+                    - requested_confirm_selected_step_multiplier,
+                    0,
+                )
+                escalation_level = min(max_level, max(1, int(math.ceil(runtime_signal))))
+                step_multiplier = min(
+                    requested_confirm_selected_runtime_step_multiplier_cap,
+                    requested_confirm_selected_step_multiplier * (1 + escalation_level),
+                )
+                repeat_count = min(
+                    requested_confirm_selected_runtime_repeat_count_cap,
+                    requested_confirm_selected_repeat_count + escalation_level,
+                )
+            profile_steps = max(1, int(steps) * step_multiplier)
+            return {
+                "round_kind": round_kind,
+                "base_step_multiplier": requested_confirm_selected_step_multiplier,
+                "step_multiplier": step_multiplier,
+                "steps": profile_steps,
+                "base_repeat_count": requested_confirm_selected_repeat_count,
+                "repeat_count": repeat_count,
+                "escalation_level": escalation_level,
+                "adaptive_runtime_applied": (
+                    step_multiplier != requested_confirm_selected_step_multiplier
+                    or repeat_count != requested_confirm_selected_repeat_count
+                ),
+                "uncertainty": uncertainty,
+                "score_scale": score_scale,
+                "uncertainty_ratio": uncertainty_ratio,
+                "decision_margin": decision_margin,
+                "margin_deficit": margin_deficit,
+                "overlap_ratio": overlap_ratio,
+                "runtime_signal": runtime_signal,
+                "shape_keys": tuple(str(candidate.get("shape_key", "")) for candidate in candidates),
+            }
+
         def confirm_selected_candidates(
             *,
             round_index: int,
@@ -10887,6 +10979,12 @@ def run_llm_batch_profile_autosize(
             )
             if not confirmation_inputs:
                 return 0
+            confirmation_state = selected_confirmation_frontier_state()
+            runtime_plan = confirmation_runtime_plan(
+                confirmation_inputs=confirmation_inputs,
+                state=confirmation_state,
+                round_kind=round_kind,
+            )
             used_seed_set = {
                 int(row.get("seed", 0))
                 for candidate in aggregated_measurement_rows
@@ -10901,7 +10999,8 @@ def run_llm_batch_profile_autosize(
 
             confirmed_rows: list[Mapping[str, Any]] = []
             confirmation_details: list[Mapping[str, Any]] = []
-            confirmation_profile_steps = max(1, int(steps) * requested_confirm_selected_step_multiplier)
+            confirmation_profile_steps = int(runtime_plan["steps"])
+            confirmation_repeat_count = int(runtime_plan["repeat_count"])
             for candidate in confirmation_inputs:
                 shape_key = str(candidate["shape_key"])
                 row_index = next(
@@ -10933,7 +11032,7 @@ def run_llm_batch_profile_autosize(
                         seed=int(seed),
                         seed_dir_prefix="confirm_seed",
                         profile_steps=confirmation_profile_steps,
-                        repeat_count=requested_confirm_selected_repeat_count,
+                        repeat_count=confirmation_repeat_count,
                     )
                 )
                 confirmed = _profile_autosize_aggregate_measurements(
@@ -10951,7 +11050,10 @@ def run_llm_batch_profile_autosize(
                         "candidate_index": candidate_index,
                         "extra_seeds": extra_seeds,
                         "confirmation_steps": confirmation_profile_steps,
-                        "confirmation_repeat_count": requested_confirm_selected_repeat_count,
+                        "confirmation_step_multiplier": int(runtime_plan["step_multiplier"]),
+                        "confirmation_repeat_count": confirmation_repeat_count,
+                        "confirmation_adaptive_runtime_applied": bool(runtime_plan["adaptive_runtime_applied"]),
+                        "confirmation_runtime_escalation_level": int(runtime_plan["escalation_level"]),
                         "before": before,
                         "after": {
                             "measured_score": float(confirmed.get("measured_score", 0.0)),
@@ -10977,10 +11079,38 @@ def run_llm_batch_profile_autosize(
                         "extra_seed_count": len(extra_seeds),
                         "extra_seeds": extra_seeds,
                         "confirmation_steps": confirmation_profile_steps,
-                        "confirmation_repeat_count": requested_confirm_selected_repeat_count,
+                        "confirmation_base_step_multiplier": int(runtime_plan["base_step_multiplier"]),
+                        "confirmation_step_multiplier": int(runtime_plan["step_multiplier"]),
+                        "confirmation_base_repeat_count": int(runtime_plan["base_repeat_count"]),
+                        "confirmation_repeat_count": confirmation_repeat_count,
+                        "confirmation_adaptive_runtime_applied": bool(runtime_plan["adaptive_runtime_applied"]),
+                        "confirmation_runtime_escalation_level": int(runtime_plan["escalation_level"]),
+                        "confirmation_runtime_uncertainty": float(runtime_plan["uncertainty"]),
+                        "confirmation_runtime_uncertainty_ratio": float(runtime_plan["uncertainty_ratio"]),
+                        "confirmation_runtime_margin_deficit": float(runtime_plan["margin_deficit"]),
+                        "confirmation_runtime_overlap_ratio": float(runtime_plan["overlap_ratio"]),
+                        "confirmation_runtime_signal": float(runtime_plan["runtime_signal"]),
                         "details": tuple(confirmation_details),
                     }
                 )
+                if bool(runtime_plan["adaptive_runtime_applied"]):
+                    confirmation_runtime_escalations.append(
+                        {
+                            "round_index": int(round_index),
+                            "round_kind": round_kind,
+                            "shape_keys": tuple(str(item["shape_key"]) for item in confirmed_rows),
+                            "extra_seeds": extra_seeds,
+                            "confirmation_steps": confirmation_profile_steps,
+                            "confirmation_step_multiplier": int(runtime_plan["step_multiplier"]),
+                            "confirmation_repeat_count": confirmation_repeat_count,
+                            "escalation_level": int(runtime_plan["escalation_level"]),
+                            "uncertainty": float(runtime_plan["uncertainty"]),
+                            "uncertainty_ratio": float(runtime_plan["uncertainty_ratio"]),
+                            "margin_deficit": float(runtime_plan["margin_deficit"]),
+                            "overlap_ratio": float(runtime_plan["overlap_ratio"]),
+                            "runtime_signal": float(runtime_plan["runtime_signal"]),
+                        }
+                    )
             return len(confirmed_rows)
 
         use_adaptive = (
@@ -11294,6 +11424,8 @@ def run_llm_batch_profile_autosize(
             "confirm_selected_max_rounds": effective_confirm_selected_max_rounds,
             "confirm_selected_decision_resolution_extra_rounds": effective_confirm_selected_decision_resolution_extra_rounds,
             "confirm_selected_decision_resolution_adaptive_extra_round_cap": requested_confirm_selected_decision_resolution_adaptive_extra_rounds,
+            "confirm_selected_runtime_step_multiplier_cap": requested_confirm_selected_runtime_step_multiplier_cap,
+            "confirm_selected_runtime_repeat_count_cap": requested_confirm_selected_runtime_repeat_count_cap,
             "confirm_selected_decision_resolution_adaptive_extra_rounds": confirmation_decision_resolution_adaptive_extra_rounds,
             "confirm_selected_decision_resolution_total_rounds": confirmation_decision_resolution_total_rounds,
             "confirmation_decision_resolution_uncertainty": confirmation_decision_resolution_uncertainty,
@@ -11301,6 +11433,8 @@ def run_llm_batch_profile_autosize(
             "confirmation_decision_resolution_overlap_ratio": confirmation_decision_resolution_overlap_ratio,
             "confirmation_decision_resolution_stop_reason": confirmation_decision_resolution_stop_reason,
             "confirmation_decision_resolution_budget_evaluations": tuple(confirmation_decision_resolution_budget_evaluations),
+            "confirmation_runtime_escalation_count": len(confirmation_runtime_escalations),
+            "confirmation_runtime_escalations": tuple(confirmation_runtime_escalations),
             "confirmation_rounds_used": len(confirmation_rounds),
             "confirmation_decision_resolution_rounds_used": sum(
                 1 for round_ in confirmation_rounds if str(round_.get("round_kind", "")) == "decision_margin_resolution"
@@ -11584,6 +11718,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     profile_autosize.add_argument("--confirm-selected-max-rounds", type=int, default=None, help="maximum finalist/frontier confirmation rounds; default covers the measured frontier")
     profile_autosize.add_argument("--confirm-selected-decision-resolution-extra-rounds", type=int, default=None, help="extra decision-margin resolution rounds after the measured frontier is confirmed; default covers the measured frontier")
     profile_autosize.add_argument("--confirm-selected-decision-resolution-adaptive-extra-rounds", type=int, default=2, help="maximum additional decision-margin resolution rounds added when confirmed winner/challenger intervals still overlap; 0 disables variance-adaptive extension")
+    profile_autosize.add_argument("--confirm-selected-runtime-step-multiplier-cap", type=int, default=4, help="maximum confirmation step multiplier used by uncertainty-adaptive finalist and decision-margin confirmation")
+    profile_autosize.add_argument("--confirm-selected-runtime-repeat-count-cap", type=int, default=4, help="maximum repeat count used by uncertainty-adaptive finalist and decision-margin confirmation")
     profile_autosize.add_argument("--measured-selection-metric", choices=PROFILE_AUTOSIZE_MEASURED_SELECTION_METRICS, default="throughput_gpu")
     profile_autosize.add_argument("--min-cases", type=int, default=1)
     profile_autosize.add_argument("--require-multi-shape", action="store_true")
@@ -11984,6 +12120,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             confirm_selected_max_rounds=args.confirm_selected_max_rounds,
             confirm_selected_decision_resolution_extra_rounds=args.confirm_selected_decision_resolution_extra_rounds,
             confirm_selected_decision_resolution_adaptive_extra_rounds=args.confirm_selected_decision_resolution_adaptive_extra_rounds,
+            confirm_selected_runtime_step_multiplier_cap=args.confirm_selected_runtime_step_multiplier_cap,
+            confirm_selected_runtime_repeat_count_cap=args.confirm_selected_runtime_repeat_count_cap,
             measured_selection_metric=args.measured_selection_metric,
             min_cases=args.min_cases,
             require_multi_shape=args.require_multi_shape,

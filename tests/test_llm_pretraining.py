@@ -1030,6 +1030,7 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
         self.assertEqual(report["measurement"]["confirmation_rounds_used"], 2)
         self.assertEqual(report["measurement"]["confirmed_candidate_count"], 2)
         self.assertEqual(report["measurement"]["confirmation_profile_count"], 4)
+        self.assertEqual(report["measurement"]["confirmation_runtime_escalation_count"], 0)
         self.assertEqual(report["measurement"]["confirmation_seed_count"], 2)
         self.assertEqual(report["measurement"]["confirmation_seeds"], (104742, 209471))
         self.assertEqual(report["measurement"]["confirmed_shape_keys"], (stable_key, fragile_key))
@@ -1165,7 +1166,8 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
         self.assertFalse(report["measurement"]["confirmation_decision_resolved"])
         self.assertEqual(report["measurement"]["confirmation_rounds_used"], 2)
         self.assertEqual(report["measurement"]["confirmed_candidate_count"], 2)
-        self.assertEqual(report["measurement"]["confirmation_profile_count"], 4)
+        self.assertEqual(report["measurement"]["confirmation_profile_count"], 5)
+        self.assertEqual(report["measurement"]["confirmation_runtime_escalation_count"], 1)
         self.assertEqual(report["measurement"]["confirmation_seeds"], (104742, 209471))
         self.assertEqual(report["measurement"]["confirmed_shape_keys"], (selected_key, challenger_key))
         self.assertEqual(report["measurement"]["confirmation_selected_shape_keys"], (selected_key,))
@@ -1180,18 +1182,22 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             report["measurement"]["confirmation_rounds"][1]["details"][0]["shape_key"],
             challenger_key,
         )
+        self.assertTrue(report["measurement"]["confirmation_rounds"][1]["confirmation_adaptive_runtime_applied"])
+        self.assertEqual(report["measurement"]["confirmation_rounds"][1]["confirmation_steps"], 4)
+        self.assertEqual(report["measurement"]["confirmation_rounds"][1]["confirmation_repeat_count"], 3)
         self.assertEqual(measured_by_key[selected_key]["measurement_seeds"], (11, 13, 104742))
         self.assertEqual(measured_by_key[challenger_key]["measurement_seeds"], (11, 13, 209471))
-        self.assertEqual(measured_by_key[challenger_key]["measurement_profile_seeds"], (11, 13, 209471, 209471))
+        self.assertEqual(measured_by_key[challenger_key]["measurement_profile_seeds"], (11, 13, 209471, 209471, 209471))
         self.assertGreater(
             measured_by_key[challenger_key]["measured_score_upper_confidence"],
             measured_by_key[selected_key]["measured_score"],
         )
-        self.assertEqual(len(profile_calls), 8)
+        self.assertEqual(len(profile_calls), 9)
         self.assertEqual(profile_calls[4]["seed"], 104742)
         self.assertEqual(profile_calls[4]["seq_len"], 32)
         self.assertEqual(profile_calls[6]["seed"], 209471)
         self.assertEqual(profile_calls[6]["seq_len"], 64)
+        self.assertEqual(profile_calls[6]["steps"], 4)
         self.assertIn("confirm_seed_104742", str(profile_calls[4]["out_dir"]))
         self.assertIn("confirm_seed_209471", str(profile_calls[6]["out_dir"]))
 
@@ -1285,7 +1291,10 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
         self.assertEqual(report["measurement"]["confirmation_rounds_used"], 3)
         self.assertEqual(report["measurement"]["confirmation_decision_resolution_rounds_used"], 1)
         self.assertEqual(report["measurement"]["confirmed_candidate_count"], 4)
-        self.assertEqual(report["measurement"]["confirmation_profile_count"], 8)
+        self.assertEqual(report["measurement"]["confirmation_profile_count"], 11)
+        self.assertEqual(report["measurement"]["confirm_selected_runtime_step_multiplier_cap"], 4)
+        self.assertEqual(report["measurement"]["confirm_selected_runtime_repeat_count_cap"], 4)
+        self.assertEqual(report["measurement"]["confirmation_runtime_escalation_count"], 2)
         self.assertEqual(report["measurement"]["confirmation_seeds"], (104742, 209471, 314200))
         self.assertEqual(report["measurement"]["confirmation_pending_shape_keys"], ())
         self.assertEqual(
@@ -1300,11 +1309,18 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             report["measurement"]["confirmation_rounds"][2]["shape_keys"],
             (selected_key, challenger_key),
         )
+        self.assertTrue(report["measurement"]["confirmation_rounds"][2]["confirmation_adaptive_runtime_applied"])
+        self.assertEqual(report["measurement"]["confirmation_rounds"][2]["confirmation_steps"], 4)
+        self.assertEqual(report["measurement"]["confirmation_rounds"][2]["confirmation_step_multiplier"], 4)
+        self.assertEqual(report["measurement"]["confirmation_rounds"][2]["confirmation_repeat_count"], 3)
+        self.assertGreater(report["measurement"]["confirmation_rounds"][2]["confirmation_runtime_signal"], 0.0)
         self.assertIsNotNone(report["matrix"])
         self.assertTrue(report["matrix"]["passed"], report["matrix"]["failed_checks"])
-        self.assertEqual(len(profile_calls), 16)
-        self.assertEqual((profile_calls[10]["seed"], profile_calls[10]["seq_len"]), (314200, 32))
-        self.assertEqual((profile_calls[12]["seed"], profile_calls[12]["seq_len"]), (314200, 64))
+        self.assertEqual(len(profile_calls), 19)
+        self.assertEqual((profile_calls[11]["seed"], profile_calls[11]["seq_len"]), (314200, 32))
+        self.assertEqual(profile_calls[11]["steps"], 4)
+        self.assertEqual((profile_calls[14]["seed"], profile_calls[14]["seq_len"]), (314200, 64))
+        self.assertEqual(profile_calls[14]["steps"], 4)
         self.assertIn("decision_margin_resolution", report["measurement"]["confirmation_rounds"][2]["round_kind"])
 
     def test_llm_batch_profile_autosize_adapts_margin_resolution_to_residual_variance(self):
@@ -1404,7 +1420,8 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
         self.assertEqual(report["measurement"]["confirmation_rounds_used"], 4)
         self.assertEqual(report["measurement"]["confirmation_decision_resolution_rounds_used"], 2)
         self.assertEqual(report["measurement"]["confirmed_candidate_count"], 6)
-        self.assertEqual(report["measurement"]["confirmation_profile_count"], 12)
+        self.assertEqual(report["measurement"]["confirmation_profile_count"], 17)
+        self.assertEqual(report["measurement"]["confirmation_runtime_escalation_count"], 3)
         self.assertEqual(report["measurement"]["confirmation_seeds"], (104742, 209471, 314200, 418929))
         self.assertEqual(
             tuple(round_["round_kind"] for round_ in report["measurement"]["confirmation_rounds"]),
@@ -1417,14 +1434,25 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
         )
         self.assertEqual(report["measurement"]["confirmation_rounds"][2]["shape_keys"], (selected_key, challenger_key))
         self.assertEqual(report["measurement"]["confirmation_rounds"][3]["shape_keys"], (selected_key, challenger_key))
+        self.assertEqual(
+            tuple(round_["confirmation_repeat_count"] for round_ in report["measurement"]["confirmation_rounds"][2:]),
+            (3, 3),
+        )
+        self.assertEqual(
+            tuple(round_["confirmation_steps"] for round_ in report["measurement"]["confirmation_rounds"][2:]),
+            (4, 4),
+        )
+        self.assertTrue(all(round_["confirmation_adaptive_runtime_applied"] for round_ in report["measurement"]["confirmation_rounds"][2:]))
         self.assertEqual(measured_by_key[challenger_key]["measurement_seeds"], (11, 13, 209471, 314200, 418929))
         self.assertEqual(measured_by_key[challenger_key]["measured_score_observation_values"], (1300.0, 100.0, 100.0, 100.0, 100.0))
         self.assertIsNotNone(report["matrix"])
         self.assertTrue(report["matrix"]["passed"], report["matrix"]["failed_checks"])
-        self.assertEqual(len(profile_calls), 20)
-        self.assertEqual((profile_calls[14]["seed"], profile_calls[14]["seq_len"]), (418929, 32))
-        self.assertEqual((profile_calls[16]["seed"], profile_calls[16]["seq_len"]), (418929, 64))
-        self.assertIn("confirm_seed_418929", str(profile_calls[14]["out_dir"]))
+        self.assertEqual(len(profile_calls), 25)
+        self.assertEqual((profile_calls[17]["seed"], profile_calls[17]["seq_len"]), (418929, 32))
+        self.assertEqual(profile_calls[17]["steps"], 4)
+        self.assertEqual((profile_calls[20]["seed"], profile_calls[20]["seq_len"]), (418929, 64))
+        self.assertEqual(profile_calls[20]["steps"], 4)
+        self.assertIn("confirm_seed_418929", str(profile_calls[17]["out_dir"]))
 
     def test_llm_batch_profile_autosize_reevaluates_margin_resolution_after_each_round(self):
         profile_calls = []
@@ -1525,7 +1553,8 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
         self.assertEqual(report["measurement"]["confirm_selected_decision_resolution_total_rounds"], 3)
         self.assertEqual(report["measurement"]["confirmation_decision_resolution_rounds_used"], 3)
         self.assertEqual(report["measurement"]["confirmation_rounds_used"], 5)
-        self.assertEqual(report["measurement"]["confirmation_profile_count"], 16)
+        self.assertEqual(report["measurement"]["confirmation_profile_count"], 23)
+        self.assertEqual(report["measurement"]["confirmation_runtime_escalation_count"], 4)
         self.assertEqual(report["measurement"]["confirmation_seeds"], (104742, 209471, 314200, 418929, 523658))
         self.assertEqual(tuple(item["budget_kind"] for item in budget_evaluations), ("base", "adaptive", "adaptive"))
         self.assertEqual(tuple(item["adaptive_extra_rounds_used"] for item in budget_evaluations), (0, 1, 2))
@@ -1540,14 +1569,25 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 "decision_margin_resolution",
             ),
         )
+        self.assertEqual(
+            tuple(round_["confirmation_repeat_count"] for round_ in report["measurement"]["confirmation_rounds"][2:]),
+            (3, 3, 3),
+        )
+        self.assertEqual(
+            tuple(round_["confirmation_steps"] for round_ in report["measurement"]["confirmation_rounds"][2:]),
+            (4, 4, 4),
+        )
+        self.assertTrue(all(round_["confirmation_adaptive_runtime_applied"] for round_ in report["measurement"]["confirmation_rounds"][2:]))
         self.assertEqual(measured_by_key[challenger_key]["measurement_seeds"], (11, 13, 209471, 314200, 418929, 523658))
         self.assertEqual(measured_by_key[challenger_key]["measured_score_observation_values"], (1300.0, 100.0, 100.0, 900.0, 100.0, 100.0))
         self.assertIsNotNone(report["matrix"])
         self.assertTrue(report["matrix"]["passed"], report["matrix"]["failed_checks"])
-        self.assertEqual(len(profile_calls), 24)
-        self.assertEqual((profile_calls[18]["seed"], profile_calls[18]["seq_len"]), (523658, 32))
-        self.assertEqual((profile_calls[20]["seed"], profile_calls[20]["seq_len"]), (523658, 64))
-        self.assertIn("confirm_seed_523658", str(profile_calls[18]["out_dir"]))
+        self.assertEqual(len(profile_calls), 31)
+        self.assertEqual((profile_calls[23]["seed"], profile_calls[23]["seq_len"]), (523658, 32))
+        self.assertEqual(profile_calls[23]["steps"], 4)
+        self.assertEqual((profile_calls[26]["seed"], profile_calls[26]["seq_len"]), (523658, 64))
+        self.assertEqual(profile_calls[26]["steps"], 4)
+        self.assertIn("confirm_seed_523658", str(profile_calls[23]["out_dir"]))
 
     def test_llm_batch_profile_autosize_default_confirmation_rounds_cover_measured_frontier(self):
         profile_calls = []
@@ -1636,7 +1676,8 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
         self.assertTrue(report["measurement"]["confirmation_decision_resolved"])
         self.assertEqual(report["measurement"]["confirmation_rounds_used"], 3)
         self.assertEqual(report["measurement"]["confirmed_candidate_count"], 3)
-        self.assertEqual(report["measurement"]["confirmation_profile_count"], 6)
+        self.assertEqual(report["measurement"]["confirmation_profile_count"], 8)
+        self.assertEqual(report["measurement"]["confirmation_runtime_escalation_count"], 2)
         self.assertEqual(report["measurement"]["confirmation_seeds"], (104742, 209471, 314200))
         self.assertEqual(
             report["measurement"]["confirmed_shape_keys"],
@@ -1647,11 +1688,13 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             tuple(round_["shape_keys"][0] for round_ in report["measurement"]["confirmation_rounds"]),
             (selected_key, challenger_96_key, challenger_64_key),
         )
-        self.assertEqual(len(profile_calls), 14)
+        self.assertEqual(len(profile_calls), 16)
         self.assertEqual((profile_calls[6]["seed"], profile_calls[6]["seq_len"]), (104742, 32))
         self.assertEqual((profile_calls[8]["seed"], profile_calls[8]["seq_len"]), (209471, 96))
-        self.assertEqual((profile_calls[10]["seed"], profile_calls[10]["seq_len"]), (314200, 64))
-        self.assertIn("confirm_seed_314200", str(profile_calls[10]["out_dir"]))
+        self.assertEqual(profile_calls[8]["steps"], 4)
+        self.assertEqual((profile_calls[11]["seed"], profile_calls[11]["seq_len"]), (314200, 64))
+        self.assertEqual(profile_calls[11]["steps"], 4)
+        self.assertIn("confirm_seed_314200", str(profile_calls[11]["out_dir"]))
 
     def test_llm_batch_profile_autosize_refines_uncertain_candidate_with_extra_seed(self):
         profile_calls = []
