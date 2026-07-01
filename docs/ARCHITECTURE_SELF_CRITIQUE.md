@@ -1,6 +1,6 @@
 # Cortex-3 Architecture Self-Critique
 
-Etat: boucle d'audit 8 apres integration du kernel CUDA natif tuilé/warp, de l'autotune CUDA mesure/cache, des profils persistants, du fast STE autograd, du backward `grad_input` natif sur poids int2 packes, de la requantization/packing CUDA fusionnee post-update, du doctor toolchain CUDA C++ explicite et d'un smoke extension PyTorch CUDA 12.8 reel.
+Etat: boucle d'audit 9 apres integration du backend PyTorch C++/CUDA extension dans le vrai training `BitLinear`, avec forward, backward `grad_input`, requantization/packing post-update, compteurs backend/requantize explicites, doctor strict et smoke LLM CUDA `--native-ternary-backend extension`.
 
 Ce document sert de registre de critique et de correction. Il ne remplace pas les tests longs interdits pour cette iteration; il se limite aux preuves courtes disponibles, aux rapports du code et aux benchmarks GPU courts.
 
@@ -14,7 +14,7 @@ Ce document sert de registre de critique et de correction. Il ne remplace pas le
   - `warp_reduction_int2`: une sortie par warp, reduction K sur 32 lanes, utile pour K plus grand.
 - Integration: `BitLinear` garde le forward ternaire packe + STE, selectionne `auto/tiled/warp`, trace le backend et la variante dans `PackedTernaryDispatch`, et les rapports LLM exposent `native_ternary_kernel_variants`.
 - Verification courte: tests CUDA fp32/fp16/bf16, gradient STE, full Cortex court et benchmarks courts RTX 5070.
-- Statut: corrige pour cette boucle, mais pas encore "termine final" car il manque autotuning large, energie/VRAM et packaging CUDA/C++ bas niveau.
+- Statut: corrige pour cette boucle, mais pas encore "termine final" car il manque autotuning large, energie/VRAM et reduction du `grad_weight` dense.
 
 ### C2. Auto-selection kernel trop grossiere
 
@@ -88,7 +88,7 @@ Ce document sert de registre de critique et de correction. Il ne remplace pas le
 - Critique: apres C9, le forward training ne payait plus le `F.linear` dense STE, mais le backward reconstruisait encore un poids dense pour calculer `grad_input`. Cela limitait la valeur "hardware-native ternary" pendant l'entrainement.
 - Correction: ajout de kernels `ternary_grad_input_warp_fp32/fp16/bf16`. Le backward CUDA de `_PackedTernarySTEFunction` calcule maintenant `grad_input = grad_output @ W_ternary` directement depuis les codes int2 packes, les scales et le residual optionnel, avec accumulation fp32 par warp.
 - Verification courte: `test_native_ternary_cuda_fast_ste_backward_matches_dense_ste` compare pertes, `grad_input`, `grad_weight` et `grad_bias` entre fast STE natif et dense STE en fp32/fp16/bf16, avec et sans residual runtime, sur GPU. Benchmark RTX 5070 `128x256x256 fp16`: forward+backward fast STE `0.9865 ms` contre dense STE legacy `1.3301 ms`, soit `1.35x`, erreur max `0.000976`.
-- Statut: corrige pour `grad_input`; `grad_weight = grad_output^T @ input` reste volontairement dense/exact dans PyTorch, et le packaging C++/CUDA bas niveau reste ouvert.
+- Statut: corrige pour `grad_input`; `grad_weight = grad_output^T @ input` reste volontairement dense/exact dans PyTorch.
 
 ### C12. Requantization/packing post-optimizer encore tensorielle
 
@@ -96,17 +96,17 @@ Ce document sert de registre de critique et de correction. Il ne remplace pas le
 - Correction: ajout de `ternary_requantize_pack_fp32/fp16/bf16`, un RawKernel CUDA row-wise. Chaque block reduit `abs(weight)` pour calculer la scale, applique le seuil, ecrit signs/mask/residual, packe directement les codes int2 et retourne le compte d'actifs par ligne. `_sync_quantized_buffers_from_weight` l'utilise automatiquement sur CUDA/shared-scale et leve l'erreur si `require_native_cuda_kernel=True` mais que le kernel echoue.
 - Debug effectue: la premiere version activait trop de poids avec seuil fixe parce que les scalaires RawKernel etaient passes sans type explicite; les arguments sont maintenant forces en `cp.int32`/`cp.float32`.
 - Verification courte: `test_native_ternary_cuda_requantize_pack_matches_torch_sync` compare signs, mask, scales, residuals, packed codes et compte d'actifs contre le chemin PyTorch en fp32/fp16/bf16, avec threshold automatique et seuil fixe plus residual threshold. Benchmark RTX 5070 `128x256x256 fp16`: requantize/pack natif `0.2245 ms` contre PyTorch `0.5901 ms`, soit `2.63x`.
-- Statut: corrige pour le chemin post-update local; reste a profiler sur toutes les shapes LLM et a sortir de CuPy/NVRTC vers extension CUDA/C++.
+- Statut: corrige pour le chemin post-update local; reste a profiler sur toutes les shapes LLM.
 
-### C13. Packaging C++/CUDA encore flou
+### C13. Packaging C++/CUDA rendu executable dans le training
 
-- Critique: l'auto-critique disait "pas extension C++/CUDA packagee" sans que le doctor sache si le PC pouvait vraiment la builder. C'etait trop flou pour un objectif qui mentionne explicitement `cl`.
+- Critique: l'auto-critique disait "pas extension C++/CUDA packagee" sans que le doctor sache si le PC pouvait vraiment la builder, puis le premier smoke prouvait seulement un kernel jouet. C'etait insuffisant pour affirmer que le training Cortex utilisait le backend extension.
 - Diagnostic reel: `cl` existe via Visual Studio Community 18 (`MSVC 14.51`), mais `nvcc 12.8` plante dans `cudafe++` avec ce host compiler, meme sur un `.cu` minimal. Visual Studio Build Tools 2022 est aussi installe (`MSVC 14.44`), et ce chemin compile correctement avec le toolkit CUDA 12.8 user-level installe par micromamba dans `C:\Users\hight\.codex\cuda-12.8\Library`.
-- Correction: `llm_doctor_report` expose maintenant plusieurs `cuda_home_candidates`, choisit le `nvcc` qui matche `torch.version.cuda=12.8`, detecte les installations Visual Studio/cl et prefere VS2022. Les scripts `tools\run_cuda128_minimal_nvcc_smoke.ps1` et `tools\run_cuda128_extension_smoke.ps1` chargent VS2022, fixent `CUDA_HOME`, isolent le cache torch extension et corrigent le layout conda `lib\x64\cudart.lib`.
-- Verification courte: `tools\train_llm.py doctor --require-cuda --require-cuda-extension --precision bf16 --device cuda` passe; le smoke `nvcc` minimal produit `minimal.obj`; le smoke PyTorch extension compile et execute `result [1.0, 2.0, 3.0, 4.0]` sur CUDA.
-- Statut: corrige pour la detection/preflight et la compilation extension; pas encore corrige pour le backend training Cortex, qui utilise toujours les RawKernels CuPy pour forward/grad_input/requantize.
+- Correction: `llm_doctor_report` expose maintenant plusieurs `cuda_home_candidates`, choisit le `nvcc` qui matche `torch.version.cuda=12.8`, detecte les installations Visual Studio/cl et prefere VS2022. `BitLinearConfig.native_cuda_backend` accepte `auto`, `extension` ou `rawkernel`; le backend extension compile les kernels Cortex forward, `grad_input` et `requantize_pack` via `torch.utils.cpp_extension.load_inline`, avec `cuda-libraries-dev` et `cuda-cccl` locaux pour `cusparse.h` et `nv/target`.
+- Verification courte: `tools\train_llm.py doctor --require-cuda --require-cuda-extension --precision bf16 --device cuda` passe; `test_bitlinear_native_extension_cuda_dispatch_runs_on_gpu` force `native_cuda_backend=extension`; le smoke LLM `tools\train_llm.py smoke --device cuda --require-cuda --native-ternary-backend extension --steps 2` rapporte `native_ternary_backend_counts={'extension': 2185}`, `native_ternary_requantize_backend_counts={'extension': 230}`, `torch_packed_ternary_dispatches=0` et les audits P2/architecture passent.
+- Statut: corrige pour le backend training Cortex extension; pas encore corrige pour la preuve hardware finale, car `grad_weight` reste dense/exact et les mesures energie/VRAM/longues shapes restent a produire.
 
-## Critique phase par phase - boucle 8
+## Critique phase par phase - boucle 9
 
 ### P1 - Verifier OS
 
@@ -118,9 +118,9 @@ Ce document sert de registre de critique et de correction. Il ne remplace pas le
 
 ### P2 - Ternary Core
 
-- Ce qui est solide: poids ternaires packes int2, quantization activations, STE, sync versionnee des buffers packes pendant training, kernels CUDA natifs tuiles/warp, autotune CUDA-event par shape, profil JSON persistant, cache layer-local, fast STE autograd forward, backward CUDA `grad_input` depuis poids int2 packes, requantization/packing post-update fusionnee CUDA, doctor CUDA distinguant RawKernel pret et extension C++/CUDA compilable, audit LLM exigeant native kernel autotune sur CUDA.
-- Preuve actuelle: tests CUDA courts, export/import profil, tests gradients fast-vs-dense STE en fp32/fp16/bf16, test de parite requantize/pack fp32/fp16/bf16, doctor toolchain strict, smoke `nvcc` minimal, smoke extension PyTorch CUDA reel, benchmark RTX 5070 avec full forward, forward+backward et requantize/pack profile, full Cortex court avec `native_ternary_autotuned_dispatches`.
-- Faiblesse: kernels training encore CuPy/NVRTC; le packaging extension est prouve mais pas encore le backend par defaut pour forward/grad_input/requantize; pas de mesure energie/VRAM longue; `grad_weight` STE reste dense pour conserver l'exactitude du gradient.
+- Ce qui est solide: poids ternaires packes int2, quantization activations, STE, sync versionnee des buffers packes pendant training, kernels CUDA natifs tuiles/warp, autotune CUDA-event par shape, profil JSON persistant, cache layer-local, fast STE autograd forward, backward CUDA `grad_input` depuis poids int2 packes, requantization/packing post-update fusionnee CUDA, backend extension C++/CUDA strict, doctor CUDA distinguant RawKernel et extension runtime, audit LLM exigeant native kernel autotune sur CUDA.
+- Preuve actuelle: tests CUDA courts, export/import profil, tests gradients fast-vs-dense STE en fp32/fp16/bf16, test de parite requantize/pack fp32/fp16/bf16, test extension forcee, doctor toolchain strict, benchmark RTX 5070 avec full forward, forward+backward et requantize/pack profile, smoke LLM extension avec 2185 dispatches forward extension et 230 requantize extension.
+- Faiblesse: pas de mesure energie/VRAM longue; `grad_weight` STE reste dense pour conserver l'exactitude du gradient; le backend extension est prouve mais pas encore benchmarke comme chemin par defaut sur larges shapes.
 - Risque architectural: le chemin training utilise maintenant les codes int2 en forward, pour `grad_input`, et pendant le repack post-update, mais le gain hardware complet demandera un kernel backward plus complet ou une strategie d'optimisation qui evite/compresse le `grad_weight` dense.
 - Correction prioritaire restante: reduire ou fusionner le cout `grad_weight` STE sans casser la semantique d'apprentissage, puis profiler energie/VRAM.
 

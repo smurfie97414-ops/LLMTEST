@@ -64,7 +64,9 @@ from cortex3_ternary import (
     LayerForwardEvent,
     MTPFSPEvent,
     PackedTernaryDispatch,
+    native_backend_from_runtime_label,
     native_ternary_cuda_available,
+    native_ternary_cuda_extension_available,
 )
 
 
@@ -168,6 +170,8 @@ def _restore_compression_trace_ledger(ledger: CompressionTraceLedger | None, pay
     ledger.total_torch_packed_ternary_dispatches = 0
     ledger.total_native_ternary_autotuned_dispatches = 0
     ledger.total_native_ternary_autotune_cache_hits = 0
+    ledger.native_ternary_backend_counts.clear()
+    ledger.native_ternary_requantize_backend_counts.clear()
     ledger.total_weight_bits_read = 0.0
     ledger.total_activation_bits = 0.0
     ledger.total_kv_bytes = 0.0
@@ -279,6 +283,10 @@ def _restore_compression_trace_ledger(ledger: CompressionTraceLedger | None, pay
                 note=str(data.get("note", "")),
                 native_kernel=bool(data.get("native_kernel", False)),
                 kernel_variant=str(data.get("kernel_variant", "")),
+                native_backend=str(
+                    data.get("native_backend")
+                    or native_backend_from_runtime_label(str(data.get("backend", "")), default="")
+                ),
                 autotuned=bool(data.get("autotuned", False)),
                 autotune_cache_hit=bool(data.get("autotune_cache_hit", False)),
                 autotune_candidate_ms=tuple(
@@ -321,6 +329,31 @@ def _restore_compression_trace_ledger(ledger: CompressionTraceLedger | None, pay
             sum(1 for item in ledger.packed_ternary_dispatches if item.autotune_cache_hit),
         )
     )
+    native_backend_counts = {
+        str(key): int(value)
+        for key, value in dict(payload.get("native_ternary_backend_counts") or {}).items()
+    }
+    native_requantize_backend_counts = {
+        str(key): int(value)
+        for key, value in dict(payload.get("native_ternary_requantize_backend_counts") or {}).items()
+    }
+    for key, value in total_counts.items():
+        text_key = str(key)
+        if text_key.startswith("native_ternary_") and text_key.endswith("_kernel_dispatches"):
+            backend = text_key.removeprefix("native_ternary_").removesuffix("_kernel_dispatches")
+            if backend:
+                native_backend_counts.setdefault(backend, int(value))
+        if text_key.startswith("native_ternary_") and text_key.endswith("_requantize_dispatches"):
+            backend = text_key.removeprefix("native_ternary_").removesuffix("_requantize_dispatches")
+            if backend:
+                native_requantize_backend_counts.setdefault(backend, int(value))
+    if not native_backend_counts:
+        for item in ledger.packed_ternary_dispatches:
+            if item.native_kernel or item.backend.startswith("native_"):
+                backend = item.native_backend or native_backend_from_runtime_label(item.backend, default="unknown")
+                native_backend_counts[backend] = native_backend_counts.get(backend, 0) + 1
+    ledger.native_ternary_backend_counts.update(native_backend_counts)
+    ledger.native_ternary_requantize_backend_counts.update(native_requantize_backend_counts)
     cost_trace = dict(payload.get("cost_trace") or {})
     ledger.total_weight_bits_read = float(
         cost_trace.get("weight_bits_read", sum(item.estimated_bits for item in ledger.compression_decisions))
@@ -1537,6 +1570,7 @@ class TransformerConfig:
     ternary_activation_bits: int = 4
     use_native_ternary_kernel: bool = True
     require_native_ternary_kernel: bool = False
+    native_ternary_backend: str = "auto"
     native_ternary_autotune_cache_path: str | None = None
     native_ternary_autotune_cache_write: bool = True
     use_skill_aware_experts: bool = False
@@ -1564,6 +1598,8 @@ class TransformerConfig:
             raise ValueError("horizons must be positive")
         if self.use_ternary_core and self.ternary_activation_bits < 2:
             raise ValueError("ternary_activation_bits must be >= 2")
+        if self.native_ternary_backend not in {"auto", "extension", "rawkernel"}:
+            raise ValueError("native_ternary_backend must be one of: auto, extension, rawkernel")
         if self.skill_expert_count < 1:
             raise ValueError("skill_expert_count must be positive")
         if not 1 <= self.skill_expert_top_k <= self.skill_expert_count:
@@ -1596,6 +1632,7 @@ def _make_transformer_linear(
             log_prefix=log_prefix,
             use_native_cuda_kernel=config.use_native_ternary_kernel,
             require_native_cuda_kernel=config.require_native_ternary_kernel,
+            native_cuda_backend=config.native_ternary_backend,
             native_cuda_autotune_cache_path=config.native_ternary_autotune_cache_path,
             native_cuda_autotune_cache_write=config.native_ternary_autotune_cache_write,
         ),
@@ -2781,6 +2818,7 @@ def cuda_toolchain_report() -> dict[str, Any]:
         selected_cuda = cuda_candidates[0]
     rawkernel_available = False
     rawkernel_error = ""
+    extension_runtime_available = False
     if torch.cuda.is_available():
         try:
             rawkernel_available = bool(native_ternary_cuda_available())
@@ -2790,6 +2828,8 @@ def cuda_toolchain_report() -> dict[str, Any]:
     has_cuda_headers = bool(selected_cuda and selected_cuda["include_cuda_runtime_h"])
     has_cudart_lib = bool(selected_cuda and selected_cuda["cudart_lib"])
     extension_ready = bool(torch.cuda.is_available() and visual_studio["cl_available"] and nvcc_matches_torch and has_cuda_headers and has_cudart_lib)
+    if extension_ready:
+        extension_runtime_available = bool(native_ternary_cuda_extension_available())
     return {
         "torch_cuda": torch_cuda,
         "cuda_available": bool(torch.cuda.is_available()),
@@ -2808,13 +2848,15 @@ def cuda_toolchain_report() -> dict[str, Any]:
         "native_rawkernel_available": rawkernel_available,
         "native_rawkernel_error": rawkernel_error,
         "cuda_extension_toolchain_ready": extension_ready,
+        "native_extension_runtime_available": extension_runtime_available,
         "cuda_extension_blocker": (
             ""
-            if extension_ready
+            if extension_ready and extension_runtime_available
             else (
                 "CUDA C++ extension build requires cl plus an nvcc toolkit whose major.minor version matches torch.version.cuda; "
                 f"torch={torch_cuda}, nvcc={selected_cuda['nvcc_release'] if selected_cuda else None}, "
-                f"cl_available={visual_studio['cl_available']}, cuda_headers={has_cuda_headers}, cudart_lib={has_cudart_lib}"
+                f"cl_available={visual_studio['cl_available']}, cuda_headers={has_cuda_headers}, cudart_lib={has_cudart_lib}, "
+                f"extension_runtime_available={extension_runtime_available}"
             )
         ),
     }
@@ -2852,6 +2894,12 @@ def llm_doctor_report(
         "cuda:extension_toolchain_ready",
         bool(cuda_toolchain["cuda_extension_toolchain_ready"]),
         cuda_toolchain["cuda_extension_blocker"] or "CUDA C++ extension toolchain is ready",
+        required=require_cuda_extension,
+    )
+    add_check(
+        "cuda:native_extension_runtime_available",
+        bool(cuda_toolchain["native_extension_runtime_available"]),
+        cuda_toolchain["cuda_extension_blocker"] or "Cortex ternary CUDA extension builds and loads",
         required=require_cuda_extension,
     )
 
@@ -2901,6 +2949,13 @@ def _cortex_architecture_audit_from_summary(summary: Mapping[str, Any]) -> dict[
     phase_counts = {str(key): int(value) for key, value in dict(summary.get("phase_event_counts") or {}).items()}
     trace_counts = {str(key): int(value) for key, value in dict(summary.get("compression_trace_counts") or {}).items()}
     native_ternary_required = bool(summary.get("native_ternary_kernel_required", False))
+    native_backend_requested = str(summary.get("native_ternary_backend_requested", "auto"))
+    native_backend_counts = {str(key): int(value) for key, value in dict(summary.get("native_ternary_backend_counts") or {}).items()}
+    native_requantize_backend_counts = {
+        str(key): int(value)
+        for key, value in dict(summary.get("native_ternary_requantize_backend_counts") or {}).items()
+    }
+    native_dispatch_required = native_ternary_required or native_backend_requested == "extension"
     replay_by_phase = {
         str(key): int(value)
         for key, value in dict(summary.get("phase_replay_examples_by_phase") or {}).items()
@@ -2921,6 +2976,14 @@ def _cortex_architecture_audit_from_summary(summary: Mapping[str, Any]) -> dict[
 
     def trace_count(name: str) -> int:
         return int(trace_counts.get(name, 0))
+
+    def requested_native_backend_met() -> bool:
+        if native_backend_requested != "extension":
+            return True
+        return (
+            native_backend_counts.get("extension", 0) > 0
+            and native_requantize_backend_counts.get("extension", 0) > 0
+        )
 
     def replay_count(phase_id: str) -> int:
         return int(replay_by_phase.get(phase_id, 0))
@@ -3046,13 +3109,18 @@ def _cortex_architecture_audit_from_summary(summary: Mapping[str, Any]) -> dict[
     )
     add(
         "native_ternary_cuda_kernel",
-        (not native_ternary_required)
+        (not native_dispatch_required)
         or (
             trace_count("native_ternary_kernel_dispatches") > 0
             and trace_count("native_ternary_autotuned_dispatches") > 0
+            and requested_native_backend_met()
         ),
         {
             "native_ternary_kernel_required": native_ternary_required,
+            "native_ternary_dispatch_required": native_dispatch_required,
+            "native_ternary_backend_requested": native_backend_requested,
+            "native_ternary_backend_counts": native_backend_counts,
+            "native_ternary_requantize_backend_counts": native_requantize_backend_counts,
             "native_ternary_kernel_dispatches": trace_count("native_ternary_kernel_dispatches"),
             "torch_packed_ternary_dispatches": trace_count("torch_packed_ternary_dispatches"),
             "native_ternary_autotuned_dispatches": trace_count("native_ternary_autotuned_dispatches"),
@@ -3257,6 +3325,13 @@ def _cortex_phase_deliverable_audit_from_summary(summary: Mapping[str, Any]) -> 
     phase_counts = {str(key): int(value) for key, value in dict(summary.get("phase_event_counts") or {}).items()}
     trace_counts = {str(key): int(value) for key, value in dict(summary.get("compression_trace_counts") or {}).items()}
     native_ternary_required = bool(summary.get("native_ternary_kernel_required", False))
+    native_backend_requested = str(summary.get("native_ternary_backend_requested", "auto"))
+    native_backend_counts = {str(key): int(value) for key, value in dict(summary.get("native_ternary_backend_counts") or {}).items()}
+    native_requantize_backend_counts = {
+        str(key): int(value)
+        for key, value in dict(summary.get("native_ternary_requantize_backend_counts") or {}).items()
+    }
+    native_dispatch_required = native_ternary_required or native_backend_requested == "extension"
     replay_by_phase = {
         str(key): int(value)
         for key, value in dict(summary.get("phase_replay_examples_by_phase") or {}).items()
@@ -3270,6 +3345,14 @@ def _cortex_phase_deliverable_audit_from_summary(summary: Mapping[str, Any]) -> 
 
     def trace(key: str) -> int:
         return int(trace_counts.get(key, 0))
+
+    def requested_native_backend_met() -> bool:
+        if native_backend_requested != "extension":
+            return True
+        return (
+            native_backend_counts.get("extension", 0) > 0
+            and native_requantize_backend_counts.get("extension", 0) > 0
+        )
 
     def number(key: str) -> float:
         value = summary.get(key, 0)
@@ -3333,10 +3416,11 @@ def _cortex_phase_deliverable_audit_from_summary(summary: Mapping[str, Any]) -> 
         and trace("compression_decisions") > 0
         and trace("packed_ternary_dispatches") > 0
         and (
-            (not native_ternary_required)
+            (not native_dispatch_required)
             or (
                 trace("native_ternary_kernel_dispatches") > 0
                 and trace("native_ternary_autotuned_dispatches") > 0
+                and requested_native_backend_met()
             )
         ),
         {
@@ -3345,6 +3429,10 @@ def _cortex_phase_deliverable_audit_from_summary(summary: Mapping[str, Any]) -> 
             "compression_decisions": trace("compression_decisions"),
             "packed_ternary_dispatches": trace("packed_ternary_dispatches"),
             "native_ternary_kernel_required": native_ternary_required,
+            "native_ternary_dispatch_required": native_dispatch_required,
+            "native_ternary_backend_requested": native_backend_requested,
+            "native_ternary_backend_counts": native_backend_counts,
+            "native_ternary_requantize_backend_counts": native_requantize_backend_counts,
             "native_ternary_kernel_dispatches": trace("native_ternary_kernel_dispatches"),
             "native_ternary_autotuned_dispatches": trace("native_ternary_autotuned_dispatches"),
             "native_ternary_autotune_cache_hits": trace("native_ternary_autotune_cache_hits"),
@@ -4529,8 +4617,18 @@ class CortexTrainingPhaseController:
     def checkpoint_state_summary(self) -> dict[str, Any]:
         compression_trace = self.model.compression_trace()
         compression_trace_counts = {}
+        native_backend_counts: dict[str, int] = {}
+        native_requantize_backend_counts: dict[str, int] = {}
         if compression_trace.get("enabled"):
             compression_trace_counts = dict(compression_trace.get("total_event_counts") or {})
+            native_backend_counts = {
+                str(key): int(value)
+                for key, value in dict(compression_trace.get("native_ternary_backend_counts") or {}).items()
+            }
+            native_requantize_backend_counts = {
+                str(key): int(value)
+                for key, value in dict(compression_trace.get("native_ternary_requantize_backend_counts") or {}).items()
+            }
             if not compression_trace_counts:
                 compression_trace_counts = {
                     "compression_decisions": len(compression_trace.get("compression_decisions", ())),
@@ -4561,6 +4659,19 @@ class CortexTrainingPhaseController:
                     compression_trace_counts["packed_ternary_dispatches"]
                     - compression_trace_counts["native_ternary_kernel_dispatches"],
                 )
+            if not native_backend_counts:
+                for item in compression_trace.get("packed_ternary_dispatches", ()):
+                    data = dict(item)
+                    if bool(data.get("native_kernel", False)) or str(data.get("backend", "")).startswith("native_"):
+                        backend = str(
+                            data.get("native_backend")
+                            or native_backend_from_runtime_label(str(data.get("backend", "")), default="unknown")
+                        )
+                        native_backend_counts[backend] = native_backend_counts.get(backend, 0) + 1
+            for backend, count in native_backend_counts.items():
+                compression_trace_counts.setdefault(f"native_ternary_{backend}_kernel_dispatches", int(count))
+            for backend, count in native_requantize_backend_counts.items():
+                compression_trace_counts.setdefault(f"native_ternary_{backend}_requantize_dispatches", int(count))
         phase_counts = dict(self.phase_counts)
         if compression_trace_counts.get("layer_forward_events", 0) > 0:
             phase_counts["P2"] = max(phase_counts.get("P2", 0), compression_trace_counts["layer_forward_events"])
@@ -4588,6 +4699,9 @@ class CortexTrainingPhaseController:
             "objective_feedback_history": _last_items(self.objective_feedback_history, 5),
             "future_contract_decisions": len(self.future_ledger.decisions),
             "compression_trace_counts": compression_trace_counts,
+            "native_ternary_backend_requested": str(self.model.config.native_ternary_backend),
+            "native_ternary_backend_counts": native_backend_counts,
+            "native_ternary_requantize_backend_counts": native_requantize_backend_counts,
             "native_ternary_kernel_required": bool(
                 torch.cuda.is_available()
                 and self.model.config.use_ternary_core
@@ -5026,8 +5140,18 @@ class CortexTrainingPhaseController:
     def summary(self) -> Mapping[str, Any]:
         compression_trace = self.model.compression_trace()
         trace_counts = {}
+        native_backend_counts: dict[str, int] = {}
+        native_requantize_backend_counts: dict[str, int] = {}
         if compression_trace.get("enabled"):
             trace_counts = dict(compression_trace.get("total_event_counts") or {})
+            native_backend_counts = {
+                str(key): int(value)
+                for key, value in dict(compression_trace.get("native_ternary_backend_counts") or {}).items()
+            }
+            native_requantize_backend_counts = {
+                str(key): int(value)
+                for key, value in dict(compression_trace.get("native_ternary_requantize_backend_counts") or {}).items()
+            }
             if not trace_counts:
                 trace_counts = {
                     "compression_decisions": len(compression_trace.get("compression_decisions", ())),
@@ -5047,6 +5171,19 @@ class CortexTrainingPhaseController:
                     0,
                     trace_counts["packed_ternary_dispatches"] - trace_counts["native_ternary_kernel_dispatches"],
                 )
+            if not native_backend_counts:
+                for item in compression_trace.get("packed_ternary_dispatches", ()):
+                    data = dict(item)
+                    if bool(data.get("native_kernel", False)) or str(data.get("backend", "")).startswith("native_"):
+                        backend = str(
+                            data.get("native_backend")
+                            or native_backend_from_runtime_label(str(data.get("backend", "")), default="unknown")
+                        )
+                        native_backend_counts[backend] = native_backend_counts.get(backend, 0) + 1
+            for backend, count in native_backend_counts.items():
+                trace_counts.setdefault(f"native_ternary_{backend}_kernel_dispatches", int(count))
+            for backend, count in native_requantize_backend_counts.items():
+                trace_counts.setdefault(f"native_ternary_{backend}_requantize_dispatches", int(count))
             if trace_counts["layer_forward_events"] > 0:
                 self.phase_counts["P2"] = max(self.phase_counts.get("P2", 0), trace_counts["layer_forward_events"])
         phases = []
@@ -5064,6 +5201,9 @@ class CortexTrainingPhaseController:
             "all_phases_active": all(item["active_in_llm_training"] for item in phases),
             "phases": phases,
             "phase_event_counts": dict(self.phase_counts),
+            "native_ternary_backend_requested": str(self.model.config.native_ternary_backend),
+            "native_ternary_backend_counts": native_backend_counts,
+            "native_ternary_requantize_backend_counts": native_requantize_backend_counts,
             "native_ternary_kernel_required": bool(
                 torch.cuda.is_available()
                 and self.model.config.use_ternary_core
@@ -5074,6 +5214,11 @@ class CortexTrainingPhaseController:
                 "packed_ternary_dispatches": trace_counts.get("packed_ternary_dispatches", 0),
                 "native_ternary_kernel_dispatches": trace_counts.get("native_ternary_kernel_dispatches", 0),
                 "torch_packed_ternary_dispatches": trace_counts.get("torch_packed_ternary_dispatches", 0),
+                "native_ternary_backend_requested": str(self.model.config.native_ternary_backend),
+                "native_ternary_backend_counts": native_backend_counts,
+                "native_ternary_requantize_backend_counts": native_requantize_backend_counts,
+                "native_ternary_extension_kernel_dispatches": trace_counts.get("native_ternary_extension_kernel_dispatches", 0),
+                "native_ternary_extension_requantize_dispatches": trace_counts.get("native_ternary_extension_requantize_dispatches", 0),
                 "native_ternary_kernel_variants": tuple(compression_trace.get("native_ternary_kernel_variants", ())),
                 "native_ternary_autotuned_dispatches": trace_counts.get("native_ternary_autotuned_dispatches", 0),
                 "native_ternary_autotune_cache_hits": trace_counts.get("native_ternary_autotune_cache_hits", 0),
@@ -5151,6 +5296,9 @@ class CortexTrainingPhaseController:
                     "objective_feedback_term_count": len(self.last_objective_loss_terms),
                     "future_contract_decisions": len(self.future_ledger.decisions),
                     "compression_trace_counts": trace_counts,
+                    "native_ternary_backend_requested": str(self.model.config.native_ternary_backend),
+                    "native_ternary_backend_counts": native_backend_counts,
+                    "native_ternary_requantize_backend_counts": native_requantize_backend_counts,
                     "native_ternary_kernel_required": bool(
                         torch.cuda.is_available()
                         and self.model.config.use_ternary_core
@@ -5211,6 +5359,14 @@ class CortexTrainingPhaseController:
                     "objective_feedback_term_count": len(self.last_objective_loss_terms),
                     "future_contract_decisions": len(self.future_ledger.decisions),
                     "compression_trace_counts": trace_counts,
+                    "native_ternary_backend_requested": str(self.model.config.native_ternary_backend),
+                    "native_ternary_backend_counts": native_backend_counts,
+                    "native_ternary_requantize_backend_counts": native_requantize_backend_counts,
+                    "native_ternary_kernel_required": bool(
+                        torch.cuda.is_available()
+                        and self.model.config.use_ternary_core
+                        and self.model.config.use_native_ternary_kernel
+                    ),
                     "variable_input_compression_events": trace_counts.get("kv_events", 0),
                     "certificate_head_forward_events": int(self.model.certificate_forward_events),
                     "input_anchor_observations": int(self.input_anchor_observations),
@@ -5250,6 +5406,8 @@ class CortexTrainingPhaseController:
                 }
             ),
             "trace_counts": trace_counts,
+            "native_ternary_backend_counts": native_backend_counts,
+            "native_ternary_requantize_backend_counts": native_requantize_backend_counts,
             "retained_trace_counts": compression_trace.get("retained_event_counts", {}),
             "future_ledger": self.future_ledger.to_dict(),
             "ledgers": _ledger_bundle_payload(
@@ -5846,6 +6004,7 @@ class ComparisonConfig:
     max_corpus_tokens: int | None = None
     tokenizer_training_chars: int | None = None
     min_planned_train_tokens: int = 0
+    native_ternary_backend: str = "auto"
 
     def __post_init__(self) -> None:
         if self.min_corpus_tokens < 0:
@@ -5858,6 +6017,8 @@ class ComparisonConfig:
             raise ValueError("tokenizer_training_chars must be positive when provided")
         if self.min_planned_train_tokens < 0:
             raise ValueError("min_planned_train_tokens must be non-negative")
+        if self.native_ternary_backend not in {"auto", "extension", "rawkernel"}:
+            raise ValueError("native_ternary_backend must be one of: auto, extension, rawkernel")
 
 
 @dataclass(frozen=True)
@@ -6329,6 +6490,7 @@ def _estimate_transformer_training_memory(config: TransformerConfig, training: T
         "learned_memory_policy": bool(config.use_learned_memory_policy),
         "native_ternary_kernel": bool(config.use_ternary_core and config.use_native_ternary_kernel),
         "native_ternary_kernel_required": bool(config.use_ternary_core and config.require_native_ternary_kernel),
+        "native_ternary_backend": str(config.native_ternary_backend) if config.use_ternary_core else "",
         "certificate_head": bool(config.use_certificate_head),
         "certificate_latent_size": int(config.certificate_latent_size) if config.use_certificate_head else 0,
         "training_state_bytes": int(training_state_bytes),
@@ -6358,6 +6520,7 @@ def _experiment_model_memory_estimates(config: ComparisonConfig) -> dict[str, An
         "use_ternary_core": True,
         "use_native_ternary_kernel": True,
         "require_native_ternary_kernel": bool(config.training.require_cuda or str(config.training.device).startswith("cuda")),
+        "native_ternary_backend": config.native_ternary_backend,
         "use_skill_aware_experts": True,
         "use_variable_in_compressor": True,
         "use_learned_memory_policy": True,
@@ -6415,6 +6578,7 @@ def build_training_plan(
         "use_ternary_core": True,
         "use_native_ternary_kernel": True,
         "require_native_ternary_kernel": bool(config.training.require_cuda or str(config.training.device).startswith("cuda")),
+        "native_ternary_backend": config.native_ternary_backend,
         "use_skill_aware_experts": True,
         "use_variable_in_compressor": True,
         "use_learned_memory_policy": True,
@@ -6479,6 +6643,7 @@ def build_training_plan(
             "cortex_variable_in_compressor": bool(cortex_config.use_variable_in_compressor),
             "cortex_learned_memory_policy": bool(cortex_config.use_learned_memory_policy),
             "cortex_certificate_head": bool(cortex_config.use_certificate_head),
+            "cortex_native_ternary_backend": str(cortex_config.native_ternary_backend),
         },
         "training": {
             "steps": optimizer_steps,
@@ -6709,6 +6874,7 @@ class LLMComparisonRunner:
                 "use_ternary_core": True,
                 "use_native_ternary_kernel": True,
                 "require_native_ternary_kernel": bool(self.config.training.require_cuda or str(self.config.training.device).startswith("cuda")),
+                "native_ternary_backend": self.config.native_ternary_backend,
                 "use_skill_aware_experts": True,
                 "use_variable_in_compressor": True,
                 "use_learned_memory_policy": True,
@@ -8592,6 +8758,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     smoke.add_argument("--max-corpus-tokens", type=int, default=None)
     smoke.add_argument("--tokenizer-training-chars", type=int, default=None)
     smoke.add_argument("--min-planned-train-tokens", type=int, default=0)
+    smoke.add_argument("--native-ternary-backend", choices=("auto", "extension", "rawkernel"), default="auto")
 
     compare = sub.add_parser("compare", help="run baseline vs Cortex comparison on text files or directories")
     compare.add_argument("paths", nargs="+")
@@ -8618,6 +8785,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     compare.add_argument("--max-corpus-tokens", type=int, default=None)
     compare.add_argument("--tokenizer-training-chars", type=int, default=None)
     compare.add_argument("--min-planned-train-tokens", type=int, default=0)
+    compare.add_argument("--native-ternary-backend", choices=("auto", "extension", "rawkernel"), default="auto")
 
     compare_matrix = sub.add_parser("compare-matrix", help="run baseline vs Cortex comparison across multiple seeds on one shared corpus")
     compare_matrix.add_argument("paths", nargs="+")
@@ -8645,6 +8813,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     compare_matrix.add_argument("--max-corpus-tokens", type=int, default=None)
     compare_matrix.add_argument("--tokenizer-training-chars", type=int, default=None)
     compare_matrix.add_argument("--min-planned-train-tokens", type=int, default=0)
+    compare_matrix.add_argument("--native-ternary-backend", choices=("auto", "extension", "rawkernel"), default="auto")
 
     corpus_matrix = sub.add_parser("corpus-matrix", help="run compare-matrix across multiple named corpora")
     corpus_matrix.add_argument("--corpus", action="append", default=[], help="named corpus spec: NAME=PATH or NAME=PATH1;PATH2")
@@ -8672,6 +8841,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     corpus_matrix.add_argument("--max-corpus-tokens", type=int, default=None)
     corpus_matrix.add_argument("--tokenizer-training-chars", type=int, default=None)
     corpus_matrix.add_argument("--min-planned-train-tokens", type=int, default=0)
+    corpus_matrix.add_argument("--native-ternary-backend", choices=("auto", "extension", "rawkernel"), default="auto")
 
     benchmark = sub.add_parser("benchmark", help="run a deterministic multi-domain LLM benchmark suite")
     benchmark.add_argument("--out-dir", default="runs/llm-benchmark")
@@ -8699,6 +8869,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     benchmark.add_argument("--max-corpus-tokens", type=int, default=None)
     benchmark.add_argument("--tokenizer-training-chars", type=int, default=None)
     benchmark.add_argument("--min-planned-train-tokens", type=int, default=0)
+    benchmark.add_argument("--native-ternary-backend", choices=("auto", "extension", "rawkernel"), default="auto")
 
     benchmark_matrix = sub.add_parser("benchmark-matrix", help="run a multi-domain x multi-seed statistical LLM benchmark")
     benchmark_matrix.add_argument("--out-dir", default="runs/llm-benchmark-matrix")
@@ -8727,6 +8898,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     benchmark_matrix.add_argument("--max-corpus-tokens", type=int, default=None)
     benchmark_matrix.add_argument("--tokenizer-training-chars", type=int, default=None)
     benchmark_matrix.add_argument("--min-planned-train-tokens", type=int, default=0)
+    benchmark_matrix.add_argument("--native-ternary-backend", choices=("auto", "extension", "rawkernel"), default="auto")
 
     prepare_hf = sub.add_parser("prepare-hf", help="export a Hugging Face dataset to text shards and a token memmap corpus")
     prepare_hf.add_argument("--dataset", required=True, help="Hugging Face dataset path, e.g. allenai/c4 or json")
@@ -8866,6 +9038,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             max_corpus_tokens=args.max_corpus_tokens,
             tokenizer_training_chars=args.tokenizer_training_chars,
             min_planned_train_tokens=args.min_planned_train_tokens,
+            native_ternary_backend=args.native_ternary_backend,
         )
         report = LLMComparisonRunner(corpus, config, run_dir=out_dir / "comparison").run(require_win=args.require_win)
         if _rank_zero():
@@ -8986,6 +9159,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             max_corpus_tokens=args.max_corpus_tokens,
             tokenizer_training_chars=args.tokenizer_training_chars,
             min_planned_train_tokens=args.min_planned_train_tokens,
+            native_ternary_backend=args.native_ternary_backend,
         )
         report = LLMBenchmarkSuite(
             run_dir=args.out_dir,
@@ -9035,6 +9209,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             max_corpus_tokens=args.max_corpus_tokens,
             tokenizer_training_chars=args.tokenizer_training_chars,
             min_planned_train_tokens=args.min_planned_train_tokens,
+            native_ternary_backend=args.native_ternary_backend,
         )
         report = LLMStatisticalBenchmarkSuite(
             run_dir=args.out_dir,
@@ -9077,6 +9252,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             max_corpus_tokens=args.max_corpus_tokens,
             tokenizer_training_chars=args.tokenizer_training_chars,
             min_planned_train_tokens=args.min_planned_train_tokens,
+            native_ternary_backend=args.native_ternary_backend,
         )
         report = LLMComparisonMatrixSuite(corpus, config, run_dir=args.out_dir, seeds=seeds).run(require_win=args.require_win)
         if _rank_zero():
@@ -9113,6 +9289,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             max_corpus_tokens=args.max_corpus_tokens,
             tokenizer_training_chars=args.tokenizer_training_chars,
             min_planned_train_tokens=args.min_planned_train_tokens,
+            native_ternary_backend=args.native_ternary_backend,
         )
         report = LLMCorpusMatrixSuite(corpora, config, run_dir=args.out_dir, seeds=seeds).run(require_win=args.require_win)
         if _rank_zero():
@@ -9143,10 +9320,11 @@ def main(argv: Sequence[str] | None = None) -> None:
         n_layers=args.n_layers,
         training=training,
         min_corpus_tokens=args.min_corpus_tokens,
-        max_corpus_tokens=args.max_corpus_tokens,
-        tokenizer_training_chars=args.tokenizer_training_chars,
-        min_planned_train_tokens=args.min_planned_train_tokens,
-    )
+            max_corpus_tokens=args.max_corpus_tokens,
+            tokenizer_training_chars=args.tokenizer_training_chars,
+            min_planned_train_tokens=args.min_planned_train_tokens,
+            native_ternary_backend=args.native_ternary_backend,
+        )
     report = LLMComparisonRunner(corpus, config, run_dir=args.out_dir).run(require_win=args.require_win)
     if _rank_zero():
         print(json.dumps(report.proof, indent=2, sort_keys=True))

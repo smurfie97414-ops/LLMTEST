@@ -30,7 +30,8 @@ Preuve post-integration des deux nouvelles briques :
 
 - `test_learned_memory_policy_is_trainable_and_affects_cortex_loss` : loss `learned_memory` non nul, gradient non nul dans la politique memoire, dispatch ternaire packe present ;
 - `test_learned_memory_ablation_shows_policy_can_reduce_loss` : ablation courte a poids partages, memoire apprise active vs desactivee, puis entrainement de la seule politique exact/latent/drop avec delta `before - after` positif sur total et next-token loss ;
-- `test_bitlinear_native_packed_ternary_cuda_dispatch_runs_on_gpu` : backend natif `native_int2_cupy_cuda_*` execute sur le GPU local avec gradient STE non nul ;
+- `test_bitlinear_native_packed_ternary_cuda_dispatch_runs_on_gpu` : backend natif `native_int2_*_cuda_*` execute sur le GPU local avec gradient STE non nul ;
+- `test_bitlinear_native_extension_cuda_dispatch_runs_on_gpu` : backend extension force, forward CUDA, backward `grad_input`, `grad_weight` STE non nul et requantize extension prouve par compteurs ;
 - `test_native_ternary_cuda_kernel_matches_packed_runtime_for_training_dtypes` : le kernel natif correspond au runtime packe en fp32, fp16 et bf16 ;
 - `test_native_ternary_cuda_fast_ste_backward_matches_dense_ste` : le backward fast STE CUDA correspond au dense STE en fp32, fp16 et bf16, avec `grad_input` calcule depuis les poids int2 packes ;
 - `test_native_ternary_cuda_requantize_pack_matches_torch_sync` : la requantization/packing CUDA fusionnee reproduit signs, mask, scales, residuals, packed codes et compte d'actifs du chemin PyTorch en fp32, fp16 et bf16 ;
@@ -285,7 +286,7 @@ Quand `use_ternary_core=True`, les lineaires principaux deviennent des `BitLinea
 - codes ternaires packes int2 dans `packed_codes` ;
 - quantization d'activation ;
 - layer forward events ;
-- `PackedTernaryDispatch` avec backend `packed_int2_torch`, `packed_int2_cuda`, `native_int2_cupy_cuda_tiled_shared_memory_int2` ou `native_int2_cupy_cuda_warp_reduction_int2`, plus les champs `autotuned`, `autotune_cache_hit` et `autotune_candidate_ms`.
+- `PackedTernaryDispatch` avec backend `packed_int2_torch`, `packed_int2_cuda`, `native_int2_extension_cuda_tiled_shared_memory_int2`, `native_int2_extension_cuda_warp_reduction_int2`, ou le backend diagnostic `native_int2_rawkernel_cuda_*`, plus les champs `native_backend`, `autotuned`, `autotune_cache_hit` et `autotune_candidate_ms`.
 - `TransformerConfig.native_ternary_autotune_cache_path` peut brancher un profil JSON d'autotune dans les `BitLinear` du vrai training.
 - backward fast STE CUDA qui calcule `grad_input` directement depuis les codes int2 packes, les scales et le residual optionnel.
 - requantization/packing CUDA fusionnee apres optimizer step, P7 ou P10 quand la version du poids change.
@@ -304,7 +305,7 @@ Le forward lit la valeur runtime depuis les codes ternaires packes, puis utilise
 
 ### Preuve Runtime
 
-Le checkpoint inspecte montre `P2=238652` evenements. Les tests ajoutes verifient en plus que `BitLinear` execute un dispatch CUDA natif tuilé ou warp-reduction sur GPU local, que les valeurs fp32/fp16/bf16 correspondent au runtime packe, que l'auto-selection choisit la variante attendue selon la forme, que le backward fast STE garde la meme semantique que le dense STE pour `grad_input`, `grad_weight` et `grad_bias`, et que le gradient STE reste non nul vers les poids entrainables.
+Le checkpoint inspecte montre `P2=238652` evenements. Le smoke court extension `tools\train_llm.py smoke --device cuda --require-cuda --native-ternary-backend extension --steps 2` montre aussi `native_ternary_backend_counts={'extension': 2185}`, `native_ternary_requantize_backend_counts={'extension': 230}`, `torch_packed_ternary_dispatches=0` et audits P2/architecture passants. Les tests ajoutes verifient en plus que `BitLinear` execute un dispatch CUDA natif tuilé ou warp-reduction sur GPU local, que les valeurs fp32/fp16/bf16 correspondent au runtime packe, que l'auto-selection choisit la variante attendue selon la forme, que le backward fast STE garde la meme semantique que le dense STE pour `grad_input`, `grad_weight` et `grad_bias`, et que le gradient STE reste non nul vers les poids entrainables.
 
 La boucle post-update est aussi native sur CUDA: apres un changement de poids, `_sync_quantized_buffers_from_weight` peut regenerer `signs`, `mask`, `scales`, `residual_weight` et `packed_codes` via un kernel fusionne. Le benchmark court RTX 5070 `128x256x256 fp16` mesure `0.2245 ms` pour le chemin fusionne contre `0.5901 ms` pour le chemin PyTorch tensoriel.
 
@@ -735,12 +736,12 @@ Etat actuel :
 
 Limite restante :
 
-- les kernels natifs actuels couvrent deja une variante tuilée shared-memory, une variante warp-reduction, un autotune mesure/cache par shape et un profil JSON persistant, mais doivent encore etre packages plus bas niveau et reduire le cout STE/backward pour grands batchs LLM ;
+- les kernels natifs actuels couvrent deja une variante tuilée shared-memory, une variante warp-reduction, un backend extension C++/CUDA strict, un autotune mesure/cache par shape et un profil JSON persistant, mais doivent encore reduire le cout STE/backward pour grands batchs LLM ;
 - les benchmarks doivent etre elargis a VRAM, energie estimee, tailles LLM reelles et qualite de convergence.
 
 Critere de fermeture :
 
-- fournir kernels ternaires optimises tuiles/fusionnes au-dela du RawKernel actuel ;
+- faire du backend extension le chemin CUDA durci, avec kernels ternaires tuiles/fusionnes et cout `grad_weight` reduit ;
 - benchmarker latence, VRAM, energie estimee, throughput et qualite face a une baseline dense sur runs LLM larges.
 
 ### Verifier Dynamique A Grande Echelle

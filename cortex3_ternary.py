@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
+import platform
+import shutil
+import subprocess
 import warnings
 from dataclasses import asdict, dataclass, field
 from math import fsum
@@ -732,6 +736,351 @@ _CUPY_TERNARY_KERNEL_CACHE: dict[Any, Any] = {}
 _NATIVE_TERNARY_AUTOTUNE_CACHE: dict[tuple[Any, ...], tuple[str, tuple[tuple[str, float], ...]]] = {}
 _NATIVE_TERNARY_AUTOTUNE_LOADED_PATHS: set[str] = set()
 _CUPY_IMPORT_ERROR: Exception | None = None
+_TERNARY_EXTENSION_MODULE: Any | None = None
+_TERNARY_EXTENSION_ERROR: Exception | None = None
+_TERNARY_EXTENSION_BUILD_ATTEMPTED = False
+_NATIVE_CUDA_BACKENDS = {"auto", "extension", "rawkernel"}
+_LAST_NATIVE_REQUANTIZE_BACKEND = ""
+
+
+def native_backend_from_runtime_label(label: str, default: str = "") -> str:
+    text = str(label or "")
+    if text in {"extension", "rawkernel"}:
+        return text
+    if text.startswith("native_int2_") and "_cuda_" in text:
+        return text.removeprefix("native_int2_").split("_cuda_", 1)[0] or default
+    if text.startswith("native_cuda_") and text.endswith("_requantize_pack"):
+        return text.removeprefix("native_cuda_").removesuffix("_requantize_pack") or default
+    if text.startswith("native_"):
+        return "unknown"
+    return default
+
+
+_TERNARY_EXTENSION_CPP_SOURCE = r"""
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAException.h>
+#include <cuda_runtime_api.h>
+
+extern "C" void launch_ternary_forward_dispatch(
+    const void* x,
+    const unsigned char* packed,
+    const float* scales,
+    const float* residual,
+    const float* bias,
+    void* out,
+    int dtype_code,
+    int variant_code,
+    int m_rows,
+    int n_cols,
+    int k_cols,
+    int packed_stride,
+    int use_residual,
+    int has_bias,
+    cudaStream_t stream);
+
+extern "C" void launch_ternary_grad_input_dispatch(
+    const void* grad_out,
+    const unsigned char* packed,
+    const float* scales,
+    const float* residual,
+    void* grad_x,
+    int dtype_code,
+    int m_rows,
+    int n_cols,
+    int k_cols,
+    int packed_stride,
+    int use_residual,
+    cudaStream_t stream);
+
+extern "C" void launch_ternary_requantize_pack_dispatch(
+    const void* values,
+    void* signs,
+    void* mask,
+    void* scales,
+    void* residual,
+    unsigned char* packed,
+    int* row_active_counts,
+    int dtype_code,
+    int rows,
+    int cols,
+    int packed_stride,
+    int use_threshold,
+    float threshold,
+    float residual_threshold,
+    cudaStream_t stream);
+
+static int c3_dtype_code(const torch::Tensor& tensor) {
+  if (tensor.scalar_type() == at::ScalarType::Float) {
+    return 0;
+  }
+  if (tensor.scalar_type() == at::ScalarType::Half) {
+    return 1;
+  }
+  if (tensor.scalar_type() == at::ScalarType::BFloat16) {
+    return 2;
+  }
+  TORCH_CHECK(false, "unsupported ternary CUDA extension dtype: ", tensor.scalar_type());
+}
+
+static void c3_check_cuda_contiguous(const torch::Tensor& tensor, const char* name) {
+  TORCH_CHECK(tensor.is_cuda(), name, " must be a CUDA tensor");
+  TORCH_CHECK(tensor.is_contiguous(), name, " must be contiguous");
+}
+
+torch::Tensor ternary_forward(
+    torch::Tensor x,
+    torch::Tensor packed,
+    torch::Tensor scales,
+    torch::Tensor residual,
+    torch::Tensor bias,
+    int64_t m_rows,
+    int64_t n_cols,
+    int64_t k_cols,
+    int64_t packed_stride,
+    bool use_residual,
+    bool has_bias,
+    bool use_warp) {
+  c3_check_cuda_contiguous(x, "x");
+  c3_check_cuda_contiguous(packed, "packed");
+  c3_check_cuda_contiguous(scales, "scales");
+  TORCH_CHECK(packed.scalar_type() == at::ScalarType::Byte, "packed must be uint8");
+  TORCH_CHECK(scales.scalar_type() == at::ScalarType::Float, "scales must be float32");
+  if (use_residual) {
+    c3_check_cuda_contiguous(residual, "residual");
+    TORCH_CHECK(residual.scalar_type() == at::ScalarType::Float, "residual must be float32");
+  }
+  if (has_bias) {
+    c3_check_cuda_contiguous(bias, "bias");
+    TORCH_CHECK(bias.scalar_type() == at::ScalarType::Float, "bias must be float32");
+  }
+  auto out = torch::empty({m_rows, n_cols}, x.options());
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream(x.get_device()).stream();
+  launch_ternary_forward_dispatch(
+      x.data_ptr(),
+      packed.data_ptr<unsigned char>(),
+      scales.data_ptr<float>(),
+      use_residual ? residual.data_ptr<float>() : nullptr,
+      has_bias ? bias.data_ptr<float>() : nullptr,
+      out.data_ptr(),
+      c3_dtype_code(x),
+      use_warp ? 1 : 0,
+      static_cast<int>(m_rows),
+      static_cast<int>(n_cols),
+      static_cast<int>(k_cols),
+      static_cast<int>(packed_stride),
+      use_residual ? 1 : 0,
+      has_bias ? 1 : 0,
+      stream);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return out;
+}
+
+torch::Tensor ternary_grad_input(
+    torch::Tensor grad_out,
+    torch::Tensor packed,
+    torch::Tensor scales,
+    torch::Tensor residual,
+    int64_t m_rows,
+    int64_t n_cols,
+    int64_t k_cols,
+    int64_t packed_stride,
+    bool use_residual) {
+  c3_check_cuda_contiguous(grad_out, "grad_out");
+  c3_check_cuda_contiguous(packed, "packed");
+  c3_check_cuda_contiguous(scales, "scales");
+  TORCH_CHECK(packed.scalar_type() == at::ScalarType::Byte, "packed must be uint8");
+  TORCH_CHECK(scales.scalar_type() == at::ScalarType::Float, "scales must be float32");
+  if (use_residual) {
+    c3_check_cuda_contiguous(residual, "residual");
+    TORCH_CHECK(residual.scalar_type() == at::ScalarType::Float, "residual must be float32");
+  }
+  auto grad_x = torch::empty({m_rows, k_cols}, grad_out.options());
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream(grad_out.get_device()).stream();
+  launch_ternary_grad_input_dispatch(
+      grad_out.data_ptr(),
+      packed.data_ptr<unsigned char>(),
+      scales.data_ptr<float>(),
+      use_residual ? residual.data_ptr<float>() : nullptr,
+      grad_x.data_ptr(),
+      c3_dtype_code(grad_out),
+      static_cast<int>(m_rows),
+      static_cast<int>(n_cols),
+      static_cast<int>(k_cols),
+      static_cast<int>(packed_stride),
+      use_residual ? 1 : 0,
+      stream);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return grad_x;
+}
+
+torch::Tensor ternary_requantize_pack(
+    torch::Tensor values,
+    torch::Tensor signs,
+    torch::Tensor mask,
+    torch::Tensor scales,
+    torch::Tensor residual,
+    torch::Tensor packed,
+    bool use_threshold,
+    double threshold,
+    double residual_threshold) {
+  c3_check_cuda_contiguous(values, "values");
+  c3_check_cuda_contiguous(signs, "signs");
+  c3_check_cuda_contiguous(mask, "mask");
+  c3_check_cuda_contiguous(scales, "scales");
+  c3_check_cuda_contiguous(residual, "residual");
+  c3_check_cuda_contiguous(packed, "packed");
+  TORCH_CHECK(values.scalar_type() == signs.scalar_type(), "values/signs dtype mismatch");
+  TORCH_CHECK(values.scalar_type() == mask.scalar_type(), "values/mask dtype mismatch");
+  TORCH_CHECK(values.scalar_type() == scales.scalar_type(), "values/scales dtype mismatch");
+  TORCH_CHECK(values.scalar_type() == residual.scalar_type(), "values/residual dtype mismatch");
+  TORCH_CHECK(packed.scalar_type() == at::ScalarType::Byte, "packed must be uint8");
+  auto row_active_counts = torch::empty({values.size(0)}, values.options().dtype(torch::kInt32));
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream(values.get_device()).stream();
+  launch_ternary_requantize_pack_dispatch(
+      values.data_ptr(),
+      signs.data_ptr(),
+      mask.data_ptr(),
+      scales.data_ptr(),
+      residual.data_ptr(),
+      packed.data_ptr<unsigned char>(),
+      row_active_counts.data_ptr<int>(),
+      c3_dtype_code(values),
+      static_cast<int>(values.size(0)),
+      static_cast<int>(values.size(1)),
+      static_cast<int>(packed.size(1)),
+      use_threshold ? 1 : 0,
+      static_cast<float>(threshold),
+      static_cast<float>(residual_threshold),
+      stream);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return row_active_counts;
+}
+"""
+
+
+_TERNARY_EXTENSION_CUDA_WRAPPERS = r"""
+extern "C" void launch_ternary_forward_dispatch(
+    const void* x,
+    const unsigned char* packed,
+    const float* scales,
+    const float* residual,
+    const float* bias,
+    void* out,
+    int dtype_code,
+    int variant_code,
+    int m_rows,
+    int n_cols,
+    int k_cols,
+    int packed_stride,
+    int use_residual,
+    int has_bias,
+    cudaStream_t stream) {
+  if (variant_code == 1) {
+    const int warps_per_block = C3_WARPS_PER_BLOCK;
+    int total_outputs = m_rows * n_cols;
+    dim3 blocks((total_outputs + warps_per_block - 1) / warps_per_block);
+    dim3 threads(warps_per_block * 32);
+    if (dtype_code == 0) {
+      ternary_matmul_warp_fp32<<<blocks, threads, 0, stream>>>(
+          static_cast<const float*>(x), packed, scales, residual, bias,
+          static_cast<float*>(out), m_rows, n_cols, k_cols, packed_stride, use_residual, has_bias);
+    } else if (dtype_code == 1) {
+      ternary_matmul_warp_fp16<<<blocks, threads, 0, stream>>>(
+          static_cast<const __half*>(x), packed, scales, residual, bias,
+          static_cast<__half*>(out), m_rows, n_cols, k_cols, packed_stride, use_residual, has_bias);
+    } else {
+      ternary_matmul_warp_bf16<<<blocks, threads, 0, stream>>>(
+          static_cast<const __nv_bfloat16*>(x), packed, scales, residual, bias,
+          static_cast<__nv_bfloat16*>(out), m_rows, n_cols, k_cols, packed_stride, use_residual, has_bias);
+    }
+    return;
+  }
+  dim3 blocks((n_cols + C3_BLOCK_N - 1) / C3_BLOCK_N, (m_rows + C3_BLOCK_M - 1) / C3_BLOCK_M);
+  dim3 threads(C3_BLOCK_N, C3_BLOCK_M);
+  if (dtype_code == 0) {
+    ternary_matmul_tiled_fp32<<<blocks, threads, 0, stream>>>(
+        static_cast<const float*>(x), packed, scales, residual, bias,
+        static_cast<float*>(out), m_rows, n_cols, k_cols, packed_stride, use_residual, has_bias);
+  } else if (dtype_code == 1) {
+    ternary_matmul_tiled_fp16<<<blocks, threads, 0, stream>>>(
+        static_cast<const __half*>(x), packed, scales, residual, bias,
+        static_cast<__half*>(out), m_rows, n_cols, k_cols, packed_stride, use_residual, has_bias);
+  } else {
+    ternary_matmul_tiled_bf16<<<blocks, threads, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(x), packed, scales, residual, bias,
+        static_cast<__nv_bfloat16*>(out), m_rows, n_cols, k_cols, packed_stride, use_residual, has_bias);
+  }
+}
+
+extern "C" void launch_ternary_grad_input_dispatch(
+    const void* grad_out,
+    const unsigned char* packed,
+    const float* scales,
+    const float* residual,
+    void* grad_x,
+    int dtype_code,
+    int m_rows,
+    int n_cols,
+    int k_cols,
+    int packed_stride,
+    int use_residual,
+    cudaStream_t stream) {
+  const int warps_per_block = C3_WARPS_PER_BLOCK;
+  int total_outputs = m_rows * k_cols;
+  dim3 blocks((total_outputs + warps_per_block - 1) / warps_per_block);
+  dim3 threads(warps_per_block * 32);
+  if (dtype_code == 0) {
+    ternary_grad_input_warp_fp32<<<blocks, threads, 0, stream>>>(
+        static_cast<const float*>(grad_out), packed, scales, residual,
+        static_cast<float*>(grad_x), m_rows, n_cols, k_cols, packed_stride, use_residual);
+  } else if (dtype_code == 1) {
+    ternary_grad_input_warp_fp16<<<blocks, threads, 0, stream>>>(
+        static_cast<const __half*>(grad_out), packed, scales, residual,
+        static_cast<__half*>(grad_x), m_rows, n_cols, k_cols, packed_stride, use_residual);
+  } else {
+    ternary_grad_input_warp_bf16<<<blocks, threads, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(grad_out), packed, scales, residual,
+        static_cast<__nv_bfloat16*>(grad_x), m_rows, n_cols, k_cols, packed_stride, use_residual);
+  }
+}
+
+extern "C" void launch_ternary_requantize_pack_dispatch(
+    const void* values,
+    void* signs,
+    void* mask,
+    void* scales,
+    void* residual,
+    unsigned char* packed,
+    int* row_active_counts,
+    int dtype_code,
+    int rows,
+    int cols,
+    int packed_stride,
+    int use_threshold,
+    float threshold,
+    float residual_threshold,
+    cudaStream_t stream) {
+  dim3 blocks(rows);
+  dim3 threads(C3_REQUANT_THREADS);
+  if (dtype_code == 0) {
+    ternary_requantize_pack_fp32<<<blocks, threads, 0, stream>>>(
+        static_cast<const float*>(values), static_cast<float*>(signs), static_cast<float*>(mask),
+        static_cast<float*>(scales), static_cast<float*>(residual), packed, row_active_counts,
+        rows, cols, packed_stride, use_threshold, threshold, residual_threshold);
+  } else if (dtype_code == 1) {
+    ternary_requantize_pack_fp16<<<blocks, threads, 0, stream>>>(
+        static_cast<const __half*>(values), static_cast<__half*>(signs), static_cast<__half*>(mask),
+        static_cast<__half*>(scales), static_cast<__half*>(residual), packed, row_active_counts,
+        rows, cols, packed_stride, use_threshold, threshold, residual_threshold);
+  } else {
+    ternary_requantize_pack_bf16<<<blocks, threads, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(values), static_cast<__nv_bfloat16*>(signs), static_cast<__nv_bfloat16*>(mask),
+        static_cast<__nv_bfloat16*>(scales), static_cast<__nv_bfloat16*>(residual), packed, row_active_counts,
+        rows, cols, packed_stride, use_threshold, threshold, residual_threshold);
+  }
+}
+"""
 
 
 def _autotune_key_to_dict(key: tuple[Any, ...]) -> dict[str, Any]:
@@ -836,6 +1185,159 @@ def load_native_ternary_autotune_cache(path: str | Path, *, merge: bool = True) 
     return loaded
 
 
+def _normalize_native_cuda_backend(backend: str) -> str:
+    normalized = str(backend).strip().lower()
+    if normalized not in _NATIVE_CUDA_BACKENDS:
+        raise RuntimeError(f"unsupported native_cuda_backend={backend!r}; expected one of {sorted(_NATIVE_CUDA_BACKENDS)}")
+    return normalized
+
+
+def _torch_cuda_home_candidate() -> Path | None:
+    torch_cuda = getattr(torch.version, "cuda", None)
+    if not torch_cuda:
+        return None
+    return Path.home() / ".codex" / f"cuda-{torch_cuda}" / "Library"
+
+
+def _candidate_vsdevcmd_paths() -> tuple[Path, ...]:
+    candidates: list[Path] = []
+    explicit = os.environ.get("CORTEX3_VSDEVCMD")
+    if explicit:
+        candidates.append(Path(explicit))
+    candidates.extend([
+        Path(r"C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\Tools\VsDevCmd.bat"),
+        Path(r"C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\Tools\VsDevCmd.bat"),
+        Path(r"C:\Program Files\Microsoft Visual Studio\18\Community\Common7\Tools\VsDevCmd.bat"),
+    ])
+    vswhere = Path(r"C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe")
+    if vswhere.exists():
+        try:
+            output = subprocess.check_output(
+                [
+                    str(vswhere),
+                    "-all",
+                    "-products",
+                    "*",
+                    "-requires",
+                    "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+                    "-property",
+                    "installationPath",
+                ],
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=5.0,
+            )
+            for line in output.splitlines():
+                if line.strip():
+                    candidates.append(Path(line.strip()) / "Common7" / "Tools" / "VsDevCmd.bat")
+        except Exception:
+            pass
+    deduped: list[Path] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = str(candidate.resolve(strict=False)).lower()
+        if key not in seen:
+            deduped.append(candidate)
+            seen.add(key)
+    return tuple(deduped)
+
+
+def _merge_vsdevcmd_environment(vsdevcmd: Path) -> None:
+    dump = subprocess.check_output(
+        f'cmd.exe /s /c ""{vsdevcmd}" -arch=x64 -host_arch=x64 >nul && set"',
+        shell=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30.0,
+    )
+    for line in dump.splitlines():
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        if key:
+            os.environ[key] = value
+
+
+def _ensure_ternary_extension_build_environment() -> None:
+    preferred_cuda_home = _torch_cuda_home_candidate()
+    if preferred_cuda_home is not None and (preferred_cuda_home / "bin" / "nvcc.exe").exists():
+        cuda_home = preferred_cuda_home
+    else:
+        cuda_home_value = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH")
+        cuda_home = Path(cuda_home_value) if cuda_home_value else None
+    if cuda_home is not None and (cuda_home / "bin" / "nvcc.exe").exists():
+        os.environ["CUDA_HOME"] = str(cuda_home)
+        os.environ["CUDA_PATH"] = str(cuda_home)
+        os.environ["PATH"] = str(cuda_home / "bin") + os.pathsep + os.environ.get("PATH", "")
+        conda_cudart = cuda_home / "lib" / "cudart.lib"
+        torch_cudart_dir = cuda_home / "lib" / "x64"
+        torch_cudart = torch_cudart_dir / "cudart.lib"
+        if conda_cudart.exists() and not torch_cudart.exists():
+            torch_cudart_dir.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(conda_cudart, torch_cudart)
+    if platform.system() == "Windows" and shutil.which("cl.exe") is None:
+        for candidate in _candidate_vsdevcmd_paths():
+            if not candidate.exists():
+                continue
+            try:
+                _merge_vsdevcmd_environment(candidate)
+                if shutil.which("cl.exe") is not None:
+                    break
+            except Exception:
+                continue
+    os.environ.setdefault("MAX_JOBS", "1")
+    os.environ.setdefault("TORCH_EXTENSIONS_DIR", str(Path.home() / ".codex" / "torch_extensions_cortex3"))
+
+
+def _load_ternary_cuda_extension() -> Any:
+    global _TERNARY_EXTENSION_MODULE, _TERNARY_EXTENSION_ERROR, _TERNARY_EXTENSION_BUILD_ATTEMPTED
+    if _TERNARY_EXTENSION_MODULE is not None:
+        return _TERNARY_EXTENSION_MODULE
+    if _TERNARY_EXTENSION_BUILD_ATTEMPTED and _TERNARY_EXTENSION_ERROR is not None:
+        raise RuntimeError("Cortex-3 ternary CUDA extension previously failed to build") from _TERNARY_EXTENSION_ERROR
+    _TERNARY_EXTENSION_BUILD_ATTEMPTED = True
+    try:
+        _ensure_ternary_extension_build_environment()
+        from torch.utils.cpp_extension import load_inline
+
+        extra_cflags = ["/std:c++17"] if platform.system() == "Windows" else ["-std=c++17"]
+        cuda_home = Path(os.environ["CUDA_HOME"])
+        extra_include_paths = []
+        target_include = cuda_home / "include" / "targets" / "x64"
+        if target_include.exists():
+            extra_include_paths.append(str(target_include))
+        module = load_inline(
+            name="cortex3_ternary_cuda_extension_v1",
+            cpp_sources=[_TERNARY_EXTENSION_CPP_SOURCE],
+            cuda_sources=[_CUPY_TERNARY_KERNEL_SOURCE + "\n" + _TERNARY_EXTENSION_CUDA_WRAPPERS],
+            functions=["ternary_forward", "ternary_grad_input", "ternary_requantize_pack"],
+            extra_include_paths=extra_include_paths,
+            extra_cflags=extra_cflags,
+            extra_cuda_cflags=["-allow-unsupported-compiler", "--std=c++17"],
+            with_cuda=True,
+            no_implicit_headers=True,
+            verbose=False,
+        )
+        _TERNARY_EXTENSION_MODULE = module
+        _TERNARY_EXTENSION_ERROR = None
+        return module
+    except Exception as exc:  # pragma: no cover - depends on local CUDA toolchain
+        _TERNARY_EXTENSION_ERROR = exc
+        raise RuntimeError(f"Cortex-3 ternary CUDA extension build/load failed: {exc}") from exc
+
+
+def native_ternary_cuda_extension_available() -> bool:
+    if not torch.cuda.is_available():
+        return False
+    try:
+        _load_ternary_cuda_extension()
+    except Exception:
+        return False
+    return True
+
+
 def _load_cupy() -> Any:
     global _CUPY_IMPORT_ERROR
     try:
@@ -905,7 +1407,54 @@ def native_ternary_cuda_available() -> bool:
     return True
 
 
-def _native_packed_ternary_grad_input_cuda(
+def _extension_ternary_forward_cuda(
+    x: Any,
+    packed_codes: Any,
+    scales: Any,
+    residual_weight: Any,
+    bias: Any,
+    in_features: int,
+    out_features: int,
+    *,
+    residual_runtime: bool,
+    variant: str,
+) -> Any:
+    if variant not in {"tiled", "warp"}:
+        raise RuntimeError(f"CUDA extension forward variant {variant!r} is not supported")
+    if x.dtype not in _CUPY_TERNARY_KERNEL_NAMES["tiled"]:
+        raise RuntimeError(f"CUDA extension forward does not support dtype {x.dtype}")
+    module = _load_ternary_cuda_extension()
+    x_flat = x.detach().contiguous().view(-1, int(in_features))
+    packed = packed_codes.to(device=x.device, dtype=torch.uint8).contiguous()
+    scale_values = scales.detach().to(device=x.device, dtype=torch.float32).contiguous().view(-1)
+    residual = (
+        residual_weight.detach().to(device=x.device, dtype=torch.float32).contiguous()
+        if residual_runtime
+        else torch.empty((0,), device=x.device, dtype=torch.float32)
+    )
+    bias_tensor = (
+        bias.detach().to(device=x.device, dtype=torch.float32).contiguous()
+        if bias is not None
+        else torch.empty((0,), device=x.device, dtype=torch.float32)
+    )
+    output_flat = module.ternary_forward(
+        x_flat,
+        packed,
+        scale_values,
+        residual,
+        bias_tensor,
+        int(x_flat.shape[0]),
+        int(out_features),
+        int(in_features),
+        int(packed.shape[1]),
+        bool(residual_runtime),
+        bool(bias is not None),
+        bool(variant == "warp"),
+    )
+    return output_flat.view(*x.shape[:-1], int(out_features))
+
+
+def _extension_ternary_grad_input_cuda(
     grad_output_flat: Any,
     packed_codes: Any,
     scales: Any,
@@ -914,10 +1463,86 @@ def _native_packed_ternary_grad_input_cuda(
     *,
     residual_runtime: bool,
 ) -> Any:
+    if grad_output_flat.dtype not in _CUPY_TERNARY_GRAD_INPUT_KERNEL_NAMES:
+        raise RuntimeError(f"CUDA extension grad-input does not support dtype {grad_output_flat.dtype}")
+    module = _load_ternary_cuda_extension()
+    grad_out = grad_output_flat.detach().contiguous()
+    packed = packed_codes.to(device=grad_out.device, dtype=torch.uint8).contiguous()
+    scale_values = scales.detach().to(device=grad_out.device, dtype=torch.float32).contiguous().view(-1)
+    residual = (
+        residual_weight.detach().to(device=grad_out.device, dtype=torch.float32).contiguous()
+        if residual_runtime
+        else torch.empty((0,), device=grad_out.device, dtype=torch.float32)
+    )
+    return module.ternary_grad_input(
+        grad_out,
+        packed,
+        scale_values,
+        residual,
+        int(grad_out.shape[0]),
+        int(grad_out.shape[1]),
+        int(in_features),
+        int(packed.shape[1]),
+        bool(residual_runtime),
+    )
+
+
+def _extension_requantize_pack_cuda(
+    values: Any,
+    signs: Any,
+    mask: Any,
+    scales: Any,
+    residual_weight: Any,
+    packed_codes: Any,
+    *,
+    threshold: float | None,
+    residual_threshold: float,
+) -> Any:
+    if values.dtype not in _CUPY_TERNARY_REQUANTIZE_KERNEL_NAMES:
+        raise RuntimeError(f"CUDA extension requantize does not support dtype {values.dtype}")
+    module = _load_ternary_cuda_extension()
+    weights = values.detach().contiguous()
+    return module.ternary_requantize_pack(
+        weights,
+        signs.contiguous(),
+        mask.contiguous(),
+        scales.contiguous(),
+        residual_weight.contiguous(),
+        packed_codes.contiguous(),
+        threshold is not None,
+        float(threshold if threshold is not None else 0.0),
+        float(residual_threshold),
+    )
+
+
+def _native_packed_ternary_grad_input_cuda(
+    grad_output_flat: Any,
+    packed_codes: Any,
+    scales: Any,
+    residual_weight: Any,
+    in_features: int,
+    *,
+    residual_runtime: bool,
+    backend: str = "auto",
+) -> Any:
     if not grad_output_flat.is_cuda:
         raise RuntimeError("native ternary CUDA grad-input kernel requires CUDA grad_output")
     if grad_output_flat.dtype not in _CUPY_TERNARY_GRAD_INPUT_KERNEL_NAMES:
         raise RuntimeError(f"native ternary CUDA grad-input kernel does not support dtype {grad_output_flat.dtype}")
+    backend = _normalize_native_cuda_backend(backend)
+    if backend in {"auto", "extension"}:
+        try:
+            return _extension_ternary_grad_input_cuda(
+                grad_output_flat,
+                packed_codes,
+                scales,
+                residual_weight,
+                in_features,
+                residual_runtime=residual_runtime,
+            )
+        except Exception:
+            if backend == "extension":
+                raise
     cp, kernel = _cupy_ternary_grad_input_kernel(grad_output_flat.dtype)
     grad_out = grad_output_flat.detach().contiguous()
     m_rows = int(grad_out.shape[0])
@@ -968,13 +1593,34 @@ def _native_requantize_pack_cuda(
     *,
     threshold: float | None,
     residual_threshold: float,
+    backend: str = "auto",
 ) -> Any:
+    global _LAST_NATIVE_REQUANTIZE_BACKEND
     if not values.is_cuda:
         raise RuntimeError("native ternary CUDA requantize kernel requires CUDA weights")
     if values.dtype not in _CUPY_TERNARY_REQUANTIZE_KERNEL_NAMES:
         raise RuntimeError(f"native ternary CUDA requantize kernel does not support dtype {values.dtype}")
     if signs.dtype != values.dtype or mask.dtype != values.dtype or scales.dtype != values.dtype or residual_weight.dtype != values.dtype:
         raise RuntimeError("native ternary CUDA requantize kernel requires weight and ternary buffers to share dtype")
+    backend = _normalize_native_cuda_backend(backend)
+    if backend in {"auto", "extension"}:
+        try:
+            row_counts = _extension_requantize_pack_cuda(
+                values,
+                signs,
+                mask,
+                scales,
+                residual_weight,
+                packed_codes,
+                threshold=threshold,
+                residual_threshold=residual_threshold,
+            )
+            _LAST_NATIVE_REQUANTIZE_BACKEND = "extension"
+            return row_counts
+        except Exception:
+            if backend == "extension":
+                raise
+    _LAST_NATIVE_REQUANTIZE_BACKEND = "rawkernel"
     cp, kernel = _cupy_ternary_requantize_kernel(values.dtype)
     row_active_counts = torch.empty((int(values.shape[0]),), device=values.device, dtype=torch.int32)
     weights = values.detach().contiguous()
@@ -1049,11 +1695,13 @@ class _PackedTernarySTEFunction(torch.autograd.Function):
         has_bias: bool,
         in_features: int,
         residual_runtime: bool,
+        native_cuda_backend: str,
     ) -> Any:
         ctx.input_shape = tuple(int(dim) for dim in x.shape)
         ctx.has_bias = bool(has_bias)
         ctx.in_features = int(in_features)
         ctx.residual_runtime = bool(residual_runtime)
+        ctx.native_cuda_backend = _normalize_native_cuda_backend(native_cuda_backend)
         ctx.float_weight_dtype = float_weight.dtype
         ctx.save_for_backward(x, packed_codes.detach(), scales.detach(), residual_weight.detach())
         return packed_output.detach()
@@ -1073,6 +1721,7 @@ class _PackedTernarySTEFunction(torch.autograd.Function):
                     residual_weight,
                     ctx.in_features,
                     residual_runtime=ctx.residual_runtime,
+                    backend=ctx.native_cuda_backend,
                 ).reshape(ctx.input_shape)
             else:
                 input_weight = _unpack_packed_ternary_weight(
@@ -1090,7 +1739,7 @@ class _PackedTernarySTEFunction(torch.autograd.Function):
             grad_weight = weight_grad.to(dtype=ctx.float_weight_dtype)
         if ctx.has_bias and ctx.needs_input_grad[2]:
             grad_bias = grad_output_flat.sum(dim=0)
-        return grad_x, grad_weight, grad_bias, None, None, None, None, None, None, None
+        return grad_x, grad_weight, grad_bias, None, None, None, None, None, None, None, None
 
 
 @dataclass(frozen=True)
@@ -1178,6 +1827,7 @@ class PackedTernaryDispatch:
     note: str = ""
     native_kernel: bool = False
     kernel_variant: str = ""
+    native_backend: str = ""
     autotuned: bool = False
     autotune_cache_hit: bool = False
     autotune_candidate_ms: tuple[tuple[str, float], ...] = ()
@@ -1204,6 +1854,8 @@ class CompressionTraceLedger:
     total_torch_packed_ternary_dispatches: int = 0
     total_native_ternary_autotuned_dispatches: int = 0
     total_native_ternary_autotune_cache_hits: int = 0
+    native_ternary_backend_counts: dict[str, int] = field(default_factory=dict)
+    native_ternary_requantize_backend_counts: dict[str, int] = field(default_factory=dict)
     total_weight_bits_read: float = 0.0
     total_activation_bits: float = 0.0
     total_kv_bytes: float = 0.0
@@ -1253,6 +1905,8 @@ class CompressionTraceLedger:
         self.total_packed_ternary_dispatches += 1
         if event.native_kernel or event.backend.startswith("native_"):
             self.total_native_ternary_kernel_dispatches += 1
+            native_backend = event.native_backend or native_backend_from_runtime_label(event.backend, default="unknown")
+            self.native_ternary_backend_counts[native_backend] = self.native_ternary_backend_counts.get(native_backend, 0) + 1
             if event.autotuned:
                 self.total_native_ternary_autotuned_dispatches += 1
             if event.autotune_cache_hit:
@@ -1262,6 +1916,12 @@ class CompressionTraceLedger:
         self.total_packed_weight_bytes += float(event.packed_weight_bytes)
         self.packed_ternary_dispatches.append(event)
         self._trim(self.packed_ternary_dispatches)
+
+    def record_native_requantize_backend(self, backend: str) -> None:
+        native_backend = native_backend_from_runtime_label(backend, default=str(backend or "unknown"))
+        self.native_ternary_requantize_backend_counts[native_backend] = (
+            self.native_ternary_requantize_backend_counts.get(native_backend, 0) + 1
+        )
 
     @property
     def cost_trace(self) -> CostTrace:
@@ -1290,11 +1950,30 @@ class CompressionTraceLedger:
         return hints or ["no_compression_culprit_logged"]
 
     def to_dict(self) -> dict[str, Any]:
+        native_backend_counts = dict(sorted(self.native_ternary_backend_counts.items()))
+        native_requantize_backend_counts = dict(sorted(self.native_ternary_requantize_backend_counts.items()))
         native_variants = tuple(sorted({
             item.kernel_variant
             for item in self.packed_ternary_dispatches
             if (item.native_kernel or item.backend.startswith("native_")) and item.kernel_variant
         }))
+        total_event_counts = {
+            "compression_decisions": self.total_compression_decisions,
+            "activation_quantizations": self.total_activation_quantizations,
+            "expert_activations": self.total_expert_activations,
+            "kv_events": self.total_kv_events,
+            "mtp_fsp_events": self.total_mtp_fsp_events,
+            "layer_forward_events": self.total_layer_forward_events,
+            "packed_ternary_dispatches": self.total_packed_ternary_dispatches,
+            "native_ternary_kernel_dispatches": self.total_native_ternary_kernel_dispatches,
+            "torch_packed_ternary_dispatches": self.total_torch_packed_ternary_dispatches,
+            "native_ternary_autotuned_dispatches": self.total_native_ternary_autotuned_dispatches,
+            "native_ternary_autotune_cache_hits": self.total_native_ternary_autotune_cache_hits,
+        }
+        for backend, count in native_backend_counts.items():
+            total_event_counts[f"native_ternary_{backend}_kernel_dispatches"] = int(count)
+        for backend, count in native_requantize_backend_counts.items():
+            total_event_counts[f"native_ternary_{backend}_requantize_dispatches"] = int(count)
         return {
             "compression_decisions": [asdict(item) for item in self.compression_decisions],
             "activation_quantizations": [asdict(item) for item in self.activation_quantizations],
@@ -1313,21 +1992,13 @@ class CompressionTraceLedger:
                 "layer_forward_events": len(self.layer_forward_events),
                 "packed_ternary_dispatches": len(self.packed_ternary_dispatches),
             },
-            "total_event_counts": {
-                "compression_decisions": self.total_compression_decisions,
-                "activation_quantizations": self.total_activation_quantizations,
-                "expert_activations": self.total_expert_activations,
-                "kv_events": self.total_kv_events,
-                "mtp_fsp_events": self.total_mtp_fsp_events,
-                "layer_forward_events": self.total_layer_forward_events,
-                "packed_ternary_dispatches": self.total_packed_ternary_dispatches,
-                "native_ternary_kernel_dispatches": self.total_native_ternary_kernel_dispatches,
-                "torch_packed_ternary_dispatches": self.total_torch_packed_ternary_dispatches,
-                "native_ternary_autotuned_dispatches": self.total_native_ternary_autotuned_dispatches,
-                "native_ternary_autotune_cache_hits": self.total_native_ternary_autotune_cache_hits,
-            },
+            "total_event_counts": total_event_counts,
             "cost_trace": asdict(self.cost_trace),
             "packed_weight_bytes_read": self.total_packed_weight_bytes,
+            "native_ternary_backend_counts": native_backend_counts,
+            "native_ternary_requantize_backend_counts": native_requantize_backend_counts,
+            "native_ternary_kernel_backends": tuple(native_backend_counts),
+            "native_ternary_requantize_backends": tuple(native_requantize_backend_counts),
             "native_ternary_kernel_variants": native_variants,
         }
 
@@ -1435,6 +2106,7 @@ class BitLinearConfig:
     use_packed_ternary_runtime: bool = True
     use_native_cuda_kernel: bool = True
     require_native_cuda_kernel: bool = False
+    native_cuda_backend: str = "auto"
     native_cuda_kernel_variant: str = "auto"
     native_cuda_autotune: bool = True
     native_cuda_autotune_warmup: int = 1
@@ -1447,6 +2119,7 @@ class BitLinearConfig:
 class BitLinear(nn.Module):
     def __init__(self, config: BitLinearConfig, ledger: CompressionTraceLedger | None = None):
         super().__init__()
+        _normalize_native_cuda_backend(config.native_cuda_backend)
         self.config = config
         self.ledger = ledger or CompressionTraceLedger()
         self.float_weight = nn.Parameter(torch.empty(config.out_features, config.in_features))
@@ -1464,6 +2137,7 @@ class BitLinear(nn.Module):
         self._last_estimated_bits = float(config.out_features * config.in_features)
         self._last_native_kernel_variant = ""
         self._last_native_kernel_family = ""
+        self._last_native_cuda_backend = ""
         self._last_native_autotuned = False
         self._last_native_autotune_cache_hit = False
         self._last_native_autotune_candidate_ms: tuple[tuple[str, float], ...] = ()
@@ -1552,9 +2226,12 @@ class BitLinear(nn.Module):
                         self.packed_codes,
                         threshold=self.config.threshold,
                         residual_threshold=self.config.residual_threshold,
+                        backend=self.config.native_cuda_backend,
                     )
                     native_requantized = True
-                    self._last_requantize_backend = "native_cuda_requantize_pack"
+                    executed_backend = _LAST_NATIVE_REQUANTIZE_BACKEND or _normalize_native_cuda_backend(self.config.native_cuda_backend)
+                    self._last_requantize_backend = f"native_cuda_{executed_backend}_requantize_pack"
+                    self.ledger.record_native_requantize_backend(executed_backend)
                 except Exception as exc:
                     if self.config.require_native_cuda_kernel:
                         raise
@@ -1703,6 +2380,26 @@ class BitLinear(nn.Module):
         save_native_ternary_autotune_cache(path)
 
     def _launch_native_cuda_kernel(self, x: Any, variant: str) -> Any:
+        backend = _normalize_native_cuda_backend(self.config.native_cuda_backend)
+        if backend in {"auto", "extension"}:
+            try:
+                output = _extension_ternary_forward_cuda(
+                    x,
+                    self.packed_codes,
+                    self.scales,
+                    self.residual_weight,
+                    self.bias,
+                    self.config.in_features,
+                    self.config.out_features,
+                    residual_runtime=self.config.residual_runtime,
+                    variant=variant,
+                )
+                self._last_native_cuda_backend = "extension"
+                return output
+            except Exception:
+                if backend == "extension":
+                    raise
+        self._last_native_cuda_backend = "rawkernel"
         cp, kernel = _cupy_ternary_kernel(x.dtype, variant)
         x_flat = x.detach().contiguous().view(-1, self.config.in_features)
         output = torch.empty(
@@ -1875,12 +2572,13 @@ class BitLinear(nn.Module):
                     packed_output = self._native_cuda_packed_output(xq)
                     native_kernel = True
                     kernel_variant = getattr(self, "_last_native_kernel_variant", "native_int2")
-                    backend = f"native_int2_cupy_cuda_{kernel_variant}"
+                    executed_backend = getattr(self, "_last_native_cuda_backend", "") or "rawkernel"
+                    backend = f"native_int2_{executed_backend}_cuda_{kernel_variant}"
                     if getattr(self, "_last_native_autotuned", False):
                         cache_note = "cache-hit" if getattr(self, "_last_native_autotune_cache_hit", False) else "measured"
-                        native_note = f"native CuPy RawKernel {kernel_variant} kernel autotuned {cache_note}"
+                        native_note = f"native {executed_backend} {kernel_variant} kernel autotuned {cache_note}"
                     else:
-                        native_note = f"native CuPy RawKernel {kernel_variant} kernel"
+                        native_note = f"native {executed_backend} {kernel_variant} kernel"
                 except Exception as exc:
                     if self.config.require_native_cuda_kernel:
                         raise
@@ -1905,6 +2603,7 @@ class BitLinear(nn.Module):
                     self.bias is not None,
                     self.config.in_features,
                     self.config.residual_runtime,
+                    self.config.native_cuda_backend,
                 )
                 max_abs_error = 0.0
                 ste_note = "custom autograd STE backward skips dense STE forward"
@@ -1935,6 +2634,7 @@ class BitLinear(nn.Module):
                 ),
                 native_kernel=native_kernel,
                 kernel_variant=getattr(self, "_last_native_kernel_variant", "") if native_kernel else "torch_unpack_linear",
+                native_backend=executed_backend if native_kernel else "",
                 autotuned=bool(getattr(self, "_last_native_autotuned", False)) if native_kernel else False,
                 autotune_cache_hit=bool(getattr(self, "_last_native_autotune_cache_hit", False)) if native_kernel else False,
                 autotune_candidate_ms=(

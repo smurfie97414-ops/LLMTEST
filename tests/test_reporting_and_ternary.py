@@ -17,6 +17,7 @@ from cortex3_ternary import (
     load_native_ternary_autotune_cache,
     make_compression_decision,
     native_ternary_cuda_available,
+    native_ternary_cuda_extension_available,
     native_ternary_autotune_cache_snapshot,
     quantize_activation_values,
     save_native_ternary_autotune_cache,
@@ -245,13 +246,58 @@ class ReportingAndTernaryTest(unittest.TestCase):
         self.assertGreater(layer.ledger.total_packed_ternary_dispatches, 0)
         self.assertGreater(layer.ledger.total_native_ternary_kernel_dispatches, 0)
         dispatch = layer.ledger.packed_ternary_dispatches[-1]
-        self.assertTrue(dispatch.backend.startswith("native_int2_cupy_cuda_"))
+        self.assertTrue(dispatch.backend.startswith("native_int2_"))
         self.assertTrue(dispatch.native_kernel)
+        self.assertIn(dispatch.native_backend, {"extension", "rawkernel"})
         self.assertTrue(dispatch.autotuned)
         self.assertEqual({name for name, _ in dispatch.autotune_candidate_ms}, {"tiled", "warp"})
         selected = min(dispatch.autotune_candidate_ms, key=lambda item: item[1])[0]
         expected_variant = "tiled_shared_memory_int2" if selected == "tiled" else "warp_reduction_int2"
         self.assertEqual(dispatch.kernel_variant, expected_variant)
+
+    def test_bitlinear_native_extension_cuda_dispatch_runs_on_gpu(self):
+        import torch
+
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA is required")
+        if not native_ternary_cuda_extension_available():
+            self.skipTest("Cortex ternary CUDA extension is not buildable in this environment")
+
+        torch.manual_seed(41)
+        layer = BitLinear(BitLinearConfig(
+            16,
+            9,
+            activation_bits=0,
+            residual_runtime=True,
+            require_native_cuda_kernel=True,
+            native_cuda_backend="extension",
+            native_cuda_kernel_variant="warp",
+            native_cuda_autotune=False,
+            log_prefix="cuda-extension-packed",
+        )).cuda()
+        layer.requantize()
+        x = torch.randn(6, 16, device="cuda", dtype=torch.float16, requires_grad=True)
+        output = layer(x)
+        loss = output.float().square().mean()
+        loss.backward()
+        torch.cuda.synchronize()
+
+        self.assertEqual(tuple(output.shape), (6, 9))
+        self.assertIsNotNone(x.grad)
+        self.assertGreater(float(x.grad.float().abs().sum().detach().cpu()), 0.0)
+        self.assertIsNotNone(layer.float_weight.grad)
+        self.assertGreater(float(layer.float_weight.grad.abs().sum().detach().cpu()), 0.0)
+        dispatch = layer.ledger.packed_ternary_dispatches[-1]
+        self.assertTrue(dispatch.native_kernel)
+        self.assertEqual(dispatch.native_backend, "extension")
+        self.assertTrue(dispatch.backend.startswith("native_int2_extension_cuda_"))
+        self.assertIn("native extension", dispatch.note)
+        self.assertEqual(layer._last_requantize_backend, "native_cuda_extension_requantize_pack")
+        payload = layer.ledger.to_dict()
+        self.assertGreater(payload["native_ternary_backend_counts"].get("extension", 0), 0)
+        self.assertGreater(payload["native_ternary_requantize_backend_counts"].get("extension", 0), 0)
+        self.assertGreater(payload["total_event_counts"].get("native_ternary_extension_kernel_dispatches", 0), 0)
+        self.assertGreater(payload["total_event_counts"].get("native_ternary_extension_requantize_dispatches", 0), 0)
 
     @unittest.skipUnless(
         __import__("torch").cuda.is_available() and native_ternary_cuda_available(),
@@ -383,7 +429,9 @@ class ReportingAndTernaryTest(unittest.TestCase):
                     reference.requantize()
                     torch.cuda.synchronize()
 
-                    self.assertEqual(native._last_requantize_backend, "native_cuda_requantize_pack")
+                    self.assertTrue(native._last_requantize_backend.startswith("native_cuda_"))
+                    self.assertTrue(native._last_requantize_backend.endswith("_requantize_pack"))
+                    self.assertTrue(native.ledger.native_ternary_requantize_backend_counts)
                     self.assertEqual(reference._last_requantize_backend, "torch_tensor_requantize")
                     self.assertTrue(torch.allclose(native.signs.float(), reference.signs.float(), atol=0.0, rtol=0.0))
                     self.assertTrue(torch.allclose(native.mask.float(), reference.mask.float(), atol=0.0, rtol=0.0))

@@ -2250,6 +2250,7 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
         self.assertIn("hardware", report)
         self.assertIn("cuda_toolchain", report)
         self.assertIn("cuda_extension_toolchain_ready", report["cuda_toolchain"])
+        self.assertIn("native_extension_runtime_available", report["cuda_toolchain"])
         self.assertIn("cuda_home_candidates", report["cuda_toolchain"])
         self.assertIn("visual_studio", report["cuda_toolchain"])
         self.assertIn("checks", report)
@@ -2263,6 +2264,7 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             self.assertTrue(extension_toolchain["include_cuda_runtime_h"], extension_toolchain)
             self.assertTrue(extension_toolchain["cudart_lib"], extension_toolchain)
             self.assertTrue(extension_toolchain["visual_studio"]["selected_cl"], extension_toolchain)
+            self.assertTrue(extension_toolchain["native_extension_runtime_available"], extension_toolchain)
         if not extension_report["cuda_toolchain"]["cuda_extension_toolchain_ready"]:
             self.assertFalse(extension_report["passed"], extension_report)
             failed_names = {check["name"] for check in extension_report["failed_required_checks"]}

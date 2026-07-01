@@ -41,9 +41,9 @@ Remaining Phase 1 hardening:
 Current executable coverage:
 
 - `TernaryBlock`, `ternarize_values`, zero states and estimated bit accounting.
-- `cortex3_ternary.BitLinear` provides a sign+mask layer with shared scales, activation quantization, optional residual runtime, packed int2 ternary weight buffers and native CuPy RawKernel CUDA paths (`tiled_shared_memory_int2` and `warp_reduction_int2`) for CUDA tensors; `auto` mode now measures both variants with CUDA events, caches the best choice by device/dtype/shape, can persist/reload JSON autotune profiles, keeps a layer-local fast cache, skips dense STE linear in forward through custom autograd, computes CUDA `grad_input` directly from packed int2 weights in the fast STE backward, runs CUDA-fused requantize/pack after weight updates, repacks only when the weight version changes, and traces autotune candidates/cache hits. PyTorch is a required dependency, CuPy is required for the current native CUDA training path, and the CUDA 12.8 PyTorch extension toolchain is now proven separately by smoke.
+- `cortex3_ternary.BitLinear` provides a sign+mask layer with shared scales, activation quantization, optional residual runtime, packed int2 ternary weight buffers, native RawKernel CUDA paths and a strict PyTorch C++/CUDA extension backend (`native_cuda_backend=extension`) for CUDA tensors; `auto` mode now measures tiled/warp variants with CUDA events, caches the best choice by device/dtype/shape, can persist/reload JSON autotune profiles, keeps a layer-local fast cache, skips dense STE linear in forward through custom autograd, computes CUDA `grad_input` directly from packed int2 weights in the fast STE backward, runs CUDA-fused requantize/pack after weight updates, repacks only when the weight version changes, and traces autotune candidates/cache hits. PyTorch is required; CuPy remains useful as the RawKernel diagnostic backend, while the extension backend is now exercised by the LLM smoke itself.
 - `ResidualSynapseBuffer` stores reconstruction residuals for compressed blocks.
-- `CompressionTraceLedger` records compression decisions, activation quantization, expert activations, KV mode events, MTP/FSP events, packed ternary dispatches and native CUDA kernel dispatch counts.
+- `CompressionTraceLedger` records compression decisions, activation quantization, expert activations, KV mode events, MTP/FSP events, packed ternary dispatches, native CUDA kernel dispatch counts, backend counts and requantize backend counts.
 - Compression decisions include active count, provisional/certified zeros, estimated bits, threshold and residual L1.
 - `LayerForwardEvent` records real `BitLinear` forward passes with layer id, input/output shapes, active weights, estimated packed weight bits and activation bits.
 - `BitLinear` uses a straight-through runtime weight path so gradients reach `float_weight` while the forward value is read from packed int2 ternary weights by default.
@@ -53,7 +53,7 @@ Remaining:
 
 - Feed layer-forward traces into persisted cycle reports outside inference-specific trace summaries.
 - Use layer-forward traces as first-class evidence in causal attribution block probes.
-- Move the current tiled/warp/requantize CuPy RawKernels into the now-working CUDA 12.8 C++ extension packaging, reduce or fuse the remaining dense `grad_weight` STE cost, and run latency/VRAM/energy benchmarks across larger LLM-shaped batches.
+- Make the extension backend the hardened default path, reduce or fuse the remaining dense `grad_weight` STE cost, and run latency/VRAM/energy benchmarks across larger LLM-shaped batches.
 
 ## Phase 3 - MTP/FSP under contract
 

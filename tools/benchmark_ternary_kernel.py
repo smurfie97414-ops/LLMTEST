@@ -180,7 +180,7 @@ def benchmark_case(
         "in_features": int(in_features),
         "out_features": int(out_features),
         "dtype": str(dtype).replace("torch.", ""),
-        "native_backend": f"native_int2_cupy_cuda_{layer._last_native_kernel_variant}",
+        "native_backend": f"native_int2_{layer._last_native_cuda_backend}_cuda_{layer._last_native_kernel_variant}",
         "kernel_variant": layer._last_native_kernel_variant,
         "kernel_family": layer._last_native_kernel_family,
         "autotuned": bool(layer._last_native_autotuned),
