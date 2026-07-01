@@ -1038,6 +1038,18 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
         self.assertEqual(measured_by_key[uncertain_key]["measurement_step_count_max"], 2)
         self.assertEqual(measured_by_key[uncertain_key]["measurement_repeat_indices"], (0, 0, 0, 1))
         self.assertEqual(measured_by_key[uncertain_key]["measurement_repeat_count_max"], 2)
+        self.assertEqual(measured_by_key[uncertain_key]["measured_score_profile_values"], (1600.0, 600.0, 1600.0, 1600.0))
+        self.assertEqual(measured_by_key[uncertain_key]["measured_score_observation_values"], (1600.0, 600.0, 1600.0))
+        self.assertEqual(measured_by_key[uncertain_key]["measured_score_observation_count"], 3)
+        self.assertEqual(
+            measured_by_key[uncertain_key]["measured_score_observation_keys"],
+            (
+                {"seed": 11, "measurement_steps": 1},
+                {"seed": 13, "measurement_steps": 1},
+                {"seed": 104742, "measurement_steps": 2},
+            ),
+        )
+        self.assertAlmostEqual(measured_by_key[uncertain_key]["measured_score"], 689.316397477041, places=6)
         self.assertEqual(tuple(row["seed"] for row in measured_by_key[uncertain_key]["seed_measurements"]), (11, 13, 104742, 104742))
         self.assertEqual(measured_by_key[stable_key]["measurement_seeds"], (11, 13))
         self.assertEqual(len(profile_calls), 8)
@@ -1143,6 +1155,9 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
         self.assertEqual(measured_by_key[selected_key]["measurement_steps"], (1, 1, 2, 2))
         self.assertEqual(measured_by_key[selected_key]["measurement_repeat_indices"], (0, 0, 0, 1))
         self.assertEqual(measured_by_key[selected_key]["measurement_repeat_count_max"], 2)
+        self.assertEqual(measured_by_key[selected_key]["measured_score_profile_values"], (1600.0, 1200.0, 1600.0, 1600.0))
+        self.assertEqual(measured_by_key[selected_key]["measured_score_observation_values"], (1600.0, 1200.0, 1600.0))
+        self.assertEqual(measured_by_key[selected_key]["measured_score_observation_count"], 3)
         self.assertEqual(measured_by_key[challenger_key]["measurement_seeds"], (11, 13))
         self.assertGreater(
             measured_by_key[selected_key]["measured_score_upper_confidence"],

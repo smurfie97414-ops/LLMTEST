@@ -9745,11 +9745,27 @@ def _profile_autosize_aggregate_measurements(
     all_phases_active = all(bool(row.get("all_phases_active")) for row in rows)
     estimated_peak_training_bytes = int(candidate["estimated_peak_training_bytes"])
     torch_cuda_peak_allocated_bytes = _max_int("torch_cuda_peak_allocated_bytes")
-    measured_score_values = _float_values("measured_score")
-    measured_score_mean = float(statistics.fmean(measured_score_values)) if measured_score_values else 0.0
-    measured_score_min = float(min(measured_score_values, default=0.0))
-    measured_score_max = float(max(measured_score_values, default=0.0))
-    measured_score_stddev = float(statistics.stdev(measured_score_values)) if len(measured_score_values) > 1 else 0.0
+    measured_score_profile_values = _float_values("measured_score")
+    score_groups: dict[tuple[int, int], list[float]] = {}
+    for row in rows:
+        key = (int(row.get("seed", 0)), int(row.get("measurement_steps", 0)))
+        score_groups.setdefault(key, []).append(float(row.get("measured_score", 0.0)))
+    measured_score_observation_values = tuple(
+        float(statistics.fmean(values))
+        for values in score_groups.values()
+    )
+    measured_score_mean = (
+        float(statistics.fmean(measured_score_observation_values))
+        if measured_score_observation_values
+        else 0.0
+    )
+    measured_score_min = float(min(measured_score_observation_values, default=0.0))
+    measured_score_max = float(max(measured_score_observation_values, default=0.0))
+    measured_score_stddev = (
+        float(statistics.stdev(measured_score_observation_values))
+        if len(measured_score_observation_values) > 1
+        else 0.0
+    )
     measured_score_lower_confidence = max(0.0, measured_score_mean - measured_score_stddev)
     measured_score_upper_confidence = measured_score_mean + measured_score_stddev
     measured_score_stability_ratio = (
@@ -9805,6 +9821,16 @@ def _profile_autosize_aggregate_measurements(
         "measured_score_lower_confidence": measured_score_lower_confidence,
         "measured_score_upper_confidence": measured_score_upper_confidence,
         "measured_score_stability_ratio": measured_score_stability_ratio,
+        "measured_score_profile_values": measured_score_profile_values,
+        "measured_score_observation_values": measured_score_observation_values,
+        "measured_score_observation_count": len(measured_score_observation_values),
+        "measured_score_observation_keys": tuple(
+            {
+                "seed": int(seed),
+                "measurement_steps": int(measurement_steps),
+            }
+            for seed, measurement_steps in score_groups.keys()
+        ),
         "train_tokens_per_second_wall": _mean_float("train_tokens_per_second_wall"),
         "planned_train_tokens": sum(int(row.get("planned_train_tokens", 0)) for row in rows),
         "gpu_utilization_percent_avg": _mean_float("gpu_utilization_percent_avg"),
