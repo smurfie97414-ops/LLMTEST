@@ -26,6 +26,14 @@ Observation ressource separee du meme run long :
 - VRAM moyenne observee : `11808.3 MB`
 - processus long run actifs : `tools/train_llm.py run-experiment experiments/c4_cuda_large_manifest.json`
 
+Preuve post-integration des deux nouvelles briques :
+
+- `test_learned_memory_policy_is_trainable_and_affects_cortex_loss` : loss `learned_memory` non nul, gradient non nul dans la politique memoire, dispatch ternaire packe present ;
+- `test_bitlinear_packed_ternary_cuda_dispatch_runs_on_gpu` : backend `packed_int2_cuda` execute sur le GPU local avec gradient STE non nul ;
+- `test_full_cortex_phase_controller_uses_all_modules_during_training` : mini training LLM complet avec audits exigeant `learned_cognitive_memory_policy` et `packed_ternary_hardware_runtime`.
+
+Le long run devra produire un nouveau sidecar sous le commit de cette integration pour remplacer l'ancien audit `22/22` par l'audit courant plus strict.
+
 Evenements phase observes dans le checkpoint :
 
 | Phase | Evenements | Replay |
@@ -78,17 +86,18 @@ Le pipeline d'entrainement Cortex-3 part d'un vrai flux LLM :
    - logits multi-horizon,
    - confiance token/sequence,
    - etat de compression Variable-In,
+   - politique memoire apprise exact/latent/drop,
    - certificat latent,
-   - traces du coeur ternaire,
+   - traces du coeur ternaire et dispatchs packed int2,
    - activations MoE skill-aware.
 6. Le loss principal entraine le modele comme un LLM causal classique.
-7. Le loss Cortex ajoute multi-horizon, temporal consistency, confidence, variable input et certificate.
+7. Le loss Cortex ajoute multi-horizon, temporal consistency, confidence, variable input, learned memory policy et certificate.
 8. Le controleur P1-P10 observe les batchs, lance les phases, produit replay, ledgers, audits, patchs P7/P10 et objectif final.
 9. Les checkpoints persistent modele, optimizer, scaler, RNG, replay, ledgers, phase state et sidecars d'audit.
 
 Les points d'integration importants sont :
 
-- `CortexTransformerLM.forward` : applique Variable-In, blocs Transformer, MoE, heads MTP/confiance/certificat.
+- `CortexTransformerLM.forward` : applique Variable-In, politique memoire apprise, blocs Transformer, MoE, heads MTP/confiance/certificat.
 - `CortexObjective.compute` : transforme ces sorties en loss trainable.
 - `LLMTrainer.train` : ajoute `auxiliary_loss`, `replay_loss`, optimizer step et `requantize_ternary_core`.
 - `CortexTrainingPhaseController.run_phase_audit` : execute P1-P10.
@@ -104,6 +113,7 @@ Le modele n'est pas un Transformer standard habille par un rapport. Son forward 
 
 - `BitLinear` pour le coeur ternaire ;
 - `VariableInCompressor` pour compression adaptative ;
+- `LearnedMemoryPolicy` pour decider quoi garder exact, latent ou drop ;
 - `SkillAwareExpertMoE` pour experts skill-aware ;
 - tetes MTP multi-horizon ;
 - tete de confiance ;
@@ -120,9 +130,10 @@ Le loss total contient :
 - temporal consistency ;
 - calibration/confiance ;
 - penalite de compression Variable-In ;
+- supervision de politique memoire apprise exact/latent/drop basee sur l'utilite token-level ;
 - certificate loss.
 
-Donc le modele n'apprend pas seulement a predire le prochain token. Il apprend aussi a predire des horizons futurs, calibrer sa confiance, produire des preuves latentes et compresser differemment selon l'importance des tokens.
+Donc le modele n'apprend pas seulement a predire le prochain token. Il apprend aussi a predire des horizons futurs, calibrer sa confiance, produire des preuves latentes, compresser differemment selon l'importance des tokens et choisir une politique memoire exact/latent/drop.
 
 ### 3. Replay Causal Verifie
 
@@ -192,10 +203,10 @@ Correspondance runtime :
 | --- | --- | --- |
 | Variable-In Compressor | `VariableInCompressor` dans le forward | audit `variable_in_compressor` |
 | Exact Anchor Ledger | observation de batchs decodes + anchors | audit `exact_anchor_ledger`, zero fidelity failure |
-| Latent Memory / KV | `CognitiveMemory` recent exact + latent old KV | audit `latent_memory_kv` |
+| Latent Memory / KV | `CognitiveMemory` recent exact + latent old KV + `LearnedMemoryPolicy` | audits `latent_memory_kv` et `learned_cognitive_memory_policy` |
 | Causal Ledger | `CausalLedger` + traces P1/P3/P4/P8/replay | audit `causal_ledger` |
 | Skill Ledger | `SkillLedger.update_from_report` | audit `skill_ledger` |
-| Ternary Core | `BitLinear`, quantization, requantization | P2 `238652` events |
+| Ternary Core | `BitLinear`, quantization, requantization, packed int2 dispatch | P2 `238652` events + audit `packed_ternary_hardware_runtime` |
 | Skill-aware Experts | `SkillAwareExpertMoE` | audit `skill_aware_experts` |
 | Future Contract / FSP | `FutureContractEngine` + observed tokens | P3 replay + contract decisions |
 | Adaptive Multi-Token Decoding | MTP horizons + inference route | audit `adaptive_multi_token_decoding` |
@@ -266,25 +277,27 @@ Quand `use_ternary_core=True`, les lineaires principaux deviennent des `BitLinea
 - signes ;
 - masque ternaire ;
 - scales ;
-- residual weights ;
+- residual weights optionnels ;
+- codes ternaires packes int2 dans `packed_codes` ;
 - quantization d'activation ;
-- layer forward events.
+- layer forward events ;
+- `PackedTernaryDispatch` avec backend `packed_int2_torch` ou `packed_int2_cuda`.
 
 ### Interaction Avec Les Autres Phases
 
 P2 fournit les traces de compression a :
 
 - P6, pour attribuer des echecs a la compression ;
-- P7/P10, car les patchs requantifient ensuite le coeur ternaire ;
+- P7/P10, car les patchs requantifient ensuite le coeur ternaire et regenerent les buffers packes ;
 - BitLedger, pour le cout effectif.
 
 ### Impact Apprentissage
 
-Le gradient passe par les poids flottants avec une approximation runtime quantifiee. Le modele apprend donc dans un regime compatible avec une execution ternaire, pas seulement dans un float Transformer classique.
+Le forward lit la valeur runtime depuis les codes ternaires packes, puis utilise une estimation straight-through pour garder un gradient vers `float_weight`. Le modele apprend donc avec une valeur avant ternaire packee, pas seulement avec une couche float habillee par des logs.
 
 ### Preuve Runtime
 
-Le checkpoint inspecte montre `P2=238652` evenements. C'est beaucoup plus qu'un smoke test ponctuel : le coeur ternaire tourne dans le run long.
+Le checkpoint inspecte montre `P2=238652` evenements. Les tests ajoutes verifient en plus que `BitLinear` execute un dispatch `packed_int2_cuda` sur GPU local et que le gradient reste non nul vers les poids entrainables.
 
 ## Phase 3 - Future Contract / FSP / MTP
 
@@ -332,6 +345,9 @@ Le controleur :
 - extrait les anchors ;
 - reconstruit via memoire recent exact + latent old KV ;
 - verifie la fidelite des anchors ;
+- observe la politique `LearnedMemoryPolicy` du forward ;
+- compte les decisions/probabilites exact/latent/drop ;
+- ajoute une supervision d'ancre vers la memoire exacte quand des ancres sont detectees ;
 - enregistre erreurs si une ancre disparait.
 
 ### Interaction Avec Les Autres Phases
@@ -341,11 +357,12 @@ P4 alimente :
 - P8, qui peut utiliser la memoire pendant inference ;
 - P6, si une regression vient de perte d'ancre ;
 - `L_anchor_fidelity` ;
+- le loss `learned_memory`, qui apprend la retention exacte/latente/drop a partir de l'utilite token-level ;
 - `CausalLedger`.
 
 ### Impact Apprentissage
 
-La memoire n'est pas un stockage passif. Les exemples d'ancrage deviennent du replay et les echecs de fidelite peuvent faire echouer l'audit. Le modele est donc contraint a ne pas gagner du cout en perdant les informations exactes.
+La memoire n'est pas un stockage passif. `LearnedMemoryPolicy` modifie le hidden state avec un melange differentiable entre exact, latent local et drop vector, puis `CortexObjective` supervise cette politique avec les pertes token-level : les tokens difficiles tendent vers exact, les tokens intermediaires vers latent et les tokens faciles/corrects vers drop. Les exemples d'ancrage restent du replay et les echecs de fidelite peuvent faire echouer l'audit.
 
 ## Phase 5 - Latent Reasoning Workspace / Certificates
 
@@ -679,34 +696,35 @@ L'avis externe qui dit "ce n'est pas encore la preuve maximale" est correct. Il 
 Etat actuel :
 
 - `VariableInCompressor` est dans le forward PyTorch et peut apprendre une compression differentiable des representations ;
-- P4 observe de vrais batchs, extrait des ancres, reconstruit via memoire exacte/latente, verifie la fidelite et genere du replay.
+- `LearnedMemoryPolicy` est maintenant dans le forward, produit des logits exact/latent/drop, modifie les representations avant les blocs Transformer et recoit un loss trainable ;
+- P4 observe de vrais batchs, extrait des ancres, reconstruit via memoire exacte/latente, verifie la fidelite, supervise les ancres et genere du replay.
 
-Limite actuelle :
+Limite restante :
 
-- `CognitiveMemory` agit encore surtout comme memoire exacte/latente verifiee et source de replay ;
-- la politique long terme "quoi garder, quoi oublier, quoi compresser, quoi preserver exactement" n'est pas encore prouvee comme politique memoire apprise et utile a grande echelle.
+- la politique exact/latent/drop est apprise et branchee, mais son gain final sur long contexte massif, cout memoire et held-out anchors doit encore etre mesure sur run long.
 
 Critere de fermeture :
 
-- ajouter une politique memoire trainable ou un gate appris sur retention/compression/oubli ;
-- mesurer son gain sur long contexte, anchors held-out, cout memoire, loss et qualite de generation.
+- finir un run long avec `learned_memory_policy_events`, decisions exact/latent/drop, `learned_memory` loss et zero fidelity failure dans les sidecars ;
+- mesurer son gain sur long contexte, anchors held-out, cout memoire, loss et qualite de generation face a une ablation sans politique apprise.
 
 ### Ternary Hardware-Native
 
 Etat actuel :
 
-- `BitLinear` tourne dans le forward ;
+- `BitLinear` tourne dans le forward avec valeur runtime issue de buffers `packed_codes` int2 ;
 - le coeur est requantifie apres optimizer step et apres patchs P7/P10 ;
-- les traces P2 prouvent une execution ternaire-compatible pendant le run.
+- les traces P2 prouvent une execution ternaire-compatible pendant le run ;
+- un smoke test CUDA verifie `packed_int2_cuda` sur GPU local avec gradient STE non nul.
 
-Limite actuelle :
+Limite restante :
 
-- l'execution reste PyTorch-compatible ;
-- il n'y a pas encore de kernel CUDA/custom hardware-native prouvant le gain final attendu d'un coeur ternaire optimise.
+- le dispatch packe est reel et GPU, mais il s'appuie encore sur les operations PyTorch pour unpack/matmul ;
+- il n'y a pas encore de kernel CUDA fusionne/custom prouvant le gain final attendu d'un coeur ternaire optimise.
 
 Critere de fermeture :
 
-- fournir kernels ternaires optimises ou backend compile ;
+- fournir kernels ternaires optimises ou backend compile fusionne ;
 - benchmarker latence, VRAM, energie estimee, throughput et qualite face a une baseline dense.
 
 ### Verifier Dynamique A Grande Echelle

@@ -63,6 +63,7 @@ from cortex3_ternary import (
     KVModeEvent,
     LayerForwardEvent,
     MTPFSPEvent,
+    PackedTernaryDispatch,
 )
 
 
@@ -154,15 +155,18 @@ def _restore_compression_trace_ledger(ledger: CompressionTraceLedger | None, pay
     ledger.kv_events.clear()
     ledger.mtp_fsp_events.clear()
     ledger.layer_forward_events.clear()
+    ledger.packed_ternary_dispatches.clear()
     ledger.total_compression_decisions = 0
     ledger.total_activation_quantizations = 0
     ledger.total_expert_activations = 0
     ledger.total_kv_events = 0
     ledger.total_mtp_fsp_events = 0
     ledger.total_layer_forward_events = 0
+    ledger.total_packed_ternary_dispatches = 0
     ledger.total_weight_bits_read = 0.0
     ledger.total_activation_bits = 0.0
     ledger.total_kv_bytes = 0.0
+    ledger.total_packed_weight_bytes = 0.0
     if not payload:
         return
     if configured_retention_limit is None and payload.get("retention_limit") is not None:
@@ -255,6 +259,22 @@ def _restore_compression_trace_ledger(ledger: CompressionTraceLedger | None, pay
             )
         )
     ledger._trim(ledger.layer_forward_events)
+    for item in payload.get("packed_ternary_dispatches", ()):
+        data = dict(item)
+        ledger.packed_ternary_dispatches.append(
+            PackedTernaryDispatch(
+                layer_id=str(data.get("layer_id", "")),
+                backend=str(data.get("backend", "")),
+                device=str(data.get("device", "")),
+                packed_weight_bytes=int(data.get("packed_weight_bytes", 0)),
+                active_weights=int(data.get("active_weights", 0)),
+                total_weights=int(data.get("total_weights", 0)),
+                max_abs_error_vs_ste=float(data.get("max_abs_error_vs_ste", 0.0)),
+                used_residual=bool(data.get("used_residual", False)),
+                note=str(data.get("note", "")),
+            )
+        )
+    ledger._trim(ledger.packed_ternary_dispatches)
     total_counts = dict(payload.get("total_event_counts") or {})
     ledger.total_compression_decisions = int(total_counts.get("compression_decisions", len(ledger.compression_decisions)))
     ledger.total_activation_quantizations = int(total_counts.get("activation_quantizations", len(ledger.activation_quantizations)))
@@ -262,6 +282,7 @@ def _restore_compression_trace_ledger(ledger: CompressionTraceLedger | None, pay
     ledger.total_kv_events = int(total_counts.get("kv_events", len(ledger.kv_events)))
     ledger.total_mtp_fsp_events = int(total_counts.get("mtp_fsp_events", len(ledger.mtp_fsp_events)))
     ledger.total_layer_forward_events = int(total_counts.get("layer_forward_events", len(ledger.layer_forward_events)))
+    ledger.total_packed_ternary_dispatches = int(total_counts.get("packed_ternary_dispatches", len(ledger.packed_ternary_dispatches)))
     cost_trace = dict(payload.get("cost_trace") or {})
     ledger.total_weight_bits_read = float(
         cost_trace.get("weight_bits_read", sum(item.estimated_bits for item in ledger.compression_decisions))
@@ -271,6 +292,9 @@ def _restore_compression_trace_ledger(ledger: CompressionTraceLedger | None, pay
     )
     ledger.total_kv_bytes = float(
         cost_trace.get("kv_bytes", sum(item.bytes_used for item in ledger.kv_events))
+    )
+    ledger.total_packed_weight_bytes = float(
+        payload.get("packed_weight_bytes_read", sum(item.packed_weight_bytes for item in ledger.packed_ternary_dispatches))
     )
 
 
@@ -1478,6 +1502,8 @@ class TransformerConfig:
     skill_expert_top_k: int = 2
     use_variable_in_compressor: bool = False
     variable_compression_wide_kernel: int = 8
+    use_learned_memory_policy: bool = False
+    learned_memory_temperature: float = 1.0
     use_certificate_head: bool = False
     certificate_latent_size: int = 64
 
@@ -1502,6 +1528,8 @@ class TransformerConfig:
             raise ValueError("skill_expert_top_k must be between 1 and skill_expert_count")
         if self.variable_compression_wide_kernel < 2:
             raise ValueError("variable_compression_wide_kernel must be >= 2")
+        if self.use_learned_memory_policy and self.learned_memory_temperature <= 0:
+            raise ValueError("learned_memory_temperature must be positive")
         if self.certificate_latent_size < 1:
             raise ValueError("certificate_latent_size must be positive")
 
@@ -1673,6 +1701,101 @@ class VariableInCompressor(nn.Module):
         return compressed, state
 
 
+@dataclass(frozen=True)
+class LearnedMemoryPolicyState:
+    logits: torch.Tensor
+    probs: torch.Tensor
+    exact_prob: torch.Tensor
+    latent_prob: torch.Tensor
+    drop_prob: torch.Tensor
+    storage_ratio: torch.Tensor
+    entropy: torch.Tensor
+    input_ids: torch.Tensor
+
+    def to_summary(self) -> dict[str, float]:
+        return {
+            "exact_prob_mean": float(self.exact_prob.detach().mean().cpu()),
+            "latent_prob_mean": float(self.latent_prob.detach().mean().cpu()),
+            "drop_prob_mean": float(self.drop_prob.detach().mean().cpu()),
+            "storage_ratio_mean": float(self.storage_ratio.detach().mean().cpu()),
+            "entropy_mean": float(self.entropy.detach().mean().cpu()),
+        }
+
+
+class LearnedMemoryPolicy(nn.Module):
+    EXACT = 0
+    LATENT = 1
+    DROP = 2
+
+    def __init__(self, config: TransformerConfig, *, ledger: CompressionTraceLedger | None = None):
+        super().__init__()
+        self.config = config
+        self.ledger = ledger
+        hidden = max(16, config.d_model // 2)
+        self.policy = nn.Sequential(
+            nn.LayerNorm(config.d_model),
+            nn.Linear(config.d_model, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, 3),
+        )
+        self.latent_projector = _make_transformer_linear(
+            config,
+            config.d_model,
+            config.d_model,
+            ledger=ledger,
+            log_prefix="learned_memory.latent_projector",
+        )
+        self.drop_vector = nn.Parameter(torch.zeros(config.d_model))
+
+    def _local_latent(self, hidden: torch.Tensor) -> torch.Tensor:
+        time_steps = hidden.shape[1]
+        kernel = max(1, min(int(self.config.variable_compression_wide_kernel), int(time_steps)))
+        left = kernel // 2
+        right = kernel - 1 - left
+        padded = F.pad(hidden.transpose(1, 2), (left, right), mode="replicate")
+        pooled = F.avg_pool1d(padded, kernel_size=kernel, stride=1).transpose(1, 2)
+        return self.latent_projector(pooled)
+
+    def forward(self, hidden: torch.Tensor, input_ids: torch.Tensor) -> tuple[torch.Tensor, LearnedMemoryPolicyState]:
+        logits = self.policy(hidden) / float(self.config.learned_memory_temperature)
+        probs = F.softmax(logits, dim=-1)
+        exact_prob = probs[..., self.EXACT]
+        latent_prob = probs[..., self.LATENT]
+        drop_prob = probs[..., self.DROP]
+        latent = self._local_latent(hidden)
+        drop = self.drop_vector.view(1, 1, -1).expand_as(hidden)
+        mixed = (
+            exact_prob.unsqueeze(-1) * hidden
+            + latent_prob.unsqueeze(-1) * latent
+            + drop_prob.unsqueeze(-1) * drop
+        )
+        storage_ratio = exact_prob + 0.25 * latent_prob
+        entropy = -(probs.clamp_min(1e-8).log() * probs).sum(dim=-1)
+        state = LearnedMemoryPolicyState(
+            logits=logits,
+            probs=probs,
+            exact_prob=exact_prob,
+            latent_prob=latent_prob,
+            drop_prob=drop_prob,
+            storage_ratio=storage_ratio,
+            entropy=entropy,
+            input_ids=input_ids.detach(),
+        )
+        if self.ledger is not None:
+            batch, time_steps, channels = hidden.shape
+            self.ledger.record_kv(
+                "llm-learned-memory-policy",
+                "learned_exact_latent_drop",
+                bytes_used=float(batch * time_steps * channels * 2) * float(storage_ratio.detach().mean().cpu()),
+                exact_anchors=int((exact_prob.detach() >= latent_prob.detach()).sum().item()),
+                note=(
+                    "learned memory policy mixed exact/latent/drop states "
+                    f"storage_ratio={float(storage_ratio.detach().mean().cpu()):.4f}"
+                ),
+            )
+        return mixed, state
+
+
 class SkillAwareExpertMoE(nn.Module):
     def __init__(self, config: TransformerConfig, *, ledger: CompressionTraceLedger | None = None):
         super().__init__()
@@ -1734,6 +1857,7 @@ class LLMForwardOutput:
     confidence: torch.Tensor | None
     certificate: CertificateHeadOutput | None = None
     variable_compression: VariableCompressionState | None = None
+    learned_memory_policy: LearnedMemoryPolicyState | None = None
 
 
 class CortexTransformerLM(nn.Module):
@@ -1748,6 +1872,11 @@ class CortexTransformerLM(nn.Module):
         self.variable_in = (
             VariableInCompressor(config, ledger=self.compression_ledger)
             if config.use_variable_in_compressor
+            else None
+        )
+        self.learned_memory = (
+            LearnedMemoryPolicy(config, ledger=self.compression_ledger)
+            if config.use_learned_memory_policy
             else None
         )
         self.blocks = nn.ModuleList([
@@ -1797,6 +1926,9 @@ class CortexTransformerLM(nn.Module):
         variable_compression = None
         if self.variable_in is not None:
             hidden, variable_compression = self.variable_in(hidden)
+        learned_memory_policy = None
+        if self.learned_memory is not None:
+            hidden, learned_memory_policy = self.learned_memory(hidden, input_ids)
         for block in self.blocks:
             hidden = block(hidden)
         hidden = self.ln_f(hidden)
@@ -1818,6 +1950,7 @@ class CortexTransformerLM(nn.Module):
             confidence=confidence,
             certificate=certificate,
             variable_compression=variable_compression,
+            learned_memory_policy=learned_memory_policy,
         )
 
     def requantize_ternary_core(self, *, certify_zeros: bool = False) -> None:
@@ -1840,6 +1973,7 @@ class LossWeights:
     temporal_consistency: float = 0.05
     confidence: float = 0.05
     variable_input: float = 0.01
+    learned_memory: float = 0.03
     certificate: float = 0.04
 
 
@@ -1851,6 +1985,7 @@ class LossBreakdown:
     temporal_consistency: float = 0.0
     confidence: float = 0.0
     variable_input: float = 0.0
+    learned_memory: float = 0.0
     certificate: float = 0.0
 
     def to_dict(self) -> dict[str, float]:
@@ -1870,12 +2005,18 @@ class CortexObjective:
         use_cortex_terms: bool,
     ) -> tuple[torch.Tensor, LossBreakdown]:
         vocab_size = output.logits.shape[-1]
-        next_loss = F.cross_entropy(output.logits.reshape(-1, vocab_size), next_targets.reshape(-1))
+        next_loss_per_token = F.cross_entropy(
+            output.logits.reshape(-1, vocab_size),
+            next_targets.reshape(-1),
+            reduction="none",
+        ).view_as(next_targets)
+        next_loss = next_loss_per_token.mean()
         total = self.weights.next_token * next_loss
         mtp_loss = output.logits.new_tensor(0.0)
         temporal_loss = output.logits.new_tensor(0.0)
         confidence_loss = output.logits.new_tensor(0.0)
         variable_loss = output.logits.new_tensor(0.0)
+        learned_memory_loss = output.logits.new_tensor(0.0)
         certificate_loss = output.logits.new_tensor(0.0)
         if use_cortex_terms:
             if not output.mtp_logits:
@@ -1906,6 +2047,29 @@ class CortexObjective:
             if output.variable_compression is not None:
                 variable_loss = output.variable_compression.estimated_ratio.mean()
                 total = total + self.weights.variable_input * variable_loss
+            if output.learned_memory_policy is not None:
+                policy = output.learned_memory_policy
+                with torch.no_grad():
+                    detached_loss = next_loss_per_token.detach()
+                    center = detached_loss.mean(dim=1, keepdim=True)
+                    spread = detached_loss.std(dim=1, keepdim=True, unbiased=False).clamp_min(1e-6)
+                    z = (detached_loss - center) / spread
+                    exact_target = z > 0.35
+                    drop_target = (z < -0.35) & output.logits.argmax(dim=-1).eq(next_targets)
+                    mode_target = torch.full_like(next_targets, LearnedMemoryPolicy.LATENT)
+                    mode_target = torch.where(exact_target, torch.full_like(mode_target, LearnedMemoryPolicy.EXACT), mode_target)
+                    mode_target = torch.where(drop_target, torch.full_like(mode_target, LearnedMemoryPolicy.DROP), mode_target)
+                    exact_supervision = exact_target.to(policy.exact_prob.dtype)
+                    target_distribution = F.one_hot(mode_target, num_classes=3).to(policy.probs.dtype).mean(dim=(0, 1))
+                mode_loss = F.cross_entropy(policy.logits.reshape(-1, 3), mode_target.reshape(-1))
+                anchor_loss = F.binary_cross_entropy_with_logits(
+                    policy.logits[..., LearnedMemoryPolicy.EXACT],
+                    exact_supervision,
+                )
+                storage_loss = policy.storage_ratio.mean()
+                collapse_loss = (policy.probs.mean(dim=(0, 1)) - target_distribution).square().sum()
+                learned_memory_loss = mode_loss + 0.50 * anchor_loss + 0.05 * storage_loss + 0.10 * collapse_loss
+                total = total + self.weights.learned_memory * learned_memory_loss
             if output.certificate is not None:
                 final_targets = next_targets[:, -1]
                 cert_answer_loss = F.cross_entropy(output.certificate.answer_logits, final_targets)
@@ -1923,6 +2087,7 @@ class CortexObjective:
             temporal_consistency=float(temporal_loss.detach().cpu()),
             confidence=float(confidence_loss.detach().cpu()),
             variable_input=float(variable_loss.detach().cpu()),
+            learned_memory=float(learned_memory_loss.detach().cpu()),
             certificate=float(certificate_loss.detach().cpu()),
         )
 
@@ -2587,6 +2752,23 @@ def _cortex_architecture_audit_from_summary(summary: Mapping[str, Any]) -> dict[
         "Cognitive memory must contain both recent exact KV and latent compressed KV",
     )
     add(
+        "learned_cognitive_memory_policy",
+        integer("learned_memory_policy_events") > 0
+        and integer("learned_memory_anchor_supervision_events") > 0
+        and integer("learned_memory_exact_decisions") > 0
+        and integer("learned_memory_latent_decisions") > 0
+        and number("learned_memory_storage_ratio_mean") > 0.0,
+        {
+            "learned_memory_policy_events": integer("learned_memory_policy_events"),
+            "learned_memory_anchor_supervision_events": integer("learned_memory_anchor_supervision_events"),
+            "learned_memory_exact_decisions": integer("learned_memory_exact_decisions"),
+            "learned_memory_latent_decisions": integer("learned_memory_latent_decisions"),
+            "learned_memory_drop_decisions": integer("learned_memory_drop_decisions"),
+            "learned_memory_storage_ratio_mean": number("learned_memory_storage_ratio_mean"),
+        },
+        "cognitive memory must learn exact/latent/drop retention decisions during LLM training, not only replay audited segments",
+    )
+    add(
         "ternary_core",
         trace_count("layer_forward_events") > 0
         and trace_count("activation_quantizations") > 0
@@ -2597,6 +2779,12 @@ def _cortex_architecture_audit_from_summary(summary: Mapping[str, Any]) -> dict[
             "compression_decisions": trace_count("compression_decisions"),
         },
         "ternary W in {-1,0,+1} core must run layer forwards and activation quantization",
+    )
+    add(
+        "packed_ternary_hardware_runtime",
+        trace_count("packed_ternary_dispatches") > 0,
+        {"packed_ternary_dispatches": trace_count("packed_ternary_dispatches")},
+        "ternary core must dispatch from packed 2-bit ternary weight buffers, not only trace PyTorch float-linear compatibility",
     )
     add(
         "skill_aware_experts",
@@ -2864,10 +3052,18 @@ def _cortex_phase_deliverable_audit_from_summary(summary: Mapping[str, Any]) -> 
     )
     add(
         "P2",
-        "ternary_sign_mask_activation_and_trace_logs",
-        trace("layer_forward_events") > 0 and trace("activation_quantizations") > 0 and trace("compression_decisions") > 0,
-        {"layer_forward_events": trace("layer_forward_events"), "activation_quantizations": trace("activation_quantizations"), "compression_decisions": trace("compression_decisions")},
-        "BitLinear sign+mask, activation quantization, and compression decisions must all be logged",
+        "ternary_sign_mask_activation_trace_logs_and_packed_dispatch",
+        trace("layer_forward_events") > 0
+        and trace("activation_quantizations") > 0
+        and trace("compression_decisions") > 0
+        and trace("packed_ternary_dispatches") > 0,
+        {
+            "layer_forward_events": trace("layer_forward_events"),
+            "activation_quantizations": trace("activation_quantizations"),
+            "compression_decisions": trace("compression_decisions"),
+            "packed_ternary_dispatches": trace("packed_ternary_dispatches"),
+        },
+        "BitLinear sign+mask, activation quantization, compression decisions and packed ternary dispatch must all run",
     )
     add(
         "P3",
@@ -2878,18 +3074,22 @@ def _cortex_phase_deliverable_audit_from_summary(summary: Mapping[str, Any]) -> 
     )
     add(
         "P4",
-        "recent_exact_old_latent_query_memory_anchor_fidelity",
+        "learned_exact_latent_drop_memory_anchor_fidelity",
         int(summary.get("memory_recent_segments", 0) or 0) > 0
         and int(summary.get("memory_latent_segments", 0) or 0) > 0
         and int(summary.get("input_anchor_count", 0) or 0) > 0
-        and int(summary.get("input_anchor_fidelity_failures", 0) or 0) == 0,
+        and int(summary.get("input_anchor_fidelity_failures", 0) or 0) == 0
+        and int(summary.get("learned_memory_policy_events", 0) or 0) > 0
+        and int(summary.get("learned_memory_anchor_supervision_events", 0) or 0) > 0,
         {
             "memory_recent_segments": int(summary.get("memory_recent_segments", 0) or 0),
             "memory_latent_segments": int(summary.get("memory_latent_segments", 0) or 0),
             "input_anchor_count": int(summary.get("input_anchor_count", 0) or 0),
             "input_anchor_fidelity_failures": int(summary.get("input_anchor_fidelity_failures", 0) or 0),
+            "learned_memory_policy_events": int(summary.get("learned_memory_policy_events", 0) or 0),
+            "learned_memory_anchor_supervision_events": int(summary.get("learned_memory_anchor_supervision_events", 0) or 0),
         },
-        "Cognitive memory must preserve exact anchors across recent/latent KV reconstruction",
+        "Cognitive memory must preserve exact anchors while learning exact/latent/drop retention decisions",
     )
     add(
         "P5",
@@ -3031,6 +3231,8 @@ class CortexTrainingPhaseController:
             raise ValueError("CortexTrainingPhaseController requires skill-aware experts for full Cortex training")
         if not model.config.use_variable_in_compressor:
             raise ValueError("CortexTrainingPhaseController requires a Variable-In compressor for full Cortex training")
+        if not model.config.use_learned_memory_policy:
+            raise ValueError("CortexTrainingPhaseController requires a learned cognitive memory policy for full Cortex training")
         if not model.config.use_certificate_head:
             raise ValueError("CortexTrainingPhaseController requires a certificate head for full Cortex training")
         self.model = model
@@ -3097,6 +3299,12 @@ class CortexTrainingPhaseController:
         self.input_anchor_observations = 0
         self.input_anchor_count = 0
         self.input_anchor_fidelity_failures = 0
+        self.learned_memory_policy_events = 0
+        self.learned_memory_anchor_supervision_events = 0
+        self.learned_memory_exact_decisions = 0
+        self.learned_memory_latent_decisions = 0
+        self.learned_memory_drop_decisions = 0
+        self.learned_memory_storage_ratio_total = 0.0
         self.regrowth_model_applications: list[dict[str, Any]] = []
         self.regrowth_model_parameter_delta_l1 = 0.0
         self.regrowth_model_repair_loss_delta = 0.0
@@ -3220,9 +3428,25 @@ class CortexTrainingPhaseController:
             "expected_calibration_error": self.uncertainty_ledger.expected_calibration_error(),
         }
 
-    def observe_input_batch(self, *, step: int, input_ids: torch.Tensor, source: str) -> None:
+    def observe_input_batch(self, *, step: int, input_ids: torch.Tensor, source: str, output: LLMForwardOutput | None = None) -> None:
         if input_ids.ndim != 2 or input_ids.shape[0] == 0:
             return
+        policy = output.learned_memory_policy if output is not None else None
+        if policy is not None:
+            with torch.no_grad():
+                decisions = policy.probs.detach().argmax(dim=-1)
+                self.learned_memory_policy_events += int(decisions.numel())
+                exact_active = int(policy.exact_prob.detach().gt(0.01).sum().item())
+                latent_active = int(policy.latent_prob.detach().gt(0.01).sum().item())
+                drop_active = int(policy.drop_prob.detach().gt(0.01).sum().item())
+                self.learned_memory_exact_decisions += exact_active
+                self.learned_memory_latent_decisions += latent_active
+                self.learned_memory_drop_decisions += drop_active
+                self.learned_memory_storage_ratio_total += float(policy.storage_ratio.detach().sum().cpu())
+                self._count("learned_memory_policy_events", int(decisions.numel()))
+                self._count("learned_memory_exact_decisions", exact_active)
+                self._count("learned_memory_latent_decisions", latent_active)
+                self._count("learned_memory_drop_decisions", drop_active)
         sample_count = min(2, int(input_ids.shape[0]))
         for row_index, row in enumerate(input_ids[:sample_count]):
             token_ids = [int(token) for token in row.detach().cpu().tolist()]
@@ -3258,6 +3482,19 @@ class CortexTrainingPhaseController:
                     note="Exact Anchor Ledger observed decoded LLM input batch",
                 )
             if anchor_count:
+                if policy is not None and row_index < policy.exact_prob.shape[0]:
+                    exact_mean = float(policy.exact_prob[row_index].detach().mean().cpu())
+                    latent_mean = float(policy.latent_prob[row_index].detach().mean().cpu())
+                    drop_mean = float(policy.drop_prob[row_index].detach().mean().cpu())
+                    self.learned_memory_anchor_supervision_events += anchor_count
+                    self._count("learned_memory_anchor_supervision_events", anchor_count)
+                    self.bit_ledger.ingest_cost(
+                        CostTrace(kv_bytes=float(anchor_count) * max(0.0, 1.0 - exact_mean), verifier_steps=1),
+                        note=(
+                            f"learned-memory-anchor-policy:{source}:{step}:"
+                            f"exact={exact_mean:.4f}:latent={latent_mean:.4f}:drop={drop_mean:.4f}"
+                        ),
+                    )
                 reconstruction = self.memory.reconstruct(text[:512], required_anchors=segment.anchors)
                 if not reconstruction.fidelity.passed:
                     self.input_anchor_fidelity_failures += 1
@@ -3874,6 +4111,12 @@ class CortexTrainingPhaseController:
             "input_anchor_observations": int(self.input_anchor_observations),
             "input_anchor_count": int(self.input_anchor_count),
             "input_anchor_fidelity_failures": int(self.input_anchor_fidelity_failures),
+            "learned_memory_policy_events": int(self.learned_memory_policy_events),
+            "learned_memory_anchor_supervision_events": int(self.learned_memory_anchor_supervision_events),
+            "learned_memory_exact_decisions": int(self.learned_memory_exact_decisions),
+            "learned_memory_latent_decisions": int(self.learned_memory_latent_decisions),
+            "learned_memory_drop_decisions": int(self.learned_memory_drop_decisions),
+            "learned_memory_storage_ratio_total": float(self.learned_memory_storage_ratio_total),
             "last_ingested_compression_cost": _cost_trace_payload(self._last_ingested_compression_cost),
             "future_ledger": self.future_ledger.to_dict(),
             "compression_trace_ledger": (
@@ -3979,6 +4222,12 @@ class CortexTrainingPhaseController:
         self.input_anchor_observations = int(payload.get("input_anchor_observations", 0))
         self.input_anchor_count = int(payload.get("input_anchor_count", 0))
         self.input_anchor_fidelity_failures = int(payload.get("input_anchor_fidelity_failures", 0))
+        self.learned_memory_policy_events = int(payload.get("learned_memory_policy_events", 0))
+        self.learned_memory_anchor_supervision_events = int(payload.get("learned_memory_anchor_supervision_events", 0))
+        self.learned_memory_exact_decisions = int(payload.get("learned_memory_exact_decisions", 0))
+        self.learned_memory_latent_decisions = int(payload.get("learned_memory_latent_decisions", 0))
+        self.learned_memory_drop_decisions = int(payload.get("learned_memory_drop_decisions", 0))
+        self.learned_memory_storage_ratio_total = float(payload.get("learned_memory_storage_ratio_total", 0.0))
         self._last_ingested_compression_cost = _cost_trace_from_payload(payload.get("last_ingested_compression_cost"))
         _restore_future_contract_ledger(self.future_ledger, payload.get("future_ledger"))
         _restore_compression_trace_ledger(self.model.compression_ledger, payload.get("compression_trace_ledger"))
@@ -4037,6 +4286,15 @@ class CortexTrainingPhaseController:
             "input_anchor_observations": int(self.input_anchor_observations),
             "input_anchor_count": int(self.input_anchor_count),
             "input_anchor_fidelity_failures": int(self.input_anchor_fidelity_failures),
+            "learned_memory_policy_events": int(self.learned_memory_policy_events),
+            "learned_memory_anchor_supervision_events": int(self.learned_memory_anchor_supervision_events),
+            "learned_memory_exact_decisions": int(self.learned_memory_exact_decisions),
+            "learned_memory_latent_decisions": int(self.learned_memory_latent_decisions),
+            "learned_memory_drop_decisions": int(self.learned_memory_drop_decisions),
+            "learned_memory_storage_ratio_mean": (
+                float(self.learned_memory_storage_ratio_total)
+                / max(1, int(self.learned_memory_policy_events))
+            ),
             "bit_ledger_total_effective_bits": self.bit_ledger.total_effective_bits,
             "skill_ledger_states": len(self.skill_ledger.states),
             "causal_ledger_traces": len(self.causal_ledger.traces),
@@ -4125,6 +4383,17 @@ class CortexTrainingPhaseController:
                 "selected_segment_ids": reconstruction.selected_segment_ids,
                 "fidelity": asdict(reconstruction.fidelity),
                 "compression": self.memory.compression_report(),
+                "learned_policy": {
+                    "policy_events": int(self.learned_memory_policy_events),
+                    "anchor_supervision_events": int(self.learned_memory_anchor_supervision_events),
+                    "exact_decisions": int(self.learned_memory_exact_decisions),
+                    "latent_decisions": int(self.learned_memory_latent_decisions),
+                    "drop_decisions": int(self.learned_memory_drop_decisions),
+                    "storage_ratio_mean": (
+                        float(self.learned_memory_storage_ratio_total)
+                        / max(1, int(self.learned_memory_policy_events))
+                    ),
+                },
             }
             self._add_verified_phase_replay(
                 "P4",
@@ -4475,12 +4744,22 @@ class CortexTrainingPhaseController:
             "phase_event_counts": dict(self.phase_counts),
             "training_influence": {
                 "ternary_core_forward_events": trace_counts.get("layer_forward_events", 0),
+                "packed_ternary_dispatches": trace_counts.get("packed_ternary_dispatches", 0),
                 "variable_input_compression_events": trace_counts.get("kv_events", 0),
                 "skill_expert_activations": trace_counts.get("expert_activations", 0),
                 "certificate_head_forward_events": int(self.model.certificate_forward_events),
                 "input_anchor_observations": int(self.input_anchor_observations),
                 "input_anchor_count": int(self.input_anchor_count),
                 "input_anchor_fidelity_failures": int(self.input_anchor_fidelity_failures),
+                "learned_memory_policy_events": int(self.learned_memory_policy_events),
+                "learned_memory_anchor_supervision_events": int(self.learned_memory_anchor_supervision_events),
+                "learned_memory_exact_decisions": int(self.learned_memory_exact_decisions),
+                "learned_memory_latent_decisions": int(self.learned_memory_latent_decisions),
+                "learned_memory_drop_decisions": int(self.learned_memory_drop_decisions),
+                "learned_memory_storage_ratio_mean": (
+                    float(self.learned_memory_storage_ratio_total)
+                    / max(1, int(self.learned_memory_policy_events))
+                ),
                 "future_contract_decisions": len(self.future_ledger.decisions),
                 "bit_ledger_total_effective_bits": self.bit_ledger.total_effective_bits,
                 "skill_ledger_states": len(self.skill_ledger.states),
@@ -4545,6 +4824,15 @@ class CortexTrainingPhaseController:
                     "input_anchor_observations": int(self.input_anchor_observations),
                     "input_anchor_count": int(self.input_anchor_count),
                     "input_anchor_fidelity_failures": int(self.input_anchor_fidelity_failures),
+                    "learned_memory_policy_events": int(self.learned_memory_policy_events),
+                    "learned_memory_anchor_supervision_events": int(self.learned_memory_anchor_supervision_events),
+                    "learned_memory_exact_decisions": int(self.learned_memory_exact_decisions),
+                    "learned_memory_latent_decisions": int(self.learned_memory_latent_decisions),
+                    "learned_memory_drop_decisions": int(self.learned_memory_drop_decisions),
+                    "learned_memory_storage_ratio_mean": (
+                        float(self.learned_memory_storage_ratio_total)
+                        / max(1, int(self.learned_memory_policy_events))
+                    ),
                     "bit_ledger_total_effective_bits": self.bit_ledger.total_effective_bits,
                     "skill_ledger_states": len(self.skill_ledger.states),
                     "causal_ledger_traces": len(self.causal_ledger.traces),
@@ -4591,6 +4879,15 @@ class CortexTrainingPhaseController:
                     "input_anchor_observations": int(self.input_anchor_observations),
                     "input_anchor_count": int(self.input_anchor_count),
                     "input_anchor_fidelity_failures": int(self.input_anchor_fidelity_failures),
+                    "learned_memory_policy_events": int(self.learned_memory_policy_events),
+                    "learned_memory_anchor_supervision_events": int(self.learned_memory_anchor_supervision_events),
+                    "learned_memory_exact_decisions": int(self.learned_memory_exact_decisions),
+                    "learned_memory_latent_decisions": int(self.learned_memory_latent_decisions),
+                    "learned_memory_drop_decisions": int(self.learned_memory_drop_decisions),
+                    "learned_memory_storage_ratio_mean": (
+                        float(self.learned_memory_storage_ratio_total)
+                        / max(1, int(self.learned_memory_policy_events))
+                    ),
                     "bit_ledger_total_effective_bits": self.bit_ledger.total_effective_bits,
                     "skill_ledger_states": len(self.skill_ledger.states),
                     "causal_ledger_traces": len(self.causal_ledger.traces),
@@ -4790,6 +5087,7 @@ class LLMTrainer:
                 and self.model.config.use_ternary_core
                 and self.model.config.use_skill_aware_experts
                 and self.model.config.use_variable_in_compressor
+                and self.model.config.use_learned_memory_policy
                 and self.model.config.use_certificate_head
                 and self.model.config.horizons == (1, 2, 4, 8)
             )
@@ -4879,7 +5177,7 @@ class LLMTrainer:
                                 future_targets=future,
                                 breakdown=breakdown,
                             )
-                            phase_controller.observe_input_batch(step=step, input_ids=x, source="train")
+                            phase_controller.observe_input_batch(step=step, input_ids=x, source="train", output=output)
                         if scaler is not None:
                             scaler.scale(loss).backward()
                         else:
@@ -5070,6 +5368,8 @@ class LLMTrainer:
         checkpoint_model_config.setdefault("skill_expert_top_k", 2)
         checkpoint_model_config.setdefault("use_variable_in_compressor", False)
         checkpoint_model_config.setdefault("variable_compression_wide_kernel", 8)
+        checkpoint_model_config.setdefault("use_learned_memory_policy", False)
+        checkpoint_model_config.setdefault("learned_memory_temperature", 1.0)
         checkpoint_model_config.setdefault("use_certificate_head", False)
         checkpoint_model_config.setdefault("certificate_latent_size", 64)
         if checkpoint_model_config != asdict(self.model.config):
@@ -5630,6 +5930,13 @@ def _transformer_parameter_count(config: TransformerConfig) -> int:
     if config.use_variable_in_compressor:
         total += d_model + 1
         total += d_model * d_model + d_model
+    if config.use_learned_memory_policy:
+        policy_hidden = max(16, d_model // 2)
+        total += 2 * d_model
+        total += d_model * policy_hidden + policy_hidden
+        total += policy_hidden * 3 + 3
+        total += d_model * d_model + d_model
+        total += d_model
     if config.use_certificate_head:
         latent = int(config.certificate_latent_size)
         total += d_model * latent + latent
@@ -5678,6 +5985,7 @@ def _estimate_transformer_training_memory(config: TransformerConfig, training: T
         "skill_expert_count": int(config.skill_expert_count) if config.use_skill_aware_experts else 0,
         "skill_expert_top_k": int(config.skill_expert_top_k) if config.use_skill_aware_experts else 0,
         "variable_in_compressor": bool(config.use_variable_in_compressor),
+        "learned_memory_policy": bool(config.use_learned_memory_policy),
         "certificate_head": bool(config.use_certificate_head),
         "certificate_latent_size": int(config.certificate_latent_size) if config.use_certificate_head else 0,
         "training_state_bytes": int(training_state_bytes),
@@ -5707,6 +6015,7 @@ def _experiment_model_memory_estimates(config: ComparisonConfig) -> dict[str, An
         "use_ternary_core": True,
         "use_skill_aware_experts": True,
         "use_variable_in_compressor": True,
+        "use_learned_memory_policy": True,
         "use_certificate_head": True,
     })
     baseline = _estimate_transformer_training_memory(baseline_config, config.training)
@@ -5761,6 +6070,7 @@ def build_training_plan(
         "use_ternary_core": True,
         "use_skill_aware_experts": True,
         "use_variable_in_compressor": True,
+        "use_learned_memory_policy": True,
         "use_certificate_head": True,
     })
     baseline_parameters = _transformer_parameter_count(baseline_config)
@@ -5820,6 +6130,7 @@ def build_training_plan(
             "cortex_skill_expert_count": int(cortex_config.skill_expert_count),
             "cortex_skill_expert_top_k": int(cortex_config.skill_expert_top_k),
             "cortex_variable_in_compressor": bool(cortex_config.use_variable_in_compressor),
+            "cortex_learned_memory_policy": bool(cortex_config.use_learned_memory_policy),
             "cortex_certificate_head": bool(cortex_config.use_certificate_head),
         },
         "training": {
@@ -6051,6 +6362,7 @@ class LLMComparisonRunner:
                 "use_ternary_core": True,
                 "use_skill_aware_experts": True,
                 "use_variable_in_compressor": True,
+                "use_learned_memory_policy": True,
                 "use_certificate_head": True,
             })
             cortex = LLMTrainer(
@@ -6127,6 +6439,7 @@ class LLMComparisonRunner:
             isinstance(cortex_model_config, Mapping)
             and cortex_model_config.get("use_cortex_heads")
             and cortex_model_config.get("use_ternary_core")
+            and cortex_model_config.get("use_learned_memory_policy")
             and tuple(int(value) for value in raw_horizons) == (1, 2, 4, 8)
         )
         phase_report = cortex.cortex_phase_report if isinstance(cortex.cortex_phase_report, Mapping) else {}

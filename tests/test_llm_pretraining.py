@@ -32,6 +32,7 @@ from cortex3_llm import (
     TrainingConfig,
     TransformerConfig,
     CortexTransformerLM,
+    CortexObjective,
     CortexTrainingPhaseController,
     TrainingPoint,
     TrainingRunReport,
@@ -130,6 +131,37 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                     max_tokens=16,
                 )
 
+    def test_learned_memory_policy_is_trainable_and_affects_cortex_loss(self):
+        torch.manual_seed(101)
+        config = TransformerConfig(
+            vocab_size=96,
+            seq_len=16,
+            d_model=32,
+            n_heads=4,
+            n_layers=1,
+            dropout=0.0,
+            horizons=(1, 2, 4, 8),
+            use_cortex_heads=True,
+            use_ternary_core=True,
+            use_skill_aware_experts=True,
+            use_variable_in_compressor=True,
+            use_learned_memory_policy=True,
+            use_certificate_head=True,
+        )
+        model = CortexTransformerLM(config)
+        x = torch.randint(4, 96, (2, 16))
+        y = torch.randint(4, 96, (2, 16))
+        future = torch.stack((y, y, y, y), dim=-1)
+
+        output = model(x)
+        loss, breakdown = CortexObjective().compute(output, y, future, use_cortex_terms=True)
+        loss.backward()
+
+        self.assertIsNotNone(output.learned_memory_policy)
+        self.assertGreater(breakdown.learned_memory, 0.0)
+        self.assertGreater(float(model.learned_memory.policy[-1].weight.grad.abs().sum()), 0.0)
+        self.assertGreater(model.compression_ledger.total_packed_ternary_dispatches, 0)
+
     def test_tokenized_corpus_builder_streams_tokens_once(self):
         class CountingTokenizer:
             vocab_size = 64
@@ -210,6 +242,7 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 "use_ternary_core": True,
                 "use_skill_aware_experts": True,
                 "use_variable_in_compressor": True,
+                "use_learned_memory_policy": True,
                 "use_certificate_head": True,
             })
             baseline_parameters = sum(parameter.numel() for parameter in CortexTransformerLM(baseline_config).parameters())
@@ -219,6 +252,7 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             self.assertTrue(plan["model"]["cortex_skill_aware_experts"])
             self.assertEqual(plan["model"]["cortex_skill_expert_count"], 4)
             self.assertTrue(plan["model"]["cortex_variable_in_compressor"])
+            self.assertTrue(plan["model"]["cortex_learned_memory_policy"])
             self.assertTrue(plan["model"]["cortex_certificate_head"])
             self.assertGreater(plan["model"]["cortex_parameters"], plan["model"]["baseline_parameters"])
             self.assertEqual(plan["training"]["tokens_per_optimizer_step"], 3 * 2 * 2 * 24)
@@ -449,7 +483,7 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 future_tokens_per_cost=0.25,
             ),
             curve=(),
-            config={"model": {"use_cortex_heads": True, "use_ternary_core": True, "horizons": [1, 2, 4, 8]}},
+            config={"model": {"use_cortex_heads": True, "use_ternary_core": True, "use_learned_memory_policy": True, "horizons": [1, 2, 4, 8]}},
             hardware={},
             cortex_phase_report={
                 "enabled": True,
@@ -877,6 +911,7 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 use_ternary_core=True,
                 use_skill_aware_experts=True,
                 use_variable_in_compressor=True,
+                use_learned_memory_policy=True,
                 use_certificate_head=True,
             )
             train = MemmapCausalDataset(manifest, split="train")
@@ -919,9 +954,11 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             expected_components = {
                 "p1_to_p10_phase_activity",
                 "variable_in_compressor",
+                "learned_cognitive_memory_policy",
                 "exact_anchor_ledger",
                 "latent_memory_kv",
                 "ternary_core",
+                "packed_ternary_hardware_runtime",
                 "skill_aware_experts",
                 "bit_ledger",
                 "skill_ledger",
@@ -946,9 +983,9 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             self.assertEqual(deliverable_audit["deliverable_count"], 10)
             expected_deliverables = {
                 "P1:verifier_os_regression_harness",
-                "P2:ternary_sign_mask_activation_and_trace_logs",
+                "P2:ternary_sign_mask_activation_trace_logs_and_packed_dispatch",
                 "P3:mtp_fsp_confidence_temporal_contract_gate",
-                "P4:recent_exact_old_latent_query_memory_anchor_fidelity",
+                "P4:learned_exact_latent_drop_memory_anchor_fidelity",
                 "P5:latent_certificate_delatentization_tool_verification",
                 "P6:causal_attribution_counterfactual_dimensions",
                 "P7:minimal_regrowth_action_space_repair_plan_and_model_patch",
@@ -959,7 +996,14 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             self.assertEqual(set(deliverable_audit["checks_by_deliverable"]), expected_deliverables)
             influence = phase_report["training_influence"]
             self.assertGreater(influence["ternary_core_forward_events"], 0)
+            self.assertGreater(influence["packed_ternary_dispatches"], 0)
             self.assertGreater(influence["variable_input_compression_events"], 0)
+            self.assertGreater(influence["learned_memory_policy_events"], 0)
+            self.assertGreater(influence["learned_memory_anchor_supervision_events"], 0)
+            self.assertGreater(influence["learned_memory_exact_decisions"], 0)
+            self.assertGreater(influence["learned_memory_latent_decisions"], 0)
+            self.assertGreater(influence["learned_memory_drop_decisions"], 0)
+            self.assertGreater(influence["learned_memory_storage_ratio_mean"], 0.0)
             self.assertGreater(influence["skill_expert_activations"], 0)
             self.assertGreater(influence["certificate_head_forward_events"], 0)
             self.assertGreater(influence["input_anchor_observations"], 0)
@@ -1063,6 +1107,7 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 use_ternary_core=True,
                 use_skill_aware_experts=True,
                 use_variable_in_compressor=True,
+                use_learned_memory_policy=True,
                 use_certificate_head=True,
             )
             controller = CortexTrainingPhaseController(
@@ -1100,6 +1145,7 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 use_ternary_core=True,
                 use_skill_aware_experts=True,
                 use_variable_in_compressor=True,
+                use_learned_memory_policy=True,
                 use_certificate_head=True,
             )
             train = MemmapCausalDataset(manifest, split="train")

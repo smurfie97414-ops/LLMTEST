@@ -443,9 +443,10 @@ class ARLossComputer:
                 multi_losses.append(F.cross_entropy(future_logit.reshape(-1, vocab), future_target.reshape(-1), ignore_index=self.pad_id))
         multi_horizon_loss = torch.stack(multi_losses).mean() if multi_losses else behavior_loss.new_tensor(0.0)
 
-        confidence_pred = output["confidence"].mean(dim=1)
-        confidence_loss = F.mse_loss(confidence_pred, target_confidence)
-        confidence_margin = torch.relu(0.75 - confidence_pred).mean()
+        valid_confidence = output["confidence"][mask]
+        target_confidence_per_token = target_confidence.unsqueeze(1).expand_as(output["confidence"])[mask]
+        confidence_loss = F.mse_loss(valid_confidence, target_confidence_per_token)
+        confidence_margin = torch.relu(0.75 - valid_confidence).mean()
         total = (
             behavior_loss
             + self.config.multi_horizon_weight * multi_horizon_loss

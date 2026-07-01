@@ -115,6 +115,69 @@ class ReportingAndTernaryTest(unittest.TestCase):
         self.assertIsNotNone(layer.float_weight.grad)
         self.assertGreater(float(x.grad.abs().sum()), 0.0)
         self.assertGreater(float(layer.float_weight.grad.abs().sum()), 0.0)
+        self.assertGreater(layer.ledger.total_packed_ternary_dispatches, 0)
+        self.assertEqual(layer.ledger.packed_ternary_dispatches[-1].backend, "packed_int2_torch")
+
+    def test_bitlinear_forward_value_uses_packed_ternary_weight_with_ste_gradient(self):
+        import torch
+        import torch.nn.functional as F
+
+        torch.manual_seed(5)
+        layer = BitLinear(BitLinearConfig(4, 3, activation_bits=0, residual_runtime=False))
+        x = torch.randn(7, 4, requires_grad=True)
+
+        actual = layer(x)
+        packed_weight = layer._packed_runtime_weight(dtype=x.dtype, device=x.device)
+        expected = F.linear(x, packed_weight, layer.bias)
+        float_output = F.linear(x, layer.float_weight, layer.bias)
+        actual.pow(2).mean().backward()
+
+        self.assertTrue(torch.allclose(actual, expected, atol=1e-6))
+        self.assertFalse(torch.allclose(actual, float_output, atol=1e-6))
+        self.assertIsNotNone(layer.float_weight.grad)
+        self.assertGreater(float(layer.float_weight.grad.abs().sum()), 0.0)
+        self.assertEqual(layer.ledger.packed_ternary_dispatches[-1].packed_weight_bytes, layer.packed_codes.numel())
+
+    def test_bitlinear_packed_runtime_syncs_after_weight_update_without_manual_requantize(self):
+        import torch
+        import torch.nn.functional as F
+
+        torch.manual_seed(17)
+        layer = BitLinear(BitLinearConfig(4, 3, activation_bits=0, residual_runtime=False))
+        x = torch.randn(5, 4)
+
+        with torch.no_grad():
+            layer.float_weight.copy_(torch.tensor([
+                [2.0, -2.0, 0.01, -0.01],
+                [-3.0, 3.0, 0.02, -0.02],
+                [4.0, -4.0, 0.03, -0.03],
+            ]))
+
+        actual = layer(x)
+        current_ste_weight = layer._runtime_weight_ste()
+        expected = F.linear(x, current_ste_weight, layer.bias)
+
+        self.assertTrue(torch.allclose(actual, expected, atol=1e-6))
+        self.assertGreater(layer.ledger.total_packed_ternary_dispatches, 0)
+
+    @unittest.skipUnless(__import__("torch").cuda.is_available(), "CUDA is required for packed ternary CUDA dispatch")
+    def test_bitlinear_packed_ternary_cuda_dispatch_runs_on_gpu(self):
+        import torch
+
+        torch.manual_seed(7)
+        layer = BitLinear(BitLinearConfig(8, 4, activation_bits=4, log_prefix="cuda-packed")).cuda()
+        x = torch.randn(5, 8, device="cuda", requires_grad=True)
+
+        output = layer(x)
+        torch.cuda.synchronize()
+        output.pow(2).mean().backward()
+        torch.cuda.synchronize()
+
+        self.assertEqual(tuple(output.shape), (5, 4))
+        self.assertIsNotNone(layer.float_weight.grad)
+        self.assertGreater(float(layer.float_weight.grad.abs().sum().detach().cpu()), 0.0)
+        self.assertGreater(layer.ledger.total_packed_ternary_dispatches, 0)
+        self.assertEqual(layer.ledger.packed_ternary_dispatches[-1].backend, "packed_int2_cuda")
 
     def test_bitlinear_matches_float_linear_when_activation_quantization_is_disabled(self):
         import torch

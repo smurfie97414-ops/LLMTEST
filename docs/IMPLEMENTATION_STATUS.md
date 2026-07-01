@@ -41,18 +41,19 @@ Remaining Phase 1 hardening:
 Current executable coverage:
 
 - `TernaryBlock`, `ternarize_values`, zero states and estimated bit accounting.
-- `cortex3_ternary.BitLinear` provides a PyTorch sign+mask layer with shared scales, activation quantization and residual weights; PyTorch is a required dependency.
+- `cortex3_ternary.BitLinear` provides a sign+mask layer with shared scales, activation quantization, optional residual runtime and packed int2 ternary weight buffers; PyTorch is a required dependency.
 - `ResidualSynapseBuffer` stores reconstruction residuals for compressed blocks.
-- `CompressionTraceLedger` records compression decisions, activation quantization, expert activations, KV mode events and MTP/FSP events.
+- `CompressionTraceLedger` records compression decisions, activation quantization, expert activations, KV mode events, MTP/FSP events and packed ternary dispatches.
 - Compression decisions include active count, provisional/certified zeros, estimated bits, threshold and residual L1.
 - `LayerForwardEvent` records real `BitLinear` forward passes with layer id, input/output shapes, active weights, estimated packed weight bits and activation bits.
-- `BitLinear` uses a straight-through runtime weight path so gradients reach `float_weight` while the forward value remains the compiled ternary/residual runtime weight.
-- Tests cover exact parity with `nn.Linear` when activation quantization is disabled, gradient survival to inputs and weights, and micro-model layer-forward traces.
+- `BitLinear` uses a straight-through runtime weight path so gradients reach `float_weight` while the forward value is read from packed int2 ternary weights by default.
+- Tests cover exact parity with `nn.Linear` only when residual runtime is explicitly enabled, gradient survival to inputs and weights, packed int2 CPU dispatch, packed int2 CUDA dispatch and micro-model layer-forward traces.
 
 Remaining:
 
 - Feed layer-forward traces into persisted cycle reports outside inference-specific trace summaries.
 - Use layer-forward traces as first-class evidence in causal attribution block probes.
+- Replace the PyTorch unpack/matmul packed dispatch with a fused custom CUDA kernel and benchmark latency/energy.
 
 ## Phase 3 - MTP/FSP under contract
 
@@ -94,7 +95,7 @@ Current executable coverage:
 
 Remaining:
 
-- Add learned query-conditioned compression instead of deterministic hashed embeddings.
+- Run large long-context ablations proving the new learned exact/latent/drop memory policy improves cost/quality over deterministic memory alone.
 - Promote anchor fidelity to a required cycle gate for long-context tasks.
 - Measure memory cost/quality tradeoffs across exact KV vs latent KV in run reports.
 
@@ -197,7 +198,7 @@ Remaining:
 
 - Add persistent checkpoint selection across runs instead of training a fresh smoke checkpoint per report.
 - Calibrate early-exit confidence and MTP acceptance on real generated distributions.
-- Add hardware-specific CUDA/CPU packed ternary kernels beyond the current dispatch metadata and reference execution.
+- Replace the current packed int2 CUDA dispatch path with fused hardware-specific kernels once the reference packed path has stable quality/gradient evidence.
 - Benchmark fast/normal/careful choices across larger verified suites and report path Pareto fronts.
 
 ## Phase 9 - Sleep phase anti-collapse
@@ -376,9 +377,9 @@ Current executable coverage:
 - `TextShardReader` streams text shards without loading the whole corpus into memory.
 - `TokenizedCorpusBuilder` streams encoded chunks once into a `uint32` token file and writes a coherent `manifest.json`.
 - `MemmapCausalDataset` samples causal next-token targets and multi-horizon future targets directly from the memmap with vectorized batch window reads.
-- `CortexTransformerLM` is a complete causal Transformer with tied embeddings, causal self-attention, MLP blocks, optional Cortex multi-horizon heads, an optional differentiable Variable-In compressor, an optional `BitLinear` ternary core for the Cortex model, a trainable skill-aware MoE path whose expert activations are recorded in the compression trace ledger and an optional latent certificate head.
-- `CortexObjective` optimizes next-token loss plus Cortex MTP, temporal-consistency, confidence, Variable-In compression-cost and certificate-head terms when the Cortex heads are enabled.
-- `CortexTrainingPhaseController` integrates P1-P10 into full LLM training when horizons are `[1, 2, 4, 8]`, Variable-In, skill-aware experts and the certificate head are enabled: verifier cycle, ternary forward traces, Variable-In KV/compression traces, exact-anchor observations decoded from real LLM input batches, skill-expert activation traces, MTP/FSP contract ledger, cumulative Bit/Skill/Causal/Uncertainty ledgers, cognitive memory reconstruction, certificate verification, causal attribution, minimal regrowth planning, fast/normal/careful inference, sleep replay batches and recursive-improvement gates.
+- `CortexTransformerLM` is a complete causal Transformer with tied embeddings, causal self-attention, MLP blocks, optional Cortex multi-horizon heads, an optional differentiable Variable-In compressor, an optional learned exact/latent/drop memory policy, an optional packed int2 `BitLinear` ternary core for the Cortex model, a trainable skill-aware MoE path whose expert activations are recorded in the compression trace ledger and an optional latent certificate head.
+- `CortexObjective` optimizes next-token loss plus Cortex MTP, temporal-consistency, confidence, Variable-In compression-cost, learned-memory policy and certificate-head terms when the Cortex heads are enabled.
+- `CortexTrainingPhaseController` integrates P1-P10 into full LLM training when horizons are `[1, 2, 4, 8]`, Variable-In, learned memory policy, skill-aware experts and the certificate head are enabled: verifier cycle, packed ternary forward traces, Variable-In KV/compression traces, exact-anchor observations decoded from real LLM input batches, learned exact/latent/drop memory decisions, skill-expert activation traces, MTP/FSP contract ledger, cumulative Bit/Skill/Causal/Uncertainty ledgers, cognitive memory reconstruction, certificate verification, causal attribution, minimal regrowth planning, fast/normal/careful inference, sleep replay batches and recursive-improvement gates.
 - The full Cortex trainer adds confidence/contract regularization to the loss, tokenizes accepted sleep/phase examples into causal replay batches, tracks replay examples by originating phase including P9 sleep, scales Cortex trainable losses with bounded cross-phase objective feedback and writes `cortex_phase_report.json` with per-phase event counts.
 - Cortex checkpoints persist and restore the phase controller's replay state, objective feedback state, future-contract ledger, retained ternary compression trace ledger, exact-input-anchor counters, Bit/Skill/Causal/Uncertainty ledgers, cognitive memory, sleep pools and recursive-improvement archive summaries, so interrupted full-architecture training keeps the same P2-P4/P9/P10 and ledger audit context instead of resetting those modules while keeping trace memory bounded.
 - `build_training_plan` writes `run_plan.json` before training starts, with real token-count, split-window, parameter-count, planned-token, checkpoint and optimizer-memory estimates for the baseline and Cortex models.

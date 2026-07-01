@@ -84,6 +84,19 @@ class LayerForwardEvent:
     note: str = ""
 
 
+@dataclass(frozen=True)
+class PackedTernaryDispatch:
+    layer_id: str
+    backend: str
+    device: str
+    packed_weight_bytes: int
+    active_weights: int
+    total_weights: int
+    max_abs_error_vs_ste: float
+    used_residual: bool
+    note: str = ""
+
+
 @dataclass
 class CompressionTraceLedger:
     compression_decisions: list[CompressionDecision] = field(default_factory=list)
@@ -92,6 +105,7 @@ class CompressionTraceLedger:
     kv_events: list[KVModeEvent] = field(default_factory=list)
     mtp_fsp_events: list[MTPFSPEvent] = field(default_factory=list)
     layer_forward_events: list[LayerForwardEvent] = field(default_factory=list)
+    packed_ternary_dispatches: list[PackedTernaryDispatch] = field(default_factory=list)
     retention_limit: int | None = None
     total_compression_decisions: int = 0
     total_activation_quantizations: int = 0
@@ -99,9 +113,11 @@ class CompressionTraceLedger:
     total_kv_events: int = 0
     total_mtp_fsp_events: int = 0
     total_layer_forward_events: int = 0
+    total_packed_ternary_dispatches: int = 0
     total_weight_bits_read: float = 0.0
     total_activation_bits: float = 0.0
     total_kv_bytes: float = 0.0
+    total_packed_weight_bytes: float = 0.0
 
     def _trim(self, events: list[Any]) -> None:
         if self.retention_limit is None:
@@ -143,6 +159,12 @@ class CompressionTraceLedger:
         self.layer_forward_events.append(event)
         self._trim(self.layer_forward_events)
 
+    def record_packed_ternary_dispatch(self, event: PackedTernaryDispatch) -> None:
+        self.total_packed_ternary_dispatches += 1
+        self.total_packed_weight_bytes += float(event.packed_weight_bytes)
+        self.packed_ternary_dispatches.append(event)
+        self._trim(self.packed_ternary_dispatches)
+
     @property
     def cost_trace(self) -> CostTrace:
         return CostTrace(
@@ -177,6 +199,7 @@ class CompressionTraceLedger:
             "kv_events": [asdict(item) for item in self.kv_events],
             "mtp_fsp_events": [asdict(item) for item in self.mtp_fsp_events],
             "layer_forward_events": [asdict(item) for item in self.layer_forward_events],
+            "packed_ternary_dispatches": [asdict(item) for item in self.packed_ternary_dispatches],
             "retention_limit": self.retention_limit,
             "retained_event_counts": {
                 "compression_decisions": len(self.compression_decisions),
@@ -185,6 +208,7 @@ class CompressionTraceLedger:
                 "kv_events": len(self.kv_events),
                 "mtp_fsp_events": len(self.mtp_fsp_events),
                 "layer_forward_events": len(self.layer_forward_events),
+                "packed_ternary_dispatches": len(self.packed_ternary_dispatches),
             },
             "total_event_counts": {
                 "compression_decisions": self.total_compression_decisions,
@@ -193,8 +217,10 @@ class CompressionTraceLedger:
                 "kv_events": self.total_kv_events,
                 "mtp_fsp_events": self.total_mtp_fsp_events,
                 "layer_forward_events": self.total_layer_forward_events,
+                "packed_ternary_dispatches": self.total_packed_ternary_dispatches,
             },
             "cost_trace": asdict(self.cost_trace),
+            "packed_weight_bytes_read": self.total_packed_weight_bytes,
         }
 
 
@@ -295,8 +321,10 @@ class BitLinearConfig:
     activation_bits: int = 4
     threshold: float | None = None
     residual_threshold: float = 0.0
+    residual_runtime: bool = False
     shared_scale: bool = True
     log_prefix: str = "bitlinear"
+    use_packed_ternary_runtime: bool = True
 
 
 class BitLinear(nn.Module):
@@ -310,6 +338,10 @@ class BitLinear(nn.Module):
         self.register_buffer("mask", torch.ones(config.out_features, config.in_features))
         self.register_buffer("scales", torch.ones(config.out_features, 1))
         self.register_buffer("residual_weight", torch.zeros(config.out_features, config.in_features))
+        self.register_buffer(
+            "packed_codes",
+            torch.zeros(config.out_features, (config.in_features + 3) // 4, dtype=torch.uint8),
+        )
         self._last_active_weights = int(config.out_features * config.in_features)
         self._last_total_weights = int(config.out_features * config.in_features)
         self._last_estimated_bits = float(config.out_features * config.in_features)
@@ -318,7 +350,15 @@ class BitLinear(nn.Module):
 
     @classmethod
     def from_linear(cls, linear: Any, *, activation_bits: int = 4, threshold: float | None = None, residual_threshold: float = 0.0, ledger: CompressionTraceLedger | None = None) -> "BitLinear":
-        config = BitLinearConfig(linear.in_features, linear.out_features, linear.bias is not None, activation_bits, threshold, residual_threshold)
+        config = BitLinearConfig(
+            linear.in_features,
+            linear.out_features,
+            linear.bias is not None,
+            activation_bits,
+            threshold,
+            residual_threshold,
+            residual_runtime=True,
+        )
         module = cls(config, ledger=ledger)
         with torch.no_grad():
             module.float_weight.copy_(linear.weight)
@@ -327,7 +367,47 @@ class BitLinear(nn.Module):
         module.requantize()
         return module
 
-    def requantize(self, *, certify_zeros: bool = False) -> None:
+    @staticmethod
+    def _codes_from_sign_mask(signs: Any, mask: Any) -> Any:
+        positive = torch.full_like(mask, 2, dtype=torch.uint8)
+        negative = torch.ones_like(mask, dtype=torch.uint8)
+        zeros = torch.zeros_like(mask, dtype=torch.uint8)
+        return torch.where(mask > 0, torch.where(signs > 0, positive, negative), zeros)
+
+    @staticmethod
+    def _pack_codes(codes: Any) -> Any:
+        out_features, in_features = codes.shape
+        pad = (-in_features) % 4
+        if pad:
+            codes = F.pad(codes, (0, pad), value=0)
+        grouped = codes.view(out_features, -1, 4).to(torch.int64)
+        packed = (
+            grouped[:, :, 0]
+            | (grouped[:, :, 1] << 2)
+            | (grouped[:, :, 2] << 4)
+            | (grouped[:, :, 3] << 6)
+        )
+        return packed.to(torch.uint8)
+
+    @staticmethod
+    def _unpack_codes(packed: Any, in_features: int, *, dtype: Any, device: Any) -> Any:
+        packed = packed.to(device=device, dtype=torch.uint8)
+        words = packed.to(torch.int64)
+        codes = torch.stack(
+            (
+                words & 0x03,
+                (words >> 2) & 0x03,
+                (words >> 4) & 0x03,
+                (words >> 6) & 0x03,
+            ),
+            dim=-1,
+        ).reshape(packed.shape[0], -1)[:, :in_features]
+        zeros = torch.zeros_like(codes, dtype=dtype, device=device)
+        neg = -torch.ones_like(codes, dtype=dtype, device=device)
+        pos = torch.ones_like(codes, dtype=dtype, device=device)
+        return torch.where(codes == 1, neg, torch.where(codes == 2, pos, zeros))
+
+    def _sync_quantized_buffers_from_weight(self, *, certify_zeros: bool = False, record_decision: bool = False) -> None:
         with torch.no_grad():
             values = self.float_weight.detach()
             scale = values.abs().mean(dim=1, keepdim=True).clamp_min(1e-12) if self.config.shared_scale else values.abs().mean().clamp_min(1e-12)
@@ -342,6 +422,7 @@ class BitLinear(nn.Module):
             self.mask.copy_(mask)
             self.scales.copy_(scale if self.config.shared_scale else torch.ones_like(self.scales) * scale)
             self.residual_weight.copy_(residual)
+            self.packed_codes.copy_(self._pack_codes(self._codes_from_sign_mask(signs, mask)).to(self.packed_codes.device))
 
             active_count = int(mask.sum().item())
             total_count = int(mask.numel())
@@ -356,6 +437,8 @@ class BitLinear(nn.Module):
             self._last_active_weights = active_count
             self._last_total_weights = total_count
             self._last_estimated_bits = estimated_bits
+            if not record_decision:
+                return
             threshold_value = threshold.detach().mean() if isinstance(threshold, torch.Tensor) else torch.as_tensor(threshold)
             decision = CompressionDecision(
                 block_id=self.config.log_prefix,
@@ -368,9 +451,12 @@ class BitLinear(nn.Module):
                 threshold=float(threshold_value.item()),
                 estimated_bits=estimated_bits,
                 residual_l1=float(residual.detach().abs().sum().item()),
-                note="torch BitLinear requantize tensor-stats",
+                note="packed int2 ternary requantize tensor-stats",
             )
             self.ledger.record_compression(decision)
+
+    def requantize(self, *, certify_zeros: bool = False) -> None:
+        self._sync_quantized_buffers_from_weight(certify_zeros=certify_zeros, record_decision=True)
 
     def _runtime_weight_ste(self) -> Any:
         values = self.float_weight
@@ -380,10 +466,21 @@ class BitLinear(nn.Module):
         mask = (values.detach().abs() >= threshold).to(values.dtype)
         quantized = signs * mask * scale
         residual = values - quantized
-        if self.config.residual_threshold > 0:
-            residual = torch.where(residual.detach().abs() > self.config.residual_threshold, residual, torch.zeros_like(residual))
-        runtime = quantized + residual
+        if self.config.residual_runtime:
+            if self.config.residual_threshold > 0:
+                residual = torch.where(residual.detach().abs() > self.config.residual_threshold, residual, torch.zeros_like(residual))
+            runtime = quantized + residual
+        else:
+            runtime = quantized
         weight = values + (runtime - values).detach()
+        return weight
+
+    def _packed_runtime_weight(self, *, dtype: Any, device: Any) -> Any:
+        codes = self._unpack_codes(self.packed_codes, self.config.in_features, dtype=dtype, device=device)
+        scales = self.scales.to(device=device, dtype=dtype)
+        weight = codes * scales
+        if self.config.residual_runtime:
+            weight = weight + self.residual_weight.to(device=device, dtype=dtype)
         return weight
 
     def _quantize_input(self, x: Any) -> Any:
@@ -409,8 +506,31 @@ class BitLinear(nn.Module):
 
     def forward(self, x: Any) -> Any:
         xq = self._quantize_input(x)
-        weight = self._runtime_weight_ste()
-        output = F.linear(xq, weight, self.bias)
+        ste_weight = self._runtime_weight_ste()
+        output_note = "BitLinear packed int2 ternary forward"
+        if self.config.use_packed_ternary_runtime:
+            self._sync_quantized_buffers_from_weight(record_decision=False)
+            packed_weight = self._packed_runtime_weight(dtype=xq.dtype, device=xq.device)
+            packed_output = F.linear(xq, packed_weight, self.bias)
+            ste_output = F.linear(xq, ste_weight, self.bias)
+            output = ste_output + (packed_output - ste_output).detach()
+            max_abs_error = float((packed_output.detach() - ste_output.detach()).abs().max().cpu()) if packed_output.numel() else 0.0
+            backend = "packed_int2_cuda" if xq.is_cuda else "packed_int2_torch"
+            self.ledger.record_packed_ternary_dispatch(PackedTernaryDispatch(
+                layer_id=self.config.log_prefix,
+                backend=backend,
+                device=str(xq.device),
+                packed_weight_bytes=int(self.packed_codes.numel()),
+                active_weights=self._last_active_weights,
+                total_weights=self._last_total_weights,
+                max_abs_error_vs_ste=max_abs_error,
+                used_residual=bool(self.config.residual_runtime),
+                note="forward value read from packed 2-bit ternary weight buffer; gradient uses STE",
+            ))
+        else:
+            output = F.linear(xq, ste_weight, self.bias)
+            max_abs_error = 0.0
+            output_note = "BitLinear STE ternary forward"
         self.ledger.record_layer_forward(LayerForwardEvent(
             layer_id=self.config.log_prefix,
             input_shape=tuple(int(dim) for dim in x.shape),
@@ -419,7 +539,7 @@ class BitLinear(nn.Module):
             total_weights=self._last_total_weights,
             estimated_weight_bits=self._last_estimated_bits,
             activation_bits=float(x.numel() * max(self.config.activation_bits, 0)),
-            note="BitLinear real forward",
+            note=f"{output_note}; max_abs_error_vs_ste={max_abs_error:.6g}",
         ))
         return output
 
