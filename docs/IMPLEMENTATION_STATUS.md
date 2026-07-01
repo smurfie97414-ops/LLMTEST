@@ -98,7 +98,7 @@ Current executable coverage:
 - `CognitiveMemory.ingest` now consumes learned `MemoryRetentionDecision` objects from decoded LLM batches, so the shared P4 memory applies exact storage, direct latent KV compression or real non-anchored drop instead of only counting policy probabilities.
 - The Exact Anchor Ledger is a hard storage safety gate: learned `DROP` requests on anchored segments are promoted to exact storage, recorded as anchor-safety overrides, reconstructed and fidelity-checked.
 - Learned retention decisions are persisted through `memory_state`, restored on checkpoint resume, surfaced in `compression_report`, `training_influence`, architecture audit and phase-deliverable audit.
-- `MemoryUtilityCredit` now records which retained learned-memory segments were actually selected by faithful downstream reconstructions. P4 input-anchor checks, phase memory audits, Frontier circuit bindings and P8 memory-augmented inference feed those credits back into a normalized exact/latent/drop utility prior. `LearnedMemoryPolicy` injects that prior into its logits, `CortexObjective` aligns the policy distribution to it, and checkpoints restore the prior plus credit ledger.
+- `MemoryUtilityCredit` now records both which retained learned-memory segments were selected by faithful downstream reconstructions and which retained learned-memory segments were left unselected. Selected faithful segments create positive utility; unselected retained exact/latent segments create negative forget/compress credits, and the controller converts those counter-credits into pressure toward latent/drop instead of rewarding the retained mode. P4 input-anchor checks, phase memory audits, Frontier circuit bindings and P8 memory-augmented inference feed those credits back into a normalized exact/latent/drop utility prior. `LearnedMemoryPolicy` injects that prior into its logits, `CortexObjective` aligns the policy distribution to it, and checkpoints restore the prior plus credit ledger.
 - `tools/benchmark_learned_memory_policy.py` runs a short shared-weight ablation against disabled learned memory, freezes non-memory parameters, trains only `learned_memory.*`, and reports before/after losses, policy gradients, exact/latent/drop decisions and storage ratio.
 - `CompiledCircuitMemoryBinding` turns Frontier circuits into retained P4 memory objects with circuit id, source/frontier/held-out lineage, obligations, metadata keys, anchors, fidelity and selected segment ids.
 - `CompiledFrontierAgent`, P8 inference, P9 sleep-frontier FastSolve and P7 Frontier repair candidates require a reconstructible P4 memory binding whenever the full LLM controller supplies shared memory; the P5 compiled-circuit certificate carries memory-binding claims.
@@ -108,7 +108,7 @@ Remaining:
 
 - Run large long-context ablations proving the learned exact/latent/drop storage policy improves cost/quality over deterministic memory alone on held-out anchors.
 - Scale compiled-skill memory retention across larger registries, competing circuits and multi-cycle restarts.
-- Prove learned downstream utility credit over repeated long-context wake/sleep cycles and larger held-out anchor/circuit workloads.
+- Prove learned positive and negative downstream utility credit over repeated long-context wake/sleep cycles and larger held-out anchor/circuit workloads.
 
 ## Phase 5 - Latent reasoning with certificates
 

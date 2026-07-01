@@ -157,6 +157,8 @@
         "learned_memory_retention_decisions",
         "learned_memory_utility_credit_count",
         "learned_memory_utility_positive_count",
+        "learned_memory_utility_negative_count",
+        "learned_memory_utility_unselected_count",
         "compiled_circuit_memory_binding_count",
         "future_contract_decisions",
         "output_goal_contract_decisions",

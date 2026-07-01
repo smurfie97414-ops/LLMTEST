@@ -135,6 +135,74 @@ class CognitiveMemoryTest(unittest.TestCase):
         self.assertEqual(report["learned_memory_utility_latent_count"], 1)
         self.assertTrue(report["learned_memory_utility_credits"])
 
+    def test_unselected_learned_retention_gets_forget_credit(self):
+        memory = CognitiveMemory(
+            CognitiveMemoryConfig(
+                recent_exact_limit=3,
+                embedding_dim=32,
+                top_k_exact=1,
+                top_k_latent=0,
+            )
+        )
+        required = Anchor("identifier", "C3-KEEP-9000", "useful")
+        memory.ingest(
+            "useful",
+            "Segment utile: la cle recherchee est C3-KEEP-9000.",
+            extra_anchors=(required,),
+            retention_decision=MemoryRetentionDecision(
+                segment_id="useful",
+                requested_mode=MemoryMode.EXACT,
+                applied_mode=MemoryMode.EXACT,
+                exact_prob=0.88,
+                latent_prob=0.08,
+                drop_prob=0.04,
+                storage_ratio=0.90,
+                confidence=0.88,
+                source="learned_memory_policy",
+            ),
+        )
+        memory.ingest(
+            "unused",
+            "Segment conserve mais inutile pour cette requete: recette publique et bruit.",
+            retention_decision=MemoryRetentionDecision(
+                segment_id="unused",
+                requested_mode=MemoryMode.EXACT,
+                applied_mode=MemoryMode.EXACT,
+                exact_prob=0.86,
+                latent_prob=0.10,
+                drop_prob=0.04,
+                storage_ratio=0.92,
+                confidence=0.86,
+                source="learned_memory_policy",
+            ),
+        )
+
+        reconstruction = memory.reconstruct(
+            "retrouve la cle C3-KEEP-9000",
+            required_anchors=(required,),
+        )
+        credits = memory.record_utility(
+            reconstruction,
+            phase="P4",
+            source="unit-reconstruction",
+            reason="forget_unused_retained_segment",
+        )
+
+        self.assertTrue(reconstruction.fidelity.passed)
+        self.assertIn("useful", reconstruction.selected_segment_ids)
+        self.assertNotIn("unused", reconstruction.selected_segment_ids)
+        selected = [credit for credit in credits if credit.selected]
+        unselected = [credit for credit in credits if not credit.selected]
+        self.assertEqual([credit.segment_id for credit in selected], ["useful"])
+        self.assertEqual([credit.segment_id for credit in unselected], ["unused"])
+        self.assertLess(unselected[0].utility, 0.0)
+        self.assertEqual(unselected[0].retention_source, "learned_memory_policy")
+        report = memory.compression_report()
+        self.assertEqual(report["learned_memory_utility_positive_count"], 1)
+        self.assertEqual(report["learned_memory_utility_negative_count"], 1)
+        self.assertEqual(report["learned_memory_utility_selected_count"], 1)
+        self.assertEqual(report["learned_memory_utility_unselected_count"], 1)
+
     def test_recent_exact_kv_eviction_creates_latent_old_kv(self):
         memory = CognitiveMemory(CognitiveMemoryConfig(recent_exact_limit=1, embedding_dim=32))
         memory.ingest("s1", "FAIT CRITIQUE: Mira a le code C3-1111-A et le montant 42,00 EUR.")

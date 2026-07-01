@@ -739,6 +739,7 @@ class CognitiveMemory:
         selected_ids = tuple(str(segment_id) for segment_id in reconstruction.selected_segment_ids)
         if not selected_ids:
             return ()
+        selected_id_set = set(selected_ids)
         base_utility = (
             float(utility)
             if utility is not None
@@ -763,6 +764,39 @@ class CognitiveMemory:
                 reason=str(reason),
             )
             credits.append(credit)
+        if reconstruction.fidelity.passed:
+            current_segment_ids = {
+                segment.segment_id
+                for segment in tuple(self.recent.segments) + tuple(self.latent.segments)
+            }
+            for segment_id, decision in decision_by_segment.items():
+                if not decision.source.startswith("learned_memory"):
+                    continue
+                if decision.applied_mode is None:
+                    continue
+                if segment_id in selected_id_set or segment_id not in current_segment_ids:
+                    continue
+                if decision.applied_mode == MemoryMode.EXACT:
+                    unselected_utility = -0.12
+                else:
+                    unselected_utility = -0.06
+                credits.append(
+                    MemoryUtilityCredit(
+                        segment_id=segment_id,
+                        source=str(source),
+                        phase=str(phase),
+                        query=reconstruction.query,
+                        selected=False,
+                        fidelity_passed=True,
+                        fidelity_score=float(reconstruction.fidelity.score),
+                        required_anchor_count=int(reconstruction.fidelity.required),
+                        utility=unselected_utility,
+                        requested_mode=decision.requested_mode,
+                        applied_mode=decision.applied_mode,
+                        retention_source=decision.source,
+                        reason=f"{reason};unselected_retained" if reason else "unselected_retained",
+                    )
+                )
         self.utility_credits.extend(credits)
         return tuple(credits)
 
@@ -786,6 +820,8 @@ class CognitiveMemory:
             "memory_utility_credit_count": len(self.utility_credits),
             "memory_utility_positive_count": sum(1 for credit in self.utility_credits if credit.utility > 0.0),
             "memory_utility_negative_count": sum(1 for credit in self.utility_credits if credit.utility <= 0.0),
+            "memory_utility_selected_count": sum(1 for credit in self.utility_credits if credit.selected),
+            "memory_utility_unselected_count": sum(1 for credit in self.utility_credits if not credit.selected),
             "memory_utility_mean": mean_utility(self.utility_credits),
             "memory_utility_exact_count": mode_count(MemoryMode.EXACT),
             "memory_utility_latent_count": mode_count(MemoryMode.LATENT),
@@ -793,6 +829,8 @@ class CognitiveMemory:
             "learned_memory_utility_credit_count": len(learned_credits),
             "learned_memory_utility_positive_count": sum(1 for credit in learned_credits if credit.utility > 0.0),
             "learned_memory_utility_negative_count": sum(1 for credit in learned_credits if credit.utility <= 0.0),
+            "learned_memory_utility_selected_count": sum(1 for credit in learned_credits if credit.selected),
+            "learned_memory_utility_unselected_count": sum(1 for credit in learned_credits if not credit.selected),
             "learned_memory_utility_mean": mean_utility(learned_credits),
             "learned_memory_utility_exact_count": mode_count(MemoryMode.EXACT, learned=True),
             "learned_memory_utility_latent_count": mode_count(MemoryMode.LATENT, learned=True),

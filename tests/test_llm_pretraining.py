@@ -3598,6 +3598,8 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             )
             self.assertGreater(influence["learned_memory_utility_credit_count"], 0)
             self.assertGreater(influence["learned_memory_utility_positive_count"], 0)
+            self.assertGreater(influence["learned_memory_utility_negative_count"], 0)
+            self.assertGreater(influence["learned_memory_utility_unselected_count"], 0)
             self.assertGreater(influence["learned_memory_utility_prior_updates"], 0)
             self.assertGreater(influence["learned_memory_utility_feedback_events"], 0)
             self.assertTrue(influence["learned_memory_last_utility_prior"], influence)

@@ -193,6 +193,8 @@ CORTEX_PHASE_REPORT_REQUIRED_TRAINING_INFLUENCE_KEYS: tuple[str, ...] = (
     "learned_memory_retention_decisions",
     "learned_memory_utility_credit_count",
     "learned_memory_utility_positive_count",
+    "learned_memory_utility_negative_count",
+    "learned_memory_utility_unselected_count",
     "compiled_circuit_memory_binding_count",
     "future_contract_decisions",
     "output_goal_contract_decisions",
@@ -4227,6 +4229,8 @@ def _cortex_architecture_audit_from_summary(summary: Mapping[str, Any]) -> dict[
         == integer("learned_memory_retention_decisions")
         and integer("learned_memory_utility_credit_count") > 0
         and integer("learned_memory_utility_positive_count") > 0
+        and integer("learned_memory_utility_negative_count") > 0
+        and integer("learned_memory_utility_unselected_count") > 0
         and integer("learned_memory_utility_prior_updates") > 0
         and integer("learned_memory_utility_feedback_events") > 0,
         {
@@ -4243,6 +4247,8 @@ def _cortex_architecture_audit_from_summary(summary: Mapping[str, Any]) -> dict[
             "learned_memory_retention_anchor_overrides": integer("learned_memory_retention_anchor_overrides"),
             "learned_memory_utility_credit_count": integer("learned_memory_utility_credit_count"),
             "learned_memory_utility_positive_count": integer("learned_memory_utility_positive_count"),
+            "learned_memory_utility_negative_count": integer("learned_memory_utility_negative_count"),
+            "learned_memory_utility_unselected_count": integer("learned_memory_utility_unselected_count"),
             "learned_memory_utility_prior_updates": integer("learned_memory_utility_prior_updates"),
             "learned_memory_utility_feedback_events": integer("learned_memory_utility_feedback_events"),
             "learned_memory_last_utility_prior": tuple(summary.get("learned_memory_last_utility_prior", ()) or ()),
@@ -4814,6 +4820,8 @@ def _cortex_phase_deliverable_audit_from_summary(summary: Mapping[str, Any]) -> 
         and int(summary.get("learned_memory_retention_decisions", 0) or 0) > 0
         and int(summary.get("learned_memory_utility_credit_count", 0) or 0) > 0
         and int(summary.get("learned_memory_utility_positive_count", 0) or 0) > 0
+        and int(summary.get("learned_memory_utility_negative_count", 0) or 0) > 0
+        and int(summary.get("learned_memory_utility_unselected_count", 0) or 0) > 0
         and int(summary.get("learned_memory_utility_prior_updates", 0) or 0) > 0
         and int(summary.get("learned_memory_utility_feedback_events", 0) or 0) > 0
         and int(summary.get("compiled_circuit_memory_binding_count", 0) or 0) > 0
@@ -4839,6 +4847,8 @@ def _cortex_phase_deliverable_audit_from_summary(summary: Mapping[str, Any]) -> 
             "learned_memory_retention_applied_drop": int(summary.get("learned_memory_retention_applied_drop", 0) or 0),
             "learned_memory_utility_credit_count": int(summary.get("learned_memory_utility_credit_count", 0) or 0),
             "learned_memory_utility_positive_count": int(summary.get("learned_memory_utility_positive_count", 0) or 0),
+            "learned_memory_utility_negative_count": int(summary.get("learned_memory_utility_negative_count", 0) or 0),
+            "learned_memory_utility_unselected_count": int(summary.get("learned_memory_utility_unselected_count", 0) or 0),
             "learned_memory_utility_prior_updates": int(summary.get("learned_memory_utility_prior_updates", 0) or 0),
             "learned_memory_utility_feedback_events": int(summary.get("learned_memory_utility_feedback_events", 0) or 0),
             "learned_memory_last_utility_prior": tuple(summary.get("learned_memory_last_utility_prior", ()) or ()),
@@ -5449,6 +5459,16 @@ class CortexTrainingPhaseController:
             else:
                 index = LearnedMemoryPolicy.DROP
             utility = max(-1.0, min(2.0, float(credit.utility)))
+            if not credit.selected:
+                if credit.fidelity_passed:
+                    if mode == MemoryMode.EXACT:
+                        scores[LearnedMemoryPolicy.LATENT] += 0.04
+                        scores[LearnedMemoryPolicy.DROP] += 0.08
+                    elif mode == MemoryMode.LATENT:
+                        scores[LearnedMemoryPolicy.DROP] += 0.06
+                    else:
+                        scores[LearnedMemoryPolicy.DROP] += 0.04
+                continue
             reward = max(0.0, utility)
             if credit.fidelity_passed:
                 reward += 0.35
@@ -7571,6 +7591,8 @@ class CortexTrainingPhaseController:
             "memory_utility_credit_count": int(memory_report.get("memory_utility_credit_count", 0) or 0),
             "learned_memory_utility_credit_count": int(memory_report.get("learned_memory_utility_credit_count", 0) or 0),
             "learned_memory_utility_positive_count": int(memory_report.get("learned_memory_utility_positive_count", 0) or 0),
+            "learned_memory_utility_negative_count": int(memory_report.get("learned_memory_utility_negative_count", 0) or 0),
+            "learned_memory_utility_unselected_count": int(memory_report.get("learned_memory_utility_unselected_count", 0) or 0),
             "learned_memory_utility_prior_updates": int(self.learned_memory_utility_prior_updates),
             "learned_memory_utility_feedback_events": int(self.integration_counts.get("learned_memory_utility_feedback_events", 0)),
             "learned_memory_last_utility_prior": tuple(float(value) for value in self.learned_memory_last_utility_prior),
@@ -8595,6 +8617,8 @@ class CortexTrainingPhaseController:
                 "memory_utility_credit_count": int(memory_report.get("memory_utility_credit_count", 0) or 0),
                 "learned_memory_utility_credit_count": int(memory_report.get("learned_memory_utility_credit_count", 0) or 0),
                 "learned_memory_utility_positive_count": int(memory_report.get("learned_memory_utility_positive_count", 0) or 0),
+                "learned_memory_utility_negative_count": int(memory_report.get("learned_memory_utility_negative_count", 0) or 0),
+                "learned_memory_utility_unselected_count": int(memory_report.get("learned_memory_utility_unselected_count", 0) or 0),
                 "learned_memory_utility_prior_updates": int(self.learned_memory_utility_prior_updates),
                 "learned_memory_utility_feedback_events": int(self.integration_counts.get("learned_memory_utility_feedback_events", 0)),
                 "learned_memory_last_utility_prior": tuple(float(value) for value in self.learned_memory_last_utility_prior),
@@ -8776,6 +8800,8 @@ class CortexTrainingPhaseController:
                     "memory_utility_credit_count": int(memory_report.get("memory_utility_credit_count", 0) or 0),
                     "learned_memory_utility_credit_count": int(memory_report.get("learned_memory_utility_credit_count", 0) or 0),
                     "learned_memory_utility_positive_count": int(memory_report.get("learned_memory_utility_positive_count", 0) or 0),
+                    "learned_memory_utility_negative_count": int(memory_report.get("learned_memory_utility_negative_count", 0) or 0),
+                    "learned_memory_utility_unselected_count": int(memory_report.get("learned_memory_utility_unselected_count", 0) or 0),
                     "learned_memory_utility_prior_updates": int(self.learned_memory_utility_prior_updates),
                     "learned_memory_utility_feedback_events": int(self.integration_counts.get("learned_memory_utility_feedback_events", 0)),
                     "learned_memory_last_utility_prior": tuple(float(value) for value in self.learned_memory_last_utility_prior),
@@ -8937,6 +8963,8 @@ class CortexTrainingPhaseController:
                     "memory_utility_credit_count": int(memory_report.get("memory_utility_credit_count", 0) or 0),
                     "learned_memory_utility_credit_count": int(memory_report.get("learned_memory_utility_credit_count", 0) or 0),
                     "learned_memory_utility_positive_count": int(memory_report.get("learned_memory_utility_positive_count", 0) or 0),
+                    "learned_memory_utility_negative_count": int(memory_report.get("learned_memory_utility_negative_count", 0) or 0),
+                    "learned_memory_utility_unselected_count": int(memory_report.get("learned_memory_utility_unselected_count", 0) or 0),
                     "learned_memory_utility_prior_updates": int(self.learned_memory_utility_prior_updates),
                     "learned_memory_utility_feedback_events": int(self.integration_counts.get("learned_memory_utility_feedback_events", 0)),
                     "learned_memory_last_utility_prior": tuple(float(value) for value in self.learned_memory_last_utility_prior),
