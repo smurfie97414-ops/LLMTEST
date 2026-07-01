@@ -235,6 +235,10 @@ CORTEX_PHASE_REPORT_REQUIRED_TRAINING_INFLUENCE_KEYS: tuple[str, ...] = (
     "regrowth_model_parameter_delta_l1",
     "regrowth_model_repair_loss_delta",
     "regrowth_model_applications",
+    "regrowth_model_rollback_artifact_count",
+    "regrowth_model_executable_rollback_count",
+    "regrowth_model_rollback_artifacts",
+    "regrowth_model_rollback_applications",
     "recursive_model_application_count",
     "recursive_model_parameter_delta_l1",
     "recursive_model_repair_loss_delta",
@@ -727,7 +731,7 @@ def _restore_compression_trace_ledger(ledger: CompressionTraceLedger | None, pay
         text_key = str(key)
         if text_key.startswith("native_ternary_") and text_key.endswith("_kernel_dispatches"):
             backend = text_key.removeprefix("native_ternary_").removesuffix("_kernel_dispatches")
-            if backend:
+            if backend and backend != "kernel_dispatches":
                 native_backend_counts.setdefault(backend, int(value))
         if text_key.startswith("native_ternary_") and text_key.endswith("_requantize_dispatches"):
             backend = text_key.removeprefix("native_ternary_").removesuffix("_requantize_dispatches")
@@ -735,7 +739,7 @@ def _restore_compression_trace_ledger(ledger: CompressionTraceLedger | None, pay
                 native_requantize_backend_counts.setdefault(backend, int(value))
         if text_key.startswith("native_ternary_") and text_key.endswith("_grad_weight_dispatches"):
             backend = text_key.removeprefix("native_ternary_").removesuffix("_grad_weight_dispatches")
-            if backend:
+            if backend and backend != "grad_weight_dispatches":
                 native_grad_weight_backend_counts.setdefault(backend, int(value))
     if not native_backend_counts:
         for item in ledger.packed_ternary_dispatches:
@@ -4109,9 +4113,22 @@ def _cortex_architecture_audit_from_summary(summary: Mapping[str, Any]) -> dict[
     )
     regrowth_model_non_regressing = any(
         bool(item.get("non_regression_passed"))
+        and bool(item.get("signed_patch_id"))
+        and bool(item.get("rollback_token"))
+        and bool(item.get("rollback_executable"))
+        and bool(item.get("rollback_artifact_path"))
+        and bool(item.get("rollback_artifact_sha256"))
+        and int(item.get("rollback_artifact_parameter_count", 0) or 0) > 0
         and float(item.get("parameter_delta_l1", 0.0) or 0.0) > 0.0
         and float(item.get("repair_loss_delta", 0.0) or 0.0) > 0.0
         and float(item.get("protected_loss_delta", 0.0) or 0.0) <= float(item.get("protected_loss_tolerance", 0.0) or 0.0)
+        for item in regrowth_model_applications
+    )
+    regrowth_model_has_executable_rollback = any(
+        bool(item.get("rollback_executable"))
+        and bool(item.get("rollback_artifact_path"))
+        and bool(item.get("rollback_artifact_sha256"))
+        and int(item.get("rollback_artifact_parameter_count", 0) or 0) > 0
         for item in regrowth_model_applications
     )
     recursive_model_applications = tuple(
@@ -4499,6 +4516,8 @@ def _cortex_architecture_audit_from_summary(summary: Mapping[str, Any]) -> dict[
         and integer("regrowth_model_application_count") > 0
         and number("regrowth_model_parameter_delta_l1") > 0.0
         and number("regrowth_model_repair_loss_delta") > 0.0
+        and integer("regrowth_model_rollback_artifact_count") > 0
+        and regrowth_model_has_executable_rollback
         and regrowth_model_non_regressing,
         {
             "P7": phase_count("P7"),
@@ -4507,9 +4526,11 @@ def _cortex_architecture_audit_from_summary(summary: Mapping[str, Any]) -> dict[
             "regrowth_model_parameter_delta_l1": number("regrowth_model_parameter_delta_l1"),
             "regrowth_model_repair_loss_delta": number("regrowth_model_repair_loss_delta"),
             "regrowth_model_protected_loss_delta": number("regrowth_model_protected_loss_delta"),
+            "regrowth_model_rollback_artifact_count": integer("regrowth_model_rollback_artifact_count"),
+            "regrowth_model_has_executable_rollback": regrowth_model_has_executable_rollback,
             "regrowth_model_non_regressing": regrowth_model_non_regressing,
         },
-        "minimal regrowth must apply a verified bounded repair to real Transformer state and keep protected loss non-regressing",
+        "minimal regrowth must apply a verified bounded repair to real Transformer state, persist executable rollback, and keep protected loss non-regressing",
     )
     add(
         "sleep_consolidation_buffer",
@@ -4679,9 +4700,22 @@ def _cortex_phase_deliverable_audit_from_summary(summary: Mapping[str, Any]) -> 
     )
     regrowth_model_non_regressing = any(
         bool(item.get("non_regression_passed"))
+        and bool(item.get("signed_patch_id"))
+        and bool(item.get("rollback_token"))
+        and bool(item.get("rollback_executable"))
+        and bool(item.get("rollback_artifact_path"))
+        and bool(item.get("rollback_artifact_sha256"))
+        and int(item.get("rollback_artifact_parameter_count", 0) or 0) > 0
         and float(item.get("parameter_delta_l1", 0.0) or 0.0) > 0.0
         and float(item.get("repair_loss_delta", 0.0) or 0.0) > 0.0
         and float(item.get("protected_loss_delta", 0.0) or 0.0) <= float(item.get("protected_loss_tolerance", 0.0) or 0.0)
+        for item in regrowth_model_applications
+    )
+    regrowth_model_has_executable_rollback = any(
+        bool(item.get("rollback_executable"))
+        and bool(item.get("rollback_artifact_path"))
+        and bool(item.get("rollback_artifact_sha256"))
+        and int(item.get("rollback_artifact_parameter_count", 0) or 0) > 0
         for item in regrowth_model_applications
     )
     recursive_model_applications = tuple(
@@ -4917,6 +4951,8 @@ def _cortex_phase_deliverable_audit_from_summary(summary: Mapping[str, Any]) -> 
         and int(number("regrowth_model_application_count")) > 0
         and number("regrowth_model_parameter_delta_l1") > 0.0
         and number("regrowth_model_repair_loss_delta") > 0.0
+        and int(number("regrowth_model_rollback_artifact_count")) > 0
+        and regrowth_model_has_executable_rollback
         and regrowth_model_non_regressing,
         {
             "regrowth_plan_events": count("regrowth_plan_events"),
@@ -4925,9 +4961,11 @@ def _cortex_phase_deliverable_audit_from_summary(summary: Mapping[str, Any]) -> 
             "regrowth_model_application_count": int(number("regrowth_model_application_count")),
             "regrowth_model_parameter_delta_l1": number("regrowth_model_parameter_delta_l1"),
             "regrowth_model_repair_loss_delta": number("regrowth_model_repair_loss_delta"),
+            "regrowth_model_rollback_artifact_count": int(number("regrowth_model_rollback_artifact_count")),
+            "regrowth_model_has_executable_rollback": regrowth_model_has_executable_rollback,
             "regrowth_model_non_regressing": regrowth_model_non_regressing,
         },
-        "minimal regrowth must evaluate candidate repair actions, feed verified replay, and apply a verified bounded patch to real model state",
+        "minimal regrowth must evaluate candidate repair actions, feed verified replay, apply a verified bounded patch to real model state, and persist an executable rollback artifact",
     )
     add(
         "P8",
@@ -5208,6 +5246,8 @@ class CortexTrainingPhaseController:
         self.latent_workspace_certificate_binding_events = 0
         self.latent_workspace_last_summary: dict[str, Any] = {}
         self.regrowth_model_applications: list[dict[str, Any]] = []
+        self.regrowth_model_rollback_artifacts: list[dict[str, Any]] = []
+        self.regrowth_model_rollback_applications: list[dict[str, Any]] = []
         self.regrowth_model_parameter_delta_l1 = 0.0
         self.regrowth_model_repair_loss_delta = 0.0
         self.regrowth_model_protected_loss_delta = 0.0
@@ -6593,6 +6633,164 @@ class CortexTrainingPhaseController:
             )
         return report
 
+    def _regrowth_model_rollback_dir(self) -> Path:
+        return self.improvement_archive_dir / "regrowth_model_patch_rollbacks"
+
+    def _persist_regrowth_model_rollback_artifact(
+        self,
+        accepted_report: Mapping[str, Any],
+        snapshots: Mapping[str, torch.Tensor],
+        parameters: Sequence[tuple[str, nn.Parameter]],
+    ) -> dict[str, Any]:
+        signed_patch_id = str(accepted_report.get("signed_patch_id") or "")
+        if not signed_patch_id:
+            raise ValueError("P7 rollback artifact requires a signed patch id")
+        rollback_token = str(accepted_report.get("rollback_token") or "")
+        if not rollback_token:
+            raise ValueError("P7 rollback artifact requires a rollback token")
+        parameter_names = tuple(str(name) for name, _ in parameters)
+        before_tensors = {
+            name: snapshots[name].detach().cpu().clone()
+            for name in parameter_names
+        }
+        before_checksums = {
+            name: _sha256_tensor(tensor)
+            for name, tensor in before_tensors.items()
+        }
+        after_checksums = {
+            name: _sha256_tensor(parameter.detach().cpu())
+            for name, parameter in parameters
+        }
+        payload = {
+            "schema_version": 1,
+            "signed_patch_id": signed_patch_id,
+            "rollback_token": rollback_token,
+            "phase": "P7",
+            "step": int(accepted_report.get("step", 0) or 0),
+            "action": str(accepted_report.get("action", "")),
+            "target": str(accepted_report.get("target", "")),
+            "failure_task_id": str(accepted_report.get("failure_task_id", "")),
+            "parameter_names": parameter_names,
+            "parameter_shapes": {
+                name: tuple(int(dim) for dim in before_tensors[name].shape)
+                for name in parameter_names
+            },
+            "parameter_dtypes": {
+                name: str(before_tensors[name].dtype)
+                for name in parameter_names
+            },
+            "before_checksums": before_checksums,
+            "after_checksums": after_checksums,
+            "before_tensors": before_tensors,
+        }
+        directory = self._regrowth_model_rollback_dir()
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / f"{signed_patch_id}.pt"
+        tmp_path = path.with_name(path.name + ".tmp")
+        torch.save(payload, tmp_path)
+        tmp_path.replace(path)
+        manifest = {
+            "schema_version": 1,
+            "signed_patch_id": signed_patch_id,
+            "rollback_token": rollback_token,
+            "phase": "P7",
+            "step": int(accepted_report.get("step", 0) or 0),
+            "action": str(accepted_report.get("action", "")),
+            "target": str(accepted_report.get("target", "")),
+            "failure_task_id": str(accepted_report.get("failure_task_id", "")),
+            "path": str(path),
+            "sha256": _sha256_file(path),
+            "size_bytes": int(path.stat().st_size),
+            "parameter_count": len(parameter_names),
+            "parameter_names": parameter_names,
+            "before_checksums": before_checksums,
+            "after_checksums": after_checksums,
+        }
+        self.regrowth_model_rollback_artifacts.append(manifest)
+        self._count("regrowth_model_rollback_artifact_events")
+        self._count("regrowth_model_rollback_artifact_parameters", len(parameter_names))
+        return manifest
+
+    def rollback_regrowth_model_patch(self, signed_patch_id: str, *, reason: str) -> dict[str, Any]:
+        patch_id = str(signed_patch_id)
+        application = next(
+            (
+                dict(item)
+                for item in reversed(self.regrowth_model_applications)
+                if str(item.get("signed_patch_id", "")) == patch_id
+            ),
+            None,
+        )
+        if application is None:
+            raise ValueError(f"no P7 regrowth model patch application found for signed patch {patch_id}")
+        artifact_path = Path(str(application.get("rollback_artifact_path") or ""))
+        if not artifact_path.exists():
+            raise FileNotFoundError(f"P7 rollback artifact for signed patch {patch_id} is missing at {artifact_path}")
+        expected_sha = str(application.get("rollback_artifact_sha256") or "")
+        if expected_sha and _sha256_file(artifact_path) != expected_sha:
+            raise ValueError(f"P7 rollback artifact checksum mismatch for signed patch {patch_id}")
+        try:
+            artifact = torch.load(artifact_path, map_location="cpu", weights_only=False)
+        except TypeError:
+            artifact = torch.load(artifact_path, map_location="cpu")
+        if int(artifact.get("schema_version", 0) or 0) != 1:
+            raise ValueError(f"unsupported P7 rollback artifact schema for signed patch {patch_id}")
+        if str(artifact.get("signed_patch_id", "")) != patch_id:
+            raise ValueError(f"P7 rollback artifact signed patch id mismatch for {patch_id}")
+        before_tensors = dict(artifact.get("before_tensors") or {})
+        before_checksums = dict(artifact.get("before_checksums") or {})
+        after_checksums = dict(artifact.get("after_checksums") or {})
+        parameter_names = tuple(str(name) for name in artifact.get("parameter_names", ()))
+        named_parameters = dict(self.model.named_parameters())
+        current_delta_l1 = 0.0
+        with torch.no_grad():
+            for name in parameter_names:
+                if name not in named_parameters:
+                    raise ValueError(f"P7 rollback artifact references missing parameter {name}")
+                if name not in before_tensors:
+                    raise ValueError(f"P7 rollback artifact has no before tensor for {name}")
+                parameter = named_parameters[name]
+                before_tensor = before_tensors[name]
+                if tuple(before_tensor.shape) != tuple(parameter.shape):
+                    raise ValueError(f"P7 rollback tensor shape mismatch for {name}")
+                current_checksum = _sha256_tensor(parameter.detach().cpu())
+                expected_after = str(after_checksums.get(name, ""))
+                if not expected_after:
+                    raise ValueError(f"P7 rollback artifact has no post-patch checksum for {name}")
+                if current_checksum != expected_after:
+                    raise ValueError(
+                        f"cannot rollback P7 signed patch {patch_id}: parameter {name} no longer matches post-patch state"
+                    )
+                expected_before = str(before_checksums.get(name, ""))
+                if expected_before and _sha256_tensor(before_tensor) != expected_before:
+                    raise ValueError(f"P7 rollback artifact before tensor checksum mismatch for {name}")
+                current_delta_l1 += float(
+                    (parameter.detach().cpu().float() - before_tensor.float()).abs().sum().item()
+                )
+                parameter.copy_(before_tensor.to(device=parameter.device, dtype=parameter.dtype))
+        self.model.requantize_ternary_core(certify_zeros=False)
+        rollback_report = {
+            "schema_version": 1,
+            "signed_patch_id": patch_id,
+            "rollback_token": str(artifact.get("rollback_token", application.get("rollback_token", ""))),
+            "phase": "P7",
+            "reason": str(reason),
+            "action": str(artifact.get("action", application.get("action", ""))),
+            "target": str(artifact.get("target", application.get("target", ""))),
+            "failure_task_id": str(artifact.get("failure_task_id", application.get("failure_task_id", ""))),
+            "parameter_count": len(parameter_names),
+            "parameter_names": parameter_names,
+            "parameter_delta_l1_restored": current_delta_l1,
+            "rollback_artifact_path": str(artifact_path),
+            "rollback_artifact_sha256": _sha256_file(artifact_path),
+            "requantized_ternary_core": bool(self.model.config.use_ternary_core),
+            "rolled_back": True,
+        }
+        self.regrowth_model_rollback_applications.append(rollback_report)
+        self._count("regrowth_model_executable_rollback_events")
+        self._count("regrowth_model_executable_rollback_parameters", len(parameter_names))
+        return rollback_report
+
     def _apply_model_regrowth(self, plan: RegrowthPlan, *, step: int) -> dict[str, Any]:
         if plan.selected is None:
             raise ValueError("P7 regrowth produced no recovered non-regressing selected action")
@@ -6658,12 +6856,35 @@ class CortexTrainingPhaseController:
                 )
             )
             if repair_delta > 0.0 and protected_delta <= protected_tolerance and parameter_delta > 0.0:
-                accepted_report = {
-                    "step": step,
+                parameter_names = tuple(name for name, _ in parameters)
+                rollback_token = f"rollback-p7-{int(step)}-{selected.action.kind.value}-{selected.action.target}"
+                signed_payload = {
+                    "phase": "P7",
+                    "step": int(step),
                     "action": selected.action.kind.value,
                     "target": selected.action.target,
+                    "failure_task_id": plan.failure.task.task_id,
+                    "failure_skill": plan.failure.task.skill,
+                    "repaired_skills": tuple(patch.repaired_skills),
+                    "repaired_task_ids": tuple(patch.repaired_task_ids),
+                    "rollback_token": rollback_token,
+                    "parameter_names": parameter_names,
+                    "repair_loss_delta": repair_delta,
+                    "protected_loss_delta": protected_delta,
+                }
+                accepted_report = {
+                    "step": step,
+                    "phase": "P7",
+                    "action": selected.action.kind.value,
+                    "target": selected.action.target,
+                    "failure_task_id": plan.failure.task.task_id,
+                    "failure_skill": plan.failure.task.skill,
+                    "rollback_token": rollback_token,
+                    "signed_patch_id": _sha256_json(signed_payload),
+                    "repaired_skills": tuple(patch.repaired_skills),
+                    "repaired_task_ids": tuple(patch.repaired_task_ids),
                     "updated_parameter_count": len(parameters),
-                    "updated_parameter_names": tuple(name for name, _ in parameters),
+                    "updated_parameter_names": parameter_names,
                     "gradient_parameter_count": len(usable),
                     "step_size": float(step_size),
                     "parameter_delta_l1": parameter_delta,
@@ -6691,6 +6912,18 @@ class CortexTrainingPhaseController:
             )
         if not was_training:
             self.model.eval()
+        rollback_artifact = self._persist_regrowth_model_rollback_artifact(
+            accepted_report,
+            snapshots,
+            parameters,
+        )
+        accepted_report.update({
+            "rollback_executable": True,
+            "rollback_artifact_path": rollback_artifact["path"],
+            "rollback_artifact_sha256": rollback_artifact["sha256"],
+            "rollback_artifact_size_bytes": rollback_artifact["size_bytes"],
+            "rollback_artifact_parameter_count": rollback_artifact["parameter_count"],
+        })
         self.regrowth_model_applications.append(accepted_report)
         self.regrowth_model_parameter_delta_l1 += float(accepted_report["parameter_delta_l1"])
         self.regrowth_model_repair_loss_delta += float(accepted_report["repair_loss_delta"])
@@ -7196,6 +7429,8 @@ class CortexTrainingPhaseController:
             "integration_counts": dict(self.integration_counts),
             "attribution_policy": self.attribution_policy.to_dict(),
             "regrowth_model_applications": list(self.regrowth_model_applications),
+            "regrowth_model_rollback_artifacts": list(self.regrowth_model_rollback_artifacts),
+            "regrowth_model_rollback_applications": list(self.regrowth_model_rollback_applications),
             "regrowth_model_parameter_delta_l1": float(self.regrowth_model_parameter_delta_l1),
             "regrowth_model_repair_loss_delta": float(self.regrowth_model_repair_loss_delta),
             "regrowth_model_protected_loss_delta": float(self.regrowth_model_protected_loss_delta),
@@ -7232,6 +7467,7 @@ class CortexTrainingPhaseController:
             "skill_expert_context_skills": tuple(self.skill_expert_context_skills),
             "last_ingested_compression_cost": _cost_trace_payload(self._last_ingested_compression_cost),
             "future_ledger": self.future_ledger.to_dict(),
+            "inference_future_ledger": self.inference.speculative.engine.ledger.to_dict(),
             "compression_trace_ledger": (
                 self.model.compression_ledger.to_dict()
                 if self.model.compression_ledger is not None
@@ -7345,6 +7581,14 @@ class CortexTrainingPhaseController:
             dict(item)
             for item in payload.get("regrowth_model_applications", ())
         ]
+        self.regrowth_model_rollback_artifacts = [
+            dict(item)
+            for item in payload.get("regrowth_model_rollback_artifacts", ())
+        ]
+        self.regrowth_model_rollback_applications = [
+            dict(item)
+            for item in payload.get("regrowth_model_rollback_applications", ())
+        ]
         self.regrowth_model_parameter_delta_l1 = float(payload.get("regrowth_model_parameter_delta_l1", 0.0))
         self.regrowth_model_repair_loss_delta = float(payload.get("regrowth_model_repair_loss_delta", 0.0))
         self.regrowth_model_protected_loss_delta = float(payload.get("regrowth_model_protected_loss_delta", 0.0))
@@ -7398,6 +7642,10 @@ class CortexTrainingPhaseController:
             self.model.set_skill_expert_context(self.skill_expert_last_context, source="checkpoint-restored-skill-ledger")
         self._last_ingested_compression_cost = _cost_trace_from_payload(payload.get("last_ingested_compression_cost"))
         _restore_future_contract_ledger(self.future_ledger, payload.get("future_ledger"))
+        _restore_future_contract_ledger(
+            self.inference.speculative.engine.ledger,
+            payload.get("inference_future_ledger"),
+        )
         _restore_compression_trace_ledger(self.model.compression_ledger, payload.get("compression_trace_ledger"))
         ledgers = dict(payload.get("ledgers") or {})
         _restore_bit_ledger(self.bit_ledger, ledgers.get("bit_ledger"))
@@ -7675,6 +7923,10 @@ class CortexTrainingPhaseController:
             "regrowth_model_repair_loss_delta": float(self.regrowth_model_repair_loss_delta),
             "regrowth_model_protected_loss_delta": float(self.regrowth_model_protected_loss_delta),
             "regrowth_model_applications": _last_items(self.regrowth_model_applications, 5),
+            "regrowth_model_rollback_artifact_count": len(self.regrowth_model_rollback_artifacts),
+            "regrowth_model_rollback_artifacts": _last_items(self.regrowth_model_rollback_artifacts, 5),
+            "regrowth_model_executable_rollback_count": len(self.regrowth_model_rollback_applications),
+            "regrowth_model_rollback_applications": _last_items(self.regrowth_model_rollback_applications, 5),
             "recursive_model_application_count": len(self.recursive_model_applications),
             "recursive_model_parameter_delta_l1": float(self.recursive_model_parameter_delta_l1),
             "recursive_model_repair_loss_delta": float(self.recursive_model_repair_loss_delta),
@@ -8553,6 +8805,10 @@ class CortexTrainingPhaseController:
             "compiled_circuit_memory_restored_reuse_events": int(
                 self.integration_counts.get("compiled_circuit_memory_restored_reuse_events", 0)
             ),
+            "regrowth_model_rollback_artifact_count": len(self.regrowth_model_rollback_artifacts),
+            "regrowth_model_rollback_artifacts": _last_items(self.regrowth_model_rollback_artifacts, 5),
+            "regrowth_model_executable_rollback_count": len(self.regrowth_model_rollback_applications),
+            "regrowth_model_rollback_applications": _last_items(self.regrowth_model_rollback_applications, 5),
             "recursive_verified_artifact_count": len(self.recursive_verified_artifacts),
             "recursive_verified_artifacts": _last_items(self.recursive_verified_artifacts, 5),
             "training_influence": {
@@ -8696,6 +8952,10 @@ class CortexTrainingPhaseController:
                 "regrowth_model_repair_loss_delta": float(self.regrowth_model_repair_loss_delta),
                 "regrowth_model_protected_loss_delta": float(self.regrowth_model_protected_loss_delta),
                 "regrowth_model_applications": _last_items(self.regrowth_model_applications, 5),
+                "regrowth_model_rollback_artifact_count": len(self.regrowth_model_rollback_artifacts),
+                "regrowth_model_rollback_artifacts": _last_items(self.regrowth_model_rollback_artifacts, 5),
+                "regrowth_model_executable_rollback_count": len(self.regrowth_model_rollback_applications),
+                "regrowth_model_rollback_applications": _last_items(self.regrowth_model_rollback_applications, 5),
                 "recursive_model_application_count": len(self.recursive_model_applications),
                 "recursive_model_parameter_delta_l1": float(self.recursive_model_parameter_delta_l1),
                 "recursive_model_repair_loss_delta": float(self.recursive_model_repair_loss_delta),
@@ -8874,6 +9134,10 @@ class CortexTrainingPhaseController:
                     "regrowth_model_repair_loss_delta": float(self.regrowth_model_repair_loss_delta),
                     "regrowth_model_protected_loss_delta": float(self.regrowth_model_protected_loss_delta),
                     "regrowth_model_applications": _last_items(self.regrowth_model_applications, 5),
+                    "regrowth_model_rollback_artifact_count": len(self.regrowth_model_rollback_artifacts),
+                    "regrowth_model_rollback_artifacts": _last_items(self.regrowth_model_rollback_artifacts, 5),
+                    "regrowth_model_executable_rollback_count": len(self.regrowth_model_rollback_applications),
+                    "regrowth_model_rollback_applications": _last_items(self.regrowth_model_rollback_applications, 5),
                     "recursive_model_application_count": len(self.recursive_model_applications),
                     "recursive_model_parameter_delta_l1": float(self.recursive_model_parameter_delta_l1),
                     "recursive_model_repair_loss_delta": float(self.recursive_model_repair_loss_delta),
@@ -9030,6 +9294,10 @@ class CortexTrainingPhaseController:
                     "regrowth_model_repair_loss_delta": float(self.regrowth_model_repair_loss_delta),
                     "regrowth_model_protected_loss_delta": float(self.regrowth_model_protected_loss_delta),
                     "regrowth_model_applications": _last_items(self.regrowth_model_applications, 5),
+                    "regrowth_model_rollback_artifact_count": len(self.regrowth_model_rollback_artifacts),
+                    "regrowth_model_rollback_artifacts": _last_items(self.regrowth_model_rollback_artifacts, 5),
+                    "regrowth_model_executable_rollback_count": len(self.regrowth_model_rollback_applications),
+                    "regrowth_model_rollback_applications": _last_items(self.regrowth_model_rollback_applications, 5),
                     "recursive_model_application_count": len(self.recursive_model_applications),
                     "recursive_model_parameter_delta_l1": float(self.recursive_model_parameter_delta_l1),
                     "recursive_model_repair_loss_delta": float(self.recursive_model_repair_loss_delta),

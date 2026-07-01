@@ -100,7 +100,23 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                     for phase_id in CORTEX_PHASE_REPORT_REQUIRED_PHASE_IDS
                 },
                 "objective_feedback_term_names": list(FINAL_LOSS_TERMS),
-                "regrowth_model_applications": [{"non_regression_passed": True}],
+                "regrowth_model_applications": [
+                    {
+                        "non_regression_passed": True,
+                        "signed_patch_id": "p7-signed",
+                        "rollback_token": "rollback-p7",
+                        "rollback_executable": True,
+                        "rollback_artifact_path": "p7-rollback.pt",
+                        "rollback_artifact_sha256": "sha256",
+                        "rollback_artifact_parameter_count": 1,
+                        "parameter_delta_l1": 1.0,
+                        "repair_loss_delta": 1.0,
+                        "protected_loss_delta": 0.0,
+                        "protected_loss_tolerance": 0.1,
+                    }
+                ],
+                "regrowth_model_rollback_artifacts": [{"rollback_artifact_path": "p7-rollback.pt"}],
+                "regrowth_model_rollback_applications": [{"rollback_token": "rollback-p7"}],
                 "sleep_external_provenance_configured": False,
                 "sleep_external_provenance_adapter_events": 0,
                 "sleep_external_provenance_accepted_examples": 0,
@@ -3767,6 +3783,12 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             self.assertTrue(phase_report["regrowth_model_applications"], phase_report)
             latest_regrowth = phase_report["regrowth_model_applications"][-1]
             self.assertTrue(latest_regrowth["non_regression_passed"], latest_regrowth)
+            self.assertTrue(latest_regrowth["signed_patch_id"], latest_regrowth)
+            self.assertTrue(latest_regrowth["rollback_token"], latest_regrowth)
+            self.assertTrue(latest_regrowth["rollback_executable"], latest_regrowth)
+            self.assertTrue(Path(latest_regrowth["rollback_artifact_path"]).exists(), latest_regrowth)
+            self.assertTrue(latest_regrowth["rollback_artifact_sha256"], latest_regrowth)
+            self.assertGreater(latest_regrowth["rollback_artifact_parameter_count"], 0, latest_regrowth)
             self.assertGreater(latest_regrowth["parameter_delta_l1"], 0.0)
             self.assertGreater(latest_regrowth["repair_loss_delta"], 0.0)
             self.assertLessEqual(
@@ -3836,10 +3858,13 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             self.assertEqual(tuple(persisted["objective_feedback_term_names"]), FINAL_LOSS_TERMS)
             self.assertEqual(set(persisted["last_objective_loss_terms"]), set(FINAL_LOSS_TERMS))
             self.assertTrue(persisted["regrowth_model_applications"], persisted)
+            self.assertGreater(persisted["regrowth_model_rollback_artifact_count"], 0, persisted)
+            self.assertTrue(persisted["regrowth_model_rollback_artifacts"], persisted)
             self.assertTrue(persisted["recursive_model_applications"], persisted)
             self.assertGreater(persisted["recursive_model_rollback_artifact_count"], 0, persisted)
             self.assertTrue(persisted["recursive_model_rollback_artifacts"], persisted)
             self.assertTrue(persisted["recursive_verified_artifacts"], persisted)
+            self.assertGreater(persisted["training_influence"]["regrowth_model_rollback_artifact_count"], 0)
             self.assertGreater(persisted["training_influence"]["recursive_verified_artifact_count"], 0)
             self.assertGreater(persisted["training_influence"]["recursive_model_rollback_artifact_count"], 0)
             self.assertGreater(persisted["training_influence"]["learned_memory_utility_credit_count"], 0)
@@ -3942,6 +3967,89 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             observed = controller._observed_contract_tokens(future_targets, 8)
 
             self.assertEqual(observed, list(range(80, 88)))
+
+    def test_regrowth_model_patch_has_executable_weight_rollback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            corpus = self._corpus(root, repeats=24)
+            tokenizer = LLMTokenizer.train(corpus, vocab_size=128, min_frequency=1)
+            model = CortexTransformerLM(
+                TransformerConfig(
+                    vocab_size=128,
+                    seq_len=16,
+                    d_model=32,
+                    n_heads=4,
+                    n_layers=1,
+                    dropout=0.0,
+                    horizons=(1, 2, 4, 8),
+                    use_cortex_heads=True,
+                    use_ternary_core=True,
+                    use_skill_aware_experts=True,
+                    use_variable_in_compressor=True,
+                    use_learned_memory_policy=True,
+                    use_certificate_head=True,
+                    use_latent_reasoning_workspace=True,
+                )
+            )
+            controller = CortexTrainingPhaseController(
+                model,
+                tokenizer,
+                TrainingConfig(steps=1, batch_size=1, eval_interval=1, checkpoint_interval=1),
+                run_dir=root / "run",
+            )
+            cycle_report = controller.cycle.run(
+                controller.reference_agent,
+                controller.trial_agent,
+                seed=17,
+                n_per_skill=1,
+            )
+            self.assertTrue(cycle_report.regressions, cycle_report)
+            attribution = controller.attribution.attribute(
+                cycle_report.regressions[0],
+                compression_ledger=model.compression_ledger,
+                future_ledger=controller.future_ledger,
+            )
+            plan = controller.regrowth.plan(
+                attribution,
+                controller.trial_agent,
+                controller._cycle_protected_tasks(cycle_report, attribution.failure.task),
+                budget=float(controller.config.cortex_phase_regrowth_budget),
+            )
+            self.assertIsNotNone(plan.selected, plan.to_dict())
+
+            original_parameters = {
+                name: parameter.detach().cpu().clone()
+                for name, parameter in model.named_parameters()
+            }
+            patch_report = controller._apply_model_regrowth(plan, step=0)
+
+            self.assertTrue(patch_report["rollback_executable"], patch_report)
+            self.assertTrue(patch_report["signed_patch_id"], patch_report)
+            self.assertTrue(patch_report["rollback_token"], patch_report)
+            self.assertTrue(Path(patch_report["rollback_artifact_path"]).exists(), patch_report)
+            self.assertGreater(patch_report["rollback_artifact_parameter_count"], 0, patch_report)
+            named_after_patch = dict(model.named_parameters())
+            changed_names = [
+                name
+                for name in patch_report["updated_parameter_names"]
+                if not torch.equal(named_after_patch[name].detach().cpu(), original_parameters[name])
+            ]
+            self.assertTrue(changed_names, patch_report)
+
+            rollback_report = controller.rollback_regrowth_model_patch(
+                patch_report["signed_patch_id"],
+                reason="unit-test-p7-protected-regression",
+            )
+
+            self.assertTrue(rollback_report["rolled_back"], rollback_report)
+            self.assertEqual(rollback_report["rollback_token"], patch_report["rollback_token"])
+            named_after_rollback = dict(model.named_parameters())
+            for name in patch_report["updated_parameter_names"]:
+                self.assertTrue(
+                    torch.equal(named_after_rollback[name].detach().cpu(), original_parameters[name]),
+                    name,
+                )
+            self.assertGreater(controller.checkpoint_state_summary()["regrowth_model_executable_rollback_count"], 0)
 
     def test_recursive_model_patch_has_executable_weight_rollback(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -4433,6 +4541,11 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 resumed_influence["regrowth_model_application_count"],
                 first_influence["regrowth_model_application_count"],
             )
+            self.assertGreaterEqual(
+                resumed_influence["regrowth_model_rollback_artifact_count"],
+                first_influence["regrowth_model_rollback_artifact_count"],
+            )
+            self.assertTrue(resumed_influence["regrowth_model_rollback_artifacts"])
             self.assertGreaterEqual(
                 resumed_influence["attribution_policy_observations"],
                 first_influence["attribution_policy_observations"],

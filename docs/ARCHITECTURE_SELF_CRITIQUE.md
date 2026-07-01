@@ -1,6 +1,6 @@
 # Cortex-3 Architecture Self-Critique
 
-Etat: boucle d'audit 84 apres relecture P1-P10 hors profiling/observabilite. La critique repart des 10 phases et vise les briques structurantes: SlowSolve -> verification -> attribution -> regrowth -> compilation -> selection runtime -> reutilisation persistante -> evolution recursive. Le dernier correctif structurel durcit P4: la memoire cognitive apprise ne recoit plus seulement des credits positifs pour les segments selectionnes, elle apprend aussi des contre-credits quand des segments retenus par la policy sont inutiles a une reconstruction fidele.
+Etat: boucle d'audit 85 apres relecture P1-P10 hors profiling/observabilite. La critique repart des 10 phases et vise les briques structurantes: SlowSolve -> verification -> attribution -> regrowth -> compilation -> selection runtime -> reutilisation persistante -> evolution recursive. Le dernier correctif structurel durcit P7: un patch minimal-regrowth accepte sur les vrais poids Transformer doit maintenant etre signe, materialise en artefact rollback executable, persiste dans checkpoints/rapports et audite comme tel.
 
 Ce document sert de registre de critique et de correction. Il ne remplace pas les tests longs interdits pour cette iteration; il se limite aux preuves courtes disponibles, aux rapports du code et aux tests courts.
 
@@ -31,6 +31,7 @@ Mise a jour C81: P9 ne depend plus uniquement des spans du dataloader pour dire 
 Mise a jour C82: P8/training ne reprend plus aveuglement `checkpoint_final.pt` quand un run repris a avance plus loin avant interruption. `_resolve_resume_checkpoint` valide le sidecar de chaque candidat, compare les steps de `checkpoint_final.pt` et `checkpoint_step_*.pt`, prefere le step complet le plus haut, et ignore un final au sidecar corrompu si un checkpoint intermediaire complet existe.
 Mise a jour C83: P10 ne se contente plus d'avoir bloque le reward-hacking dans `PatchAcceptanceGate`. `_apply_recursive_model_improvement` embarque maintenant dans le payload signe et dans le rapport de patch applique la decision acceptee, la raison, les scores baseline/trial/robustesse, les deltas qualite/cout/robustesse/calibration, les protected losses et les flags reward/collapse/diversite vides. Les audits architecture/livrable exigent cette preuve avant de declarer qu'un patch P10 reel est valide.
 Mise a jour C84: P4 apprend maintenant aussi l'inutilite. `CognitiveMemory.record_utility` emet des `MemoryUtilityCredit(selected=False)` negatifs pour les segments learned-memory retenus mais non selectionnes lors d'une reconstruction fidele; le controleur transforme ces contre-credits en pression de prior vers latent/drop au lieu de renforcer le mode retenu. Les audits P4 exigent maintenant credits positifs et negatifs, dont des credits non selectionnes.
+Mise a jour C85: P7 ne laisse plus un patch modele accepte sans preuve de retour arriere. `_apply_model_regrowth` signe le patch, ecrit un artefact `.pt` avec tensors pre-patch et checksums pre/post, expose `rollback_executable` dans le rapport, persiste les artefacts/applications de rollback et `rollback_regrowth_model_patch` restaure les poids en refusant un modele deja divergent.
 
 ## Audit transversal haut enjeu apres C55
 
@@ -80,6 +81,16 @@ Mise a jour C84: P4 apprend maintenant aussi l'inutilite. `CognitiveMemory.recor
 - Correction integration: P5 construit un certificat lineaire, un certificat symbolique SymPy et un certificat code riche. Le replay P5 ajoute aussi l'exemple symbolique verifie. `certificate_symbolic_solver_events` est persiste dans `state_dict`, `summary`, `checkpoint_state_summary`, sidecars et `training_influence`; les audits architecture et livrable P5 echouent si ce compteur reste nul.
 - Verification courte: `py_compile`, `test_algebra_oracle_accepts_exact_symbolic_quadratic_root_sets`, `test_symbolic_algebra_certificate_uses_sympy_solver_for_quadratic_roots`, `test_default_registry_contains_required_tools`, `test_full_cortex_phase_controller_uses_all_modules_during_training` et `test_cortex_phase_state_survives_checkpoint_resume` passent.
 - Statut: corrige pour le pont "solveur symbolique specialise -> certificat P5 -> oracle DSV -> replay causal -> checkpoint/audit". Reste a etendre les solveurs a davantage de domaines symboliques et a prouver le gain sur suites larges quand les tests longs seront autorises.
+
+### C85. P7 appliquait un patch de poids sans rollback executable persistant
+
+- Critique: apres C84, P7 modifiait deja de vrais parametres Transformer avec un gate repair/protected strict, mais contrairement a P10, un patch accepte ne portait pas encore de `signed_patch_id`, de token de rollback ni d'artefact executable contenant les tensors pre-patch. Cela creait une asymetrie dangereuse: la phase "minimal regrowth" pouvait changer le modele sans preuve autonome de restauration, alors qu'elle est censee etre la brique fine et sure entre attribution P6 et consolidation P9/P10.
+- Correction patch: `_apply_model_regrowth` signe maintenant le payload P7 avec phase, action, target, failure task/skill, skills/taches reparees, parametres touches, deltas de loss et rollback token. Chaque patch accepte appelle `_persist_regrowth_model_rollback_artifact`, qui ecrit un `.pt` avec tensors avant patch, checksums avant/apres et metadata de patch.
+- Correction rollback/checkpoint: `rollback_regrowth_model_patch` refuse un artefact absent, corrompu ou applique a un modele deja divergent, restaure les poids, requantifie le coeur ternaire et enregistre l'application. Les artefacts/applications de rollback P7 sont maintenant persistes dans `state_dict`, resumes/checkpoints, `training_influence` et le schema JSON public.
+- Debug reprise: le test checkpoint a expose deux dettes voisines. La restauration P2 reclassait a tort les compteurs agreges `native_ternary_kernel_dispatches` et `native_ternary_grad_weight_dispatches` comme noms de backend; cela polluait `native_ternary_backend_counts` apres resume. Le checkpoint sauvegardait aussi `future_ledger` mais pas la ledger P8 interne qui porte une partie des output-goal decisions. Les deux chemins sont maintenant corriges.
+- Correction audit: les audits architecture/livrable exigent maintenant que P7 ait un rollback executable, un artefact signe et au moins un parametre restaurable, en plus de la non-regression et des deltas before/after.
+- Verification courte: `py_compile`, `test_published_cortex_phase_report_schema_matches_runtime_contract`, `test_regrowth_model_patch_has_executable_weight_rollback`, `test_full_cortex_phase_controller_uses_all_modules_during_training` et `test_cortex_phase_state_survives_checkpoint_resume` passent.
+- Statut: corrige pour le pont "P6 attribution -> P7 patch poids reel signe -> rollback executable -> checkpoint/audit -> P9/P10 peuvent continuer sans dette de restauration".
 
 ### C84. La memoire cognitive apprise ne savait pas assez apprendre l'oubli utile
 
@@ -813,11 +824,11 @@ Mise a jour C84: P4 apprend maintenant aussi l'inutilite. `CognitiveMemory.recor
 
 ### P7 - Minimal Regrowth
 
-- Ce qui est solide: action space executable, patch modele, non-regression gate, repair/protected loss deltas.
-- Preuve actuelle: tests regrowth et full Cortex report.
+- Ce qui est solide: action space executable, patch modele, non-regression gate, repair/protected loss deltas, signature de patch et rollback poids executable.
+- Preuve actuelle: tests regrowth, full Cortex report et test direct `test_regrowth_model_patch_has_executable_weight_rollback` qui applique P7, restaure les poids et verifie les tensors contre le snapshot original.
 - Faiblesse: budgets et tolerances encore heuristiques; peu de suivi long terme des patchs accumules.
-- Risque architectural: patch local peut masquer une regression plus tardive.
-- Correction prioritaire restante: rendre les deltas before/after explicites partout et ajouter audit cumulatif des patchs.
+- Risque architectural: patch local peut masquer une regression plus tardive, mais il est maintenant restaurable et auditable comme P10.
+- Correction prioritaire restante: scaler les schedules de regrowth sur plusieurs cycles/corpus et auditer les interactions entre patchs successifs, sans revenir a du simple logging.
 
 ### P8 - Fast/Normal/Careful Inference
 

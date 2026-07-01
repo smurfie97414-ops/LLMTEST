@@ -499,8 +499,10 @@ P7 :
 8. mesure repair loss avant/apres ;
 9. mesure protected loss ;
 10. requantifie le coeur ternaire ;
-11. rollback si le gate echoue ;
-12. renvoie le resultat accepte a la politique P6.
+11. signe le patch accepte ;
+12. ecrit un artefact rollback executable avec tensors pre-patch et checksums ;
+13. rollback si le gate echoue ou via `rollback_regrowth_model_patch` si le patch accepte doit etre annule ;
+14. renvoie le resultat accepte a la politique P6.
 
 ### Interaction Avec Les Autres Phases
 
