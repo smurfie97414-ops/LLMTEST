@@ -101,6 +101,7 @@ Le pipeline d'entrainement Cortex-3 part d'un vrai flux LLM :
 7. Le loss Cortex ajoute multi-horizon, temporal consistency, confidence, variable input, learned memory policy, certificate et pression `L_future_contract` issue aussi des contrats output-goal.
 8. Le controleur P1-P10 observe les batchs, lance les phases, produit replay, ledgers, audits, patchs P7/P10 et objectif final.
 9. Les checkpoints persistent modele, optimizer, scaler, RNG, replay, ledgers, phase state et sidecars d'audit.
+10. A la reprise checkpoint, le controleur restaure d'abord la memoire P4, recharge ensuite le registre Frontier persiste, execute une FastSolve restauree avec binding P4 restaure, output-goal et certificat `compiled_circuit`, puis echoue durement si le checkpoint annonce des circuits mais que le registre manque.
 
 Les points d'integration importants sont :
 
@@ -108,7 +109,8 @@ Les points d'integration importants sont :
 - `CortexObjective.compute` : transforme ces sorties en loss trainable.
 - `LLMTrainer.train` : ajoute `auxiliary_loss`, `replay_loss`, optimizer step et `requantize_ternary_core`.
 - `CortexTrainingPhaseController.run_phase_audit` : execute P1-P10.
-- `checkpoint_state_summary` / `summary` : prouve que les phases ont vraiment tourne et influence le training.
+- `CortexTrainingPhaseController.load_state_dict` : restaure les ledgers, la memoire P4, le registre Frontier, puis prouve une FastSolve restauree avant de continuer le training.
+- `checkpoint_state_summary` / `summary` : prouve que les phases ont vraiment tourne, influence le training et conservent les competences compilees au-dela du run courant.
 
 ## Influence Directe Sur L'Apprentissage
 
@@ -219,6 +221,7 @@ Correspondance runtime :
 | Adaptive Multi-Token Decoding | MTP horizons + inference route | audit `adaptive_multi_token_decoding` |
 | Latent Reasoning Workspace | `LatentProofState` + cert head | P5 audit |
 | Certificate Generator | `CertificateHead` + verifier | P5 certificate verification |
+| Frontier FastSolve persistant | `FrontierCircuitRegistry` + `CompiledFrontierAgent` | registre restaure, binding P4 restaure, output-goal et certificat compile |
 | Hierarchical Dynamic Verifier | `DynamicSkillVerifier` | P1 + no phase errors |
 | Attribute Regression | `CausalAttributionEngine` | P6 |
 | Minimal Regrowth | `MinimalRegrowthEngine` + model patch | P7 patch evidence |

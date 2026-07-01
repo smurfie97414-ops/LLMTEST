@@ -3606,6 +3606,14 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                     0,
                 )
                 self.assertGreater(len(checkpoint["cortex_phase_state"]["memory_state"]["recent"]), 0)
+                self.assertGreater(
+                    len(checkpoint["cortex_phase_state"]["memory_state"]["compiled_circuit_bindings"]),
+                    0,
+                )
+                self.assertGreater(
+                    checkpoint["cortex_phase_state"]["frontier_registry_summary"]["circuit_count"],
+                    0,
+                )
                 self.assertGreater(len(checkpoint["cortex_phase_state"]["sleep_state"]["replay_examples"]), 0)
                 self.assertGreater(len(checkpoint["cortex_phase_state"]["sleep_state"]["synthetic_examples"]), 0)
                 improvement_archive = checkpoint["cortex_phase_state"]["improvement_state"]["archive"]
@@ -3639,6 +3647,22 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                     independent_controller.integration_counts["recursive_persistent_archive_loaded_decisions"],
                     0,
                 )
+                missing_registry_state = dict(checkpoint["cortex_phase_state"])
+                missing_registry_state["frontier_registry_path"] = str(root / "missing-frontier-registry")
+                missing_registry_controller = CortexTrainingPhaseController(
+                    CortexTransformerLM(model_config),
+                    tokenizer,
+                    TrainingConfig(
+                        steps=1,
+                        batch_size=1,
+                        eval_interval=1,
+                        checkpoint_interval=1,
+                        cortex_improvement_archive_dir=str(archive_dir),
+                    ),
+                    run_dir=root / "missing-frontier-controller",
+                )
+                with self.assertRaises(FileNotFoundError):
+                    missing_registry_controller.load_state_dict(missing_registry_state)
                 sidecar = json.loads((run_dir / "checkpoint_final.pt.json").read_text(encoding="utf-8"))
                 self.assertTrue(sidecar["cortex_phase_state_present"])
                 self.assertTrue(
@@ -3875,6 +3899,19 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 resumed_influence["sleep_frontier_fastsolve_events"],
                 first_influence["sleep_frontier_fastsolve_events"],
             )
+            self.assertGreater(resumed_influence["frontier_registry_loaded_events"], 0)
+            self.assertGreater(resumed_influence["frontier_registry_loaded_circuits"], 0)
+            self.assertGreater(resumed_influence["frontier_restored_fastsolve_events"], 0)
+            self.assertGreater(resumed_influence["compiled_circuit_memory_restored_reuse_events"], 0)
+            self.assertTrue(resumed.cortex_phase_report["restored_frontier_fastsolve_reports"])
+            restored_fastsolve = resumed.cortex_phase_report["restored_frontier_fastsolve_reports"][-1]
+            self.assertEqual(restored_fastsolve["source"], "checkpoint_restore")
+            self.assertTrue(restored_fastsolve["frontier_compiled_selected"], restored_fastsolve)
+            self.assertTrue(restored_fastsolve["verified"], restored_fastsolve)
+            self.assertTrue(restored_fastsolve["frontier_memory_binding_passed"], restored_fastsolve)
+            self.assertTrue(restored_fastsolve["frontier_output_goal_contract_passed"], restored_fastsolve)
+            self.assertTrue(restored_fastsolve["frontier_compiled_contract_verified"], restored_fastsolve)
+            self.assertGreater(restored_fastsolve["frontier_memory_binding_fidelity"], 0.0)
             self.assertGreaterEqual(
                 resumed_influence["improvement_archive_accepted"] + resumed_influence["improvement_archive_rejected"],
                 first_influence["improvement_archive_accepted"] + first_influence["improvement_archive_rejected"],

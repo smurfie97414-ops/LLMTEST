@@ -1,6 +1,6 @@
 # Cortex-3 Architecture Self-Critique
 
-Etat: boucle d'audit 64 apres relecture P1-P10 hors profiling/observabilite. La critique repart des 10 phases et vise les briques structurantes: SlowSolve -> verification -> attribution -> regrowth -> compilation -> selection runtime -> reutilisation persistante -> evolution recursive. Le dernier correctif structurel ferme la boucle P6/P7: les attributions ne sont plus seulement des probes deterministes, elles apprennent des reparations P7 verifiees.
+Etat: boucle d'audit 65 apres relecture P1-P10 hors profiling/observabilite. La critique repart des 10 phases et vise les briques structurantes: SlowSolve -> verification -> attribution -> regrowth -> compilation -> selection runtime -> reutilisation persistante -> evolution recursive. Le dernier correctif structurel prouve qu'un circuit Frontier persiste peut etre recharge depuis checkpoint, reconstruire son binding P4 et repondre immediatement en FastSolve sans recompilation silencieuse.
 
 Ce document sert de registre de critique et de correction. Il ne remplace pas les tests longs interdits pour cette iteration; il se limite aux preuves courtes disponibles, aux rapports du code et aux tests courts.
 
@@ -11,18 +11,19 @@ Mise a jour C61: P4 ne se limite plus aux batches observes. Les circuits Frontie
 Mise a jour C62: P10 ne perd plus ses decisions detaillees hors checkpoint. `archive.json` et `rollback.json` persistent propositions, decisions, evaluations sandbox et tokens rollback; un controleur LLM neuf peut les recharger via `cortex_improvement_archive_dir`.
 Mise a jour C63: P10 ne reste plus sur une seule vague de propositions par audit. Les propositions acceptees deviennent des parents de propositions descendantes dans la meme execution P10, avec lineage, selection de type sous-represente et compteurs generationnels audites par le controleur LLM.
 Mise a jour C64: P6 n'est plus seulement un classement de probes. `AttributionPolicyMemory` apprend skill/cause/intervention depuis les reparations P7 acceptees, repondere les causes futures, persiste dans les checkpoints et devient obligatoire dans l'audit P6 du controleur LLM.
+Mise a jour C65: P4/P8/P9/Frontier ne prouvent plus seulement qu'un circuit a existe avant checkpoint. A la reprise, le controleur recharge le registre Frontier, echoue si le manifeste manque, puis execute une FastSolve restauree avec binding P4 reconstruit, output-goal et certificat compile verifies.
 
 ## Audit transversal haut enjeu apres C55
 
 - P1 Dynamic Skill Verifier: la base DSV couvre bien les familles rares, metamorphiques et anti-metamorphiques. Le risque structurant restant n'est pas de mieux compter les tests, mais d'utiliser les competences detectees comme entrees directes de compilation et non comme simples regressions de rapport.
 - P2 Ternary Core: le backend ternaire natif est deja fortement travaille. Le risque haut enjeu restant est son emploi comme substrat de circuits compiles reutilisables, pas de nouvelles metriques de profiling.
 - P3 MTP/FSP: les contrats token-horizon sont branches dans le training, et les nouveaux contrats output-goal protegent maintenant les objectifs de sortie/skill au-dela du prochain token.
-- P4 Cognitive Memory: la memoire apprise existe dans le Transformer LLM, la memoire autonome conserve les ancres, et les competences compilees Frontier sont maintenant retenues comme objets memoire avec gate de reconstruction avant FastSolve. Le manque suivant est de prouver cette retention sur de plus grands registres et plusieurs cycles longs.
+- P4 Cognitive Memory: la memoire apprise existe dans le Transformer LLM, la memoire autonome conserve les ancres, et les competences compilees Frontier sont maintenant retenues comme objets memoire avec gate de reconstruction avant FastSolve, y compris apres restauration checkpoint. Le manque suivant est de prouver cette retention sur de plus grands registres et plusieurs cycles longs.
 - P5 Certificates: les certificats prouvent des sorties et des traces latentes. Ils certifient maintenant aussi l'origine compilee d'une competence reutilisee via un contrat `compiled_circuit` a checksum, incluant le passage du contrat output-goal, et couvrent une premiere preuve algebrique multi-step plus des tests code visibles/caches/proprietes.
 - P6 Attribution: les ablations savent localiser des causes. Le point fort enjeu est de transformer ces causes en selection de circuit compile ou regrowth cible, pas seulement en estimation.
 - P7 Minimal Regrowth: le LLM sait appliquer un patch borne aux vrais parametres. Le pont ajoute ici teste maintenant une competence compilee comme candidat de reparation verifie avant d'acheter du regrowth parametrique, puis conserve le regrowth existant sous gate stricte.
-- P8 Fast/Normal/Careful Inference: les routes existent, le chemin FastSolve consomme maintenant un registre frontier seulement quand un circuit couvre vraiment la tache, et chaque reponse inferee porte aussi un contrat output-goal qui peut faire echouer le gate si la sortie finale ne respecte pas l'objectif.
-- P9 Sleep Anti-Collapse: le replay et les exemples verifies alimentent le training, puis certaines familles coherentes acceptees par le sommeil sont maintenant promues en circuits Frontier persistants avec held-out gate, FastSolve immediat et proposition P10. Le manque suivant n'est plus le pont structurel, mais sa retention sur cycles longs et donnees reelles.
+- P8 Fast/Normal/Careful Inference: les routes existent, le chemin FastSolve consomme maintenant un registre frontier seulement quand un circuit couvre vraiment la tache, chaque reponse inferee porte un contrat output-goal, et la reprise checkpoint execute une FastSolve restauree avant de continuer.
+- P9 Sleep Anti-Collapse: le replay et les exemples verifies alimentent le training, puis certaines familles coherentes acceptees par le sommeil sont maintenant promues en circuits Frontier persistants avec held-out gate, FastSolve immediat, FastSolve restauree apres checkpoint et proposition P10. Le manque suivant n'est plus le pont structurel, mais son scale sur cycles longs et donnees reelles.
 - P10 Recursive Improvement: les propositions peuvent appliquer des patchs signes. Le controleur LLM ne reste plus bloque sur une proposition unique apres reprise: il explore un budget borne de propositions tout en conservant les gates Pareto/protection/calibration/diversite/reward-hacking. Les reparations Frontier acceptees par P7 sont maintenant promues en propositions `compiled_frontier` prioritaires avant le patch modele P10, l'archive complete peut survivre a un run independant sans dependance au checkpoint, et les propositions acceptees peuvent engendrer une generation suivante sous pression de diversite.
 
 ### C56. Les circuits Frontier etaient valides mais pas reutilisables
@@ -107,6 +108,13 @@ Mise a jour C64: P6 n'est plus seulement un classement de probes. `AttributionPo
 - Debug precis: le premier echec court venait d'une incoherence d'exposition: les compteurs P6 appris existaient dans `training_influence`, mais l'audit architecture lisait le niveau superieur et les dictionnaires internes d'audit. Les champs `attribution_policy_observations`, `attribution_policy_successes`, `attribution_policy_updates` et `attribution_policy_applied_events` sont maintenant exposes dans les trois chemins.
 - Verification courte: `py_compile`, `tests.test_causal_attribution`, `tests.test_regrowth`, `tests.test_llm_pretraining.LLMPretrainingHarnessTest.test_full_cortex_phase_controller_uses_all_modules_during_training` et `tests.test_llm_pretraining.LLMPretrainingHarnessTest.test_cortex_phase_state_survives_checkpoint_resume` passent.
 - Statut: corrige pour la boucle courte "P6 cause -> P7 patch verifie -> P6 politique apprise -> audit LLM". Reste a scaler la politique sur longues traces, causes multiples et cycles de training reels.
+
+### C65. Les circuits compiles persistaient mais la reprise ne prouvait pas leur reutilisation immediate
+
+- Critique: apres C61/C64, `frontier_registry.json`, les checkpoints micro-modele, `CompiledCircuitMemoryBinding` et les compteurs de FastSolve etaient bien persistants. Mais la reprise LLM prouvait surtout que les rapports et compteurs survivaient, puis le run pouvait recompiler de nouveaux circuits pendant l'audit suivant. Il manquait donc une preuve structurante: un circuit compile deja persiste doit etre recharge, retrouver son binding P4 restaure, passer output-goal/certificat et repondre en FastSolve avant toute recompilation nouvelle. Sans cela, SlowSolve -> Compile -> FastSolve restait trop dependant du run courant.
+- Correction: `CortexTrainingPhaseController.load_state_dict` recharge maintenant le registre Frontier seulement apres restauration de la memoire P4. Si le checkpoint annonce des circuits mais que `frontier_registry.json` manque, la reprise leve `FileNotFoundError` au lieu de perdre silencieusement les competences compilees. Quand le registre est charge, `_validate_restored_frontier_fastsolve` execute `CompiledFrontierAgent` sur une tache couverte restauree avec la memoire P4 restauree; il exige selection compilee, oracle verifie, binding memoire passe, output-goal passe et certificat `compiled_circuit` verifie. Les compteurs `frontier_registry_loaded_events`, `frontier_restored_fastsolve_events` et `compiled_circuit_memory_restored_reuse_events` alimentent ensuite les audits P4.
+- Verification courte: `py_compile`, `tests.test_llm_pretraining.LLMPretrainingHarnessTest.test_cortex_phase_state_survives_checkpoint_resume` et `tests.test_llm_pretraining.LLMPretrainingHarnessTest.test_full_cortex_phase_controller_uses_all_modules_during_training` passent. Le test de reprise verifie aussi le chemin dur: checkpoint avec circuits annonces mais registre absent => erreur.
+- Statut: corrige pour la boucle courte "checkpoint -> registre Frontier restaure -> binding P4 restaure -> FastSolve restauree". Reste a scaler sur registres plus grands, plus de skills, cycles sleep/wake multiples et selection de plusieurs circuits concurrents.
 
 ## Boucle 1 - Corrections executees maintenant
 
@@ -654,16 +662,16 @@ Mise a jour C64: P6 n'est plus seulement un classement de probes. `AttributionPo
 
 ### P8 - Fast/Normal/Careful Inference
 
-- Ce qui est solide: router, budget predictor, early exit, memory augmentation, future contracts, certificate gate, ternary kernel dispatch traces.
-- Preuve actuelle: tests inference.
-- Faiblesse: pas encore branche directement au checkpoint LLM complet pour generation large; kernel dispatcher inference et BitLinear training doivent rester alignes.
-- Risque architectural: P8 peut etre une boucle executable correcte mais pas encore le vrai decodeur du LLM pre-entraine.
+- Ce qui est solide: router, budget predictor, early exit, memory augmentation, future contracts, certificate gate, ternary kernel dispatch traces, FastSolve Frontier restaure depuis checkpoint.
+- Preuve actuelle: tests inference, test Frontier et test LLM resume qui exige une FastSolve restauree avec binding P4.
+- Faiblesse: pas encore branche directement au checkpoint LLM complet pour generation large; kernel dispatcher inference et BitLinear training doivent rester alignes; le choix entre plusieurs circuits concurrents reste court.
+- Risque architectural: P8 peut etre une boucle executable correcte mais pas encore le vrai decodeur du LLM pre-entraine a grande echelle.
 - Correction prioritaire restante: unifier davantage les metadata kernel entre P8 dispatcher et `BitLinear` natif.
 
 ### P9 - Sleep / Consolidation Buffer
 
 - Ce qui est solide: replay failures, synthetic verified pool, real reservoir, anti-collapse filter, schedule.
-- Preuve actuelle: tests sleep et full Cortex replay counts.
+- Preuve actuelle: tests sleep, full Cortex replay counts, compilation Frontier sleep et FastSolve restauree apres checkpoint.
 - Faiblesse: reservoir reel petit; pas de politique d'oubli/consolidation mesuree sur longue duree.
 - Risque architectural: sleep peut ajouter du replay utile sans prouver consolidation durable.
 - Correction prioritaire restante: ablation courte replay on/off sur micro-LLM et audit diversity drift.

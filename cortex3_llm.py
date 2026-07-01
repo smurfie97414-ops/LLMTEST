@@ -3258,13 +3258,23 @@ def _cortex_architecture_audit_from_summary(summary: Mapping[str, Any]) -> dict[
         "compiled_circuit_memory_retention",
         integer("compiled_circuit_memory_binding_count") > 0
         and integer("compiled_circuit_memory_binding_events") > 0
-        and integer("compiled_circuit_memory_fidelity_failures") == 0,
+        and integer("compiled_circuit_memory_fidelity_failures") == 0
+        and (
+            integer("frontier_registry_loaded_events") == 0
+            or (
+                integer("frontier_restored_fastsolve_events") > 0
+                and integer("compiled_circuit_memory_restored_reuse_events") > 0
+            )
+        ),
         {
             "compiled_circuit_memory_binding_count": integer("compiled_circuit_memory_binding_count"),
             "compiled_circuit_memory_binding_events": integer("compiled_circuit_memory_binding_events"),
             "compiled_circuit_memory_fidelity_failures": integer("compiled_circuit_memory_fidelity_failures"),
+            "frontier_registry_loaded_events": integer("frontier_registry_loaded_events"),
+            "frontier_restored_fastsolve_events": integer("frontier_restored_fastsolve_events"),
+            "compiled_circuit_memory_restored_reuse_events": integer("compiled_circuit_memory_restored_reuse_events"),
         },
-        "P4 memory must retain and reconstruct compiled Frontier circuits before FastSolve/P7/P9/P10 reuse",
+        "P4 memory must retain, restore and reconstruct compiled Frontier circuits before FastSolve/P7/P9/P10 reuse",
     )
     add(
         "ternary_core",
@@ -3713,7 +3723,14 @@ def _cortex_phase_deliverable_audit_from_summary(summary: Mapping[str, Any]) -> 
         and int(summary.get("learned_memory_anchor_supervision_events", 0) or 0) > 0
         and int(summary.get("compiled_circuit_memory_binding_count", 0) or 0) > 0
         and int(summary.get("compiled_circuit_memory_binding_events", 0) or 0) > 0
-        and int(summary.get("compiled_circuit_memory_fidelity_failures", 0) or 0) == 0,
+        and int(summary.get("compiled_circuit_memory_fidelity_failures", 0) or 0) == 0
+        and (
+            count("frontier_registry_loaded_events") == 0
+            or (
+                count("frontier_restored_fastsolve_events") > 0
+                and count("compiled_circuit_memory_restored_reuse_events") > 0
+            )
+        ),
         {
             "memory_recent_segments": int(summary.get("memory_recent_segments", 0) or 0),
             "memory_latent_segments": int(summary.get("memory_latent_segments", 0) or 0),
@@ -3724,8 +3741,11 @@ def _cortex_phase_deliverable_audit_from_summary(summary: Mapping[str, Any]) -> 
             "compiled_circuit_memory_binding_count": int(summary.get("compiled_circuit_memory_binding_count", 0) or 0),
             "compiled_circuit_memory_binding_events": int(summary.get("compiled_circuit_memory_binding_events", 0) or 0),
             "compiled_circuit_memory_fidelity_failures": int(summary.get("compiled_circuit_memory_fidelity_failures", 0) or 0),
+            "frontier_registry_loaded_events": count("frontier_registry_loaded_events"),
+            "frontier_restored_fastsolve_events": count("frontier_restored_fastsolve_events"),
+            "compiled_circuit_memory_restored_reuse_events": count("compiled_circuit_memory_restored_reuse_events"),
         },
-        "Cognitive memory must preserve exact anchors, learn exact/latent/drop retention decisions, and retain compiled Frontier circuits for reuse",
+        "Cognitive memory must preserve exact anchors, learn exact/latent/drop retention decisions, and retain restored compiled Frontier circuits for reuse",
     )
     add(
         "P5",
@@ -3972,6 +3992,7 @@ class CortexTrainingPhaseController:
         self.phase_audits: list[dict[str, Any]] = []
         self.frontier_reports: list[dict[str, Any]] = []
         self.sleep_frontier_reports: list[dict[str, Any]] = []
+        self.restored_frontier_fastsolve_reports: list[dict[str, Any]] = []
         self.frontier_compiled_fastsolve_events = 0
         self.frontier_repair_candidates: list[dict[str, Any]] = []
         self.frontier_repair_accepted_events = 0
@@ -4540,6 +4561,83 @@ class CortexTrainingPhaseController:
             "runtime_fidelity": asdict(reconstruction.fidelity),
             "runtime_selected_segment_ids": reconstruction.selected_segment_ids,
         }
+
+    def _validate_restored_frontier_fastsolve(self, *, registry_path: Path) -> dict[str, Any] | None:
+        runtime_circuits = tuple(
+            circuit
+            for skill in self.frontier_registry.compiled_skills()
+            for circuit in self.frontier_registry.circuits_for_skill(skill)
+        )
+        if not runtime_circuits:
+            return None
+        for runtime_circuit in runtime_circuits:
+            covered_tasks = tuple(runtime_circuit.verified_tasks) + tuple(runtime_circuit.heldout_tasks)
+            if not covered_tasks:
+                continue
+            task = covered_tasks[0]
+            circuit_id = compiled_circuit_id(runtime_circuit.report)
+            answer = CompiledFrontierAgent(
+                self.frontier_registry,
+                verifier=self.verifier,
+                memory=self.memory,
+            )(task)
+            verification = self.verifier.oracle_registry.verify(task.skill, task, answer)
+            memory_binding = dict(answer.raw.get("frontier_memory_binding") or {})
+            runtime_fidelity = dict(memory_binding.get("runtime_fidelity") or {})
+            report = {
+                "source": "checkpoint_restore",
+                "registry_path": str(registry_path),
+                "task_id": task.task_id,
+                "skill": task.skill,
+                "circuit_id": circuit_id,
+                "frontier_compiled_selected": bool(answer.raw.get("frontier_compiled_selected", False)),
+                "verified": bool(verification.passed),
+                "verification_reason": verification.reason,
+                "frontier_memory_binding_id": answer.certificate.get("frontier_memory_binding_id"),
+                "frontier_memory_binding_passed": bool(answer.certificate.get("frontier_memory_binding_passed", False)),
+                "frontier_memory_binding_fidelity": float(
+                    answer.certificate.get("frontier_memory_binding_fidelity", 0.0) or 0.0
+                ),
+                "runtime_selected_segment_ids": tuple(memory_binding.get("runtime_selected_segment_ids", ())),
+                "runtime_fidelity": runtime_fidelity,
+                "frontier_heldout_gate_passed": bool(answer.certificate.get("frontier_heldout_gate_passed", False)),
+                "frontier_heldout_passed": int(answer.certificate.get("frontier_heldout_passed", 0) or 0),
+                "frontier_heldout_total": int(answer.certificate.get("frontier_heldout_total", 0) or 0),
+                "frontier_output_goal_contract_passed": bool(
+                    answer.certificate.get("frontier_output_goal_contract_passed", False)
+                ),
+                "frontier_compiled_contract_verified": bool(
+                    answer.certificate.get("frontier_compiled_contract_verified", False)
+                ),
+                "cost": _cost_trace_payload(answer.cost),
+            }
+            if not report["frontier_compiled_selected"]:
+                raise ValueError(f"restored Frontier registry did not select circuit {circuit_id} for {task.task_id}")
+            if not report["verified"]:
+                raise ValueError(f"restored Frontier FastSolve failed oracle for {task.task_id}: {verification.reason}")
+            if not report["frontier_memory_binding_passed"]:
+                raise ValueError(f"restored Frontier circuit {circuit_id} failed restored P4 memory binding")
+            if not report["frontier_output_goal_contract_passed"]:
+                raise ValueError(f"restored Frontier circuit {circuit_id} failed restored output-goal contract")
+            if not report["frontier_compiled_contract_verified"]:
+                raise ValueError(f"restored Frontier circuit {circuit_id} failed restored compiled-circuit certificate")
+            self.restored_frontier_fastsolve_reports.append(report)
+            self._count("frontier_restored_fastsolve_events")
+            self._count("frontier_compiled_fastsolve_events")
+            self._count("compiled_circuit_memory_restored_reuse_events")
+            self.frontier_compiled_fastsolve_events += 1
+            self.bit_ledger.ingest_cost(answer.cost, note=f"P8:restored-frontier-fastsolve:{task.skill}")
+            self.uncertainty_ledger.record(task.skill, answer.confidence, True)
+            self._record_causal_trace(
+                trace_id=f"P8-restored-frontier-{len(self.restored_frontier_fastsolve_reports)}-{task.task_id}",
+                skill=task.skill,
+                confidence=answer.confidence,
+                anchors=len(task.anchors),
+                certificate_fields=answer.certificate.keys(),
+                verifier_level=2,
+            )
+            return report
+        raise ValueError("restored Frontier registry contained circuits but no covered task for FastSolve validation")
 
     def _compile_sleep_frontier(
         self,
@@ -5114,6 +5212,7 @@ class CortexTrainingPhaseController:
             "phase_audits": list(self.phase_audits),
             "frontier_reports": list(self.frontier_reports),
             "sleep_frontier_reports": list(self.sleep_frontier_reports),
+            "restored_frontier_fastsolve_reports": list(self.restored_frontier_fastsolve_reports),
             "frontier_compiled_fastsolve_events": int(self.frontier_compiled_fastsolve_events),
             "frontier_repair_candidates": list(self.frontier_repair_candidates),
             "frontier_repair_accepted_events": int(self.frontier_repair_accepted_events),
@@ -5184,13 +5283,14 @@ class CortexTrainingPhaseController:
         self.phase_audits = [dict(item) for item in payload.get("phase_audits", ())]
         self.frontier_reports = [dict(item) for item in payload.get("frontier_reports", ())]
         self.sleep_frontier_reports = [dict(item) for item in payload.get("sleep_frontier_reports", ())]
+        self.restored_frontier_fastsolve_reports = [
+            dict(item)
+            for item in payload.get("restored_frontier_fastsolve_reports", ())
+        ]
         self.frontier_compiled_fastsolve_events = int(payload.get("frontier_compiled_fastsolve_events", 0))
         self.frontier_repair_candidates = [dict(item) for item in payload.get("frontier_repair_candidates", ())]
         self.frontier_repair_accepted_events = int(payload.get("frontier_repair_accepted_events", 0))
         frontier_path = Path(str(payload.get("frontier_registry_path") or (self.run_dir / "frontier_registry")))
-        if frontier_path.exists() and (frontier_path / "frontier_registry.json").exists():
-            self.frontier_registry = FrontierCircuitRegistry.load(frontier_path)
-            self.inference.set_compiled_frontier_registry(self.frontier_registry)
         self.replay_batches = [
             batch.detach().cpu().to(dtype=torch.long)
             if isinstance(batch, torch.Tensor)
@@ -5288,6 +5388,30 @@ class CortexTrainingPhaseController:
         _restore_memory_state(self.memory, payload.get("memory_state"))
         _restore_sleep_state(self.sleep, payload.get("sleep_state"))
         _restore_improvement_state(self.improvement, payload.get("improvement_state"))
+        frontier_summary = dict(payload.get("frontier_registry_summary") or {})
+        expected_frontier_circuits = int(frontier_summary.get("circuit_count", 0) or 0)
+        frontier_manifest = frontier_path / "frontier_registry.json"
+        if frontier_manifest.exists():
+            self.frontier_registry = FrontierCircuitRegistry.load(frontier_path)
+            self.inference.set_compiled_frontier_registry(self.frontier_registry)
+            restored_count = int(self.frontier_registry.to_dict().get("circuit_count", 0) or 0)
+            if expected_frontier_circuits > 0 and restored_count <= 0:
+                raise ValueError(
+                    f"checkpoint expected {expected_frontier_circuits} restored Frontier circuits, "
+                    "but the loaded registry is empty"
+                )
+            if restored_count > 0:
+                self._count("frontier_registry_loaded_events")
+                self.integration_counts["frontier_registry_loaded_circuits"] = max(
+                    int(self.integration_counts.get("frontier_registry_loaded_circuits", 0)),
+                    restored_count,
+                )
+                self._validate_restored_frontier_fastsolve(registry_path=frontier_path)
+        elif expected_frontier_circuits > 0:
+            raise FileNotFoundError(
+                f"checkpoint expected {expected_frontier_circuits} Frontier circuits, "
+                f"but persisted registry is missing at {frontier_manifest}"
+            )
         self.improvement_persistent_archive_state = dict(
             payload.get("improvement_persistent_archive_state")
             or self.improvement_persistent_archive_state
@@ -5441,12 +5565,19 @@ class CortexTrainingPhaseController:
             "frontier_compiled_skill_count": int(frontier_registry_summary["compiled_skill_count"]),
             **frontier_heldout_summary,
             "frontier_compiled_fastsolve_events": int(self.frontier_compiled_fastsolve_events),
+            "frontier_registry_loaded_events": int(self.integration_counts.get("frontier_registry_loaded_events", 0)),
+            "frontier_registry_loaded_circuits": int(self.integration_counts.get("frontier_registry_loaded_circuits", 0)),
+            "frontier_restored_fastsolve_events": int(self.integration_counts.get("frontier_restored_fastsolve_events", 0)),
+            "compiled_circuit_memory_restored_reuse_events": int(
+                self.integration_counts.get("compiled_circuit_memory_restored_reuse_events", 0)
+            ),
             "sleep_frontier_fastsolve_events": int(self.integration_counts.get("sleep_frontier_fastsolve_events", 0)),
             "frontier_repair_candidate_count": len(self.frontier_repair_candidates),
             "frontier_repair_accepted_events": int(self.frontier_repair_accepted_events),
             "frontier_registry_path": str(self.run_dir / "frontier_registry"),
             "frontier_reports": _last_items(self.frontier_reports, 3),
             "sleep_frontier_reports": _last_items(self.sleep_frontier_reports, 3),
+            "restored_frontier_fastsolve_reports": _last_items(self.restored_frontier_fastsolve_reports, 3),
             "frontier_repair_candidates": _last_items(self.frontier_repair_candidates, 3),
             "improvement_archive_accepted": self.improvement.archive.accepted_count,
             "improvement_archive_rejected": self.improvement.archive.rejected_count,
@@ -6167,6 +6298,12 @@ class CortexTrainingPhaseController:
             "attribution_policy_successes": int(self.attribution_policy.success_count),
             "attribution_policy_updates": int(self.integration_counts.get("attribution_policy_updates", 0)),
             "attribution_policy_applied_events": int(self.integration_counts.get("attribution_policy_applied_events", 0)),
+            "frontier_registry_loaded_events": int(self.integration_counts.get("frontier_registry_loaded_events", 0)),
+            "frontier_registry_loaded_circuits": int(self.integration_counts.get("frontier_registry_loaded_circuits", 0)),
+            "frontier_restored_fastsolve_events": int(self.integration_counts.get("frontier_restored_fastsolve_events", 0)),
+            "compiled_circuit_memory_restored_reuse_events": int(
+                self.integration_counts.get("compiled_circuit_memory_restored_reuse_events", 0)
+            ),
             "training_influence": {
                 "ternary_core_forward_events": trace_counts.get("layer_forward_events", 0),
                 "packed_ternary_dispatches": trace_counts.get("packed_ternary_dispatches", 0),
@@ -6225,6 +6362,12 @@ class CortexTrainingPhaseController:
                 "compiled_circuit_memory_binding_events": int(self.integration_counts.get("compiled_circuit_memory_binding_events", 0)),
                 "compiled_circuit_memory_fidelity_failures": int(self.integration_counts.get("compiled_circuit_memory_fidelity_failures", 0)),
                 "sleep_frontier_memory_binding_events": int(self.integration_counts.get("sleep_frontier_memory_binding_events", 0)),
+                "frontier_registry_loaded_events": int(self.integration_counts.get("frontier_registry_loaded_events", 0)),
+                "frontier_registry_loaded_circuits": int(self.integration_counts.get("frontier_registry_loaded_circuits", 0)),
+                "frontier_restored_fastsolve_events": int(self.integration_counts.get("frontier_restored_fastsolve_events", 0)),
+                "compiled_circuit_memory_restored_reuse_events": int(
+                    self.integration_counts.get("compiled_circuit_memory_restored_reuse_events", 0)
+                ),
                 "compiled_circuit_memory_bindings": _last_items(memory_report.get("compiled_circuit_memory_bindings", ()), 5),
                 "sleep_replay_examples": len(self.sleep.replay.examples),
                 "sleep_synthetic_examples": len(self.sleep.synthetic.examples),
@@ -6234,6 +6377,7 @@ class CortexTrainingPhaseController:
                 **frontier_heldout_summary,
                 "frontier_compiled_fastsolve_events": int(self.frontier_compiled_fastsolve_events),
                 "sleep_frontier_fastsolve_events": int(self.integration_counts.get("sleep_frontier_fastsolve_events", 0)),
+                "restored_frontier_fastsolve_reports": _last_items(self.restored_frontier_fastsolve_reports, 3),
                 "frontier_repair_candidate_count": len(self.frontier_repair_candidates),
                 "frontier_repair_accepted_events": int(self.frontier_repair_accepted_events),
                 "recursive_frontier_proposal_events": int(self.integration_counts.get("recursive_frontier_proposal_events", 0)),
@@ -6333,6 +6477,12 @@ class CortexTrainingPhaseController:
                     "compiled_circuit_memory_binding_events": int(self.integration_counts.get("compiled_circuit_memory_binding_events", 0)),
                     "compiled_circuit_memory_fidelity_failures": int(self.integration_counts.get("compiled_circuit_memory_fidelity_failures", 0)),
                     "sleep_frontier_memory_binding_events": int(self.integration_counts.get("sleep_frontier_memory_binding_events", 0)),
+                    "frontier_registry_loaded_events": int(self.integration_counts.get("frontier_registry_loaded_events", 0)),
+                    "frontier_registry_loaded_circuits": int(self.integration_counts.get("frontier_registry_loaded_circuits", 0)),
+                    "frontier_restored_fastsolve_events": int(self.integration_counts.get("frontier_restored_fastsolve_events", 0)),
+                    "compiled_circuit_memory_restored_reuse_events": int(
+                        self.integration_counts.get("compiled_circuit_memory_restored_reuse_events", 0)
+                    ),
                     "sleep_replay_examples": len(self.sleep.replay.examples),
                     "sleep_synthetic_examples": len(self.sleep.synthetic.examples),
                     "sleep_reservoir_examples": len(self.sleep.reservoir.examples),
@@ -6341,6 +6491,7 @@ class CortexTrainingPhaseController:
                     **frontier_heldout_summary,
                     "frontier_compiled_fastsolve_events": int(self.frontier_compiled_fastsolve_events),
                     "sleep_frontier_fastsolve_events": int(self.integration_counts.get("sleep_frontier_fastsolve_events", 0)),
+                    "restored_frontier_fastsolve_reports": _last_items(self.restored_frontier_fastsolve_reports, 3),
                     "frontier_repair_candidate_count": len(self.frontier_repair_candidates),
                     "frontier_repair_accepted_events": int(self.frontier_repair_accepted_events),
                     "recursive_frontier_proposal_events": int(self.integration_counts.get("recursive_frontier_proposal_events", 0)),
@@ -6425,6 +6576,12 @@ class CortexTrainingPhaseController:
                     "compiled_circuit_memory_binding_events": int(self.integration_counts.get("compiled_circuit_memory_binding_events", 0)),
                     "compiled_circuit_memory_fidelity_failures": int(self.integration_counts.get("compiled_circuit_memory_fidelity_failures", 0)),
                     "sleep_frontier_memory_binding_events": int(self.integration_counts.get("sleep_frontier_memory_binding_events", 0)),
+                    "frontier_registry_loaded_events": int(self.integration_counts.get("frontier_registry_loaded_events", 0)),
+                    "frontier_registry_loaded_circuits": int(self.integration_counts.get("frontier_registry_loaded_circuits", 0)),
+                    "frontier_restored_fastsolve_events": int(self.integration_counts.get("frontier_restored_fastsolve_events", 0)),
+                    "compiled_circuit_memory_restored_reuse_events": int(
+                        self.integration_counts.get("compiled_circuit_memory_restored_reuse_events", 0)
+                    ),
                     "sleep_replay_examples": len(self.sleep.replay.examples),
                     "sleep_synthetic_examples": len(self.sleep.synthetic.examples),
                     "sleep_reservoir_examples": len(self.sleep.reservoir.examples),
@@ -6475,6 +6632,7 @@ class CortexTrainingPhaseController:
             "frontier_registry_summary": self.frontier_registry.to_dict(),
             "frontier_reports": _last_items(self.frontier_reports, 3),
             "sleep_frontier_reports": _last_items(self.sleep_frontier_reports, 3),
+            "restored_frontier_fastsolve_reports": _last_items(self.restored_frontier_fastsolve_reports, 3),
             "frontier_repair_candidates": _last_items(self.frontier_repair_candidates, 3),
             "improvement_state_summary": _improvement_state(self.improvement),
             "improvement_archive_dir": str(self.improvement_archive_dir),
