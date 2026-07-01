@@ -14,6 +14,7 @@ if str(ROOT) not in sys.path:
 import torch
 import torch.nn.functional as F
 
+from cortex3_llm import ResourceUsageMonitor
 from cortex3_ternary import BitLinear, BitLinearConfig, native_ternary_cuda_available, native_ternary_cuda_extension_available
 from cortex3_ternary import (
     clear_native_ternary_autotune_cache,
@@ -28,6 +29,7 @@ DTYPES = {
     "fp16": torch.float16,
     "bf16": torch.bfloat16,
 }
+DEFAULT_MATRIX_SHAPES = ((64, 128, 128), (128, 256, 256), (256, 512, 512))
 
 
 def _time_cuda(fn, *, warmup: int, repeat: int) -> float:
@@ -224,13 +226,101 @@ def benchmark_case(
     }
 
 
+def _parse_shape(raw: str) -> tuple[int, int, int]:
+    normalized = raw.lower().replace(",", "x").replace(":", "x")
+    parts = [part.strip() for part in normalized.split("x") if part.strip()]
+    if len(parts) != 3:
+        raise argparse.ArgumentTypeError("shape must be BATCHxIN_FEATURESxOUT_FEATURES")
+    try:
+        batch, in_features, out_features = (int(part) for part in parts)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("shape values must be integers") from exc
+    if min(batch, in_features, out_features) < 1:
+        raise argparse.ArgumentTypeError("shape values must be positive")
+    return batch, in_features, out_features
+
+
+def _resource_metrics(report: dict[str, Any]) -> dict[str, Any]:
+    usage = dict(report.get("resource_usage") or {})
+    metrics = dict(usage.get("metrics") or {})
+    out: dict[str, Any] = {}
+    for key in (
+        "cpu_total_percent",
+        "process_cpu_percent_of_total",
+        "gpu_utilization_percent",
+        "gpu_memory_utilization_percent",
+        "gpu_memory_used_mb",
+    ):
+        stats = metrics.get(key)
+        if isinstance(stats, dict):
+            out[key] = {
+                "avg": float(stats.get("avg", 0.0) or 0.0),
+                "max": float(stats.get("max", 0.0) or 0.0),
+            }
+    return out
+
+
+def _case_strict_extension_only(report: dict[str, Any]) -> bool:
+    counts = {str(key): int(value) for key, value in dict(report.get("native_grad_weight_backend_counts") or {}).items()}
+    return (
+        str(report.get("native_backend", "")).startswith("native_int2_extension_cuda_")
+        and int(counts.get("extension", 0)) > 0
+        and not any(value > 0 and backend != "extension" for backend, value in counts.items())
+    )
+
+
+def _benchmark_case_with_resource_monitor(*, resource_interval: float, **kwargs: Any) -> dict[str, Any]:
+    device = torch.device("cuda", torch.cuda.current_device())
+    monitor = ResourceUsageMonitor(device=device, interval_seconds=max(0.01, float(resource_interval)))
+    monitor.start()
+    try:
+        report = benchmark_case(**kwargs)
+    finally:
+        resource_usage = monitor.stop()
+    report["resource_usage"] = resource_usage
+    report["resource_metrics"] = _resource_metrics(report)
+    report["strict_extension_only"] = _case_strict_extension_only(report)
+    return report
+
+
+def _matrix_summary(cases: list[dict[str, Any]]) -> dict[str, Any]:
+    speedups = [float(case.get("full_forward_backward_speedup_vs_legacy_dense_ste", 0.0) or 0.0) for case in cases]
+    forward_ms = [float(case.get("full_bitlinear_forward_ms", 0.0) or 0.0) for case in cases]
+    forward_backward_ms = [float(case.get("full_bitlinear_forward_backward_ms", 0.0) or 0.0) for case in cases]
+    gpu_avg = [
+        float(dict(dict(case.get("resource_metrics") or {}).get("gpu_utilization_percent") or {}).get("avg", 0.0) or 0.0)
+        for case in cases
+    ]
+    cpu_avg = [
+        float(dict(dict(case.get("resource_metrics") or {}).get("process_cpu_percent_of_total") or {}).get("avg", 0.0) or 0.0)
+        for case in cases
+    ]
+    strict_extension_only = all(bool(case.get("strict_extension_only")) for case in cases)
+    speedup_passed = all(speedup > 1.0 for speedup in speedups)
+    return {
+        "schema_version": 1,
+        "case_count": len(cases),
+        "strict_extension_only": strict_extension_only,
+        "speedup_vs_legacy_dense_ste_passed": speedup_passed,
+        "passed": strict_extension_only and speedup_passed,
+        "min_full_forward_backward_speedup_vs_legacy_dense_ste": min(speedups) if speedups else 0.0,
+        "avg_full_forward_backward_speedup_vs_legacy_dense_ste": sum(speedups) / len(speedups) if speedups else 0.0,
+        "avg_full_bitlinear_forward_ms": sum(forward_ms) / len(forward_ms) if forward_ms else 0.0,
+        "avg_full_bitlinear_forward_backward_ms": sum(forward_backward_ms) / len(forward_backward_ms) if forward_backward_ms else 0.0,
+        "avg_gpu_utilization_percent": sum(gpu_avg) / len(gpu_avg) if gpu_avg else 0.0,
+        "avg_process_cpu_percent_of_total": sum(cpu_avg) / len(cpu_avg) if cpu_avg else 0.0,
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Benchmark Cortex-3 native packed ternary CUDA kernel.")
     parser.add_argument("--batch", type=int, default=256)
     parser.add_argument("--in-features", type=int, default=512)
     parser.add_argument("--out-features", type=int, default=512)
+    parser.add_argument("--matrix", action="store_true", help="run a short multi-shape benchmark matrix")
+    parser.add_argument("--shape", action="append", type=_parse_shape, default=[], help="matrix case as BATCHxIN_FEATURESxOUT_FEATURES; may be repeated")
     parser.add_argument("--dtype", choices=tuple(DTYPES), default="fp16")
-    parser.add_argument("--native-backend", choices=("auto", "extension", "rawkernel"), default="auto")
+    parser.add_argument("--native-backend", choices=("auto", "extension", "rawkernel"), default="extension")
     parser.add_argument("--kernel-variant", choices=("auto", "tiled", "warp"), default="auto")
     parser.add_argument("--disable-autotune", action="store_true")
     parser.add_argument("--autotune-warmup", type=int, default=1)
@@ -240,6 +330,8 @@ def main() -> None:
     parser.add_argument("--no-autotune-cache-write", action="store_true")
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--repeat", type=int, default=100)
+    parser.add_argument("--resource-interval", type=float, default=0.05)
+    parser.add_argument("--allow-speedup-failure", action="store_true", help="write a matrix report even if a strict extension case is not faster than dense STE")
     parser.add_argument("--json-out", type=Path, default=None)
     args = parser.parse_args()
 
@@ -255,27 +347,59 @@ def main() -> None:
         load_native_ternary_autotune_cache(args.autotune_cache, merge=True)
 
     started = time()
-    report = benchmark_case(
-        batch=args.batch,
-        in_features=args.in_features,
-        out_features=args.out_features,
-        dtype=DTYPES[args.dtype],
-        kernel_variant=args.kernel_variant,
-        native_backend=args.native_backend,
-        enable_autotune=not args.disable_autotune,
-        autotune_warmup=args.autotune_warmup,
-        autotune_repeat=args.autotune_repeat,
-        autotune_cache_path=args.autotune_cache,
-        autotune_cache_write=not args.no_autotune_cache_write,
-        warmup=args.warmup,
-        repeat=args.repeat,
-    )
-    report["elapsed_seconds"] = time() - started
-    report["device"] = torch.cuda.get_device_name()
+    shapes = list(args.shape)
+    if args.matrix and not shapes:
+        shapes = list(DEFAULT_MATRIX_SHAPES)
+    common = {
+        "dtype": DTYPES[args.dtype],
+        "kernel_variant": args.kernel_variant,
+        "native_backend": args.native_backend,
+        "enable_autotune": not args.disable_autotune,
+        "autotune_warmup": args.autotune_warmup,
+        "autotune_repeat": args.autotune_repeat,
+        "autotune_cache_path": args.autotune_cache,
+        "autotune_cache_write": not args.no_autotune_cache_write,
+        "warmup": args.warmup,
+        "repeat": args.repeat,
+    }
+    if shapes:
+        cases = [
+            _benchmark_case_with_resource_monitor(
+                resource_interval=args.resource_interval,
+                batch=batch,
+                in_features=in_features,
+                out_features=out_features,
+                **common,
+            )
+            for batch, in_features, out_features in shapes
+        ]
+        report = {
+            "schema_version": 1,
+            "mode": "matrix",
+            "device": torch.cuda.get_device_name(),
+            "dtype": args.dtype,
+            "native_backend_requested": args.native_backend,
+            "kernel_variant_requested": args.kernel_variant,
+            "elapsed_seconds": time() - started,
+            "summary": _matrix_summary(cases),
+            "cases": cases,
+        }
+    else:
+        report = _benchmark_case_with_resource_monitor(
+            resource_interval=args.resource_interval,
+            batch=args.batch,
+            in_features=args.in_features,
+            out_features=args.out_features,
+            **common,
+        )
+        report["elapsed_seconds"] = time() - started
+        report["device"] = torch.cuda.get_device_name()
     print(json.dumps(report, indent=2, sort_keys=True))
     if args.json_out is not None:
         args.json_out.parent.mkdir(parents=True, exist_ok=True)
         args.json_out.write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
+    if shapes and not report["summary"]["passed"] and not args.allow_speedup_failure:
+        raise RuntimeError("strict extension matrix failed speedup or backend checks")
     if args.autotune_cache is not None and not args.no_autotune_cache_write:
         save_native_ternary_autotune_cache(args.autotune_cache)
 

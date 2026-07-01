@@ -123,6 +123,14 @@ Ce document sert de registre de critique et de correction. Il ne remplace pas le
 - Verification courte: `py_compile` passe; `test_cuda_ternary_training_contract_is_strict_extension` et `test_default_ternary_training_backend_is_extension` figent le contrat; le smoke CUDA court sans `--native-ternary-backend` confirme `native_ternary_backend_requested=extension`, `torch_packed_ternary_dispatches=0` et `strict_extension_only=true`.
 - Statut: corrige pour le contrat de training CUDA strict. Restent a traiter: benchmark multi-shapes/monitoring GPU et preuve longue Cortex vs baseline quand autorisee.
 
+### C16. Matrice multi-shapes et monitoring GPU/CPU absents
+
+- Critique: apres C15, la preuve perf restait centree sur une seule shape. On ne savait pas si le gain tenait sur plusieurs tailles, ni si le GPU et le CPU etaient mesures pendant le benchmark.
+- Correction: `tools/benchmark_ternary_kernel.py` a maintenant un mode `--matrix`, des shapes repetables `--shape BATCHxINxOUT`, un backend `extension` par defaut, un `ResourceUsageMonitor` par cas, et un resume qui exige `strict_extension_only` + speedup forward/backward > 1 contre dense STE legacy.
+- Verification courte: matrice fp16 `64x128x128`, `128x256x256`, `256x512x512`, `warmup=2`, `repeat=8` passee avec `strict_extension_only=true`, speedup min `1.37x`, speedup moyen `1.70x`, GPU moyen `8.67%`, CPU process moyen `26.67%`.
+- Limite: les mesures `nvidia-smi` sont sub-seconde et n'ont souvent qu'un echantillon par cas; elles prouvent que le monitoring est branche, pas encore que l'occupation GPU finale est optimale.
+- Statut: corrige pour matrice courte + monitoring branche. Prochain point: fenetre soutenue courte mais plus stable, plus grandes shapes LLM, et eventuelle variante WMMA/Tensor Core si `grad_weight` tuilé devient limitant.
+
 ## Critique phase par phase - boucle 11
 
 ### P1 - Verifier OS
@@ -136,10 +144,10 @@ Ce document sert de registre de critique et de correction. Il ne remplace pas le
 ### P2 - Ternary Core
 
 - Ce qui est solide: poids ternaires packes int2, quantization activations, STE, sync versionnee des buffers packes pendant training, kernels CUDA natifs tuiles/warp, autotune CUDA-event par shape, profil JSON persistant, cache layer-local, fast STE autograd forward, backward CUDA `grad_input` depuis poids int2 packes, backward CUDA tuilé `grad_weight` + `grad_bias`, requantization/packing post-update fusionnee CUDA, backend extension C++/CUDA strict par defaut, doctor CUDA distinguant RawKernel et extension runtime, audit LLM exigeant native forward/requantize/grad_weight exclusivement extension en training CUDA strict.
-- Preuve actuelle: tests CUDA courts, export/import profil, tests gradients fast-vs-dense STE en fp32/fp16/bf16, test de parite requantize/pack fp32/fp16/bf16, test extension forcee, doctor toolchain strict, benchmark RTX 5070 avec full forward/backward et requantize/pack profile, smoke LLM extension avec 2185 dispatches forward extension, 230 requantize extension et 160 `grad_weight` extension.
-- Faiblesse: pas de mesure energie/VRAM longue; backend extension prouve sur smoke et benchmark court mais pas encore benchmarke sur une matrice de shapes LLM; pas encore de kernel WMMA/Tensor Core specialise pour `grad_weight` si le tuilé fp32 devient limite a grande taille.
+- Preuve actuelle: tests CUDA courts, export/import profil, tests gradients fast-vs-dense STE en fp32/fp16/bf16, test de parite requantize/pack fp32/fp16/bf16, test extension forcee, doctor toolchain strict, benchmark RTX 5070 avec full forward/backward et requantize/pack profile, matrice courte strict extension 3 shapes avec monitoring GPU/CPU, smoke LLM extension avec 2185 dispatches forward extension, 230 requantize extension et 160 `grad_weight` extension.
+- Faiblesse: pas de mesure energie/VRAM longue; matrice courte encore trop sub-seconde pour conclure sur l'occupation GPU; pas encore de kernel WMMA/Tensor Core specialise pour `grad_weight` si le tuilé fp32 devient limite a grande taille.
 - Risque architectural: le chemin training est maintenant completement branché en extension pour forward, `grad_input`, `grad_weight`, `grad_bias` et repack, mais une preuve de paradigme demandera que ce gain survive aux vrais batchs LLM et ne degrade pas la convergence.
-- Correction prioritaire restante: matrice courte multi-shapes + monitoring GPU/VRAM/CPU, puis run long seulement quand autorise.
+- Correction prioritaire restante: fenetre de monitoring soutenue + shapes LLM plus grandes, puis run long seulement quand autorise.
 
 ### P3 - Future Contract / FSP / MTP
 
@@ -281,7 +289,7 @@ Ce document sert de registre de critique et de correction. Il ne remplace pas le
 
 ## File de correction priorisee apres boucle 11
 
-1. P2: benchmarker le backend extension complet sur une matrice courte de shapes LLM, avec GPU/VRAM/CPU moyens.
+1. P2: stabiliser le monitoring GPU/VRAM/CPU sur une fenetre courte mais soutenue et des shapes LLM plus grandes.
 2. P2: etudier une variante `grad_weight` WMMA/Tensor Core si le kernel tuilé fp32 ne tient pas sur grandes shapes.
 3. P4: scaler l'ablation learned memory vs deterministic memory sur anchors long-context synthetiques puis held-out.
 4. P6/P7: afficher partout `repair_loss_before`, `repair_loss_after`, `protected_loss_before`, `protected_loss_after`, delta et convention.
