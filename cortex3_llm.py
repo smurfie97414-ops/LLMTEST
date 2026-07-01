@@ -10258,11 +10258,11 @@ def run_llm_batch_profile_autosize(
     if requested_confirm_selected_repeat_count < 1:
         raise ValueError("confirm_selected_repeat_count must be positive")
     requested_confirm_selected_max_rounds = (
-        max(1, int(selected_shape_count) + 1)
+        None
         if confirm_selected_max_rounds is None
         else int(confirm_selected_max_rounds)
     )
-    if requested_confirm_selected_max_rounds < 1:
+    if requested_confirm_selected_max_rounds is not None and requested_confirm_selected_max_rounds < 1:
         raise ValueError("confirm_selected_max_rounds must be positive")
     if measure_candidate_strategy not in PROFILE_AUTOSIZE_MEASUREMENT_STRATEGIES:
         raise ValueError(
@@ -10415,6 +10415,11 @@ def run_llm_batch_profile_autosize(
         max(requested_measure_candidate_count, int(selected_shape_count))
         if requested_measure_candidate_count > 0
         else 0
+    )
+    effective_confirm_selected_max_rounds = (
+        max(1, int(effective_measure_candidate_count or selected_shape_count))
+        if requested_confirm_selected_max_rounds is None
+        else requested_confirm_selected_max_rounds
     )
     if effective_measure_candidate_count > 0:
         aggregated_measurement_rows: list[Mapping[str, Any]] = []
@@ -10923,7 +10928,7 @@ def run_llm_batch_profile_autosize(
             measure_round(remaining_inputs, round_index=round_index, round_kind=f"fill_{measure_candidate_strategy}")
         refine_uncertain_candidates(round_index=round_index + 1)
         if requested_confirm_selected_candidate_count > 0 and requested_confirm_selected_extra_seed_count > 0:
-            for confirm_round_offset in range(requested_confirm_selected_max_rounds):
+            for confirm_round_offset in range(effective_confirm_selected_max_rounds):
                 if not selected_confirmation_missing():
                     confirmation_complete = True
                     break
@@ -11098,7 +11103,7 @@ def run_llm_batch_profile_autosize(
             "confirm_selected_extra_seed_count": requested_confirm_selected_extra_seed_count,
             "confirm_selected_step_multiplier": requested_confirm_selected_step_multiplier,
             "confirm_selected_repeat_count": requested_confirm_selected_repeat_count,
-            "confirm_selected_max_rounds": requested_confirm_selected_max_rounds,
+            "confirm_selected_max_rounds": effective_confirm_selected_max_rounds,
             "confirmation_rounds_used": len(confirmation_rounds),
             "confirmed_candidate_count": sum(int(round_["candidate_count"]) for round_ in confirmation_rounds),
             "confirmation_profile_count": sum(
