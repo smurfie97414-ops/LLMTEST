@@ -308,6 +308,75 @@ __global__ void ternary_grad_weight_bias_wmma_fp16_float(
   }
 }
 
+__global__ void ternary_grad_weight_bias_wmma_bf16_float(
+    const __nv_bfloat16* grad_out,
+    const __nv_bfloat16* x,
+    float* grad_weight,
+    float* grad_bias,
+    int m_rows,
+    int n_cols,
+    int k_cols,
+    int has_bias) {
+  using namespace nvcuda;
+  int tile_k = blockIdx.x;
+  int tile_n = blockIdx.y;
+  int n0 = tile_n * 16;
+  int k0 = tile_k * 16;
+
+  __shared__ __nv_bfloat16 grad_tile[16 * 16];
+  __shared__ __nv_bfloat16 x_tile[16 * 16];
+  __shared__ float output_tile[16 * 16];
+
+  wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::col_major> grad_frag;
+  wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::row_major> x_frag;
+  wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc_frag;
+  wmma::fill_fragment(acc_frag, 0.0f);
+
+  for (int m0 = 0; m0 < m_rows; m0 += 16) {
+    for (int offset = threadIdx.x; offset < 16 * 16; offset += blockDim.x) {
+      int local_m = offset / 16;
+      int local_n_or_k = offset - local_m * 16;
+      int m = m0 + local_m;
+      int n = n0 + local_n_or_k;
+      int k = k0 + local_n_or_k;
+      grad_tile[local_m * 16 + local_n_or_k] = (m < m_rows && n < n_cols)
+          ? grad_out[m * n_cols + n]
+          : __float2bfloat16(0.0f);
+      x_tile[offset] = (m < m_rows && k < k_cols)
+          ? x[m * k_cols + k]
+          : __float2bfloat16(0.0f);
+    }
+    __syncthreads();
+    wmma::load_matrix_sync(grad_frag, grad_tile, 16);
+    wmma::load_matrix_sync(x_frag, x_tile, 16);
+    wmma::mma_sync(acc_frag, grad_frag, x_frag, acc_frag);
+    __syncthreads();
+  }
+
+  wmma::store_matrix_sync(output_tile, acc_frag, 16, wmma::mem_row_major);
+  __syncthreads();
+  for (int offset = threadIdx.x; offset < 16 * 16; offset += blockDim.x) {
+    int local_n = offset / 16;
+    int local_k = offset - local_n * 16;
+    int n = n0 + local_n;
+    int k = k0 + local_k;
+    if (n < n_cols && k < k_cols) {
+      grad_weight[n * k_cols + k] = output_tile[offset];
+    }
+  }
+
+  if (has_bias && tile_k == 0 && threadIdx.x < 16) {
+    int n = n0 + threadIdx.x;
+    if (n < n_cols) {
+      float bias_acc = 0.0f;
+      for (int m = 0; m < m_rows; ++m) {
+        bias_acc += __bfloat162float(grad_out[m * n_cols + n]);
+      }
+      grad_bias[n] = bias_acc;
+    }
+  }
+}
+
 extern "C" __global__ void ternary_matmul_tiled_fp32(
     const float* x,
     const unsigned char* packed,
@@ -704,6 +773,70 @@ __global__ void ternary_grad_input_wmma_fp16(
     int k = k0 + local_k;
     if (m < m_rows && k < k_cols) {
       grad_x[m * k_cols + k] = __float2half_rn(output_tile[offset]);
+    }
+  }
+}
+
+__global__ void ternary_grad_input_wmma_bf16(
+    const __nv_bfloat16* grad_out,
+    const unsigned char* packed,
+    const float* scales,
+    const float* residual,
+    __nv_bfloat16* grad_x,
+    int m_rows,
+    int n_cols,
+    int k_cols,
+    int packed_stride,
+    int use_residual) {
+  using namespace nvcuda;
+  int tile_k = blockIdx.x;
+  int tile_m = blockIdx.y;
+  int m0 = tile_m * 16;
+  int k0 = tile_k * 16;
+
+  __shared__ __nv_bfloat16 grad_tile[16 * 16];
+  __shared__ __nv_bfloat16 weight_tile[16 * 16];
+  __shared__ float output_tile[16 * 16];
+
+  wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> grad_frag;
+  wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::row_major> weight_frag;
+  wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc_frag;
+  wmma::fill_fragment(acc_frag, 0.0f);
+
+  for (int n0 = 0; n0 < n_cols; n0 += 16) {
+    for (int offset = threadIdx.x; offset < 16 * 16; offset += blockDim.x) {
+      int local_m_or_n = offset / 16;
+      int local_n_or_k = offset - local_m_or_n * 16;
+      int m = m0 + local_m_or_n;
+      int grad_n = n0 + local_n_or_k;
+      grad_tile[offset] = (m < m_rows && grad_n < n_cols)
+          ? grad_out[m * n_cols + grad_n]
+          : __float2bfloat16(0.0f);
+      int local_n = local_m_or_n;
+      int local_k = local_n_or_k;
+      int n = n0 + local_n;
+      int k = k0 + local_k;
+      float w = (n < n_cols && k < k_cols)
+          ? c3_decode_weight(packed, scales, residual, n, k, packed_stride, k_cols, use_residual)
+          : 0.0f;
+      weight_tile[offset] = __float2bfloat16(w);
+    }
+    __syncthreads();
+    wmma::load_matrix_sync(grad_frag, grad_tile, 16);
+    wmma::load_matrix_sync(weight_frag, weight_tile, 16);
+    wmma::mma_sync(acc_frag, grad_frag, weight_frag, acc_frag);
+    __syncthreads();
+  }
+
+  wmma::store_matrix_sync(output_tile, acc_frag, 16, wmma::mem_row_major);
+  __syncthreads();
+  for (int offset = threadIdx.x; offset < 16 * 16; offset += blockDim.x) {
+    int local_m = offset / 16;
+    int local_k = offset - local_m * 16;
+    int m = m0 + local_m;
+    int k = k0 + local_k;
+    if (m < m_rows && k < k_cols) {
+      grad_x[m * k_cols + k] = __float2bfloat16(output_tile[offset]);
     }
   }
 }
@@ -1360,6 +1493,26 @@ extern "C" void launch_ternary_grad_input_dispatch(
         use_residual);
     return;
   }
+  if (
+      dtype_code == 2 &&
+      m_rows >= 16 &&
+      n_cols >= 16 &&
+      k_cols >= 16) {
+    dim3 blocks((k_cols + 15) / 16, (m_rows + 15) / 16);
+    dim3 threads(32);
+    ternary_grad_input_wmma_bf16<<<blocks, threads, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(grad_out),
+        packed,
+        scales,
+        residual,
+        static_cast<__nv_bfloat16*>(grad_x),
+        m_rows,
+        n_cols,
+        k_cols,
+        packed_stride,
+        use_residual);
+    return;
+  }
   const int warps_per_block = C3_WARPS_PER_BLOCK;
   int total_outputs = m_rows * k_cols;
   dim3 blocks((total_outputs + warps_per_block - 1) / warps_per_block);
@@ -1435,6 +1588,25 @@ extern "C" void launch_ternary_grad_weight_bias_dispatch(
     ternary_grad_weight_bias_wmma_fp16_float<<<blocks, threads, 0, stream>>>(
         static_cast<const __half*>(grad_out),
         static_cast<const __half*>(x),
+        static_cast<float*>(grad_weight),
+        static_cast<float*>(grad_bias),
+        m_rows,
+        n_cols,
+        k_cols,
+        has_bias);
+    return;
+  }
+  if (
+      input_dtype_code == 2 &&
+      output_dtype_code == 0 &&
+      m_rows >= 16 &&
+      n_cols >= 16 &&
+      k_cols >= 16) {
+    dim3 blocks((k_cols + 15) / 16, (n_cols + 15) / 16);
+    dim3 threads(32);
+    ternary_grad_weight_bias_wmma_bf16_float<<<blocks, threads, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(grad_out),
+        static_cast<const __nv_bfloat16*>(x),
         static_cast<float*>(grad_weight),
         static_cast<float*>(grad_bias),
         m_rows,
@@ -1729,7 +1901,7 @@ def _load_ternary_cuda_extension() -> Any:
         if target_include.exists():
             extra_include_paths.append(str(target_include))
         module = load_inline(
-            name="cortex3_ternary_cuda_extension_v5",
+            name="cortex3_ternary_cuda_extension_v6",
             cpp_sources=[_TERNARY_EXTENSION_CPP_SOURCE],
             cuda_sources=[_CUPY_TERNARY_KERNEL_SOURCE + "\n" + _TERNARY_EXTENSION_CUDA_WRAPPERS],
             functions=["ternary_forward", "ternary_grad_input", "ternary_grad_weight_bias", "ternary_requantize_pack"],
@@ -1889,7 +2061,7 @@ def _extension_ternary_grad_input_cuda(
     module = _load_ternary_cuda_extension()
     grad_out = grad_output_flat.detach().contiguous()
     grad_input_wmma_candidate = (
-        grad_out.dtype == torch.float16
+        grad_out.dtype in {torch.float16, torch.bfloat16}
         and int(grad_out.shape[0]) >= 16
         and int(grad_out.shape[1]) >= 16
         and int(in_features) >= 16
@@ -1902,8 +2074,16 @@ def _extension_ternary_grad_input_cuda(
     )
     _LAST_NATIVE_GRAD_INPUT_KERNEL = (
         "wmma_fp16"
-        if grad_input_wmma_aligned
-        else ("wmma_fp16_padded" if grad_input_wmma_candidate else "warp")
+        if grad_input_wmma_aligned and grad_out.dtype == torch.float16
+        else (
+            "wmma_bf16"
+            if grad_input_wmma_aligned and grad_out.dtype == torch.bfloat16
+            else (
+                "wmma_fp16_padded"
+                if grad_input_wmma_candidate and grad_out.dtype == torch.float16
+                else ("wmma_bf16_padded" if grad_input_wmma_candidate else "warp")
+            )
+        )
     )
     _record_native_grad_input_kernel(_LAST_NATIVE_GRAD_INPUT_KERNEL)
     packed = packed_codes.to(device=grad_out.device, dtype=torch.uint8).contiguous()
@@ -1939,7 +2119,7 @@ def _extension_ternary_grad_weight_bias_cuda(
     grad_out = grad_output_flat.detach().contiguous()
     x_values = x_flat.detach().to(dtype=grad_out.dtype).contiguous()
     grad_weight_wmma_candidate = (
-        grad_out.dtype == torch.float16
+        grad_out.dtype in {torch.float16, torch.bfloat16}
         and float_weight_dtype == torch.float32
         and int(grad_out.shape[0]) >= 16
         and int(grad_out.shape[1]) >= 16
@@ -1953,8 +2133,16 @@ def _extension_ternary_grad_weight_bias_cuda(
     )
     kernel = (
         "wmma_fp16_float"
-        if grad_weight_wmma_aligned
-        else ("wmma_fp16_float_padded" if grad_weight_wmma_candidate else "tiled")
+        if grad_weight_wmma_aligned and grad_out.dtype == torch.float16
+        else (
+            "wmma_bf16_float"
+            if grad_weight_wmma_aligned and grad_out.dtype == torch.bfloat16
+            else (
+                "wmma_fp16_float_padded"
+                if grad_weight_wmma_candidate and grad_out.dtype == torch.float16
+                else ("wmma_bf16_float_padded" if grad_weight_wmma_candidate else "tiled")
+            )
+        )
     )
     grad_weight, grad_bias = module.ternary_grad_weight_bias(
         grad_out,

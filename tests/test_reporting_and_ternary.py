@@ -424,6 +424,70 @@ class ReportingAndTernaryTest(unittest.TestCase):
         self.assertGreater(native_grad_input_kernel_counts().get("wmma_fp16_padded", 0), 0)
         self.assertGreater(native_grad_weight_kernel_counts().get("wmma_fp16_float_padded", 0), 0)
 
+    def test_bitlinear_native_extension_cuda_bf16_wmma_paths_match_dense_ste(self):
+        import torch
+
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA is required")
+        if hasattr(torch.cuda, "is_bf16_supported") and not torch.cuda.is_bf16_supported():
+            self.skipTest("CUDA bf16 is required")
+        if not native_ternary_cuda_extension_available():
+            self.skipTest("Cortex ternary CUDA extension is not buildable in this environment")
+
+        for batch, in_features, out_features, input_label, weight_label in (
+            (32, 32, 32, "wmma_bf16", "wmma_bf16_float"),
+            (31, 33, 35, "wmma_bf16_padded", "wmma_bf16_float_padded"),
+        ):
+            with self.subTest(shape=(batch, in_features, out_features)):
+                torch.manual_seed(53 + batch + in_features + out_features)
+                fast = BitLinear(BitLinearConfig(
+                    in_features,
+                    out_features,
+                    activation_bits=0,
+                    residual_runtime=False,
+                    require_native_cuda_kernel=True,
+                    native_cuda_backend="extension",
+                    native_cuda_kernel_variant="warp",
+                    native_cuda_autotune=False,
+                    use_fast_ste_autograd=True,
+                    log_prefix=f"cuda-extension-bf16-wmma-fast-{batch}-{in_features}-{out_features}",
+                )).cuda()
+                dense = BitLinear(BitLinearConfig(
+                    in_features,
+                    out_features,
+                    activation_bits=0,
+                    residual_runtime=False,
+                    require_native_cuda_kernel=True,
+                    native_cuda_backend="extension",
+                    native_cuda_kernel_variant="warp",
+                    native_cuda_autotune=False,
+                    use_fast_ste_autograd=False,
+                    log_prefix=f"cuda-extension-bf16-wmma-dense-{batch}-{in_features}-{out_features}",
+                )).cuda()
+                with torch.no_grad():
+                    dense.float_weight.copy_(fast.float_weight)
+                    if fast.bias is not None and dense.bias is not None:
+                        dense.bias.copy_(fast.bias)
+                fast.requantize()
+                dense.requantize()
+                x_fast = torch.randn(batch, in_features, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+                x_dense = x_fast.detach().clone().requires_grad_(True)
+
+                fast_loss = fast(x_fast).float().square().mean()
+                dense_loss = dense(x_dense).float().square().mean()
+                fast_loss.backward()
+                dense_loss.backward()
+                torch.cuda.synchronize()
+
+                self.assertTrue(torch.allclose(fast_loss.detach(), dense_loss.detach(), atol=8e-2, rtol=8e-2))
+                self.assertTrue(torch.allclose(x_fast.grad.float(), x_dense.grad.float(), atol=8e-2, rtol=8e-2))
+                self.assertTrue(torch.allclose(fast.float_weight.grad, dense.float_weight.grad, atol=8e-2, rtol=8e-2))
+                self.assertTrue(torch.allclose(fast.bias.grad, dense.bias.grad, atol=8e-2, rtol=8e-2))
+                self.assertEqual(last_native_grad_input_kernel(), input_label)
+                self.assertEqual(last_native_grad_weight_kernel(), weight_label)
+                self.assertGreater(native_grad_input_kernel_counts().get(input_label, 0), 0)
+                self.assertGreater(native_grad_weight_kernel_counts().get(weight_label, 0), 0)
+
     @unittest.skipUnless(
         __import__("torch").cuda.is_available() and native_ternary_cuda_available(),
         "CUDA plus CuPy native ternary kernel is required",
