@@ -265,6 +265,68 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             self.assertTrue(report["matrix"]["passed"], report["matrix"]["failed_checks"])
             self.assertEqual(report["matrix"]["summary"]["case_count"], 1)
 
+    def test_llm_batch_profile_autosize_blocks_measured_vram_over_budget(self):
+        fake_profile = {
+            "passed": True,
+            "failed_checks": (),
+            "throughput": {
+                "train_tokens_per_second_wall": 100.0,
+                "planned_train_tokens": 64,
+            },
+            "resource_usage": {
+                "metrics": {
+                    "gpu_utilization_percent": {"avg": 25.0, "min": 20.0, "max": 30.0},
+                    "gpu_memory_used_mb": {"avg": 1024.0, "min": 1024.0, "max": 1024.0},
+                    "gpu_power_draw_watts": {"avg": 90.0, "min": 88.0, "max": 92.0},
+                }
+            },
+            "torch_cuda_memory": {
+                "after": {
+                    "max_memory_allocated_bytes": 64 * 1024 * 1024,
+                }
+            },
+            "kernel_evidence": {"strict_extension_only": True},
+            "architecture": {"all_phases_active": True},
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch("cortex3_llm.run_llm_batch_profile", return_value=fake_profile):
+                report = run_llm_batch_profile_autosize(
+                    out_dir=root / "autosize-measured-budget",
+                    candidate_seq_lens=(32,),
+                    candidate_d_models=(32,),
+                    candidate_n_layers=(1,),
+                    candidate_batch_sizes=(2,),
+                    n_heads=4,
+                    selected_shape_count=1,
+                    min_selected_shapes=1,
+                    seeds=(11,),
+                    steps=1,
+                    vocab_size=128,
+                    precision="fp32",
+                    device="cpu",
+                    require_cuda=False,
+                    memory_budget_mb=512,
+                    measure_candidate_count=1,
+                    min_cases=1,
+                )
+
+            self.assertFalse(report["passed"])
+            self.assertIn("no_measured_viable_shapes", report["failed_checks"])
+            self.assertIn("min_selected_shapes", report["failed_checks"])
+            self.assertIn("measured_budget_exceeded", report["failed_checks"])
+            self.assertIsNone(report["matrix"])
+            self.assertEqual(report["measurement"]["measured_candidate_count"], 1)
+            self.assertEqual(report["measurement"]["measured_profile_passed_candidate_count"], 1)
+            self.assertEqual(report["measurement"]["measured_passed_candidate_count"], 0)
+            measured = report["measured_candidates"][0]
+            self.assertTrue(measured["measurement_profile_passed"])
+            self.assertFalse(measured["measurement_passed"])
+            self.assertTrue(measured["measured_budget_enforced"])
+            self.assertFalse(measured["measured_budget_passed"])
+            self.assertIn("observed_gpu_memory_budget", measured["measurement_failed_checks"])
+            self.assertGreater(measured["observed_gpu_memory_budget_fraction_used"], 1.0)
+
     def test_llm_batch_profile_autosize_blocks_when_budget_has_no_viable_shape(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

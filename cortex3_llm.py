@@ -9234,14 +9234,21 @@ def _profile_autosize_measurement_summary(
     if error is not None:
         return {
             **base,
+            "measurement_profile_passed": False,
             "measurement_passed": False,
             "measurement_error_type": type(error).__name__,
             "measurement_error": str(error),
+            "measurement_failed_checks": ("measurement_error",),
             "measured_score": 0.0,
             "train_tokens_per_second_wall": 0.0,
             "gpu_utilization_percent_avg": 0.0,
+            "gpu_memory_used_mb_max": 0.0,
             "gpu_memory_used_mb_avg": 0.0,
             "gpu_power_draw_watts_avg": 0.0,
+            "observed_gpu_memory_used_bytes": 0,
+            "observed_gpu_memory_budget_fraction_used": 0.0,
+            "measured_budget_enforced": False,
+            "measured_budget_passed": False,
             "torch_cuda_peak_allocated_bytes": 0,
             "strict_extension_only": False,
             "all_phases_active": False,
@@ -9251,9 +9258,16 @@ def _profile_autosize_measurement_summary(
     throughput = dict(profile.get("throughput") or {})
     train_tokens_per_second = float(throughput.get("train_tokens_per_second_wall", 0.0))
     gpu_utilization_percent = float(metrics.get("gpu_utilization_percent", {}).get("avg", 0.0))
-    gpu_memory_used_mb = float(metrics.get("gpu_memory_used_mb", {}).get("avg", 0.0))
+    gpu_memory_metric = dict(metrics.get("gpu_memory_used_mb") or {})
+    gpu_memory_used_mb = float(gpu_memory_metric.get("avg", 0.0))
+    gpu_memory_used_mb_max = float(gpu_memory_metric.get("max", 0.0))
     gpu_power_draw_watts = float(metrics.get("gpu_power_draw_watts", {}).get("avg", 0.0))
     torch_cuda_peak = int(profile.get("torch_cuda_memory", {}).get("after", {}).get("max_memory_allocated_bytes", 0))
+    observed_gpu_memory_bytes = int(gpu_memory_used_mb_max * 1024 * 1024) if gpu_memory_used_mb_max > 0.0 else 0
+    measured_budget_enforced = observed_gpu_memory_bytes > 0
+    measured_budget_passed = (not measured_budget_enforced) or observed_gpu_memory_bytes <= int(candidate["budget_bytes"])
+    profile_failed_checks = tuple(str(item) for item in profile.get("failed_checks", ()))
+    budget_failed_checks = ("observed_gpu_memory_budget",) if not measured_budget_passed else ()
     measured_score = _profile_autosize_measured_score(
         train_tokens_per_second=train_tokens_per_second,
         gpu_utilization_percent=gpu_utilization_percent,
@@ -9261,14 +9275,23 @@ def _profile_autosize_measurement_summary(
     )
     return {
         **base,
-        "measurement_passed": bool(profile.get("passed")),
-        "measurement_failed_checks": tuple(str(item) for item in profile.get("failed_checks", ())),
+        "measurement_profile_passed": bool(profile.get("passed")),
+        "measurement_passed": bool(profile.get("passed")) and measured_budget_passed,
+        "measurement_profile_failed_checks": profile_failed_checks,
+        "measurement_failed_checks": profile_failed_checks + budget_failed_checks,
         "measured_score": float(measured_score),
         "train_tokens_per_second_wall": train_tokens_per_second,
         "planned_train_tokens": int(throughput.get("planned_train_tokens", 0)),
         "gpu_utilization_percent_avg": gpu_utilization_percent,
         "gpu_memory_used_mb_avg": gpu_memory_used_mb,
+        "gpu_memory_used_mb_max": gpu_memory_used_mb_max,
         "gpu_power_draw_watts_avg": gpu_power_draw_watts,
+        "observed_gpu_memory_used_bytes": observed_gpu_memory_bytes,
+        "observed_gpu_memory_budget_fraction_used": float(
+            observed_gpu_memory_bytes / max(1, int(candidate["budget_bytes"]))
+        ) if measured_budget_enforced else 0.0,
+        "measured_budget_enforced": measured_budget_enforced,
+        "measured_budget_passed": measured_budget_passed,
         "torch_cuda_peak_allocated_bytes": torch_cuda_peak,
         "torch_cuda_peak_to_estimate_ratio": float(
             torch_cuda_peak / max(1, int(candidate["estimated_peak_training_bytes"]))
@@ -9610,6 +9633,7 @@ def run_llm_batch_profile_autosize(
     )
     measured_candidates: tuple[Mapping[str, Any], ...] = ()
     measured_passed_candidates: tuple[Mapping[str, Any], ...] = ()
+    measured_profile_passed_count = 0
     measurement_seed = int(normalized_seeds[0])
     selection_source = "estimated"
     selection_pool: Sequence[Mapping[str, Any]] = ranked_candidates
@@ -9667,6 +9691,7 @@ def run_llm_batch_profile_autosize(
                 )
             )
         measured_candidates = tuple(measurement_rows)
+        measured_profile_passed_count = sum(1 for item in measured_candidates if bool(item.get("measurement_profile_passed")))
         measured_passed_candidates = tuple(
             sorted(
                 (item for item in measured_candidates if bool(item.get("measurement_passed"))),
@@ -9690,6 +9715,13 @@ def run_llm_batch_profile_autosize(
             failed_checks.append("no_measured_viable_shapes" if effective_measure_candidate_count > 0 else "no_viable_shapes")
     if len(selected) < int(min_selected_shapes):
         failed_checks.append("min_selected_shapes")
+    if (
+        effective_measure_candidate_count > 0
+        and measured_candidates
+        and not measured_passed_candidates
+        and any(bool(item.get("measurement_profile_passed")) and not bool(item.get("measured_budget_passed")) for item in measured_candidates)
+    ):
+        failed_checks.append("measured_budget_exceeded")
     matrix_report: Mapping[str, Any] | None = None
     if selected:
         selected_shapes = tuple(dict(item["shape"]) for item in selected)
@@ -9738,6 +9770,7 @@ def run_llm_batch_profile_autosize(
             "viable_candidate_count": len(candidates),
             "rejected_candidate_count": len(rejected),
             "measured_candidate_count": len(measured_candidates),
+            "measured_profile_passed_candidate_count": measured_profile_passed_count,
             "measured_passed_candidate_count": len(measured_passed_candidates),
             "selected_shapes": tuple(dict(item["shape"]) for item in selected),
             "selected_shape_keys": tuple(str(item["shape_key"]) for item in selected),
@@ -9747,6 +9780,7 @@ def run_llm_batch_profile_autosize(
             "requested_candidate_count": requested_measure_candidate_count,
             "effective_candidate_count": effective_measure_candidate_count,
             "measured_candidate_count": len(measured_candidates),
+            "measured_profile_passed_candidate_count": measured_profile_passed_count,
             "measured_passed_candidate_count": len(measured_passed_candidates),
             "measurement_seed": measurement_seed,
             "measured_selection_metric": measured_selection_metric,
