@@ -45,6 +45,7 @@ from cortex3_llm import (
     inspect_llm_experiment,
     llm_doctor_report,
     main as llm_main,
+    run_llm_batch_profile_autosize,
     run_llm_batch_profile,
     run_llm_batch_profile_matrix,
 )
@@ -171,6 +172,74 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             self.assertFalse(threshold["passed"])
             self.assertEqual(threshold["required"], 1e12)
             self.assertGreater(threshold["observed"], 0.0)
+
+    def test_llm_batch_profile_autosize_selects_budgeted_shape_and_runs_matrix(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            report = run_llm_batch_profile_autosize(
+                out_dir=root / "autosize",
+                candidate_seq_lens=(32, 40),
+                candidate_d_models=(32,),
+                candidate_n_layers=(1,),
+                candidate_batch_sizes=(2, 4),
+                n_heads=4,
+                selected_shape_count=1,
+                min_selected_shapes=1,
+                seeds=(11,),
+                steps=1,
+                gradient_accumulation_steps=1,
+                vocab_size=128,
+                precision="fp32",
+                device="cpu",
+                require_cuda=False,
+                resource_interval=0.01,
+                min_resource_samples=1,
+                corpus_repeats=64,
+                max_corpus_tokens=2048,
+                memory_budget_mb=512,
+                min_cases=1,
+            )
+
+            autosize_path = root / "autosize" / "llm_batch_profile_autosize.json"
+            self.assertTrue(autosize_path.exists())
+            payload = json.loads(autosize_path.read_text(encoding="utf-8"))
+            self.assertTrue(payload["passed"], payload["failed_checks"])
+            self.assertEqual(payload["selection"]["selected_shape_count"], 1)
+            self.assertEqual(len(payload["selection"]["selected_shapes"]), 1)
+            selected = payload["candidates"][0]
+            self.assertTrue(selected["fits_budget"])
+            self.assertLessEqual(selected["estimated_peak_training_bytes"], payload["budget"]["budget_bytes"])
+            self.assertTrue(payload["matrix"]["passed"], payload["matrix"]["failed_checks"])
+            self.assertEqual(payload["matrix"]["summary"]["case_count"], 1)
+            self.assertTrue(payload["matrix"]["summary"]["threshold_checks"]["min_train_tokens_per_second_mean"]["passed"])
+            self.assertEqual(report["selection"]["viable_candidate_count"], 4)
+
+    def test_llm_batch_profile_autosize_blocks_when_budget_has_no_viable_shape(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            report = run_llm_batch_profile_autosize(
+                out_dir=root / "autosize",
+                candidate_seq_lens=(32,),
+                candidate_d_models=(32,),
+                candidate_n_layers=(1,),
+                candidate_batch_sizes=(4,),
+                n_heads=4,
+                selected_shape_count=1,
+                min_selected_shapes=1,
+                seeds=(11,),
+                steps=1,
+                vocab_size=128,
+                precision="fp32",
+                device="cpu",
+                require_cuda=False,
+                memory_budget_mb=1,
+            )
+
+            self.assertFalse(report["passed"])
+            self.assertIn("no_viable_shapes", report["failed_checks"])
+            self.assertIn("min_selected_shapes", report["failed_checks"])
+            self.assertEqual(report["selection"]["viable_candidate_count"], 0)
+            self.assertEqual(report["selection"]["rejected_candidate_count"], 1)
 
     def test_cuda_ternary_training_contract_is_strict_extension(self):
         loose_config = TransformerConfig(

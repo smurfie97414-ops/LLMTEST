@@ -739,11 +739,12 @@ Etat actuel :
 - un smoke test CUDA verifie les backends natifs sur GPU local avec gradient STE non nul ;
 - `tools/train_llm.py profile-batch` lance un vrai batch training Cortex strict avec optimizer, backward, requantize, P1-P10, monitoring CPU/GPU/power/VRAM et snapshot memoire CUDA torch ;
 - `tools/train_llm.py profile-matrix` repete ce profil sur plusieurs shapes et seeds, ecrit JSON/CSV agreges, et rend bloquants `min_cases`, `require_multi_shape`, `require_multi_seed`, extension-only, all-phases-active et les seuils optionnels de throughput/GPU/VRAM/puissance ;
+- `tools/train_llm.py profile-autosize` estime les candidats avec la config Cortex complete, selectionne les shapes qui rentrent dans un budget memoire/VRAM, puis lance `profile-matrix` sur les shapes choisies ;
 - `tools/benchmark_ternary_kernel.py` fournit un benchmark reproductible du kernel natif contre unpack+`F.linear`.
 
 Limite restante :
 
-- les kernels natifs actuels couvrent deja une variante tuilée shared-memory, une variante warp-reduction, un forward WMMA fp16/bf16 decode-shared, un backend extension C++/CUDA strict, un autotune mesure/cache par shape, un profil JSON persistant, WMMA fp16/bf16 pour `grad_input` aligne/padde et WMMA fp16/bf16->fp32 pour `grad_weight` aligne/padde, le profil court `runs/llm-batch-profile-v1/llm_batch_profile.json` mesure deja un vrai batch bf16 CUDA avec `passed=true`, et la matrice courte `runs/llm-batch-profile-matrix-v2/llm_batch_profile_matrix.json` mesure 2 shapes x 2 seeds avec `passed=true`, seuils ressource passants, `strict_extension_only_cases=4`, `all_phases_active_cases=4`, throughput moyen `77.310` tokens/s, GPU moyen `13.336%`, puissance moyenne `39.612 W` et VRAM moyenne `976.110 MB` ;
+- les kernels natifs actuels couvrent deja une variante tuilée shared-memory, une variante warp-reduction, un forward WMMA fp16/bf16 decode-shared, un backend extension C++/CUDA strict, un autotune mesure/cache par shape, un profil JSON persistant, WMMA fp16/bf16 pour `grad_input` aligne/padde et WMMA fp16/bf16->fp32 pour `grad_weight` aligne/padde, le profil court `runs/llm-batch-profile-v1/llm_batch_profile.json` mesure deja un vrai batch bf16 CUDA avec `passed=true`, la matrice courte `runs/llm-batch-profile-matrix-v2/llm_batch_profile_matrix.json` mesure 2 shapes x 2 seeds avec seuils ressource passants, et `runs/llm-profile-autosize-v1/llm_batch_profile_autosize.json` selectionne automatiquement `seq48_d96_h4_l2_b8` + `seq32_d96_h4_l2_b8` sous budget VRAM avant de verifier 2/2 cas stricts ;
 - les benchmarks doivent etre elargis a plusieurs tailles LLM reelles, seeds, durees et qualite de convergence.
 
 Critere de fermeture :

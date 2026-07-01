@@ -9052,6 +9052,141 @@ def _profile_shape_key(shape: Mapping[str, int]) -> str:
     )
 
 
+def _profile_shape_memory_estimate(
+    shape: Mapping[str, int],
+    *,
+    vocab_size: int,
+    precision: str,
+    device: str,
+    require_cuda: bool,
+    gradient_accumulation_steps: int,
+    native_ternary_backend: str,
+) -> Mapping[str, Any]:
+    training = TrainingConfig(
+        steps=1,
+        batch_size=int(shape["batch_size"]),
+        gradient_accumulation_steps=int(gradient_accumulation_steps),
+        eval_interval=1,
+        eval_batches=1,
+        device=device,
+        precision=_resolve_cli_precision(precision, device=device, require_cuda=require_cuda),
+        require_cuda=bool(require_cuda),
+        checkpoint_interval=1,
+        max_intermediate_checkpoints=0,
+        cortex_phase_interval=1,
+        cortex_phase_probe_tasks=1,
+        cortex_phase_max_proposals=1,
+        resource_monitor_interval=0.05,
+        num_threads=1,
+    )
+    strict_native_required = _strict_native_ternary_required_for_training(training)
+    config = TransformerConfig(
+        vocab_size=int(vocab_size),
+        seq_len=int(shape["seq_len"]),
+        d_model=int(shape["d_model"]),
+        n_heads=int(shape["n_heads"]),
+        n_layers=int(shape["n_layers"]),
+        dropout=0.0,
+        horizons=(1, 2, 4, 8),
+        use_cortex_heads=True,
+        use_ternary_core=True,
+        use_native_ternary_kernel=strict_native_required,
+        require_native_ternary_kernel=strict_native_required,
+        native_ternary_backend=native_ternary_backend,
+        use_skill_aware_experts=True,
+        use_variable_in_compressor=True,
+        use_learned_memory_policy=True,
+        use_certificate_head=True,
+    )
+    return _estimate_transformer_training_memory(config, training)
+
+
+def _profile_autosize_budget(
+    *,
+    memory_budget_mb: float,
+    memory_budget_fraction: float,
+    device: str,
+    require_cuda: bool,
+) -> Mapping[str, Any]:
+    explicit_bytes = int(float(memory_budget_mb) * 1024 * 1024)
+    if explicit_bytes > 0:
+        return {
+            "source": "explicit_mb",
+            "budget_bytes": explicit_bytes,
+            "memory_budget_mb": float(memory_budget_mb),
+            "memory_budget_fraction": float(memory_budget_fraction),
+        }
+    if not 0.0 < float(memory_budget_fraction) <= 1.0:
+        raise ValueError("memory_budget_fraction must be > 0 and <= 1")
+    resolves_to_cuda = bool(require_cuda)
+    if not resolves_to_cuda:
+        if str(device) == "auto":
+            resolves_to_cuda = bool(torch.cuda.is_available())
+        else:
+            try:
+                resolves_to_cuda = torch.device(device).type == "cuda"
+            except (TypeError, RuntimeError):
+                resolves_to_cuda = str(device).startswith("cuda")
+    if resolves_to_cuda:
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA memory autosize requested but CUDA is unavailable")
+        cuda_device = torch.cuda.current_device()
+        free_bytes, total_bytes = torch.cuda.mem_get_info(cuda_device)
+        return {
+            "source": "cuda_free_fraction",
+            "cuda_device": int(cuda_device),
+            "free_memory_bytes": int(free_bytes),
+            "total_memory_bytes": int(total_bytes),
+            "budget_bytes": int(float(free_bytes) * float(memory_budget_fraction)),
+            "memory_budget_mb": 0.0,
+            "memory_budget_fraction": float(memory_budget_fraction),
+        }
+    available_bytes = int(psutil.virtual_memory().available)
+    return {
+        "source": "system_ram_available_fraction",
+        "available_memory_bytes": available_bytes,
+        "budget_bytes": int(float(available_bytes) * float(memory_budget_fraction)),
+        "memory_budget_mb": 0.0,
+        "memory_budget_fraction": float(memory_budget_fraction),
+    }
+
+
+def _profile_autosize_candidate(
+    shape: Mapping[str, int],
+    *,
+    vocab_size: int,
+    precision: str,
+    device: str,
+    require_cuda: bool,
+    gradient_accumulation_steps: int,
+    native_ternary_backend: str,
+    budget_bytes: int,
+) -> Mapping[str, Any]:
+    estimate = _profile_shape_memory_estimate(
+        shape,
+        vocab_size=vocab_size,
+        precision=precision,
+        device=device,
+        require_cuda=require_cuda,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        native_ternary_backend=native_ternary_backend,
+    )
+    estimated_peak = int(estimate["estimated_peak_training_bytes"])
+    tokens_per_step = int(shape["seq_len"]) * int(shape["batch_size"]) * int(gradient_accumulation_steps)
+    score = float(estimated_peak) * math.log2(max(tokens_per_step, 2))
+    return {
+        "shape": dict(shape),
+        "shape_key": _profile_shape_key(shape),
+        "memory_estimate": estimate,
+        "estimated_peak_training_bytes": estimated_peak,
+        "budget_bytes": int(budget_bytes),
+        "budget_fraction_used": float(estimated_peak / max(1, int(budget_bytes))),
+        "tokens_per_optimizer_step": tokens_per_step,
+        "score": score,
+        "fits_budget": estimated_peak <= int(budget_bytes),
+    }
+
+
 def run_llm_batch_profile_matrix(
     *,
     out_dir: str | Path,
@@ -9270,6 +9405,173 @@ def run_llm_batch_profile_matrix(
     return matrix
 
 
+def run_llm_batch_profile_autosize(
+    *,
+    out_dir: str | Path,
+    candidate_seq_lens: Sequence[int],
+    candidate_d_models: Sequence[int],
+    candidate_n_layers: Sequence[int],
+    candidate_batch_sizes: Sequence[int],
+    n_heads: int = 4,
+    selected_shape_count: int = 2,
+    min_selected_shapes: int = 1,
+    seeds: Sequence[int] = (71,),
+    steps: int = 1,
+    gradient_accumulation_steps: int = 1,
+    vocab_size: int = 256,
+    precision: str = "auto",
+    device: str = "auto",
+    require_cuda: bool = False,
+    native_ternary_backend: str = STRICT_NATIVE_TERNARY_BACKEND,
+    resource_interval: float = 0.05,
+    min_resource_samples: int = 2,
+    corpus_repeats: int = 192,
+    max_corpus_tokens: int | None = 8192,
+    memory_budget_mb: float = 0.0,
+    memory_budget_fraction: float = 0.35,
+    min_cases: int = 1,
+    require_multi_shape: bool = False,
+    require_multi_seed: bool = False,
+    min_train_tokens_per_second_mean: float = 0.0,
+    min_gpu_utilization_percent_mean: float = 0.0,
+    min_gpu_memory_used_mb_mean: float = 0.0,
+    min_gpu_power_draw_watts_mean: float = 0.0,
+    overwrite: bool = False,
+) -> Mapping[str, Any]:
+    output_dir = Path(out_dir)
+    if output_dir.exists():
+        if not overwrite:
+            raise FileExistsError(f"profile autosize output directory already exists: {output_dir}")
+        shutil.rmtree(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    if selected_shape_count < 1:
+        raise ValueError("selected_shape_count must be positive")
+    if min_selected_shapes < 1:
+        raise ValueError("min_selected_shapes must be positive")
+    normalized_seeds = tuple(int(seed) for seed in seeds)
+    if not normalized_seeds:
+        raise ValueError("at least one autosize seed is required")
+    budget = _profile_autosize_budget(
+        memory_budget_mb=memory_budget_mb,
+        memory_budget_fraction=memory_budget_fraction,
+        device=device,
+        require_cuda=require_cuda,
+    )
+    budget_bytes = int(budget["budget_bytes"])
+    candidates: list[Mapping[str, Any]] = []
+    rejected: list[Mapping[str, Any]] = []
+    seen_shapes: set[str] = set()
+    for seq_len in candidate_seq_lens:
+        for d_model in candidate_d_models:
+            for n_layers in candidate_n_layers:
+                for batch_size in candidate_batch_sizes:
+                    try:
+                        shape = _normalize_profile_shape_spec(
+                            {
+                                "seq_len": int(seq_len),
+                                "d_model": int(d_model),
+                                "n_heads": int(n_heads),
+                                "n_layers": int(n_layers),
+                                "batch_size": int(batch_size),
+                            },
+                            default_batch_size=int(batch_size),
+                        )
+                    except ValueError as exc:
+                        rejected.append({"shape": {"seq_len": seq_len, "d_model": d_model, "n_heads": n_heads, "n_layers": n_layers, "batch_size": batch_size}, "reason": str(exc)})
+                        continue
+                    shape_key = _profile_shape_key(shape)
+                    if shape_key in seen_shapes:
+                        continue
+                    seen_shapes.add(shape_key)
+                    candidate = _profile_autosize_candidate(
+                        shape,
+                        vocab_size=vocab_size,
+                        precision=precision,
+                        device=device,
+                        require_cuda=require_cuda,
+                        gradient_accumulation_steps=gradient_accumulation_steps,
+                        native_ternary_backend=native_ternary_backend,
+                        budget_bytes=budget_bytes,
+                    )
+                    if bool(candidate["fits_budget"]):
+                        candidates.append(candidate)
+                    else:
+                        rejected.append({**candidate, "reason": "estimated_peak_exceeds_budget"})
+    ranked_candidates = sorted(
+        candidates,
+        key=lambda item: (
+            float(item["score"]),
+            int(item["estimated_peak_training_bytes"]),
+            int(item["tokens_per_optimizer_step"]),
+            str(item["shape_key"]),
+        ),
+        reverse=True,
+    )
+    selected = tuple(ranked_candidates[: int(selected_shape_count)])
+    failed_checks: list[str] = []
+    if not selected:
+        failed_checks.append("no_viable_shapes")
+    if len(selected) < int(min_selected_shapes):
+        failed_checks.append("min_selected_shapes")
+    matrix_report: Mapping[str, Any] | None = None
+    if selected:
+        selected_shapes = tuple(dict(item["shape"]) for item in selected)
+        matrix_report = run_llm_batch_profile_matrix(
+            out_dir=output_dir / "matrix",
+            shape_specs=selected_shapes,
+            seeds=normalized_seeds,
+            steps=steps,
+            gradient_accumulation_steps=gradient_accumulation_steps,
+            vocab_size=vocab_size,
+            precision=precision,
+            device=device,
+            require_cuda=require_cuda,
+            native_ternary_backend=native_ternary_backend,
+            resource_interval=resource_interval,
+            min_resource_samples=min_resource_samples,
+            corpus_repeats=corpus_repeats,
+            max_corpus_tokens=max_corpus_tokens,
+            min_cases=max(int(min_cases), len(selected_shapes) * len(normalized_seeds)),
+            require_multi_shape=require_multi_shape,
+            require_multi_seed=require_multi_seed,
+            min_train_tokens_per_second_mean=min_train_tokens_per_second_mean,
+            min_gpu_utilization_percent_mean=min_gpu_utilization_percent_mean,
+            min_gpu_memory_used_mb_mean=min_gpu_memory_used_mb_mean,
+            min_gpu_power_draw_watts_mean=min_gpu_power_draw_watts_mean,
+            overwrite=False,
+        )
+        if not bool(matrix_report.get("passed")):
+            failed_checks.append("profile_matrix_failed")
+            failed_checks.extend(f"matrix:{item}" for item in matrix_report.get("failed_checks", ()))
+    report = {
+        "schema_version": 1,
+        "run_dir": str(output_dir),
+        "budget": budget,
+        "candidate_grid": {
+            "candidate_seq_lens": tuple(int(value) for value in candidate_seq_lens),
+            "candidate_d_models": tuple(int(value) for value in candidate_d_models),
+            "candidate_n_layers": tuple(int(value) for value in candidate_n_layers),
+            "candidate_batch_sizes": tuple(int(value) for value in candidate_batch_sizes),
+            "n_heads": int(n_heads),
+        },
+        "selection": {
+            "selected_shape_count": int(selected_shape_count),
+            "min_selected_shapes": int(min_selected_shapes),
+            "viable_candidate_count": len(candidates),
+            "rejected_candidate_count": len(rejected),
+            "selected_shapes": tuple(dict(item["shape"]) for item in selected),
+            "selected_shape_keys": tuple(str(item["shape_key"]) for item in selected),
+        },
+        "candidates": tuple(ranked_candidates),
+        "rejected_candidates": tuple(rejected),
+        "matrix": matrix_report,
+        "failed_checks": tuple(failed_checks),
+        "passed": not failed_checks,
+    }
+    _write_json(output_dir / "llm_batch_profile_autosize.json", report)
+    return report
+
+
 def build_benchmark_corpus(path: str | Path, *, domain: str, repeats: int = 256) -> tuple[str, ...]:
     if repeats < 8:
         raise ValueError("benchmark repeats must be >= 8")
@@ -9308,6 +9610,21 @@ def _parse_seed_list(raw: str) -> tuple[int, ...]:
     if not seeds:
         raise ValueError("at least one seed is required")
     return tuple(seeds)
+
+
+def _parse_positive_int_list(raw: str, *, name: str) -> tuple[int, ...]:
+    values: list[int] = []
+    for part in _parse_list(raw):
+        try:
+            value = int(part)
+        except ValueError as exc:
+            raise ValueError(f"invalid {name} value {part!r}; expected integers") from exc
+        if value <= 0:
+            raise ValueError(f"invalid {name} value {part!r}; expected positive integers")
+        values.append(value)
+    if not values:
+        raise ValueError(f"at least one {name} value is required")
+    return tuple(values)
 
 
 def _parse_profile_shape_specs(raw: str) -> tuple[Mapping[str, int], ...]:
@@ -9453,6 +9770,38 @@ def main(argv: Sequence[str] | None = None) -> None:
     profile_matrix.add_argument("--min-gpu-power-draw-watts-mean", type=float, default=0.0)
     profile_matrix.add_argument("--overwrite", action="store_true", help="delete and recreate the output directory instead of failing when it exists")
     profile_matrix.add_argument("--native-ternary-backend", choices=NATIVE_TERNARY_BACKEND_CHOICES, default=STRICT_NATIVE_TERNARY_BACKEND)
+
+    profile_autosize = sub.add_parser("profile-autosize", help="select strict Cortex LLM profile shapes under a memory budget, then run the profile matrix")
+    profile_autosize.add_argument("--out-dir", default="runs/llm-batch-profile-autosize")
+    profile_autosize.add_argument("--candidate-seq-lens", default="32,40,48")
+    profile_autosize.add_argument("--candidate-d-models", default="64,96")
+    profile_autosize.add_argument("--candidate-n-layers", default="2")
+    profile_autosize.add_argument("--candidate-batch-sizes", default="4,8")
+    profile_autosize.add_argument("--n-heads", type=int, default=4)
+    profile_autosize.add_argument("--selected-shape-count", type=int, default=2)
+    profile_autosize.add_argument("--min-selected-shapes", type=int, default=1)
+    profile_autosize.add_argument("--seeds", default="71")
+    profile_autosize.add_argument("--steps", type=int, default=1)
+    profile_autosize.add_argument("--gradient-accumulation-steps", type=int, default=1)
+    profile_autosize.add_argument("--vocab-size", type=int, default=256)
+    profile_autosize.add_argument("--precision", choices=("auto", "fp32", "bf16", "fp16"), default="auto")
+    profile_autosize.add_argument("--device", default="auto")
+    profile_autosize.add_argument("--require-cuda", action="store_true")
+    profile_autosize.add_argument("--resource-interval", type=float, default=0.05)
+    profile_autosize.add_argument("--min-resource-samples", type=int, default=2)
+    profile_autosize.add_argument("--corpus-repeats", type=int, default=192)
+    profile_autosize.add_argument("--max-corpus-tokens", type=int, default=8192)
+    profile_autosize.add_argument("--memory-budget-mb", type=float, default=0.0)
+    profile_autosize.add_argument("--memory-budget-fraction", type=float, default=0.35)
+    profile_autosize.add_argument("--min-cases", type=int, default=1)
+    profile_autosize.add_argument("--require-multi-shape", action="store_true")
+    profile_autosize.add_argument("--require-multi-seed", action="store_true")
+    profile_autosize.add_argument("--min-train-tokens-per-second-mean", type=float, default=0.0)
+    profile_autosize.add_argument("--min-gpu-utilization-percent-mean", type=float, default=0.0)
+    profile_autosize.add_argument("--min-gpu-memory-used-mb-mean", type=float, default=0.0)
+    profile_autosize.add_argument("--min-gpu-power-draw-watts-mean", type=float, default=0.0)
+    profile_autosize.add_argument("--overwrite", action="store_true", help="delete and recreate the output directory instead of failing when it exists")
+    profile_autosize.add_argument("--native-ternary-backend", choices=NATIVE_TERNARY_BACKEND_CHOICES, default=STRICT_NATIVE_TERNARY_BACKEND)
 
     compare = sub.add_parser("compare", help="run baseline vs Cortex comparison on text files or directories")
     compare.add_argument("paths", nargs="+")
@@ -9796,6 +10145,45 @@ def main(argv: Sequence[str] | None = None) -> None:
         if not bool(report["passed"]):
             failed = ", ".join(str(item) for item in report["failed_checks"])
             raise RuntimeError(f"Cortex LLM batch profile matrix failed required checks: {failed}")
+        return
+
+    if args.command == "profile-autosize":
+        report = run_llm_batch_profile_autosize(
+            out_dir=args.out_dir,
+            candidate_seq_lens=_parse_positive_int_list(args.candidate_seq_lens, name="candidate-seq-lens"),
+            candidate_d_models=_parse_positive_int_list(args.candidate_d_models, name="candidate-d-models"),
+            candidate_n_layers=_parse_positive_int_list(args.candidate_n_layers, name="candidate-n-layers"),
+            candidate_batch_sizes=_parse_positive_int_list(args.candidate_batch_sizes, name="candidate-batch-sizes"),
+            n_heads=args.n_heads,
+            selected_shape_count=args.selected_shape_count,
+            min_selected_shapes=args.min_selected_shapes,
+            seeds=_parse_seed_list(args.seeds),
+            steps=args.steps,
+            gradient_accumulation_steps=args.gradient_accumulation_steps,
+            vocab_size=args.vocab_size,
+            precision=args.precision,
+            device=args.device,
+            require_cuda=args.require_cuda,
+            native_ternary_backend=args.native_ternary_backend,
+            resource_interval=args.resource_interval,
+            min_resource_samples=args.min_resource_samples,
+            corpus_repeats=args.corpus_repeats,
+            max_corpus_tokens=args.max_corpus_tokens,
+            memory_budget_mb=args.memory_budget_mb,
+            memory_budget_fraction=args.memory_budget_fraction,
+            min_cases=args.min_cases,
+            require_multi_shape=args.require_multi_shape,
+            require_multi_seed=args.require_multi_seed,
+            min_train_tokens_per_second_mean=args.min_train_tokens_per_second_mean,
+            min_gpu_utilization_percent_mean=args.min_gpu_utilization_percent_mean,
+            min_gpu_memory_used_mb_mean=args.min_gpu_memory_used_mb_mean,
+            min_gpu_power_draw_watts_mean=args.min_gpu_power_draw_watts_mean,
+            overwrite=args.overwrite,
+        )
+        print(json.dumps(report, indent=2, sort_keys=True, default=_json_default))
+        if not bool(report["passed"]):
+            failed = ", ".join(str(item) for item in report["failed_checks"])
+            raise RuntimeError(f"Cortex LLM batch profile autosize failed required checks: {failed}")
         return
 
     if args.command == "prepare-hf":

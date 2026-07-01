@@ -181,6 +181,14 @@ python tools/train_llm.py profile-matrix --out-dir runs/llm-batch-profile-matrix
 
 Elle écrit `llm_batch_profile_matrix.json` et `llm_batch_profile_matrix.csv`, puis échoue si un profil enfant échoue, si toutes les phases ne sont pas actives, si un run CUDA strict n'est pas extension-only, si les exigences multi-shape/multi-seed ne sont pas satisfaites, ou si un seuil explicite de throughput/GPU/VRAM/puissance n'est pas atteint. Le run court RTX 5070 avec seuils bloquants passe avec `case_count=4`, `passed_cases=4`, `shape_count=2`, `seed_count=2`, `strict_extension_only_cases=4`, `all_phases_active_cases=4`, `576` tokens planifiés, throughput moyen `77.310` tokens/s, GPU moyen par cas `13.336%`, puissance moyenne `39.612 W`, VRAM moyenne `976.110 MB`, et tous les `threshold_checks` passants.
 
+Pour laisser le harness choisir les shapes les plus lourdes qui rentrent dans un budget mémoire avant de lancer la matrice stricte :
+
+```bash
+python tools/train_llm.py profile-autosize --out-dir runs/llm-profile-autosize-v1 --overwrite --device cuda --require-cuda --precision bf16 --steps 1 --candidate-seq-lens 32,48 --candidate-d-models 64,96 --candidate-n-layers 2 --candidate-batch-sizes 4,8 --n-heads 4 --selected-shape-count 2 --min-selected-shapes 2 --seeds 71 --memory-budget-fraction 0.10 --min-cases 2 --require-multi-shape --min-train-tokens-per-second-mean 10 --min-gpu-utilization-percent-mean 5 --min-gpu-memory-used-mb-mean 900 --min-gpu-power-draw-watts-mean 30 --resource-interval 0.05 --min-resource-samples 2 --corpus-repeats 128 --max-corpus-tokens 4096
+```
+
+Ce rapport écrit `llm_batch_profile_autosize.json`, classe les candidats avec l'estimation mémoire du Transformer Cortex complet, rejette ceux qui dépassent le budget, sélectionne les meilleurs, puis lance `profile-matrix` sur ces shapes. Le run local court choisit `seq48_d96_h4_l2_b8` et `seq32_d96_h4_l2_b8` parmi 8 candidats viables sous `10%` de la mémoire CUDA libre, puis passe la matrice stricte avec 2/2 cas, `640` tokens planifiés, throughput moyen `125.247` tokens/s, GPU moyen `9.837%`, puissance moyenne `37.888 W` et VRAM moyenne `983.118 MB`.
+
 `tools/benchmark_learned_memory_policy.py` exécute une ablation courte contrôlée : mêmes poids partagés, mémoire apprise active contre mémoire désactivée, puis entraînement de la seule politique exact/latent/drop. Le rapport JSON expose les losses avant/après, le gradient mémoire, les décisions exact/latent/drop et le delta `before - after`.
 
 ## Démo noyau
@@ -356,7 +364,7 @@ python -m pytest tests/test_llm_pretraining.py -q
 ## Roadmap immédiate
 
 1. Durcir Phase 1 jusqu'au statut Verifier OS complet : coût par cas réel, familles génératives plus larges, tests de faux positifs/faux négatifs d'oracle.
-2. Durcir Phase 2 au-delà de la matrice batch LLM courte : élargir les shapes forward/backward réelles, puis répéter latence/VRAM/énergie/throughput sur batchs LLM plus grands, plus longs et multi-seed.
+2. Durcir Phase 2 au-delà de l'auto-sizing estimé : mesurer plusieurs candidats courts et garder les meilleurs par GPU/throughput sous budget, puis répéter sur batchs LLM plus grands, plus longs et multi-seed.
 3. Étendre Phase 3 vers des suites held-out plus larges, benchmarks MTP vs NTP et contrats FSP orientés objectifs de sortie.
 4. Étendre Phase 4 au-delà de l'ablation courte actuelle avec benchmarks coût/qualité de la politique mémoire apprise exact/latent/drop sur long contexte et held-out anchors.
 5. Étendre Phase 5 avec vérification algébrique multi-étapes, tests code plus riches et mesure held-out des économies de tokens de certificat.
