@@ -275,6 +275,7 @@ def _restore_compression_trace_ledger(ledger: CompressionTraceLedger | None, pay
                 used_residual=bool(data.get("used_residual", False)),
                 note=str(data.get("note", "")),
                 native_kernel=bool(data.get("native_kernel", False)),
+                kernel_variant=str(data.get("kernel_variant", "")),
             )
         )
     ledger._trim(ledger.packed_ternary_dispatches)
@@ -4812,6 +4813,7 @@ class CortexTrainingPhaseController:
                 "packed_ternary_dispatches": trace_counts.get("packed_ternary_dispatches", 0),
                 "native_ternary_kernel_dispatches": trace_counts.get("native_ternary_kernel_dispatches", 0),
                 "torch_packed_ternary_dispatches": trace_counts.get("torch_packed_ternary_dispatches", 0),
+                "native_ternary_kernel_variants": tuple(compression_trace.get("native_ternary_kernel_variants", ())),
                 "variable_input_compression_events": trace_counts.get("kv_events", 0),
                 "skill_expert_activations": trace_counts.get("expert_activations", 0),
                 "certificate_head_forward_events": int(self.model.certificate_forward_events),

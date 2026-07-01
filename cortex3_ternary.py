@@ -112,12 +112,299 @@ extern "C" __global__ void ternary_matmul_bf16(
   }
   out[idx] = __float2bfloat16(acc);
 }
+
+#define C3_BLOCK_M 16
+#define C3_BLOCK_N 16
+#define C3_BLOCK_K 32
+#define C3_WARPS_PER_BLOCK 8
+
+__device__ __forceinline__ float c3_decode_weight(
+    const unsigned char* packed,
+    const float* scales,
+    const float* residual,
+    int n,
+    int k,
+    int packed_stride,
+    int k_cols,
+    int use_residual) {
+  const unsigned char* packed_row = packed + n * packed_stride;
+  unsigned char byte = packed_row[k >> 2];
+  unsigned int code = (byte >> ((k & 3) << 1)) & 3;
+  float sign = code == 1 ? -1.0f : (code == 2 ? 1.0f : 0.0f);
+  float w = sign * scales[n];
+  if (use_residual) w += residual[n * k_cols + k];
+  return w;
+}
+
+__device__ __forceinline__ float c3_warp_sum(float value) {
+  #pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    value += __shfl_down_sync(0xffffffff, value, offset);
+  }
+  return value;
+}
+
+extern "C" __global__ void ternary_matmul_tiled_fp32(
+    const float* x,
+    const unsigned char* packed,
+    const float* scales,
+    const float* residual,
+    const float* bias,
+    float* out,
+    int m_rows,
+    int n_cols,
+    int k_cols,
+    int packed_stride,
+    int use_residual,
+    int has_bias) {
+  __shared__ float x_tile[C3_BLOCK_M][C3_BLOCK_K];
+  __shared__ float w_tile[C3_BLOCK_N][C3_BLOCK_K];
+  int local_m = threadIdx.y;
+  int local_n = threadIdx.x;
+  int tid = local_m * blockDim.x + local_n;
+  int global_m = blockIdx.y * C3_BLOCK_M + local_m;
+  int global_n = blockIdx.x * C3_BLOCK_N + local_n;
+  float acc = (global_n < n_cols && has_bias) ? bias[global_n] : 0.0f;
+  for (int k0 = 0; k0 < k_cols; k0 += C3_BLOCK_K) {
+    for (int index = tid; index < C3_BLOCK_M * C3_BLOCK_K; index += C3_BLOCK_M * C3_BLOCK_N) {
+      int lm = index / C3_BLOCK_K;
+      int lk = index - lm * C3_BLOCK_K;
+      int m = blockIdx.y * C3_BLOCK_M + lm;
+      int k = k0 + lk;
+      x_tile[lm][lk] = (m < m_rows && k < k_cols) ? x[m * k_cols + k] : 0.0f;
+    }
+    for (int index = tid; index < C3_BLOCK_N * C3_BLOCK_K; index += C3_BLOCK_M * C3_BLOCK_N) {
+      int ln = index / C3_BLOCK_K;
+      int lk = index - ln * C3_BLOCK_K;
+      int n = blockIdx.x * C3_BLOCK_N + ln;
+      int k = k0 + lk;
+      w_tile[ln][lk] = (n < n_cols && k < k_cols)
+          ? c3_decode_weight(packed, scales, residual, n, k, packed_stride, k_cols, use_residual)
+          : 0.0f;
+    }
+    __syncthreads();
+    if (global_m < m_rows && global_n < n_cols) {
+      #pragma unroll
+      for (int kk = 0; kk < C3_BLOCK_K; ++kk) {
+        if (k0 + kk < k_cols) acc += x_tile[local_m][kk] * w_tile[local_n][kk];
+      }
+    }
+    __syncthreads();
+  }
+  if (global_m < m_rows && global_n < n_cols) {
+    out[global_m * n_cols + global_n] = acc;
+  }
+}
+
+extern "C" __global__ void ternary_matmul_tiled_fp16(
+    const __half* x,
+    const unsigned char* packed,
+    const float* scales,
+    const float* residual,
+    const float* bias,
+    __half* out,
+    int m_rows,
+    int n_cols,
+    int k_cols,
+    int packed_stride,
+    int use_residual,
+    int has_bias) {
+  __shared__ float x_tile[C3_BLOCK_M][C3_BLOCK_K];
+  __shared__ float w_tile[C3_BLOCK_N][C3_BLOCK_K];
+  int local_m = threadIdx.y;
+  int local_n = threadIdx.x;
+  int tid = local_m * blockDim.x + local_n;
+  int global_m = blockIdx.y * C3_BLOCK_M + local_m;
+  int global_n = blockIdx.x * C3_BLOCK_N + local_n;
+  float acc = (global_n < n_cols && has_bias) ? bias[global_n] : 0.0f;
+  for (int k0 = 0; k0 < k_cols; k0 += C3_BLOCK_K) {
+    for (int index = tid; index < C3_BLOCK_M * C3_BLOCK_K; index += C3_BLOCK_M * C3_BLOCK_N) {
+      int lm = index / C3_BLOCK_K;
+      int lk = index - lm * C3_BLOCK_K;
+      int m = blockIdx.y * C3_BLOCK_M + lm;
+      int k = k0 + lk;
+      x_tile[lm][lk] = (m < m_rows && k < k_cols) ? __half2float(x[m * k_cols + k]) : 0.0f;
+    }
+    for (int index = tid; index < C3_BLOCK_N * C3_BLOCK_K; index += C3_BLOCK_M * C3_BLOCK_N) {
+      int ln = index / C3_BLOCK_K;
+      int lk = index - ln * C3_BLOCK_K;
+      int n = blockIdx.x * C3_BLOCK_N + ln;
+      int k = k0 + lk;
+      w_tile[ln][lk] = (n < n_cols && k < k_cols)
+          ? c3_decode_weight(packed, scales, residual, n, k, packed_stride, k_cols, use_residual)
+          : 0.0f;
+    }
+    __syncthreads();
+    if (global_m < m_rows && global_n < n_cols) {
+      #pragma unroll
+      for (int kk = 0; kk < C3_BLOCK_K; ++kk) {
+        if (k0 + kk < k_cols) acc += x_tile[local_m][kk] * w_tile[local_n][kk];
+      }
+    }
+    __syncthreads();
+  }
+  if (global_m < m_rows && global_n < n_cols) {
+    out[global_m * n_cols + global_n] = __float2half(acc);
+  }
+}
+
+extern "C" __global__ void ternary_matmul_tiled_bf16(
+    const __nv_bfloat16* x,
+    const unsigned char* packed,
+    const float* scales,
+    const float* residual,
+    const float* bias,
+    __nv_bfloat16* out,
+    int m_rows,
+    int n_cols,
+    int k_cols,
+    int packed_stride,
+    int use_residual,
+    int has_bias) {
+  __shared__ float x_tile[C3_BLOCK_M][C3_BLOCK_K];
+  __shared__ float w_tile[C3_BLOCK_N][C3_BLOCK_K];
+  int local_m = threadIdx.y;
+  int local_n = threadIdx.x;
+  int tid = local_m * blockDim.x + local_n;
+  int global_m = blockIdx.y * C3_BLOCK_M + local_m;
+  int global_n = blockIdx.x * C3_BLOCK_N + local_n;
+  float acc = (global_n < n_cols && has_bias) ? bias[global_n] : 0.0f;
+  for (int k0 = 0; k0 < k_cols; k0 += C3_BLOCK_K) {
+    for (int index = tid; index < C3_BLOCK_M * C3_BLOCK_K; index += C3_BLOCK_M * C3_BLOCK_N) {
+      int lm = index / C3_BLOCK_K;
+      int lk = index - lm * C3_BLOCK_K;
+      int m = blockIdx.y * C3_BLOCK_M + lm;
+      int k = k0 + lk;
+      x_tile[lm][lk] = (m < m_rows && k < k_cols) ? __bfloat162float(x[m * k_cols + k]) : 0.0f;
+    }
+    for (int index = tid; index < C3_BLOCK_N * C3_BLOCK_K; index += C3_BLOCK_M * C3_BLOCK_N) {
+      int ln = index / C3_BLOCK_K;
+      int lk = index - ln * C3_BLOCK_K;
+      int n = blockIdx.x * C3_BLOCK_N + ln;
+      int k = k0 + lk;
+      w_tile[ln][lk] = (n < n_cols && k < k_cols)
+          ? c3_decode_weight(packed, scales, residual, n, k, packed_stride, k_cols, use_residual)
+          : 0.0f;
+    }
+    __syncthreads();
+    if (global_m < m_rows && global_n < n_cols) {
+      #pragma unroll
+      for (int kk = 0; kk < C3_BLOCK_K; ++kk) {
+        if (k0 + kk < k_cols) acc += x_tile[local_m][kk] * w_tile[local_n][kk];
+      }
+    }
+    __syncthreads();
+  }
+  if (global_m < m_rows && global_n < n_cols) {
+    out[global_m * n_cols + global_n] = __float2bfloat16(acc);
+  }
+}
+
+extern "C" __global__ void ternary_matmul_warp_fp32(
+    const float* x,
+    const unsigned char* packed,
+    const float* scales,
+    const float* residual,
+    const float* bias,
+    float* out,
+    int m_rows,
+    int n_cols,
+    int k_cols,
+    int packed_stride,
+    int use_residual,
+    int has_bias) {
+  int lane = threadIdx.x & 31;
+  int warp = threadIdx.x >> 5;
+  int output_index = blockIdx.x * C3_WARPS_PER_BLOCK + warp;
+  int total = m_rows * n_cols;
+  if (output_index >= total) return;
+  int m = output_index / n_cols;
+  int n = output_index - m * n_cols;
+  float acc = 0.0f;
+  for (int k = lane; k < k_cols; k += 32) {
+    acc += x[m * k_cols + k] * c3_decode_weight(packed, scales, residual, n, k, packed_stride, k_cols, use_residual);
+  }
+  acc = c3_warp_sum(acc);
+  if (lane == 0) {
+    if (has_bias) acc += bias[n];
+    out[output_index] = acc;
+  }
+}
+
+extern "C" __global__ void ternary_matmul_warp_fp16(
+    const __half* x,
+    const unsigned char* packed,
+    const float* scales,
+    const float* residual,
+    const float* bias,
+    __half* out,
+    int m_rows,
+    int n_cols,
+    int k_cols,
+    int packed_stride,
+    int use_residual,
+    int has_bias) {
+  int lane = threadIdx.x & 31;
+  int warp = threadIdx.x >> 5;
+  int output_index = blockIdx.x * C3_WARPS_PER_BLOCK + warp;
+  int total = m_rows * n_cols;
+  if (output_index >= total) return;
+  int m = output_index / n_cols;
+  int n = output_index - m * n_cols;
+  float acc = 0.0f;
+  for (int k = lane; k < k_cols; k += 32) {
+    acc += __half2float(x[m * k_cols + k]) * c3_decode_weight(packed, scales, residual, n, k, packed_stride, k_cols, use_residual);
+  }
+  acc = c3_warp_sum(acc);
+  if (lane == 0) {
+    if (has_bias) acc += bias[n];
+    out[output_index] = __float2half(acc);
+  }
+}
+
+extern "C" __global__ void ternary_matmul_warp_bf16(
+    const __nv_bfloat16* x,
+    const unsigned char* packed,
+    const float* scales,
+    const float* residual,
+    const float* bias,
+    __nv_bfloat16* out,
+    int m_rows,
+    int n_cols,
+    int k_cols,
+    int packed_stride,
+    int use_residual,
+    int has_bias) {
+  int lane = threadIdx.x & 31;
+  int warp = threadIdx.x >> 5;
+  int output_index = blockIdx.x * C3_WARPS_PER_BLOCK + warp;
+  int total = m_rows * n_cols;
+  if (output_index >= total) return;
+  int m = output_index / n_cols;
+  int n = output_index - m * n_cols;
+  float acc = 0.0f;
+  for (int k = lane; k < k_cols; k += 32) {
+    acc += __bfloat162float(x[m * k_cols + k]) * c3_decode_weight(packed, scales, residual, n, k, packed_stride, k_cols, use_residual);
+  }
+  acc = c3_warp_sum(acc);
+  if (lane == 0) {
+    if (has_bias) acc += bias[n];
+    out[output_index] = __float2bfloat16(acc);
+  }
+}
 """
 
 _CUPY_TERNARY_KERNEL_NAMES = {
-    torch.float32: "ternary_matmul_fp32",
-    torch.float16: "ternary_matmul_fp16",
-    torch.bfloat16: "ternary_matmul_bf16",
+    "tiled": {
+        torch.float32: "ternary_matmul_tiled_fp32",
+        torch.float16: "ternary_matmul_tiled_fp16",
+        torch.bfloat16: "ternary_matmul_tiled_bf16",
+    },
+    "warp": {
+        torch.float32: "ternary_matmul_warp_fp32",
+        torch.float16: "ternary_matmul_warp_fp16",
+        torch.bfloat16: "ternary_matmul_warp_bf16",
+    },
 }
 _CUPY_TERNARY_KERNEL_CACHE: dict[Any, Any] = {}
 _CUPY_IMPORT_ERROR: Exception | None = None
@@ -134,24 +421,29 @@ def _load_cupy() -> Any:
     return cp
 
 
-def _cupy_ternary_kernel(dtype: Any) -> tuple[Any, Any]:
-    if dtype not in _CUPY_TERNARY_KERNEL_NAMES:
+def _cupy_ternary_kernel(dtype: Any, variant: str = "tiled") -> tuple[Any, Any]:
+    if variant not in _CUPY_TERNARY_KERNEL_NAMES:
+        raise RuntimeError(f"native ternary CUDA kernel variant {variant!r} is not supported")
+    names = _CUPY_TERNARY_KERNEL_NAMES[variant]
+    if dtype not in names:
         raise RuntimeError(f"native ternary CUDA kernel does not support dtype {dtype}")
     cp = _load_cupy()
-    if dtype not in _CUPY_TERNARY_KERNEL_CACHE:
-        _CUPY_TERNARY_KERNEL_CACHE[dtype] = cp.RawKernel(
+    key = (variant, dtype)
+    if key not in _CUPY_TERNARY_KERNEL_CACHE:
+        _CUPY_TERNARY_KERNEL_CACHE[key] = cp.RawKernel(
             _CUPY_TERNARY_KERNEL_SOURCE,
-            _CUPY_TERNARY_KERNEL_NAMES[dtype],
+            names[dtype],
             options=("--std=c++17",),
         )
-    return cp, _CUPY_TERNARY_KERNEL_CACHE[dtype]
+    return cp, _CUPY_TERNARY_KERNEL_CACHE[key]
 
 
 def native_ternary_cuda_available() -> bool:
     if not torch.cuda.is_available():
         return False
     try:
-        _cupy_ternary_kernel(torch.float32)
+        _cupy_ternary_kernel(torch.float32, "tiled")
+        _cupy_ternary_kernel(torch.float32, "warp")
     except Exception:
         return False
     return True
@@ -241,6 +533,7 @@ class PackedTernaryDispatch:
     used_residual: bool
     note: str = ""
     native_kernel: bool = False
+    kernel_variant: str = ""
 
 
 @dataclass
@@ -344,6 +637,11 @@ class CompressionTraceLedger:
         return hints or ["no_compression_culprit_logged"]
 
     def to_dict(self) -> dict[str, Any]:
+        native_variants = tuple(sorted({
+            item.kernel_variant
+            for item in self.packed_ternary_dispatches
+            if (item.native_kernel or item.backend.startswith("native_")) and item.kernel_variant
+        }))
         return {
             "compression_decisions": [asdict(item) for item in self.compression_decisions],
             "activation_quantizations": [asdict(item) for item in self.activation_quantizations],
@@ -375,6 +673,7 @@ class CompressionTraceLedger:
             },
             "cost_trace": asdict(self.cost_trace),
             "packed_weight_bytes_read": self.total_packed_weight_bytes,
+            "native_ternary_kernel_variants": native_variants,
         }
 
 
@@ -481,6 +780,7 @@ class BitLinearConfig:
     use_packed_ternary_runtime: bool = True
     use_native_cuda_kernel: bool = True
     require_native_cuda_kernel: bool = False
+    native_cuda_kernel_variant: str = "auto"
 
 
 class BitLinear(nn.Module):
@@ -642,11 +942,18 @@ class BitLinear(nn.Module):
     def _native_cuda_packed_output(self, x: Any) -> Any:
         if not x.is_cuda:
             raise RuntimeError("native ternary kernel requires CUDA input")
-        if x.dtype not in _CUPY_TERNARY_KERNEL_NAMES:
+        if x.dtype not in _CUPY_TERNARY_KERNEL_NAMES["tiled"]:
             raise RuntimeError(f"native ternary kernel does not support dtype {x.dtype}")
         if not self.config.shared_scale:
             raise RuntimeError("native ternary kernel currently requires per-output shared scales")
-        cp, kernel = _cupy_ternary_kernel(x.dtype)
+        variant = self.config.native_cuda_kernel_variant
+        if variant == "auto":
+            flattened_rows = int(x.numel() // self.config.in_features)
+            variant = "warp" if self.config.in_features >= 384 and flattened_rows * self.config.out_features >= 16384 else "tiled"
+        if variant not in {"tiled", "warp"}:
+            raise RuntimeError(f"unsupported native_cuda_kernel_variant={self.config.native_cuda_kernel_variant!r}")
+        self._last_native_kernel_variant = f"{variant}_shared_memory_int2" if variant == "tiled" else "warp_reduction_int2"
+        cp, kernel = _cupy_ternary_kernel(x.dtype, variant)
         x_flat = x.detach().contiguous().view(-1, self.config.in_features)
         output = torch.empty(
             (*x.shape[:-1], self.config.out_features),
@@ -666,16 +973,26 @@ class BitLinear(nn.Module):
             if self.bias is not None
             else torch.empty((0,), device=x.device, dtype=torch.float32)
         )
-        total = int(output_flat.numel())
-        threads = 256
-        blocks = ((total + threads - 1) // threads,)
+        if variant == "warp":
+            warps_per_block = 8
+            total_outputs = int(x_flat.shape[0]) * int(self.config.out_features)
+            blocks = ((total_outputs + warps_per_block - 1) // warps_per_block,)
+            threads = (warps_per_block * 32,)
+        else:
+            block_m = 16
+            block_n = 16
+            blocks = (
+                (int(self.config.out_features) + block_n - 1) // block_n,
+                (int(x_flat.shape[0]) + block_m - 1) // block_m,
+            )
+            threads = (block_n, block_m)
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", category=DeprecationWarning, message="ExternalStream is deprecated.*")
             stream = cp.cuda.ExternalStream(torch.cuda.current_stream(x.device).cuda_stream)
         with stream:
             kernel(
                 blocks,
-                (threads,),
+                threads,
                 (
                     cp.from_dlpack(x_flat),
                     cp.from_dlpack(packed),
@@ -727,8 +1044,9 @@ class BitLinear(nn.Module):
                 try:
                     packed_output = self._native_cuda_packed_output(xq)
                     native_kernel = True
-                    backend = "native_int2_cupy_cuda"
-                    native_note = "native CuPy RawKernel"
+                    kernel_variant = getattr(self, "_last_native_kernel_variant", "native_int2")
+                    backend = f"native_int2_cupy_cuda_{kernel_variant}"
+                    native_note = f"native CuPy RawKernel {kernel_variant} kernel"
                 except Exception as exc:
                     if self.config.require_native_cuda_kernel:
                         raise
@@ -760,6 +1078,7 @@ class BitLinear(nn.Module):
                     + (f"; {native_note}" if native_note else "")
                 ),
                 native_kernel=native_kernel,
+                kernel_variant=getattr(self, "_last_native_kernel_variant", "") if native_kernel else "torch_unpack_linear",
             ))
         else:
             output = F.linear(xq, ste_weight, self.bias)

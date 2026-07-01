@@ -87,7 +87,7 @@ Cette base contient maintenant :
 - `cortex3.py` : noyau de tâches, skills, vérificateur dynamique, adversarial checks, ternaire sign+mask, ancrage exact, horizon MTP adaptatif, regrowth minimal et CLI de démonstration ;
 - Phase 1 du Verifier OS est maintenant élargie avec registre d'oracles, anti-métamorphiques, coûts vérificateur par cas, audit faux positifs/faux négatifs d'oracle, harnais de défauts injectés et familles de compétences `arithmetic`, `algebra`, `long_context_anchor`, `entity_tracking`, `instruction_following`, `code_unit_tests`, `calibration` ;
 - `cortex3_reporting.py` : persistance des cycles dans `runs/` avec JSON structuré, rapport markdown et matrice de défauts injectés ;
-- `cortex3_ternary.py` : instrumentation Phase 2 avec quantization d'activations 8→4 bit, residual synapse buffer, compression logs, `BitLinear` sign+mask, buffers ternaires packes int2 et kernel CUDA natif CuPy RawKernel avec gradient STE ;
+- `cortex3_ternary.py` : instrumentation Phase 2 avec quantization d'activations 8→4 bit, residual synapse buffer, compression logs, `BitLinear` sign+mask, buffers ternaires packes int2 et kernels CUDA natifs CuPy RawKernel tuilé/warp-reduction avec gradient STE ;
 - `cortex3_future.py` : Phase 3 MTP/FSP sous contrat avec têtes PyTorch horizons 1/2/4/8, calibration autonome, confidence head, temporal consistency loss, Future Contract, révision et accept/reject gates ;
 - `cortex3_memory.py` : Phase 4 mémoire cognitive avec KV récent exact, KV ancien latent compact, Exact Anchor Ledger, reconstruction conditionnée par requête, récupération de réponse augmentée par mémoire et vérificateur de fidélité aux ancres ;
 - `cortex3_certificates.py` : Phase 5 raisonnement latent avec `latent proof state`, tête PyTorch de certificat calibrée, génération proof-carrying, certificats courts vérifiables, dé-latentisation aléatoire et vérification par outils ;
@@ -146,9 +146,15 @@ Pour remplacer un build PyTorch CPU par le build CUDA validé localement :
 pip install -r requirements-cuda-cu128.txt
 python tools/train_llm.py doctor --require-cuda --precision bf16 --device cuda
 python tools/benchmark_ternary_kernel.py --dtype fp16
+python tools/benchmark_learned_memory_policy.py --device cuda
 ```
 
-`requirements-cuda-cu128.txt` installe aussi `cupy-cuda12x` et `ml_dtypes`, nécessaires au kernel CUDA natif `native_int2_cupy_cuda`. Sur RTX 5070, le smoke benchmark local `batch=128, in=256, out=256, fp16` mesure `0.1008 ms` pour le kernel natif contre `0.3065 ms` pour unpack+`F.linear`, soit `3.04x`, avec erreur max `0.001953`.
+`requirements-cuda-cu128.txt` installe aussi `cupy-cuda12x` et `ml_dtypes`, nécessaires aux kernels CUDA natifs `native_int2_cupy_cuda_*`. Sur RTX 5070, les benchmarks courts locaux donnent :
+
+- `batch=128, in=256, out=256, fp16` : variante `tiled_shared_memory_int2`, `0.0951 ms` contre `0.2890 ms` pour unpack+`F.linear`, soit `3.04x`, erreur max `0.000976`.
+- `batch=512, in=512, out=512, fp16` : variante `warp_reduction_int2`, `0.2268 ms` contre `0.2349 ms` pour unpack+`F.linear`, soit `1.04x`, erreur max `0.000976`.
+
+`tools/benchmark_learned_memory_policy.py` exécute une ablation courte contrôlée : mêmes poids partagés, mémoire apprise active contre mémoire désactivée, puis entraînement de la seule politique exact/latent/drop. Le rapport JSON expose les losses avant/après, le gradient mémoire, les décisions exact/latent/drop et le delta `before - after`.
 
 ## Démo noyau
 
@@ -325,7 +331,7 @@ python -m pytest tests/test_llm_pretraining.py -q
 1. Durcir Phase 1 jusqu'au statut Verifier OS complet : coût par cas réel, familles génératives plus larges, tests de faux positifs/faux négatifs d'oracle.
 2. Durcir Phase 2 au-delà du RawKernel natif actuel avec kernels CUDA plus tuilés/fusionnés, benchmarks latence/VRAM/énergie plus larges et mesure sous vrais batchs LLM.
 3. Étendre Phase 3 vers des suites held-out plus larges, benchmarks MTP vs NTP et contrats FSP orientés objectifs de sortie.
-4. Étendre Phase 4 avec benchmarks coût/qualité de la politique mémoire apprise exact/latent/drop sur long contexte et ablation sans mémoire apprise.
+4. Étendre Phase 4 au-delà de l'ablation courte actuelle avec benchmarks coût/qualité de la politique mémoire apprise exact/latent/drop sur long contexte et held-out anchors.
 5. Étendre Phase 5 avec vérification algébrique multi-étapes, tests code plus riches et mesure held-out des économies de tokens de certificat.
 6. Étendre la boucle générative autoregressive vers held-out suites, benchmarks coût/qualité plus larges et calibration de confiance.
 7. Étendre le banc MTP vs NTP en faible précision sur variantes de checkpoints autoregressifs et LLM.

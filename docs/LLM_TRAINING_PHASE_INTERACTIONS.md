@@ -29,7 +29,8 @@ Observation ressource separee du meme run long :
 Preuve post-integration des deux nouvelles briques :
 
 - `test_learned_memory_policy_is_trainable_and_affects_cortex_loss` : loss `learned_memory` non nul, gradient non nul dans la politique memoire, dispatch ternaire packe present ;
-- `test_bitlinear_native_packed_ternary_cuda_dispatch_runs_on_gpu` : backend `native_int2_cupy_cuda` execute sur le GPU local avec gradient STE non nul ;
+- `test_learned_memory_ablation_shows_policy_can_reduce_loss` : ablation courte a poids partages, memoire apprise active vs desactivee, puis entrainement de la seule politique exact/latent/drop avec delta `before - after` positif sur total et next-token loss ;
+- `test_bitlinear_native_packed_ternary_cuda_dispatch_runs_on_gpu` : backend natif `native_int2_cupy_cuda_*` execute sur le GPU local avec gradient STE non nul ;
 - `test_native_ternary_cuda_kernel_matches_packed_runtime_for_training_dtypes` : le kernel natif correspond au runtime packe en fp32, fp16 et bf16 ;
 - `test_full_cortex_phase_controller_uses_all_modules_during_training` : mini training LLM complet avec audits exigeant `learned_cognitive_memory_policy`, `packed_ternary_hardware_runtime` et `native_ternary_cuda_kernel` quand CUDA est disponible.
 
@@ -282,7 +283,7 @@ Quand `use_ternary_core=True`, les lineaires principaux deviennent des `BitLinea
 - codes ternaires packes int2 dans `packed_codes` ;
 - quantization d'activation ;
 - layer forward events ;
-- `PackedTernaryDispatch` avec backend `packed_int2_torch`, `packed_int2_cuda` ou `native_int2_cupy_cuda`.
+- `PackedTernaryDispatch` avec backend `packed_int2_torch`, `packed_int2_cuda`, `native_int2_cupy_cuda_tiled_shared_memory_int2` ou `native_int2_cupy_cuda_warp_reduction_int2`.
 
 ### Interaction Avec Les Autres Phases
 
@@ -298,7 +299,7 @@ Le forward lit la valeur runtime depuis les codes ternaires packes, puis utilise
 
 ### Preuve Runtime
 
-Le checkpoint inspecte montre `P2=238652` evenements. Les tests ajoutes verifient en plus que `BitLinear` execute un dispatch CUDA natif `native_int2_cupy_cuda` sur GPU local, que les valeurs fp32/fp16/bf16 correspondent au runtime packe, et que le gradient STE reste non nul vers les poids entrainables.
+Le checkpoint inspecte montre `P2=238652` evenements. Les tests ajoutes verifient en plus que `BitLinear` execute un dispatch CUDA natif tuilé ou warp-reduction sur GPU local, que les valeurs fp32/fp16/bf16 correspondent au runtime packe, que l'auto-selection choisit la variante attendue selon la forme, et que le gradient STE reste non nul vers les poids entrainables.
 
 ## Phase 3 - Future Contract / FSP / MTP
 
@@ -364,6 +365,8 @@ P4 alimente :
 ### Impact Apprentissage
 
 La memoire n'est pas un stockage passif. `LearnedMemoryPolicy` modifie le hidden state avec un melange differentiable entre exact, latent local et drop vector, puis `CortexObjective` supervise cette politique avec les pertes token-level : les tokens difficiles tendent vers exact, les tokens intermediaires vers latent et les tokens faciles/corrects vers drop. Les exemples d'ancrage restent du replay et les echecs de fidelite peuvent faire echouer l'audit.
+
+Une ablation courte reproductible existe avec `tools/benchmark_learned_memory_policy.py` : elle charge les memes poids partages dans un modele avec memoire apprise et un modele sans memoire apprise, fige tout sauf `learned_memory.*`, puis mesure gradient, decisions exact/latent/drop, ratio de stockage et delta de loss. Cette preuve montre que la politique peut modifier l'apprentissage sur un batch controle ; elle ne remplace pas encore une preuve long-contexte held-out.
 
 ## Phase 5 - Latent Reasoning Workspace / Certificates
 
@@ -698,11 +701,12 @@ Etat actuel :
 
 - `VariableInCompressor` est dans le forward PyTorch et peut apprendre une compression differentiable des representations ;
 - `LearnedMemoryPolicy` est maintenant dans le forward, produit des logits exact/latent/drop, modifie les representations avant les blocs Transformer et recoit un loss trainable ;
+- `tools/benchmark_learned_memory_policy.py` fournit une ablation courte a poids partages et mesure `disabled`, `before`, `after`, decisions exact/latent/drop, gradient memoire et delta `before - after` ;
 - P4 observe de vrais batchs, extrait des ancres, reconstruit via memoire exacte/latente, verifie la fidelite, supervise les ancres et genere du replay.
 
 Limite restante :
 
-- la politique exact/latent/drop est apprise et branchee, mais son gain final sur long contexte massif, cout memoire et held-out anchors doit encore etre mesure sur run long.
+- la politique exact/latent/drop est apprise, branchee et ablatee en court, mais son gain final sur long contexte massif, cout memoire et held-out anchors doit encore etre mesure sur run long.
 
 Critere de fermeture :
 
@@ -714,15 +718,15 @@ Critere de fermeture :
 Etat actuel :
 
 - `BitLinear` tourne dans le forward avec valeur runtime issue de buffers `packed_codes` int2 ;
-- sur CUDA, le forward peut lancer le kernel natif CuPy RawKernel `native_int2_cupy_cuda` via DLPack zero-copy ;
+- sur CUDA, le forward peut lancer les kernels natifs CuPy RawKernel `tiled_shared_memory_int2` ou `warp_reduction_int2` via DLPack zero-copy ;
 - le coeur est requantifie apres optimizer step et apres patchs P7/P10 ;
 - les traces P2 prouvent une execution ternaire-compatible pendant le run ;
-- un smoke test CUDA verifie `native_int2_cupy_cuda` sur GPU local avec gradient STE non nul ;
+- un smoke test CUDA verifie les backends natifs sur GPU local avec gradient STE non nul ;
 - `tools/benchmark_ternary_kernel.py` fournit un benchmark reproductible du kernel natif contre unpack+`F.linear`.
 
 Limite restante :
 
-- le kernel natif actuel est simple, un thread par sortie, et doit encore etre remplace ou complete par des kernels tuiles/fusionnes plus optimises pour grands batchs LLM ;
+- les kernels natifs actuels couvrent deja une variante tuilée shared-memory et une variante warp-reduction, mais doivent encore etre packages plus bas niveau et autotunes plus finement pour grands batchs LLM ;
 - les benchmarks doivent etre elargis a VRAM, energie estimee, tailles LLM reelles et qualite de convergence.
 
 Critere de fermeture :

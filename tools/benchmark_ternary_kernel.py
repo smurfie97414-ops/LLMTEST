@@ -44,6 +44,7 @@ def benchmark_case(
     in_features: int,
     out_features: int,
     dtype: torch.dtype,
+    kernel_variant: str,
     warmup: int,
     repeat: int,
 ) -> dict[str, Any]:
@@ -54,6 +55,7 @@ def benchmark_case(
             activation_bits=0,
             residual_runtime=False,
             require_native_cuda_kernel=True,
+            native_cuda_kernel_variant=kernel_variant,
             log_prefix="bench-native-ternary",
         )
     ).cuda()
@@ -79,7 +81,8 @@ def benchmark_case(
         "in_features": int(in_features),
         "out_features": int(out_features),
         "dtype": str(dtype).replace("torch.", ""),
-        "native_backend": "native_int2_cupy_cuda",
+        "native_backend": f"native_int2_cupy_cuda_{layer._last_native_kernel_variant}",
+        "kernel_variant": layer._last_native_kernel_variant,
         "native_ms": native_ms,
         "torch_unpack_linear_ms": unpacked_ms,
         "speedup_vs_torch_unpack_linear": unpacked_ms / max(native_ms, 1e-9),
@@ -99,6 +102,7 @@ def main() -> None:
     parser.add_argument("--in-features", type=int, default=512)
     parser.add_argument("--out-features", type=int, default=512)
     parser.add_argument("--dtype", choices=tuple(DTYPES), default="fp16")
+    parser.add_argument("--kernel-variant", choices=("auto", "tiled", "warp"), default="auto")
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--repeat", type=int, default=100)
     parser.add_argument("--json-out", type=Path, default=None)
@@ -115,6 +119,7 @@ def main() -> None:
         in_features=args.in_features,
         out_features=args.out_features,
         dtype=DTYPES[args.dtype],
+        kernel_variant=args.kernel_variant,
         warmup=args.warmup,
         repeat=args.repeat,
     )

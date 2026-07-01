@@ -46,6 +46,7 @@ from cortex3_llm import (
     llm_doctor_report,
     main as llm_main,
 )
+from tools.benchmark_learned_memory_policy import run_learned_memory_ablation
 from tools.launch_llm_ddp import _manifest_requests_cuda, _train_args_request_cuda
 
 
@@ -161,6 +162,28 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
         self.assertGreater(breakdown.learned_memory, 0.0)
         self.assertGreater(float(model.learned_memory.policy[-1].weight.grad.abs().sum()), 0.0)
         self.assertGreater(model.compression_ledger.total_packed_ternary_dispatches, 0)
+
+    def test_learned_memory_ablation_shows_policy_can_reduce_loss(self):
+        report = run_learned_memory_ablation(device="cpu", steps=8, seed=202)
+
+        self.assertTrue(report["passed_short_ablation"], report)
+        self.assertGreater(report["shared_weight_tensors"], 0)
+        self.assertGreater(report["max_learned_memory_gradient_l1"], 0.0)
+        self.assertGreater(report["loss_delta_before_minus_after"]["total"], 0.0)
+        self.assertGreater(report["loss_delta_before_minus_after"]["next_token"], 0.0)
+        self.assertGreater(report["policy_probability_shift_l1"], 0.0)
+        before = report["learned_memory_before_policy"]
+        after = report["learned_memory_after_policy"]
+        self.assertEqual(before["tokens"], 64)
+        self.assertEqual(after["tokens"], 64)
+        self.assertEqual(
+            before["exact_decisions"] + before["latent_decisions"] + before["drop_decisions"],
+            before["tokens"],
+        )
+        self.assertEqual(
+            after["exact_decisions"] + after["latent_decisions"] + after["drop_decisions"],
+            after["tokens"],
+        )
 
     def test_tokenized_corpus_builder_streams_tokens_once(self):
         class CountingTokenizer:
@@ -1000,6 +1023,7 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             self.assertGreater(influence["packed_ternary_dispatches"], 0)
             if phase_report["native_ternary_kernel_required"]:
                 self.assertGreater(influence["native_ternary_kernel_dispatches"], 0)
+                self.assertTrue(influence["native_ternary_kernel_variants"])
             self.assertGreater(influence["variable_input_compression_events"], 0)
             self.assertGreater(influence["learned_memory_policy_events"], 0)
             self.assertGreater(influence["learned_memory_anchor_supervision_events"], 0)
