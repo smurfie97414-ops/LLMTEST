@@ -75,8 +75,33 @@ def benchmark_case(
             log_prefix="bench-native-ternary",
         )
     ).cuda()
+    legacy_layer = BitLinear(
+        BitLinearConfig(
+            in_features,
+            out_features,
+            activation_bits=0,
+            residual_runtime=False,
+            require_native_cuda_kernel=True,
+            native_cuda_kernel_variant=kernel_variant,
+            native_cuda_autotune=enable_autotune,
+            native_cuda_autotune_warmup=autotune_warmup,
+            native_cuda_autotune_repeat=autotune_repeat,
+            native_cuda_autotune_cache_path=str(autotune_cache_path) if autotune_cache_path is not None else None,
+            native_cuda_autotune_cache_write=autotune_cache_write,
+            use_fast_ste_autograd=False,
+            log_prefix="bench-legacy-ste",
+        )
+    ).cuda()
+    with torch.no_grad():
+        legacy_layer.float_weight.copy_(layer.float_weight)
+        if layer.bias is not None and legacy_layer.bias is not None:
+            legacy_layer.bias.copy_(layer.bias)
     x = torch.randn(batch, in_features, device="cuda", dtype=dtype)
+    x_train = x.detach().clone().requires_grad_(True)
+    legacy_x_train = x.detach().clone().requires_grad_(True)
+    target = torch.randn(batch, out_features, device="cuda", dtype=dtype)
     layer._sync_quantized_buffers_from_weight(record_decision=False)
+    legacy_layer._sync_quantized_buffers_from_weight(record_decision=False)
 
     def native() -> torch.Tensor:
         return layer._native_cuda_packed_output(x)
@@ -97,6 +122,20 @@ def benchmark_case(
     def bitlinear_forward() -> torch.Tensor:
         return layer(x)
 
+    def bitlinear_forward_backward() -> torch.Tensor:
+        layer.zero_grad(set_to_none=True)
+        x_train.grad = None
+        loss = (layer(x_train).float() - target.float()).square().mean()
+        loss.backward()
+        return loss
+
+    def legacy_forward_backward() -> torch.Tensor:
+        legacy_layer.zero_grad(set_to_none=True)
+        legacy_x_train.grad = None
+        loss = (legacy_layer(legacy_x_train).float() - target.float()).square().mean()
+        loss.backward()
+        return loss
+
     native_out = native()
     unpacked_out = torch_unpacked()
     ste_out = ste_dense()
@@ -109,6 +148,8 @@ def benchmark_case(
     unpacked_ms = _time_cuda(torch_unpacked, warmup=warmup, repeat=repeat)
     ste_dense_ms = _time_cuda(ste_dense, warmup=warmup, repeat=repeat)
     full_forward_ms = _time_cuda(bitlinear_forward, warmup=warmup, repeat=repeat)
+    full_forward_backward_ms = _time_cuda(bitlinear_forward_backward, warmup=max(1, warmup // 2), repeat=max(1, repeat // 2))
+    legacy_forward_backward_ms = _time_cuda(legacy_forward_backward, warmup=max(1, warmup // 2), repeat=max(1, repeat // 2))
     legacy_training_forward_ms = native_ms + ste_dense_ms
     return {
         "batch": int(batch),
@@ -126,11 +167,14 @@ def benchmark_case(
         "torch_unpack_linear_ms": unpacked_ms,
         "ste_dense_ms": ste_dense_ms,
         "full_bitlinear_forward_ms": full_forward_ms,
+        "full_bitlinear_forward_backward_ms": full_forward_backward_ms,
+        "legacy_dense_ste_forward_backward_ms": legacy_forward_backward_ms,
         "legacy_training_forward_native_plus_ste_dense_ms": legacy_training_forward_ms,
         "estimated_training_forward_native_plus_ste_ms": legacy_training_forward_ms,
         "ste_dense_over_native_ratio": ste_dense_ms / max(native_ms, 1e-9),
         "fast_ste_autograd_enabled": bool(layer.config.use_fast_ste_autograd),
         "full_forward_speedup_vs_legacy_native_plus_ste_dense": legacy_training_forward_ms / max(full_forward_ms, 1e-9),
+        "full_forward_backward_speedup_vs_legacy_dense_ste": legacy_forward_backward_ms / max(full_forward_backward_ms, 1e-9),
         "full_forward_over_native_ratio": full_forward_ms / max(native_ms, 1e-9),
         "speedup_vs_torch_unpack_linear": unpacked_ms / max(native_ms, 1e-9),
         "speedup_vs_ste_dense": ste_dense_ms / max(native_ms, 1e-9),

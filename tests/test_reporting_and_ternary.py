@@ -257,6 +257,64 @@ class ReportingAndTernaryTest(unittest.TestCase):
         __import__("torch").cuda.is_available() and native_ternary_cuda_available(),
         "CUDA plus CuPy native ternary kernel is required",
     )
+    def test_native_ternary_cuda_fast_ste_backward_matches_dense_ste(self):
+        import torch
+
+        torch.manual_seed(31)
+        for dtype, atol in ((torch.float32, 2e-5), (torch.float16, 4e-2), (torch.bfloat16, 5e-2)):
+            for residual_runtime in (False, True):
+                with self.subTest(dtype=str(dtype), residual_runtime=residual_runtime):
+                    fast = BitLinear(BitLinearConfig(
+                        19,
+                        13,
+                        activation_bits=0,
+                        residual_runtime=residual_runtime,
+                        require_native_cuda_kernel=True,
+                        native_cuda_kernel_variant="warp",
+                        native_cuda_autotune=False,
+                        use_fast_ste_autograd=True,
+                        log_prefix=f"cuda-fast-ste-{dtype}",
+                    )).cuda()
+                    dense = BitLinear(BitLinearConfig(
+                        19,
+                        13,
+                        activation_bits=0,
+                        residual_runtime=residual_runtime,
+                        require_native_cuda_kernel=True,
+                        native_cuda_kernel_variant="warp",
+                        native_cuda_autotune=False,
+                        use_fast_ste_autograd=False,
+                        log_prefix=f"cuda-dense-ste-{dtype}",
+                    )).cuda()
+                    with torch.no_grad():
+                        dense.float_weight.copy_(fast.float_weight)
+                        if fast.bias is not None and dense.bias is not None:
+                            dense.bias.copy_(fast.bias)
+                    fast.requantize()
+                    dense.requantize()
+                    x_fast = torch.randn(7, 19, device="cuda", dtype=dtype, requires_grad=True)
+                    x_dense = x_fast.detach().clone().requires_grad_(True)
+
+                    fast_loss = fast(x_fast).float().square().mean()
+                    dense_loss = dense(x_dense).float().square().mean()
+                    fast_loss.backward()
+                    dense_loss.backward()
+                    torch.cuda.synchronize()
+
+                    self.assertTrue(torch.allclose(fast_loss.detach(), dense_loss.detach(), atol=atol, rtol=atol))
+                    self.assertTrue(torch.allclose(x_fast.grad.float(), x_dense.grad.float(), atol=atol, rtol=atol))
+                    self.assertTrue(torch.allclose(fast.float_weight.grad, dense.float_weight.grad, atol=atol, rtol=atol))
+                    self.assertIsNotNone(fast.bias.grad)
+                    self.assertIsNotNone(dense.bias.grad)
+                    self.assertTrue(torch.allclose(fast.bias.grad, dense.bias.grad, atol=atol, rtol=atol))
+                    dispatch = fast.ledger.packed_ternary_dispatches[-1]
+                    self.assertTrue(dispatch.native_kernel)
+                    self.assertIn("custom autograd STE backward", dispatch.note)
+
+    @unittest.skipUnless(
+        __import__("torch").cuda.is_available() and native_ternary_cuda_available(),
+        "CUDA plus CuPy native ternary kernel is required",
+    )
     def test_native_ternary_cuda_kernel_matches_packed_runtime_for_training_dtypes(self):
         import torch
         import torch.nn.functional as F

@@ -32,6 +32,7 @@ Preuve post-integration des deux nouvelles briques :
 - `test_learned_memory_ablation_shows_policy_can_reduce_loss` : ablation courte a poids partages, memoire apprise active vs desactivee, puis entrainement de la seule politique exact/latent/drop avec delta `before - after` positif sur total et next-token loss ;
 - `test_bitlinear_native_packed_ternary_cuda_dispatch_runs_on_gpu` : backend natif `native_int2_cupy_cuda_*` execute sur le GPU local avec gradient STE non nul ;
 - `test_native_ternary_cuda_kernel_matches_packed_runtime_for_training_dtypes` : le kernel natif correspond au runtime packe en fp32, fp16 et bf16 ;
+- `test_native_ternary_cuda_fast_ste_backward_matches_dense_ste` : le backward fast STE CUDA correspond au dense STE en fp32, fp16 et bf16, avec `grad_input` calcule depuis les poids int2 packes ;
 - `test_full_cortex_phase_controller_uses_all_modules_during_training` : mini training LLM complet avec audits exigeant `learned_cognitive_memory_policy`, `packed_ternary_hardware_runtime` et `native_ternary_cuda_kernel` quand CUDA est disponible.
 
 Le long run devra produire un nouveau sidecar sous le commit de cette integration pour remplacer l'ancien audit `22/22` par l'audit courant plus strict incluant `native_ternary_cuda_kernel`.
@@ -285,6 +286,7 @@ Quand `use_ternary_core=True`, les lineaires principaux deviennent des `BitLinea
 - layer forward events ;
 - `PackedTernaryDispatch` avec backend `packed_int2_torch`, `packed_int2_cuda`, `native_int2_cupy_cuda_tiled_shared_memory_int2` ou `native_int2_cupy_cuda_warp_reduction_int2`, plus les champs `autotuned`, `autotune_cache_hit` et `autotune_candidate_ms`.
 - `TransformerConfig.native_ternary_autotune_cache_path` peut brancher un profil JSON d'autotune dans les `BitLinear` du vrai training.
+- backward fast STE CUDA qui calcule `grad_input` directement depuis les codes int2 packes, les scales et le residual optionnel.
 
 ### Interaction Avec Les Autres Phases
 
@@ -296,11 +298,11 @@ P2 fournit les traces de compression a :
 
 ### Impact Apprentissage
 
-Le forward lit la valeur runtime depuis les codes ternaires packes, puis utilise une estimation straight-through pour garder un gradient vers `float_weight`. Le modele apprend donc avec une valeur avant ternaire packee, pas seulement avec une couche float habillee par des logs.
+Le forward lit la valeur runtime depuis les codes ternaires packes, puis utilise une estimation straight-through pour garder un gradient vers `float_weight`. Sur CUDA fp32/fp16/bf16, le fast STE calcule aussi `grad_input` depuis les codes int2 packes au lieu de reconstruire un poids dense pour cette partie. Le modele apprend donc avec une valeur avant ternaire packee et un morceau important du backward ternaire packe, pas seulement avec une couche float habillee par des logs.
 
 ### Preuve Runtime
 
-Le checkpoint inspecte montre `P2=238652` evenements. Les tests ajoutes verifient en plus que `BitLinear` execute un dispatch CUDA natif tuilé ou warp-reduction sur GPU local, que les valeurs fp32/fp16/bf16 correspondent au runtime packe, que l'auto-selection choisit la variante attendue selon la forme, et que le gradient STE reste non nul vers les poids entrainables.
+Le checkpoint inspecte montre `P2=238652` evenements. Les tests ajoutes verifient en plus que `BitLinear` execute un dispatch CUDA natif tuilé ou warp-reduction sur GPU local, que les valeurs fp32/fp16/bf16 correspondent au runtime packe, que l'auto-selection choisit la variante attendue selon la forme, que le backward fast STE garde la meme semantique que le dense STE pour `grad_input`, `grad_weight` et `grad_bias`, et que le gradient STE reste non nul vers les poids entrainables.
 
 ## Phase 3 - Future Contract / FSP / MTP
 

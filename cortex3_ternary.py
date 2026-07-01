@@ -394,6 +394,93 @@ extern "C" __global__ void ternary_matmul_warp_bf16(
     out[output_index] = __float2bfloat16(acc);
   }
 }
+
+extern "C" __global__ void ternary_grad_input_warp_fp32(
+    const float* grad_out,
+    const unsigned char* packed,
+    const float* scales,
+    const float* residual,
+    float* grad_x,
+    int m_rows,
+    int n_cols,
+    int k_cols,
+    int packed_stride,
+    int use_residual) {
+  int lane = threadIdx.x & 31;
+  int warp = threadIdx.x >> 5;
+  int output_index = blockIdx.x * C3_WARPS_PER_BLOCK + warp;
+  int total = m_rows * k_cols;
+  if (output_index >= total) return;
+  int m = output_index / k_cols;
+  int k = output_index - m * k_cols;
+  float acc = 0.0f;
+  for (int n = lane; n < n_cols; n += 32) {
+    acc += grad_out[m * n_cols + n]
+        * c3_decode_weight(packed, scales, residual, n, k, packed_stride, k_cols, use_residual);
+  }
+  acc = c3_warp_sum(acc);
+  if (lane == 0) {
+    grad_x[output_index] = acc;
+  }
+}
+
+extern "C" __global__ void ternary_grad_input_warp_fp16(
+    const __half* grad_out,
+    const unsigned char* packed,
+    const float* scales,
+    const float* residual,
+    __half* grad_x,
+    int m_rows,
+    int n_cols,
+    int k_cols,
+    int packed_stride,
+    int use_residual) {
+  int lane = threadIdx.x & 31;
+  int warp = threadIdx.x >> 5;
+  int output_index = blockIdx.x * C3_WARPS_PER_BLOCK + warp;
+  int total = m_rows * k_cols;
+  if (output_index >= total) return;
+  int m = output_index / k_cols;
+  int k = output_index - m * k_cols;
+  float acc = 0.0f;
+  for (int n = lane; n < n_cols; n += 32) {
+    acc += __half2float(grad_out[m * n_cols + n])
+        * c3_decode_weight(packed, scales, residual, n, k, packed_stride, k_cols, use_residual);
+  }
+  acc = c3_warp_sum(acc);
+  if (lane == 0) {
+    grad_x[output_index] = __float2half(acc);
+  }
+}
+
+extern "C" __global__ void ternary_grad_input_warp_bf16(
+    const __nv_bfloat16* grad_out,
+    const unsigned char* packed,
+    const float* scales,
+    const float* residual,
+    __nv_bfloat16* grad_x,
+    int m_rows,
+    int n_cols,
+    int k_cols,
+    int packed_stride,
+    int use_residual) {
+  int lane = threadIdx.x & 31;
+  int warp = threadIdx.x >> 5;
+  int output_index = blockIdx.x * C3_WARPS_PER_BLOCK + warp;
+  int total = m_rows * k_cols;
+  if (output_index >= total) return;
+  int m = output_index / k_cols;
+  int k = output_index - m * k_cols;
+  float acc = 0.0f;
+  for (int n = lane; n < n_cols; n += 32) {
+    acc += __bfloat162float(grad_out[m * n_cols + n])
+        * c3_decode_weight(packed, scales, residual, n, k, packed_stride, k_cols, use_residual);
+  }
+  acc = c3_warp_sum(acc);
+  if (lane == 0) {
+    grad_x[output_index] = __float2bfloat16(acc);
+  }
+}
 """
 
 _CUPY_TERNARY_KERNEL_NAMES = {
@@ -407,6 +494,11 @@ _CUPY_TERNARY_KERNEL_NAMES = {
         torch.float16: "ternary_matmul_warp_fp16",
         torch.bfloat16: "ternary_matmul_warp_bf16",
     },
+}
+_CUPY_TERNARY_GRAD_INPUT_KERNEL_NAMES = {
+    torch.float32: "ternary_grad_input_warp_fp32",
+    torch.float16: "ternary_grad_input_warp_fp16",
+    torch.bfloat16: "ternary_grad_input_warp_bf16",
 }
 _CUPY_TERNARY_KERNEL_CACHE: dict[Any, Any] = {}
 _NATIVE_TERNARY_AUTOTUNE_CACHE: dict[tuple[Any, ...], tuple[str, tuple[tuple[str, float], ...]]] = {}
@@ -544,15 +636,83 @@ def _cupy_ternary_kernel(dtype: Any, variant: str = "tiled") -> tuple[Any, Any]:
     return cp, _CUPY_TERNARY_KERNEL_CACHE[key]
 
 
+def _cupy_ternary_grad_input_kernel(dtype: Any) -> tuple[Any, Any]:
+    if dtype not in _CUPY_TERNARY_GRAD_INPUT_KERNEL_NAMES:
+        raise RuntimeError(f"native ternary CUDA grad-input kernel does not support dtype {dtype}")
+    cp = _load_cupy()
+    key = ("grad_input_warp", dtype)
+    if key not in _CUPY_TERNARY_KERNEL_CACHE:
+        _CUPY_TERNARY_KERNEL_CACHE[key] = cp.RawKernel(
+            _CUPY_TERNARY_KERNEL_SOURCE,
+            _CUPY_TERNARY_GRAD_INPUT_KERNEL_NAMES[dtype],
+            options=("--std=c++17",),
+        )
+    return cp, _CUPY_TERNARY_KERNEL_CACHE[key]
+
+
 def native_ternary_cuda_available() -> bool:
     if not torch.cuda.is_available():
         return False
     try:
         _cupy_ternary_kernel(torch.float32, "tiled")
         _cupy_ternary_kernel(torch.float32, "warp")
+        _cupy_ternary_grad_input_kernel(torch.float32)
     except Exception:
         return False
     return True
+
+
+def _native_packed_ternary_grad_input_cuda(
+    grad_output_flat: Any,
+    packed_codes: Any,
+    scales: Any,
+    residual_weight: Any,
+    in_features: int,
+    *,
+    residual_runtime: bool,
+) -> Any:
+    if not grad_output_flat.is_cuda:
+        raise RuntimeError("native ternary CUDA grad-input kernel requires CUDA grad_output")
+    if grad_output_flat.dtype not in _CUPY_TERNARY_GRAD_INPUT_KERNEL_NAMES:
+        raise RuntimeError(f"native ternary CUDA grad-input kernel does not support dtype {grad_output_flat.dtype}")
+    cp, kernel = _cupy_ternary_grad_input_kernel(grad_output_flat.dtype)
+    grad_out = grad_output_flat.detach().contiguous()
+    m_rows = int(grad_out.shape[0])
+    n_cols = int(grad_out.shape[1])
+    k_cols = int(in_features)
+    packed = packed_codes.to(device=grad_out.device, dtype=torch.uint8).contiguous()
+    scale_values = scales.detach().to(device=grad_out.device, dtype=torch.float32).contiguous().view(-1)
+    residual = (
+        residual_weight.detach().to(device=grad_out.device, dtype=torch.float32).contiguous()
+        if residual_runtime
+        else torch.empty((0,), device=grad_out.device, dtype=torch.float32)
+    )
+    grad_x = torch.empty((m_rows, k_cols), device=grad_out.device, dtype=grad_out.dtype)
+    warps_per_block = 8
+    total_outputs = m_rows * k_cols
+    blocks = ((total_outputs + warps_per_block - 1) // warps_per_block,)
+    threads = (warps_per_block * 32,)
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=DeprecationWarning, message="ExternalStream is deprecated.*")
+        stream = cp.cuda.ExternalStream(torch.cuda.current_stream(grad_out.device).cuda_stream)
+    with stream:
+        kernel(
+            blocks,
+            threads,
+            (
+                cp.from_dlpack(grad_out),
+                cp.from_dlpack(packed),
+                cp.from_dlpack(scale_values),
+                cp.from_dlpack(residual),
+                cp.from_dlpack(grad_x),
+                m_rows,
+                n_cols,
+                k_cols,
+                int(packed.shape[1]),
+                int(bool(residual_runtime)),
+            ),
+        )
+    return grad_x
 
 
 def _unpack_packed_ternary_weight(
@@ -615,16 +775,26 @@ class _PackedTernarySTEFunction(torch.autograd.Function):
         x_flat = x.reshape(-1, x.shape[-1])
         grad_x = grad_weight = grad_bias = None
         if ctx.needs_input_grad[0]:
-            input_weight = _unpack_packed_ternary_weight(
-                packed_codes,
-                scales,
-                residual_weight,
-                ctx.in_features,
-                dtype=grad_output_flat.dtype,
-                device=grad_output_flat.device,
-                residual_runtime=ctx.residual_runtime,
-            )
-            grad_x = grad_output_flat.matmul(input_weight).reshape(ctx.input_shape)
+            if grad_output_flat.is_cuda and grad_output_flat.dtype in _CUPY_TERNARY_GRAD_INPUT_KERNEL_NAMES:
+                grad_x = _native_packed_ternary_grad_input_cuda(
+                    grad_output_flat,
+                    packed_codes,
+                    scales,
+                    residual_weight,
+                    ctx.in_features,
+                    residual_runtime=ctx.residual_runtime,
+                ).reshape(ctx.input_shape)
+            else:
+                input_weight = _unpack_packed_ternary_weight(
+                    packed_codes,
+                    scales,
+                    residual_weight,
+                    ctx.in_features,
+                    dtype=grad_output_flat.dtype,
+                    device=grad_output_flat.device,
+                    residual_runtime=ctx.residual_runtime,
+                )
+                grad_x = grad_output_flat.matmul(input_weight).reshape(ctx.input_shape)
         if ctx.needs_input_grad[1]:
             weight_grad = grad_output_flat.transpose(0, 1).matmul(x_flat.to(dtype=grad_output_flat.dtype))
             grad_weight = weight_grad.to(dtype=ctx.float_weight_dtype)

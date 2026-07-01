@@ -1,6 +1,6 @@
 # Cortex-3 Architecture Self-Critique
 
-Etat: boucle d'audit 4 apres integration du kernel CUDA natif tuilé/warp, de l'autotune CUDA mesure/cache, des profils persistants et du fast STE autograd.
+Etat: boucle d'audit 5 apres integration du kernel CUDA natif tuilé/warp, de l'autotune CUDA mesure/cache, des profils persistants, du fast STE autograd et du backward `grad_input` natif sur poids int2 packes.
 
 Ce document sert de registre de critique et de correction. Il ne remplace pas les tests longs interdits pour cette iteration; il se limite aux preuves courtes disponibles, aux rapports du code et aux benchmarks GPU courts.
 
@@ -83,7 +83,14 @@ Ce document sert de registre de critique et de correction. Il ne remplace pas le
 - Verification courte: test dedie confirme zero repack sur deux forwards inchanges et un repack apres modification in-place du poids; le test existant de sync apres update reste passant.
 - Statut: corrige.
 
-## Critique phase par phase - boucle 4
+### C11. Backward STE encore trop dense
+
+- Critique: apres C9, le forward training ne payait plus le `F.linear` dense STE, mais le backward reconstruisait encore un poids dense pour calculer `grad_input`. Cela limitait la valeur "hardware-native ternary" pendant l'entrainement.
+- Correction: ajout de kernels `ternary_grad_input_warp_fp32/fp16/bf16`. Le backward CUDA de `_PackedTernarySTEFunction` calcule maintenant `grad_input = grad_output @ W_ternary` directement depuis les codes int2 packes, les scales et le residual optionnel, avec accumulation fp32 par warp.
+- Verification courte: `test_native_ternary_cuda_fast_ste_backward_matches_dense_ste` compare pertes, `grad_input`, `grad_weight` et `grad_bias` entre fast STE natif et dense STE en fp32/fp16/bf16, avec et sans residual runtime, sur GPU. Benchmark RTX 5070 `128x256x256 fp16`: forward+backward fast STE `1.0521 ms` contre dense STE legacy `1.3243 ms`, soit `1.26x`, erreur max `0.000976`.
+- Statut: corrige pour `grad_input`; `grad_weight = grad_output^T @ input` reste volontairement dense/exact dans PyTorch, et le packaging C++/CUDA bas niveau reste ouvert.
+
+## Critique phase par phase - boucle 5
 
 ### P1 - Verifier OS
 
@@ -95,11 +102,11 @@ Ce document sert de registre de critique et de correction. Il ne remplace pas le
 
 ### P2 - Ternary Core
 
-- Ce qui est solide: poids ternaires packes int2, quantization activations, STE, sync versionnee des buffers packes pendant training, kernels CUDA natifs tuiles/warp, autotune CUDA-event par shape, profil JSON persistant, cache layer-local, fast STE autograd forward, audit LLM exigeant native kernel autotune sur CUDA.
-- Preuve actuelle: tests CUDA courts, export/import profil, tests gradients fast-vs-dense STE, benchmark RTX 5070 avec full forward profile, full Cortex court avec `native_ternary_autotuned_dispatches`.
-- Faiblesse: kernels encore CuPy/NVRTC, pas extension C++/CUDA packagee; pas de mesure energie/VRAM longue; pas encore de backward kernel custom.
-- Risque architectural: le forward ternaire natif est maintenant rapide, mais le backward STE reconstruit encore un poids dense et n'a pas de kernel custom.
-- Correction prioritaire restante: reduire le cout backward STE sans enlever la semantique ternaire, puis profiler energie/VRAM.
+- Ce qui est solide: poids ternaires packes int2, quantization activations, STE, sync versionnee des buffers packes pendant training, kernels CUDA natifs tuiles/warp, autotune CUDA-event par shape, profil JSON persistant, cache layer-local, fast STE autograd forward, backward CUDA `grad_input` depuis poids int2 packes, audit LLM exigeant native kernel autotune sur CUDA.
+- Preuve actuelle: tests CUDA courts, export/import profil, tests gradients fast-vs-dense STE en fp32/fp16/bf16, benchmark RTX 5070 avec full forward et forward+backward profile, full Cortex court avec `native_ternary_autotuned_dispatches`.
+- Faiblesse: kernels encore CuPy/NVRTC, pas extension C++/CUDA packagee; pas de mesure energie/VRAM longue; `grad_weight` STE reste dense pour conserver l'exactitude du gradient.
+- Risque architectural: le chemin training utilise maintenant les codes int2 en forward et pour `grad_input`, mais le gain hardware complet demandera un kernel backward plus complet ou une strategie d'optimisation qui evite/compresse le `grad_weight` dense.
+- Correction prioritaire restante: reduire ou fusionner le cout `grad_weight` STE sans casser la semantique d'apprentissage, puis profiler energie/VRAM.
 
 ### P3 - Future Contract / FSP / MTP
 
@@ -112,9 +119,9 @@ Ce document sert de registre de critique et de correction. Il ne remplace pas le
 ### P4 - Memoire cognitive apprise
 
 - Ce qui est solide: policy exact/latent/drop trainable, branchee dans forward, loss, P4 anchor supervision, checkpoints et audit.
-- Preuve actuelle: test gradient policy, ablation courte a poids partages, full Cortex court, counters exact/latent/drop/storage.
+- Preuve actuelle: test gradient policy, ablation courte a poids partages qui fige tout sauf `learned_memory.*`, delta positif `before - after` sur total et next-token loss, full Cortex court, counters exact/latent/drop/storage.
 - Faiblesse: pas encore de preuve que la politique apprise bat une regle deterministe sur long contexte held-out; supervision derivee de loss locale encore simple.
-- Risque architectural: la memoire peut etre "apprise" mais pas encore utile ou optimale.
+- Risque architectural: la memoire est bien apprise et utile sur un batch controle, mais pas encore prouvee optimale ni generalisee.
 - Correction prioritaire restante: scaler l'ablation sur anchors long-context held-out, sans se limiter au batch controle.
 
 ### P5 - Certificate Generator
@@ -199,9 +206,9 @@ Ce document sert de registre de critique et de correction. Il ne remplace pas le
 
 ### Ternary Core W in {-1,0,+1}
 
-- Statut: le forward lit les codes packes int2 et lance CUDA natif sur GPU.
-- Faiblesse: backward STE reconstruit encore une matrice dense.
-- Correction restante: reduire le cout backward STE.
+- Statut: le forward lit les codes packes int2 et lance CUDA natif sur GPU; le backward CUDA calcule aussi `grad_input` depuis les codes int2 packes.
+- Faiblesse: `grad_weight` STE reste dense et les kernels sont encore CuPy/NVRTC.
+- Correction restante: compresser/fusionner le calcul `grad_weight` et packager en extension CUDA/C++.
 
 ### Skill-aware Experts
 
