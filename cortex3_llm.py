@@ -64,6 +64,7 @@ from cortex3_ternary import (
     LayerForwardEvent,
     MTPFSPEvent,
     PackedTernaryDispatch,
+    native_ternary_cuda_available,
 )
 
 
@@ -2623,9 +2624,130 @@ def _package_versions() -> dict[str, Any]:
     return payload
 
 
+def _command_stdout(args: Sequence[str], *, timeout: float = 5.0) -> str | None:
+    try:
+        completed = subprocess.run(args, capture_output=True, text=True, timeout=timeout, check=False)
+    except Exception:
+        return None
+    if completed.returncode != 0:
+        return None
+    return completed.stdout.strip()
+
+
+def _nvcc_release_from_output(output: str | None) -> str | None:
+    if not output:
+        return None
+    for line in output.splitlines():
+        if "release " in line:
+            return line.split("release ", 1)[1].split(",", 1)[0].strip()
+    return None
+
+
+def _visual_studio_toolchain_probe() -> dict[str, Any]:
+    cl_on_path = shutil.which("cl")
+    program_files_x86 = os.environ.get("ProgramFiles(x86)")
+    vswhere = (
+        Path(program_files_x86) / "Microsoft Visual Studio" / "Installer" / "vswhere.exe"
+        if program_files_x86
+        else None
+    )
+    installation_path = None
+    if vswhere is not None and vswhere.exists():
+        installation_path = _command_stdout([
+            str(vswhere),
+            "-latest",
+            "-products",
+            "*",
+            "-requires",
+            "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+            "-property",
+            "installationPath",
+        ])
+    cl_candidates: list[str] = []
+    if installation_path:
+        vc_root = Path(installation_path) / "VC" / "Tools" / "MSVC"
+        for candidate in vc_root.glob("*/bin/Hostx64/x64/cl.exe"):
+            cl_candidates.append(str(candidate))
+    return {
+        "cl_on_path": cl_on_path,
+        "visual_studio_installation_path": installation_path,
+        "cl_candidates": tuple(sorted(cl_candidates)),
+        "cl_available": bool(cl_on_path or cl_candidates),
+    }
+
+
+def _pip_nvcc_cu12_probe() -> dict[str, Any]:
+    from importlib.metadata import PackageNotFoundError, distribution, version
+
+    try:
+        dist = distribution("nvidia-cuda-nvcc-cu12")
+        files = tuple(str(path).replace("\\", "/") for path in (dist.files or ()))
+        has_nvcc_exe = any(path.endswith("/nvcc.exe") or path.endswith("/nvcc") for path in files)
+        return {
+            "installed": True,
+            "version": version("nvidia-cuda-nvcc-cu12"),
+            "has_nvcc_exe": has_nvcc_exe,
+            "has_ptxas": any(path.endswith("/ptxas.exe") or path.endswith("/ptxas") for path in files),
+        }
+    except PackageNotFoundError:
+        return {
+            "installed": False,
+            "version": None,
+            "has_nvcc_exe": False,
+            "has_ptxas": False,
+        }
+
+
+def cuda_toolchain_report() -> dict[str, Any]:
+    nvcc_path = shutil.which("nvcc")
+    nvcc_output = _command_stdout([nvcc_path, "--version"], timeout=5.0) if nvcc_path else None
+    nvcc_release = _nvcc_release_from_output(nvcc_output)
+    torch_cuda = getattr(torch.version, "cuda", None)
+    try:
+        from torch.utils import cpp_extension
+
+        cpp_cuda_home = cpp_extension.CUDA_HOME
+    except Exception:
+        cpp_cuda_home = None
+    visual_studio = _visual_studio_toolchain_probe()
+    pip_nvcc = _pip_nvcc_cu12_probe()
+    rawkernel_available = False
+    rawkernel_error = ""
+    if torch.cuda.is_available():
+        try:
+            rawkernel_available = bool(native_ternary_cuda_available())
+        except Exception as exc:
+            rawkernel_error = f"{type(exc).__name__}: {exc}"
+    nvcc_matches_torch = bool(torch_cuda and nvcc_release and str(nvcc_release).startswith(str(torch_cuda)))
+    extension_ready = bool(torch.cuda.is_available() and visual_studio["cl_available"] and nvcc_matches_torch)
+    return {
+        "torch_cuda": torch_cuda,
+        "cuda_available": bool(torch.cuda.is_available()),
+        "cuda_home": str(cpp_cuda_home) if cpp_cuda_home else None,
+        "cuda_path": os.environ.get("CUDA_PATH"),
+        "nvcc_path": nvcc_path,
+        "nvcc_release": nvcc_release,
+        "nvcc_matches_torch_cuda": nvcc_matches_torch,
+        "visual_studio": visual_studio,
+        "pip_nvidia_cuda_nvcc_cu12": pip_nvcc,
+        "native_rawkernel_available": rawkernel_available,
+        "native_rawkernel_error": rawkernel_error,
+        "cuda_extension_toolchain_ready": extension_ready,
+        "cuda_extension_blocker": (
+            ""
+            if extension_ready
+            else (
+                "CUDA C++ extension build requires cl plus an nvcc toolkit whose major.minor version matches torch.version.cuda; "
+                f"torch={torch_cuda}, nvcc={nvcc_release}, cl_available={visual_studio['cl_available']}"
+            )
+        ),
+    }
+
+
 def llm_doctor_report(
     *,
     require_cuda: bool = False,
+    require_cuda_extension: bool = False,
     precision: str = "bf16",
     device: str = "auto",
     distributed: bool = False,
@@ -2633,6 +2755,7 @@ def llm_doctor_report(
 ) -> dict[str, Any]:
     hardware = hardware_report()
     dependencies = _package_versions()
+    cuda_toolchain = cuda_toolchain_report()
     device_type = "cuda" if (device == "auto" and torch.cuda.is_available()) or str(device).startswith("cuda") else "cpu"
     checks: list[dict[str, Any]] = []
 
@@ -2644,6 +2767,17 @@ def llm_doctor_report(
     add_check("torch:cuda_available", bool(hardware["cuda_available"]), f"cuda_device_count={hardware['cuda_device_count']}", required=require_cuda)
     if require_cuda:
         add_check("torch:require_cuda", device_type == "cuda" and bool(hardware["cuda_available"]), f"resolved_device_type={device_type}")
+        add_check(
+            "cuda:native_rawkernel_available",
+            bool(cuda_toolchain["native_rawkernel_available"]),
+            cuda_toolchain["native_rawkernel_error"] or "CuPy RawKernel ternary kernels compile",
+        )
+    add_check(
+        "cuda:extension_toolchain_ready",
+        bool(cuda_toolchain["cuda_extension_toolchain_ready"]),
+        cuda_toolchain["cuda_extension_blocker"] or "CUDA C++ extension toolchain is ready",
+        required=require_cuda_extension,
+    )
 
     try:
         dtype = PrecisionPolicy(precision, require_cuda=require_cuda).dtype(device_type)
@@ -2667,12 +2801,14 @@ def llm_doctor_report(
         "device_type": device_type,
         "requested": {
             "require_cuda": require_cuda,
+            "require_cuda_extension": require_cuda_extension,
             "precision": precision,
             "device": device,
             "distributed": distributed,
             "gloo_interface": gloo_interface,
         },
         "hardware": hardware,
+        "cuda_toolchain": cuda_toolchain,
         "dependencies": dependencies,
         "checks": tuple(checks),
         "failed_required_checks": tuple(failed_required),
@@ -7410,6 +7546,7 @@ class LLMExperimentRunner:
         payload = dict(raw or {})
         return {
             "require_cuda": bool(payload.get("require_cuda", False)),
+            "require_cuda_extension": bool(payload.get("require_cuda_extension", False)),
             "precision": str(payload.get("precision", "bf16")),
             "device": str(payload.get("device", "auto")),
             "distributed": bool(payload.get("distributed", False)),
@@ -8342,6 +8479,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     doctor.add_argument("--precision", choices=("fp32", "bf16", "fp16"), default="bf16")
     doctor.add_argument("--device", default="auto")
     doctor.add_argument("--require-cuda", action="store_true")
+    doctor.add_argument("--require-cuda-extension", action="store_true")
     doctor.add_argument("--distributed", action="store_true")
     doctor.add_argument("--gloo-interface", default=None)
 
@@ -8543,6 +8681,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     if args.command == "doctor":
         report = llm_doctor_report(
             require_cuda=args.require_cuda,
+            require_cuda_extension=args.require_cuda_extension,
             precision=args.precision,
             device=args.device,
             distributed=args.distributed,

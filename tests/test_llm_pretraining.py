@@ -2248,8 +2248,17 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
         self.assertIn("torch", report["dependencies"])
         self.assertTrue(report["dependencies"]["torch"]["installed"])
         self.assertIn("hardware", report)
+        self.assertIn("cuda_toolchain", report)
+        self.assertIn("cuda_extension_toolchain_ready", report["cuda_toolchain"])
         self.assertIn("checks", report)
         self.assertTrue(report["passed"], report)
+        check_names = {check["name"] for check in report["checks"]}
+        self.assertIn("cuda:extension_toolchain_ready", check_names)
+        extension_report = llm_doctor_report(precision="fp32", device="auto", require_cuda_extension=True)
+        if not extension_report["cuda_toolchain"]["cuda_extension_toolchain_ready"]:
+            self.assertFalse(extension_report["passed"], extension_report)
+            failed_names = {check["name"] for check in extension_report["failed_required_checks"]}
+            self.assertIn("cuda:extension_toolchain_ready", failed_names)
         if not torch.cuda.is_available():
             cuda_report = llm_doctor_report(require_cuda=True, precision="fp32", device="auto")
             self.assertFalse(cuda_report["passed"], cuda_report)

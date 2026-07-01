@@ -156,6 +156,8 @@ python tools/benchmark_learned_memory_policy.py --device cuda
 - `batch=128, in=256, out=256, fp16`, requantize/pack post-update : kernel CUDA fusionné `0.2245 ms` contre chemin PyTorch `0.5901 ms`, soit `2.63x`.
 - `batch=512, in=512, out=512, fp16` : autotune `warp_reduction_int2`, candidats `tiled=0.5668 ms`, `warp=0.3368 ms`, runtime natif `0.2561 ms` contre `0.2734 ms` pour unpack+`F.linear`, soit `1.07x`, erreur max `0.000976`.
 
+Le doctor distingue maintenant le backend RawKernel actuel et le futur packaging C++/CUDA. Sur ce PC, `tools/train_llm.py doctor --require-cuda --precision bf16 --device cuda` passe avec `native_rawkernel_available=true`. En revanche `--require-cuda-extension` échoue explicitement tant que le toolkit complet `nvcc.exe` ne matche pas `torch.version.cuda=12.8` : Visual Studio/cl est détecté, mais le `nvcc` local est CUDA 13.2.
+
 `tools/benchmark_learned_memory_policy.py` exécute une ablation courte contrôlée : mêmes poids partagés, mémoire apprise active contre mémoire désactivée, puis entraînement de la seule politique exact/latent/drop. Le rapport JSON expose les losses avant/après, le gradient mémoire, les décisions exact/latent/drop et le delta `before - after`.
 
 ## Démo noyau
