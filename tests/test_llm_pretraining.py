@@ -1006,6 +1006,7 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                     measure_candidate_count=2,
                     measure_candidate_adaptive_rounds=1,
                     refine_uncertain_extra_seed_count=0,
+                    confirm_selected_decision_resolution_extra_rounds=0,
                     measured_selection_metric="throughput",
                     min_cases=2,
                     require_multi_seed=True,
@@ -1146,6 +1147,7 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                     measure_candidate_count=2,
                     measure_candidate_adaptive_rounds=1,
                     refine_uncertain_extra_seed_count=0,
+                    confirm_selected_decision_resolution_extra_rounds=0,
                     measured_selection_metric="throughput",
                     min_cases=2,
                     require_multi_seed=True,
@@ -1193,7 +1195,7 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
         self.assertIn("confirm_seed_104742", str(profile_calls[4]["out_dir"]))
         self.assertIn("confirm_seed_209471", str(profile_calls[6]["out_dir"]))
 
-    def test_llm_batch_profile_autosize_uses_spare_round_to_resolve_confirmed_margin(self):
+    def test_llm_batch_profile_autosize_uses_dedicated_budget_to_resolve_confirmed_margin(self):
         profile_calls = []
 
         def fake_profile(**kwargs):
@@ -1264,6 +1266,7 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                     measure_candidate_count=3,
                     measure_candidate_adaptive_rounds=1,
                     refine_uncertain_extra_seed_count=0,
+                    confirm_selected_max_rounds=2,
                     measured_selection_metric="throughput",
                     min_cases=2,
                     require_multi_seed=True,
@@ -1277,7 +1280,8 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
         self.assertTrue(report["measurement"]["confirmation_complete"])
         self.assertTrue(report["measurement"]["confirmation_decision_resolved"])
         self.assertGreater(report["measurement"]["confirmation_decision_margin"], 0.0)
-        self.assertEqual(report["measurement"]["confirm_selected_max_rounds"], 3)
+        self.assertEqual(report["measurement"]["confirm_selected_max_rounds"], 2)
+        self.assertEqual(report["measurement"]["confirm_selected_decision_resolution_extra_rounds"], 3)
         self.assertEqual(report["measurement"]["confirmation_rounds_used"], 3)
         self.assertEqual(report["measurement"]["confirmation_decision_resolution_rounds_used"], 1)
         self.assertEqual(report["measurement"]["confirmed_candidate_count"], 4)

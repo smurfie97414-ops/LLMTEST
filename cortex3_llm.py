@@ -10203,6 +10203,7 @@ def run_llm_batch_profile_autosize(
     confirm_selected_step_multiplier: int = 2,
     confirm_selected_repeat_count: int = 2,
     confirm_selected_max_rounds: int | None = None,
+    confirm_selected_decision_resolution_extra_rounds: int | None = None,
     measured_selection_metric: str = "throughput_gpu",
     min_cases: int = 1,
     require_multi_shape: bool = False,
@@ -10264,6 +10265,16 @@ def run_llm_batch_profile_autosize(
     )
     if requested_confirm_selected_max_rounds is not None and requested_confirm_selected_max_rounds < 1:
         raise ValueError("confirm_selected_max_rounds must be positive")
+    requested_confirm_selected_decision_resolution_extra_rounds = (
+        None
+        if confirm_selected_decision_resolution_extra_rounds is None
+        else int(confirm_selected_decision_resolution_extra_rounds)
+    )
+    if (
+        requested_confirm_selected_decision_resolution_extra_rounds is not None
+        and requested_confirm_selected_decision_resolution_extra_rounds < 0
+    ):
+        raise ValueError("confirm_selected_decision_resolution_extra_rounds must be >= 0")
     if measure_candidate_strategy not in PROFILE_AUTOSIZE_MEASUREMENT_STRATEGIES:
         raise ValueError(
             f"unknown measure_candidate_strategy {measure_candidate_strategy!r}; "
@@ -10420,6 +10431,11 @@ def run_llm_batch_profile_autosize(
         max(1, int(effective_measure_candidate_count or selected_shape_count))
         if requested_confirm_selected_max_rounds is None
         else requested_confirm_selected_max_rounds
+    )
+    effective_confirm_selected_decision_resolution_extra_rounds = (
+        max(1, int(effective_measure_candidate_count or selected_shape_count))
+        if requested_confirm_selected_decision_resolution_extra_rounds is None
+        else requested_confirm_selected_decision_resolution_extra_rounds
     )
     if effective_measure_candidate_count > 0:
         aggregated_measurement_rows: list[Mapping[str, Any]] = []
@@ -10964,19 +10980,31 @@ def run_llm_batch_profile_autosize(
             for confirm_round_offset in range(effective_confirm_selected_max_rounds):
                 confirmation_state = selected_confirmation_frontier_state()
                 pending_inputs = tuple(confirmation_state["pending_candidates"])
-                if not pending_inputs and confirmation_decision_resolved(confirmation_state):
-                    confirmation_complete = True
+                if not pending_inputs:
+                    if confirmation_decision_resolved(confirmation_state):
+                        confirmation_complete = True
                     break
-                if pending_inputs:
-                    confirmation_inputs = pending_inputs[: int(requested_confirm_selected_candidate_count)]
-                    confirmation_round_kind = "selected_candidate_confirmation"
-                else:
-                    confirmation_inputs = decision_resolution_inputs(confirmation_state)
-                    confirmation_round_kind = "decision_margin_resolution"
                 confirmed_count = confirm_selected_candidates(
                     round_index=round_index + 2 + confirm_round_offset,
-                    confirmation_inputs=confirmation_inputs,
-                    round_kind=confirmation_round_kind,
+                    confirmation_inputs=pending_inputs[: int(requested_confirm_selected_candidate_count)],
+                    round_kind="selected_candidate_confirmation",
+                )
+                if confirmed_count <= 0:
+                    break
+            for resolution_round_offset in range(effective_confirm_selected_decision_resolution_extra_rounds):
+                confirmation_state = selected_confirmation_frontier_state()
+                if tuple(confirmation_state["pending_candidates"]):
+                    break
+                if confirmation_decision_resolved(confirmation_state):
+                    confirmation_complete = True
+                    break
+                confirmed_count = confirm_selected_candidates(
+                    round_index=round_index
+                    + 2
+                    + effective_confirm_selected_max_rounds
+                    + resolution_round_offset,
+                    confirmation_inputs=decision_resolution_inputs(confirmation_state),
+                    round_kind="decision_margin_resolution",
                 )
                 if confirmed_count <= 0:
                     break
@@ -11159,6 +11187,7 @@ def run_llm_batch_profile_autosize(
             "confirm_selected_step_multiplier": requested_confirm_selected_step_multiplier,
             "confirm_selected_repeat_count": requested_confirm_selected_repeat_count,
             "confirm_selected_max_rounds": effective_confirm_selected_max_rounds,
+            "confirm_selected_decision_resolution_extra_rounds": effective_confirm_selected_decision_resolution_extra_rounds,
             "confirmation_rounds_used": len(confirmation_rounds),
             "confirmation_decision_resolution_rounds_used": sum(
                 1 for round_ in confirmation_rounds if str(round_.get("round_kind", "")) == "decision_margin_resolution"
@@ -11439,7 +11468,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     profile_autosize.add_argument("--confirm-selected-extra-seed-count", type=int, default=1, help="fresh confirmation seeds per final selected candidate before final ranking")
     profile_autosize.add_argument("--confirm-selected-step-multiplier", type=int, default=2, help="multiply profile steps for final selected candidate confirmation")
     profile_autosize.add_argument("--confirm-selected-repeat-count", type=int, default=2, help="repeat each final selected confirmation seed profile to reduce runtime jitter")
-    profile_autosize.add_argument("--confirm-selected-max-rounds", type=int, default=None, help="maximum final-selection confirmation rounds; default allows the winner to change once and still be confirmed")
+    profile_autosize.add_argument("--confirm-selected-max-rounds", type=int, default=None, help="maximum finalist/frontier confirmation rounds; default covers the measured frontier")
+    profile_autosize.add_argument("--confirm-selected-decision-resolution-extra-rounds", type=int, default=None, help="extra decision-margin resolution rounds after the measured frontier is confirmed; default covers the measured frontier")
     profile_autosize.add_argument("--measured-selection-metric", choices=PROFILE_AUTOSIZE_MEASURED_SELECTION_METRICS, default="throughput_gpu")
     profile_autosize.add_argument("--min-cases", type=int, default=1)
     profile_autosize.add_argument("--require-multi-shape", action="store_true")
@@ -11838,6 +11868,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             confirm_selected_step_multiplier=args.confirm_selected_step_multiplier,
             confirm_selected_repeat_count=args.confirm_selected_repeat_count,
             confirm_selected_max_rounds=args.confirm_selected_max_rounds,
+            confirm_selected_decision_resolution_extra_rounds=args.confirm_selected_decision_resolution_extra_rounds,
             measured_selection_metric=args.measured_selection_metric,
             min_cases=args.min_cases,
             require_multi_shape=args.require_multi_shape,
