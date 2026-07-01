@@ -9,6 +9,7 @@ import torch.nn as nn
 
 from cortex3 import CandidateAnswer, CostTrace, DynamicSkillVerifier, Task, VerificationCaseResult
 from cortex3_certificates import CertificateHead, CertificateType, CertificateVerifier, LatentProofState, ShortCertificate, build_certificate
+from cortex3_frontier import CompiledFrontierAgent, FrontierCircuitRegistry
 from cortex3_future import FutureContractEngine, MTPFSPConfig, MTPFSPHeads
 from cortex3_memory import CognitiveMemory, MemoryReconstruction, embed_text, tokenize
 from cortex3_ternary import BitLinear, BitLinearConfig, CompressionTraceLedger
@@ -310,11 +311,24 @@ class SelfSpeculativeDecoder:
 
 
 class UltraFastInferenceEngine:
-    def __init__(self, verifier: DynamicSkillVerifier, agent: Agent, config: InferenceConfig | None = None, memory: CognitiveMemory | None = None):
+    def __init__(
+        self,
+        verifier: DynamicSkillVerifier,
+        agent: Agent,
+        config: InferenceConfig | None = None,
+        memory: CognitiveMemory | None = None,
+        compiled_frontier_registry: FrontierCircuitRegistry | None = None,
+    ):
         self.verifier = verifier
         self.agent = agent
         self.config = config or InferenceConfig()
         self.memory = memory or CognitiveMemory()
+        self.compiled_frontier_registry = compiled_frontier_registry
+        self.compiled_frontier_agent = (
+            CompiledFrontierAgent(compiled_frontier_registry, verifier=verifier)
+            if compiled_frontier_registry is not None
+            else None
+        )
         self.router = DifficultyRouter(self.config)
         self.budget = BudgetPredictor()
         self.early_exit = EarlyExitPolicy()
@@ -323,6 +337,21 @@ class UltraFastInferenceEngine:
         self.speculative = SelfSpeculativeDecoder(self.config)
         self.certificate_head = CertificateHead(self.config.hidden_size, max(8, self.config.hidden_size // 2), self.config.vocab_size)
         self.certificate_verifier = CertificateVerifier()
+
+    def set_compiled_frontier_registry(self, registry: FrontierCircuitRegistry | None) -> None:
+        self.compiled_frontier_registry = registry
+        self.compiled_frontier_agent = (
+            CompiledFrontierAgent(registry, verifier=self.verifier)
+            if registry is not None
+            else None
+        )
+
+    def _compiled_frontier_answer(self, task: Task) -> CandidateAnswer | None:
+        if self.compiled_frontier_registry is None or self.compiled_frontier_agent is None:
+            return None
+        if self.compiled_frontier_registry.select(task) is None:
+            return None
+        return self.compiled_frontier_agent(task)
 
     def _reset_trace(self) -> None:
         self.trace = CompressionTraceLedger()
@@ -439,7 +468,8 @@ class UltraFastInferenceEngine:
 
     def infer(self, task: Task, *, forced_path: InferencePath | None = None) -> InferenceResult:
         self._reset_trace()
-        base_answer = CandidateAnswer.coerce(self.agent(task))
+        compiled_answer = self._compiled_frontier_answer(task)
+        base_answer = compiled_answer if compiled_answer is not None else CandidateAnswer.coerce(self.agent(task))
         signal = self.router.signal(task, base_answer.confidence)
         route = self.router.route(signal, forced_path)
         prediction = self.budget.predict(route, signal.prompt_tokens)

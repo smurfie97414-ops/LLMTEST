@@ -44,6 +44,7 @@ from cortex3 import (
 from cortex3_attribution import CausalAttributionEngine
 from cortex3_certificates import CertificateHead, CertificateHeadOutput, CertificateType, CertificateVerifier, LatentProofState, RandomDelatentizer, build_certificate, evaluate_certificate_efficiency
 from cortex3_cycle import CortexCycle
+from cortex3_frontier import FrontierCircuitRegistry, FrontierSkillDiscovery
 from cortex3_future import ContractDecision, FutureContract, FutureContractEngine, FutureContractLedger, MTPFSPConfig
 from cortex3_improvement import AcceptanceDecision, ProposalKind, RecursiveImprovementEngine, RollbackEvent
 from cortex3_inference import InferenceConfig, InferencePath, UltraFastInferenceEngine
@@ -2333,6 +2334,9 @@ class TrainingConfig:
     cortex_phase_probe_tasks: int = 1
     cortex_phase_max_proposals: int = 1
     cortex_phase_regrowth_budget: float = 32.0
+    cortex_phase_frontier_max_skills: int = 1
+    cortex_phase_frontier_per_failure: int = 1
+    cortex_phase_frontier_epochs: int = 40
     cortex_phase_regularization_weight: float = 0.001
     cortex_phase_replay_weight: float = 0.05
     cortex_objective_feedback_weight: float = 0.05
@@ -2363,6 +2367,12 @@ class TrainingConfig:
             raise ValueError("cortex_phase_max_proposals must be non-negative")
         if self.cortex_phase_regrowth_budget <= 0:
             raise ValueError("cortex_phase_regrowth_budget must be positive")
+        if self.cortex_phase_frontier_max_skills < 0:
+            raise ValueError("cortex_phase_frontier_max_skills must be non-negative")
+        if self.cortex_phase_frontier_per_failure < 1:
+            raise ValueError("cortex_phase_frontier_per_failure must be positive")
+        if self.cortex_phase_frontier_epochs < 1:
+            raise ValueError("cortex_phase_frontier_epochs must be positive")
         if self.cortex_phase_regularization_weight < 0:
             raise ValueError("cortex_phase_regularization_weight must be non-negative")
         if self.cortex_phase_replay_weight < 0:
@@ -3707,6 +3717,8 @@ class CortexTrainingPhaseController:
         self.reference_agent = ReferenceRuleAgent()
         self.trial_agent = CorruptedCompressedAgent()
         self.cycle = CortexCycle(self.verifier)
+        self.frontier_registry = FrontierCircuitRegistry()
+        self.frontier_discovery = FrontierSkillDiscovery(self.verifier, self.reference_agent)
         self.future_ledger = FutureContractLedger()
         self.future_engine = FutureContractEngine(
             MTPFSPConfig(
@@ -3725,6 +3737,7 @@ class CortexTrainingPhaseController:
             self.verifier,
             self.reference_agent,
             memory=self.memory,
+            compiled_frontier_registry=self.frontier_registry,
             config=InferenceConfig(
                 hidden_size=max(32, model.config.d_model),
                 vocab_size=max(64, min(model.config.vocab_size, 4096)),
@@ -3740,6 +3753,8 @@ class CortexTrainingPhaseController:
         self.errors: list[dict[str, Any]] = []
         self.batch_contract_samples: list[dict[str, Any]] = []
         self.phase_audits: list[dict[str, Any]] = []
+        self.frontier_reports: list[dict[str, Any]] = []
+        self.frontier_compiled_fastsolve_events = 0
         self.replay_batches: list[torch.Tensor] = []
         self.replay_cursor = 0
         self.regularization_steps = 0
@@ -4548,6 +4563,10 @@ class CortexTrainingPhaseController:
             "errors": list(self.errors),
             "batch_contract_samples": list(self.batch_contract_samples),
             "phase_audits": list(self.phase_audits),
+            "frontier_reports": list(self.frontier_reports),
+            "frontier_compiled_fastsolve_events": int(self.frontier_compiled_fastsolve_events),
+            "frontier_registry_path": str(self.run_dir / "frontier_registry"),
+            "frontier_registry_summary": self.frontier_registry.to_dict(),
             "replay_batches": [batch.detach().cpu() for batch in self.replay_batches],
             "replay_cursor": int(self.replay_cursor),
             "regularization_steps": int(self.regularization_steps),
@@ -4606,6 +4625,12 @@ class CortexTrainingPhaseController:
         self.errors = [dict(item) for item in payload.get("errors", ())]
         self.batch_contract_samples = [dict(item) for item in payload.get("batch_contract_samples", ())]
         self.phase_audits = [dict(item) for item in payload.get("phase_audits", ())]
+        self.frontier_reports = [dict(item) for item in payload.get("frontier_reports", ())]
+        self.frontier_compiled_fastsolve_events = int(payload.get("frontier_compiled_fastsolve_events", 0))
+        frontier_path = Path(str(payload.get("frontier_registry_path") or (self.run_dir / "frontier_registry")))
+        if frontier_path.exists() and (frontier_path / "frontier_registry.json").exists():
+            self.frontier_registry = FrontierCircuitRegistry.load(frontier_path)
+            self.inference.set_compiled_frontier_registry(self.frontier_registry)
         self.replay_batches = [
             batch.detach().cpu().to(dtype=torch.long)
             if isinstance(batch, torch.Tensor)
@@ -4831,6 +4856,11 @@ class CortexTrainingPhaseController:
             "sleep_replay_examples": len(self.sleep.replay.examples),
             "sleep_synthetic_examples": len(self.sleep.synthetic.examples),
             "sleep_reservoir_examples": len(self.sleep.reservoir.examples),
+            "frontier_compiled_circuit_count": int(self.frontier_registry.to_dict()["circuit_count"]),
+            "frontier_compiled_skill_count": int(self.frontier_registry.to_dict()["compiled_skill_count"]),
+            "frontier_compiled_fastsolve_events": int(self.frontier_compiled_fastsolve_events),
+            "frontier_registry_path": str(self.run_dir / "frontier_registry"),
+            "frontier_reports": _last_items(self.frontier_reports, 3),
             "improvement_archive_accepted": self.improvement.archive.accepted_count,
             "improvement_archive_rejected": self.improvement.archive.rejected_count,
             "regrowth_model_application_count": len(self.regrowth_model_applications),
@@ -4885,6 +4915,41 @@ class CortexTrainingPhaseController:
             )
         except Exception as exc:
             self._record_error("P1", exc)
+
+        frontier_task_for_inference = None
+        try:
+            if (
+                cycle_report is not None
+                and cycle_report.regressions
+                and int(self.config.cortex_phase_frontier_max_skills) > 0
+            ):
+                frontier_report = self.frontier_discovery.discover(
+                    cycle_report,
+                    seed=self.config.seed + step,
+                    max_skills=int(self.config.cortex_phase_frontier_max_skills),
+                    per_failure=int(self.config.cortex_phase_frontier_per_failure),
+                    epochs=int(self.config.cortex_phase_frontier_epochs),
+                    registry=self.frontier_registry,
+                )
+                frontier_payload = frontier_report.to_dict()
+                self.frontier_reports.append(frontier_payload)
+                self._count("frontier_discovery_events")
+                self._count("frontier_compiled_circuits", len(frontier_report.circuits))
+                self.integration_counts["frontier_compiled_skills"] = len(self.frontier_registry.compiled_skills())
+                if frontier_report.circuits:
+                    registry_dir = self.run_dir / "frontier_registry"
+                    registry_path = self.frontier_registry.save(registry_dir)
+                    self.integration_counts["frontier_registry_saves"] = self.integration_counts.get("frontier_registry_saves", 0) + 1
+                    audit["frontier_discovery"] = {
+                        **frontier_payload,
+                        "registry_path": str(registry_path),
+                    }
+                    first_skill = frontier_report.circuits[0].skill
+                    runtime_circuits = self.frontier_registry.circuits_for_skill(first_skill)
+                    if runtime_circuits and runtime_circuits[0].verified_tasks:
+                        frontier_task_for_inference = runtime_circuits[0].verified_tasks[0]
+        except Exception as exc:
+            self._record_error("frontier", exc)
 
         try:
             if first_failure is not None:
@@ -5054,7 +5119,12 @@ class CortexTrainingPhaseController:
 
         inference_results: list[Any] = []
         try:
-            task = first_failure.task if first_failure is not None else Task("phase-infer", "instruction_following", "Output OK exactly.", "OK")
+            if frontier_task_for_inference is not None:
+                task = frontier_task_for_inference
+            elif first_failure is not None:
+                task = first_failure.task
+            else:
+                task = Task("phase-infer", "instruction_following", "Output OK exactly.", "OK")
             forced_paths = (InferencePath.FAST, InferencePath.NORMAL, InferencePath.CAREFUL)
             route_reports = []
             for forced_path in forced_paths:
@@ -5069,6 +5139,9 @@ class CortexTrainingPhaseController:
                     self._count("inference_self_speculative_events")
                 if inferred.memory_reconstruction is not None:
                     self._count("inference_latent_kv_events")
+                if bool(inferred.answer.raw.get("frontier_compiled_selected")):
+                    self._count("frontier_compiled_fastsolve_events")
+                    self.frontier_compiled_fastsolve_events += 1
             self._touch("P8")
             audit["inference"] = route_reports[0] if route_reports else {}
             audit["inference_routes"] = route_reports
@@ -5141,16 +5214,26 @@ class CortexTrainingPhaseController:
         improvement_report = None
         try:
             if cycle_report is not None and self.config.cortex_phase_max_proposals > 0:
+                p10_proposal_budget = max(
+                    int(self.config.cortex_phase_max_proposals),
+                    min(
+                        6,
+                        int(self.config.cortex_phase_max_proposals)
+                        + int(self.improvement.archive.accepted_count)
+                        + 1,
+                    ),
+                )
                 improvement_report = self.improvement.run(
                     cycle_report,
                     baseline_agent=self.trial_agent,
                     reference_agent=self.reference_agent,
-                    max_proposals=self.config.cortex_phase_max_proposals,
+                    max_proposals=p10_proposal_budget,
                     seed=self.config.seed + step,
                     n_per_skill=self.config.cortex_phase_probe_tasks,
                 )
                 self._touch("P10")
                 audit["recursive_improvement"] = improvement_report.to_dict()
+                audit["recursive_improvement"]["proposal_budget"] = p10_proposal_budget
                 self._count("recursive_proposal_events", len(improvement_report.proposals))
                 self._count("recursive_sandbox_trials", len(improvement_report.decisions))
                 self._count("recursive_dynamic_evaluations", len(improvement_report.decisions))
@@ -5371,6 +5454,10 @@ class CortexTrainingPhaseController:
                 "sleep_replay_examples": len(self.sleep.replay.examples),
                 "sleep_synthetic_examples": len(self.sleep.synthetic.examples),
                 "sleep_reservoir_examples": len(self.sleep.reservoir.examples),
+                "frontier_compiled_circuit_count": int(self.frontier_registry.to_dict()["circuit_count"]),
+                "frontier_compiled_skill_count": int(self.frontier_registry.to_dict()["compiled_skill_count"]),
+                "frontier_compiled_fastsolve_events": int(self.frontier_compiled_fastsolve_events),
+                "frontier_registry_path": str(self.run_dir / "frontier_registry"),
                 "regrowth_model_application_count": len(self.regrowth_model_applications),
                 "regrowth_model_parameter_delta_l1": float(self.regrowth_model_parameter_delta_l1),
                 "regrowth_model_repair_loss_delta": float(self.regrowth_model_repair_loss_delta),
@@ -5446,6 +5533,9 @@ class CortexTrainingPhaseController:
                     "sleep_replay_examples": len(self.sleep.replay.examples),
                     "sleep_synthetic_examples": len(self.sleep.synthetic.examples),
                     "sleep_reservoir_examples": len(self.sleep.reservoir.examples),
+                    "frontier_compiled_circuit_count": int(self.frontier_registry.to_dict()["circuit_count"]),
+                    "frontier_compiled_skill_count": int(self.frontier_registry.to_dict()["compiled_skill_count"]),
+                    "frontier_compiled_fastsolve_events": int(self.frontier_compiled_fastsolve_events),
                     "regrowth_model_application_count": len(self.regrowth_model_applications),
                     "regrowth_model_parameter_delta_l1": float(self.regrowth_model_parameter_delta_l1),
                     "regrowth_model_repair_loss_delta": float(self.regrowth_model_repair_loss_delta),
@@ -5543,6 +5633,8 @@ class CortexTrainingPhaseController:
                 "synthetic_examples": len(self.sleep.synthetic.examples),
                 "reservoir_examples": len(self.sleep.reservoir.examples),
             },
+            "frontier_registry_summary": self.frontier_registry.to_dict(),
+            "frontier_reports": _last_items(self.frontier_reports, 3),
             "improvement_state_summary": _improvement_state(self.improvement),
             "regrowth_model_applications": _last_items(self.regrowth_model_applications, 5),
             "recursive_model_applications": _last_items(self.recursive_model_applications, 5),

@@ -3141,6 +3141,12 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             TrainingConfig(cortex_trace_retention_limit=-1)
         with self.assertRaisesRegex(ValueError, "cortex_phase_regrowth_budget"):
             TrainingConfig(cortex_phase_regrowth_budget=0.0)
+        with self.assertRaisesRegex(ValueError, "cortex_phase_frontier_max_skills"):
+            TrainingConfig(cortex_phase_frontier_max_skills=-1)
+        with self.assertRaisesRegex(ValueError, "cortex_phase_frontier_per_failure"):
+            TrainingConfig(cortex_phase_frontier_per_failure=0)
+        with self.assertRaisesRegex(ValueError, "cortex_phase_frontier_epochs"):
+            TrainingConfig(cortex_phase_frontier_epochs=0)
 
     def test_full_cortex_phase_controller_uses_all_modules_during_training(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -3294,6 +3300,10 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             self.assertGreater(influence["memory_recent_segments"], 0)
             self.assertGreater(influence["sleep_replay_examples"], 0)
             self.assertGreater(influence["sleep_synthetic_examples"], 0)
+            self.assertGreater(influence["frontier_compiled_circuit_count"], 0)
+            self.assertGreater(influence["frontier_compiled_skill_count"], 0)
+            self.assertGreater(influence["frontier_compiled_fastsolve_events"], 0)
+            self.assertTrue((Path(influence["frontier_registry_path"]) / "frontier_registry.json").exists())
             self.assertGreater(
                 influence["improvement_archive_accepted"] + influence["improvement_archive_rejected"],
                 0,
@@ -3343,6 +3353,11 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             self.assertTrue(persisted["regrowth_model_applications"], persisted)
             self.assertTrue(persisted["recursive_model_applications"], persisted)
             self.assertEqual(persisted["training_influence"]["sleep_replay_updates"], influence["sleep_replay_updates"])
+            self.assertEqual(
+                persisted["training_influence"]["frontier_compiled_fastsolve_events"],
+                influence["frontier_compiled_fastsolve_events"],
+            )
+            self.assertGreater(persisted["frontier_registry_summary"]["circuit_count"], 0)
             self.assertEqual(
                 persisted["training_influence"]["objective_feedback_events"],
                 influence["objective_feedback_events"],

@@ -4,7 +4,8 @@ import unittest
 
 from cortex3 import CorruptedCompressedAgent, DynamicSkillVerifier, ReferenceRuleAgent, default_skill_specs
 from cortex3_cycle import CortexCycle
-from cortex3_frontier import FrontierSkillDiscovery
+from cortex3_frontier import CompiledFrontierAgent, FrontierCircuitRegistry, FrontierSkillDiscovery
+from cortex3_inference import InferencePath, UltraFastInferenceEngine
 from cortex3_reporting import write_cycle_run
 
 
@@ -12,8 +13,9 @@ class FrontierSkillDiscoveryTest(unittest.TestCase):
     def test_frontier_discovery_slow_solves_distills_and_compiles_fragile_skill(self):
         verifier = DynamicSkillVerifier(default_skill_specs())
         cycle = CortexCycle(verifier).run(ReferenceRuleAgent(), CorruptedCompressedAgent(), seed=3, n_per_skill=1)
+        registry = FrontierCircuitRegistry()
 
-        report = FrontierSkillDiscovery(verifier).discover(cycle, seed=3, max_skills=1, epochs=120)
+        report = FrontierSkillDiscovery(verifier).discover(cycle, seed=3, max_skills=1, epochs=120, registry=registry)
 
         self.assertTrue(report.passed)
         self.assertEqual(len(report.circuits), 1)
@@ -25,19 +27,44 @@ class FrontierSkillDiscoveryTest(unittest.TestCase):
         self.assertGreater(circuit.active_weights, 0)
         self.assertGreater(circuit.training["after_accuracy"], circuit.training["before_accuracy"])
         self.assertTrue(circuit.invariants.prompt_obligations)
+        self.assertEqual(registry.compiled_skills(), (circuit.skill,))
+        runtime_circuit = registry.circuits_for_skill(circuit.skill)[0]
+        task = runtime_circuit.verified_tasks[0]
+        selected = registry.select(task)
+        self.assertIsNotNone(selected)
+        self.assertEqual(selected.report.skill, task.skill)
+        answer = CompiledFrontierAgent(registry, verifier=verifier)(task)
+        self.assertTrue(answer.raw["frontier_compiled_selected"])
+        self.assertTrue(answer.certificate["frontier_compiled_circuit"])
+        self.assertTrue(answer.certificate["frontier_verification_passed"])
+        self.assertTrue(verifier.oracle_registry.verify(task.skill, task, answer).passed)
+        engine = UltraFastInferenceEngine(verifier, CorruptedCompressedAgent(), compiled_frontier_registry=registry)
+        inferred = engine.infer(task, forced_path=InferencePath.FAST)
+        self.assertTrue(inferred.answer.raw["frontier_compiled_selected"])
+        self.assertTrue(inferred.answer.certificate["frontier_compiled_circuit"])
+        self.assertTrue(inferred.passed)
 
     def test_frontier_discovery_report_is_persisted(self):
         verifier = DynamicSkillVerifier(default_skill_specs())
         cycle = CortexCycle(verifier).run(ReferenceRuleAgent(), CorruptedCompressedAgent(), seed=4, n_per_skill=1)
-        frontier = FrontierSkillDiscovery(verifier).discover(cycle, seed=4, max_skills=1, epochs=120)
+        registry = FrontierCircuitRegistry()
+        frontier = FrontierSkillDiscovery(verifier).discover(cycle, seed=4, max_skills=1, epochs=120, registry=registry)
 
         with tempfile.TemporaryDirectory() as tmp:
             artifacts = write_cycle_run(cycle, output_dir=tmp, run_id="frontier-run", frontier_report=frontier)
             payload = json.loads(artifacts.summary_json.read_text(encoding="utf-8"))
+            registry_path = registry.save(tmp)
+            loaded_registry = FrontierCircuitRegistry.load(tmp)
+            runtime_circuit = loaded_registry.circuits_for_skill(frontier.circuits[0].skill)[0]
+            task = runtime_circuit.verified_tasks[0]
+            answer = CompiledFrontierAgent(loaded_registry, verifier=verifier)(task)
 
         self.assertTrue(payload["frontier_discovery"]["passed"])
         self.assertTrue(payload["frontier_discovery"]["circuits"])
         self.assertGreater(payload["frontier_discovery"]["circuits"][0]["compiled_weight_bits"], 0.0)
+        self.assertEqual(registry_path.name, "frontier_registry.json")
+        self.assertTrue(answer.raw["frontier_compiled_selected"])
+        self.assertTrue(verifier.oracle_registry.verify(task.skill, task, answer).passed)
 
 
 if __name__ == "__main__":

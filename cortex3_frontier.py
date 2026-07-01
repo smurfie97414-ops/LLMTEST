@@ -2,11 +2,12 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Any, Iterable, Mapping
 
-from cortex3 import CandidateAnswer, CompressionAdversary, DynamicSkillVerifier, ReferenceRuleAgent, Task
+from cortex3 import Anchor, CandidateAnswer, CompressionAdversary, CostTrace, DynamicSkillVerifier, ReferenceRuleAgent, Task
 from cortex3_cycle import CycleReport
-from cortex3_microtrain import CortexMicroModel, CortexMicroTrainer, MicroModelAgent, examples_from_tasks
+from cortex3_microtrain import CheckpointManager, CortexMicroModel, CortexMicroTrainer, MicroModelAgent, examples_from_tasks
 
 
 @dataclass(frozen=True)
@@ -19,6 +20,16 @@ class FrontierInvariantSet:
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+    @staticmethod
+    def from_dict(payload: Mapping[str, Any]) -> "FrontierInvariantSet":
+        return FrontierInvariantSet(
+            skill=str(payload["skill"]),
+            expected_types=tuple(str(item) for item in payload.get("expected_types", ())),
+            metadata_keys=tuple(str(item) for item in payload.get("metadata_keys", ())),
+            anchor_kinds=tuple(str(item) for item in payload.get("anchor_kinds", ())),
+            prompt_obligations=tuple(str(item) for item in payload.get("prompt_obligations", ())),
+        )
 
 
 @dataclass(frozen=True)
@@ -50,6 +61,22 @@ class FrontierCompiledCircuit:
             "passed": self.passed,
         }
 
+    @staticmethod
+    def from_dict(payload: Mapping[str, Any]) -> "FrontierCompiledCircuit":
+        return FrontierCompiledCircuit(
+            skill=str(payload["skill"]),
+            source_failure_ids=tuple(str(item) for item in payload.get("source_failure_ids", ())),
+            frontier_task_ids=tuple(str(item) for item in payload.get("frontier_task_ids", ())),
+            verified_slow_solutions=int(payload.get("verified_slow_solutions", 0)),
+            invariants=FrontierInvariantSet.from_dict(dict(payload.get("invariants") or {})),
+            training=dict(payload.get("training") or {}),
+            dsv=dict(payload.get("dsv") or {}),
+            compiled_weight_bits=float(payload.get("compiled_weight_bits", 0.0)),
+            active_weights=int(payload.get("active_weights", 0)),
+            total_weights=int(payload.get("total_weights", 0)),
+            passed=bool(payload.get("passed", False)),
+        )
+
 
 @dataclass(frozen=True)
 class FrontierDiscoveryReport:
@@ -63,6 +90,247 @@ class FrontierDiscoveryReport:
             "selected_skills": list(self.selected_skills),
             "circuits": [circuit.to_dict() for circuit in self.circuits],
         }
+
+
+def _anchor_to_dict(anchor: Anchor) -> dict[str, Any]:
+    return asdict(anchor)
+
+
+def _anchor_from_dict(payload: Mapping[str, Any]) -> Anchor:
+    return Anchor(
+        kind=str(payload["kind"]),
+        value=str(payload["value"]),
+        source_id=str(payload.get("source_id", "")),
+        importance=float(payload.get("importance", 1.0)),
+    )
+
+
+def _task_to_dict(task: Task) -> dict[str, Any]:
+    return {
+        "task_id": task.task_id,
+        "skill": task.skill,
+        "prompt": task.prompt,
+        "expected": task.expected,
+        "metadata": dict(task.metadata),
+        "anchors": [_anchor_to_dict(anchor) for anchor in task.anchors],
+        "group_id": task.group_id,
+    }
+
+
+def _task_from_dict(payload: Mapping[str, Any]) -> Task:
+    return Task(
+        task_id=str(payload["task_id"]),
+        skill=str(payload["skill"]),
+        prompt=str(payload["prompt"]),
+        expected=payload.get("expected"),
+        metadata=dict(payload.get("metadata") or {}),
+        anchors=tuple(_anchor_from_dict(dict(anchor)) for anchor in payload.get("anchors", ())),
+        group_id=str(payload["group_id"]) if payload.get("group_id") is not None else None,
+    )
+
+
+@dataclass(frozen=True)
+class RuntimeFrontierCircuit:
+    report: FrontierCompiledCircuit
+    model: CortexMicroModel
+    verified_tasks: tuple[Task, ...]
+    checkpoint_path: str | None = None
+
+    @property
+    def skill(self) -> str:
+        return self.report.skill
+
+    @property
+    def agent(self) -> MicroModelAgent:
+        return MicroModelAgent(self.model)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "report": self.report.to_dict(),
+            "verified_tasks": [_task_to_dict(task) for task in self.verified_tasks],
+            "checkpoint_path": self.checkpoint_path,
+        }
+
+
+class FrontierCircuitRegistry:
+    def __init__(self) -> None:
+        self._circuits: dict[str, list[RuntimeFrontierCircuit]] = {}
+
+    def register(
+        self,
+        report: FrontierCompiledCircuit,
+        model: CortexMicroModel,
+        verified_tasks: Iterable[Task],
+        *,
+        checkpoint_path: str | None = None,
+    ) -> RuntimeFrontierCircuit:
+        if not report.passed:
+            raise ValueError(f"cannot register failing frontier circuit for skill {report.skill!r}")
+        tasks = tuple(verified_tasks)
+        if not tasks:
+            raise ValueError("frontier circuit registration requires verified slow-solve tasks")
+        if any(task.skill != report.skill for task in tasks):
+            raise ValueError("all registered frontier tasks must match the compiled circuit skill")
+        circuit = RuntimeFrontierCircuit(report, model, tasks, checkpoint_path)
+        bucket = self._circuits.setdefault(report.skill, [])
+        bucket.append(circuit)
+        bucket.sort(
+            key=lambda item: (
+                float(item.report.dsv.get("verified_capability_per_cost", 0.0)),
+                int(item.report.verified_slow_solutions),
+                -float(item.report.compiled_weight_bits),
+            ),
+            reverse=True,
+        )
+        return circuit
+
+    def circuits_for_skill(self, skill: str) -> tuple[RuntimeFrontierCircuit, ...]:
+        return tuple(self._circuits.get(skill, ()))
+
+    def compiled_skills(self) -> tuple[str, ...]:
+        return tuple(sorted(self._circuits))
+
+    def _match_score(self, circuit: RuntimeFrontierCircuit, task: Task) -> float:
+        if task.skill != circuit.skill:
+            return float("-inf")
+        invariants = circuit.report.invariants
+        task_anchor_kinds = {anchor.kind for anchor in task.anchors}
+        invariant_anchor_kinds = set(invariants.anchor_kinds)
+        task_metadata = set(task.metadata)
+        invariant_metadata = set(invariants.metadata_keys)
+        task_obligations = set(_prompt_obligations((task,)))
+        invariant_obligations = set(invariants.prompt_obligations)
+        score = 1.0
+        score += float(circuit.report.verified_slow_solutions)
+        score += float(len(task_anchor_kinds & invariant_anchor_kinds)) * 1.5
+        score += float(len(task_metadata & invariant_metadata)) * 0.5
+        score += float(len(task_obligations & invariant_obligations)) * 2.0
+        score += float(circuit.report.dsv.get("verified_capability_per_cost", 0.0))
+        score -= float(circuit.report.compiled_weight_bits) * 1e-9
+        return score
+
+    def select(self, task: Task) -> RuntimeFrontierCircuit | None:
+        candidates = self.circuits_for_skill(task.skill)
+        if not candidates:
+            return None
+        scored = [(self._match_score(circuit, task), circuit) for circuit in candidates]
+        scored = [item for item in scored if item[0] != float("-inf")]
+        if not scored:
+            return None
+        scored.sort(key=lambda item: item[0], reverse=True)
+        return scored[0][1]
+
+    def to_dict(self) -> dict[str, Any]:
+        circuits = [circuit.to_dict() for skill in self.compiled_skills() for circuit in self._circuits[skill]]
+        return {
+            "schema_version": 1,
+            "compiled_skill_count": len(self._circuits),
+            "compiled_skills": list(self.compiled_skills()),
+            "circuit_count": len(circuits),
+            "circuits": circuits,
+        }
+
+    def save(self, directory: str | Path) -> Path:
+        root = Path(directory)
+        root.mkdir(parents=True, exist_ok=True)
+        manifest: dict[str, Any] = {
+            "schema_version": 1,
+            "compiled_skills": list(self.compiled_skills()),
+            "circuits": [],
+        }
+        manager = CheckpointManager()
+        for skill in self.compiled_skills():
+            for index, circuit in enumerate(self._circuits[skill]):
+                checkpoint = root / f"{skill}_{index}.pt"
+                manager.save(circuit.model, checkpoint)
+                manifest["circuits"].append(
+                    {
+                        "checkpoint_path": checkpoint.name,
+                        "report": circuit.report.to_dict(),
+                        "verified_tasks": [_task_to_dict(task) for task in circuit.verified_tasks],
+                    }
+                )
+        path = root / "frontier_registry.json"
+        path.write_text(json_dumps(manifest), encoding="utf-8")
+        return path
+
+    @staticmethod
+    def load(directory: str | Path) -> "FrontierCircuitRegistry":
+        root = Path(directory)
+        import json
+
+        manifest = json.loads((root / "frontier_registry.json").read_text(encoding="utf-8"))
+        if int(manifest.get("schema_version", 0)) != 1:
+            raise ValueError(f"unsupported frontier registry schema: {manifest.get('schema_version')!r}")
+        registry = FrontierCircuitRegistry()
+        manager = CheckpointManager()
+        for item in manifest.get("circuits", ()):
+            payload = dict(item)
+            report = FrontierCompiledCircuit.from_dict(dict(payload["report"]))
+            model = manager.load(root / str(payload["checkpoint_path"]))
+            tasks = tuple(_task_from_dict(dict(task)) for task in payload.get("verified_tasks", ()))
+            registry.register(report, model, tasks, checkpoint_path=str(root / str(payload["checkpoint_path"])))
+        return registry
+
+
+def json_dumps(payload: Mapping[str, Any]) -> str:
+    import json
+
+    return json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False)
+
+
+class CompiledFrontierAgent:
+    def __init__(
+        self,
+        registry: FrontierCircuitRegistry,
+        *,
+        fallback: Any | None = None,
+        verifier: DynamicSkillVerifier | None = None,
+        verify_outputs: bool = True,
+    ):
+        self.registry = registry
+        self.fallback = fallback
+        self.verifier = verifier
+        self.verify_outputs = verify_outputs
+
+    def __call__(self, task: Task) -> CandidateAnswer:
+        circuit = self.registry.select(task)
+        if circuit is None:
+            if self.fallback is None:
+                raise ValueError(f"no compiled frontier circuit registered for skill {task.skill!r}")
+            answer = CandidateAnswer.coerce(self.fallback(task))
+            return CandidateAnswer(
+                answer.text,
+                confidence=answer.confidence,
+                certificate=dict(answer.certificate),
+                cost=answer.cost,
+                raw={**dict(answer.raw), "frontier_compiled_selected": False},
+            )
+        answer = circuit.agent(task)
+        certificate = {
+            **dict(answer.certificate),
+            "frontier_compiled_circuit": True,
+            "frontier_skill": circuit.skill,
+            "frontier_verified_slow_solutions": circuit.report.verified_slow_solutions,
+            "frontier_compiled_weight_bits": circuit.report.compiled_weight_bits,
+            "frontier_prompt_obligations": circuit.report.invariants.prompt_obligations,
+        }
+        raw = {
+            **dict(answer.raw),
+            "frontier_compiled_selected": True,
+            "frontier_skill": circuit.skill,
+            "frontier_source_failure_ids": circuit.report.source_failure_ids,
+            "frontier_task_ids": circuit.report.frontier_task_ids,
+        }
+        cost = answer.cost.merge(CostTrace(verifier_steps=1 if self.verifier is not None and self.verify_outputs else 0))
+        confidence = answer.confidence
+        if self.verifier is not None and self.verify_outputs:
+            verification = self.verifier.oracle_registry.verify(task.skill, task, answer)
+            raw["frontier_compiled_verified"] = verification.passed
+            raw["frontier_compiled_verification_reason"] = verification.reason
+            certificate["frontier_verification_passed"] = verification.passed
+            confidence = min(confidence, verification.score)
+        return CandidateAnswer(answer.text, confidence=confidence, certificate=certificate, cost=cost, raw=raw)
 
 
 def _prompt_obligations(tasks: Iterable[Task]) -> tuple[str, ...]:
@@ -123,6 +391,7 @@ class FrontierSkillDiscovery:
         max_skills: int = 2,
         per_failure: int = 4,
         epochs: int = 120,
+        registry: FrontierCircuitRegistry | None = None,
     ) -> FrontierDiscoveryReport:
         fragile = report.skill_ledger.fragile_skills()
         selected = tuple(state.skill for state in fragile[:max_skills])
@@ -143,7 +412,7 @@ class FrontierSkillDiscovery:
             agent = MicroModelAgent(model)
             dsv = self.verifier.evaluate_tasks(agent, verified_tasks)
             compiled_bits, active_weights, total_weights = _compiled_weight_bits(model)
-            circuits.append(FrontierCompiledCircuit(
+            compiled = FrontierCompiledCircuit(
                 skill=skill,
                 source_failure_ids=tuple(failure.task.task_id for failure in failures),
                 frontier_task_ids=tuple(task.task_id for task in verified_tasks),
@@ -160,5 +429,8 @@ class FrontierSkillDiscovery:
                 active_weights=active_weights,
                 total_weights=total_weights,
                 passed=dsv.passed == dsv.total and training.after_accuracy >= training.before_accuracy,
-            ))
+            )
+            circuits.append(compiled)
+            if registry is not None and compiled.passed:
+                registry.register(compiled, model, verified_tasks)
         return FrontierDiscoveryReport(tuple(circuits), selected, bool(circuits) and all(circuit.passed for circuit in circuits))
