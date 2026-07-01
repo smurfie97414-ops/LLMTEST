@@ -527,6 +527,8 @@ P8 recoit une tache et force ou choisit un chemin :
 - normal ;
 - careful.
 
+Dans le harness LLM, la source de reponse par defaut est maintenant le vrai `CortexTransformerLM` via `CortexTransformerInferenceAgent`. Les circuits Frontier restent prioritaires uniquement lorsqu'un circuit compile couvre la tache et passe le binding memoire P4.
+
 ### Travail Execute
 
 L'inference route selon :
@@ -547,6 +549,7 @@ Le chemin choisi controle :
 - early exit ;
 - self-speculative future contracts ;
 - dispatch kernel ternaire.
+- generation greedy courte depuis le `lm_head` du Transformer quand aucun FastSolve Frontier couvert ne fournit la reponse.
 
 ### Interaction Avec Les Autres Phases
 
@@ -557,10 +560,11 @@ P8 utilise :
 - P3 future contracts ;
 - P2 kernel ternaire ;
 - verifier P1 pour audit final.
+- le `CortexTransformerLM` lui-meme pour la reponse model-backed et les metadonnees de `CertificateHead`.
 
 ### Impact Apprentissage
 
-P8 fournit des exemples verifies par route et mesure la capacite par cout effectif. Il aide le modele a apprendre une politique ou la qualite verifiee compte plus que le debit brut.
+P8 fournit des exemples verifies par route et mesure la capacite par cout effectif. Il aide le modele a apprendre une politique ou la qualite verifiee compte plus que le debit brut. Depuis C71, les rapports exigent aussi `inference_model_backed_events` et `inference_model_backed_generated_tokens`, ce qui prouve que P8 ne s'appuie plus seulement sur une reponse symbolique externe.
 
 ## Phase 9 - Sleep / Consolidation
 

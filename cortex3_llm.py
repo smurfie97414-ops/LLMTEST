@@ -2116,6 +2116,95 @@ class CortexTransformerLM(nn.Module):
         return {"enabled": True, **self.compression_ledger.to_dict()}
 
 
+class CortexTransformerInferenceAgent:
+    def __init__(self, model: CortexTransformerLM, tokenizer: LLMTokenizer, *, max_new_tokens: int = 8):
+        if max_new_tokens < 1:
+            raise ValueError("max_new_tokens must be positive")
+        self.model = model
+        self.tokenizer = tokenizer
+        self.max_new_tokens = int(max_new_tokens)
+        self.call_count = 0
+        self.last_event: dict[str, Any] | None = None
+
+    def _prompt(self, task: Task) -> str:
+        return (
+            f"Skill: {task.skill}\n"
+            f"Task: {task.prompt}\n"
+            "Answer:"
+        )
+
+    def __call__(self, task: Task) -> CandidateAnswer:
+        self.call_count += 1
+        was_training = self.model.training
+        device = next(self.model.parameters()).device
+        ids = list(self.tokenizer.encode(self._prompt(task)))
+        if not ids:
+            ids = [self.tokenizer.bos_id]
+        ids = ids[-self.model.config.seq_len :]
+        generated: list[int] = []
+        confidences: list[float] = []
+        certificate_payload: dict[str, Any] = {}
+        self.model.eval()
+        try:
+            with torch.no_grad():
+                for _ in range(self.max_new_tokens):
+                    window = ids[-self.model.config.seq_len :]
+                    x = torch.tensor([window], dtype=torch.long, device=device)
+                    output = self.model(x)
+                    probs = torch.softmax(output.logits[0, -1].float(), dim=-1)
+                    confidence, token = torch.max(probs, dim=-1)
+                    token_id = int(token.detach().cpu())
+                    generated.append(token_id)
+                    confidences.append(float(confidence.detach().cpu()))
+                    ids.append(token_id)
+                    if output.certificate is not None:
+                        cert = output.certificate
+                        latent_state = LatentProofState(
+                            state_id=f"p8-model-{task.task_id}-{self.call_count}",
+                            task_id=task.task_id,
+                            skill=task.skill,
+                            tensor=cert.latent_state.detach(),
+                            latent_steps=max(1, len(generated)),
+                        )
+                        certificate_payload = {
+                            "model_certificate_latent_checksum": latent_state.checksum(),
+                            "model_certificate_answer_token": int(cert.answer_logits[0].detach().argmax(dim=-1).cpu()),
+                            "model_certificate_type_index": int(cert.certificate_type_logits[0].detach().argmax(dim=-1).cpu()),
+                            "model_certificate_uncertainty": float(cert.uncertainty[0].detach().cpu()),
+                        }
+                    if token_id == self.tokenizer.eos_id:
+                        break
+        finally:
+            if was_training:
+                self.model.train()
+        text = self.tokenizer.decode(generated).strip()
+        confidence_value = sum(confidences) / max(1, len(confidences))
+        prompt_token_count = max(0, len(ids) - len(generated))
+        event = {
+            "task_id": task.task_id,
+            "skill": task.skill,
+            "prompt_token_count": prompt_token_count,
+            "generated_token_count": len(generated),
+            "generated_token_ids": tuple(generated),
+            "decoded_text": text,
+            "confidence": float(confidence_value),
+            **certificate_payload,
+        }
+        self.last_event = event
+        return CandidateAnswer(
+            text=text,
+            confidence=float(max(0.0, min(0.99, confidence_value))),
+            certificate={
+                "cortex_transformer_inference": "greedy_lm_head",
+                "model_backed_inference": True,
+                "generated_token_count": len(generated),
+                **certificate_payload,
+            },
+            cost=CostTrace(generated_tokens=max(1, len(generated)), latent_steps=max(1, len(generated))),
+            raw={"model_backed_inference": event},
+        )
+
+
 @dataclass(frozen=True)
 class LossWeights:
     next_token: float = 1.0
@@ -3409,13 +3498,17 @@ def _cortex_architecture_audit_from_summary(summary: Mapping[str, Any]) -> dict[
     )
     add(
         "adaptive_multi_token_decoding",
-        phase_count("P8") > 0 and integer("future_contract_decisions") > 0 and trace_count("mtp_fsp_events") > 0,
+        phase_count("P8") > 0
+        and integer("future_contract_decisions") > 0
+        and trace_count("mtp_fsp_events") > 0
+        and integer("inference_model_backed_events") > 0,
         {
             "P8": phase_count("P8"),
             "future_contract_decisions": integer("future_contract_decisions"),
             "mtp_fsp_events": trace_count("mtp_fsp_events"),
+            "inference_model_backed_events": integer("inference_model_backed_events"),
         },
-        "adaptive multi-token path must be active with MTP/FSP evidence",
+        "adaptive multi-token path must be active with MTP/FSP evidence and a real Transformer-backed answer source",
     )
     add(
         "frontier_heldout_generalization_gate",
@@ -3888,7 +3981,9 @@ def _cortex_phase_deliverable_audit_from_summary(summary: Mapping[str, Any]) -> 
         and count("inference_early_exit_events") >= 3
         and count("inference_self_speculative_events") >= 3
         and count("inference_kernel_dispatches") > 0
-        and count("inference_latent_kv_events") > 0,
+        and count("inference_latent_kv_events") > 0
+        and count("inference_model_backed_events") > 0
+        and count("inference_model_backed_forced_careful_events") > 0,
         {
             "fast": count("inference_fast_path_events"),
             "normal": count("inference_normal_path_events"),
@@ -3898,8 +3993,10 @@ def _cortex_phase_deliverable_audit_from_summary(summary: Mapping[str, Any]) -> 
             "self_speculative_events": count("inference_self_speculative_events"),
             "kernel_dispatches": count("inference_kernel_dispatches"),
             "latent_kv_events": count("inference_latent_kv_events"),
+            "model_backed_events": count("inference_model_backed_events"),
+            "model_backed_forced_careful_events": count("inference_model_backed_forced_careful_events"),
         },
-        "all inference paths plus budget predictor, early exit, self-speculative MTP, latent KV and ternary dispatch must run",
+        "all inference paths plus budget predictor, early exit, self-speculative MTP, latent KV, ternary dispatch and a real Transformer-backed answer source must run",
     )
     add(
         "P9",
@@ -4038,9 +4135,10 @@ class CortexTrainingPhaseController:
         self.attribution_policy = AttributionPolicyMemory()
         self.attribution = CausalAttributionEngine(self.verifier, policy_memory=self.attribution_policy)
         self.regrowth = MinimalRegrowthEngine(self.verifier)
+        self.model_inference_agent = CortexTransformerInferenceAgent(self.model, self.tokenizer)
         self.inference = UltraFastInferenceEngine(
             self.verifier,
-            self.reference_agent,
+            self.model_inference_agent,
             memory=self.memory,
             compiled_frontier_registry=self.frontier_registry,
             config=InferenceConfig(
@@ -6023,6 +6121,10 @@ class CortexTrainingPhaseController:
             "frontier_compiled_skill_count": int(frontier_registry_summary["compiled_skill_count"]),
             **frontier_heldout_summary,
             "frontier_compiled_fastsolve_events": int(self.frontier_compiled_fastsolve_events),
+            "inference_model_backed_events": int(self.integration_counts.get("inference_model_backed_events", 0)),
+            "inference_model_backed_generated_tokens": int(self.integration_counts.get("inference_model_backed_generated_tokens", 0)),
+            "inference_model_backed_verified_events": int(self.integration_counts.get("inference_model_backed_verified_events", 0)),
+            "inference_model_backed_forced_careful_events": int(self.integration_counts.get("inference_model_backed_forced_careful_events", 0)),
             "frontier_registry_loaded_events": int(self.integration_counts.get("frontier_registry_loaded_events", 0)),
             "frontier_registry_loaded_circuits": int(self.integration_counts.get("frontier_registry_loaded_circuits", 0)),
             "frontier_restored_fastsolve_events": int(self.integration_counts.get("frontier_restored_fastsolve_events", 0)),
@@ -6447,10 +6549,24 @@ class CortexTrainingPhaseController:
                 task = Task("phase-infer", "instruction_following", "Output OK exactly.", "OK")
             forced_paths = (InferencePath.FAST, InferencePath.NORMAL, InferencePath.CAREFUL)
             route_reports = []
+            model_backed_events: list[dict[str, Any]] = []
+
+            def record_model_backed_event(inferred: Any) -> None:
+                event = inferred.answer.raw.get("model_backed_inference") if hasattr(inferred.answer, "raw") else None
+                if not isinstance(event, Mapping):
+                    return
+                payload = dict(event)
+                model_backed_events.append(payload)
+                self._count("inference_model_backed_events")
+                self._count("inference_model_backed_generated_tokens", int(payload.get("generated_token_count", 0) or 0))
+                if bool(inferred.passed):
+                    self._count("inference_model_backed_verified_events")
+
             for forced_path in forced_paths:
                 inferred = self.inference.infer(task, forced_path=forced_path)
                 inference_results.append(inferred)
                 route_reports.append(inferred.to_dict())
+                record_model_backed_event(inferred)
                 self._count(f"inference_{inferred.route.path.value}_path_events")
                 self._count("inference_budget_predictions")
                 self._count("inference_early_exit_events")
@@ -6464,9 +6580,27 @@ class CortexTrainingPhaseController:
                     self.frontier_compiled_fastsolve_events += 1
                     if bool(inferred.answer.certificate.get("frontier_memory_binding_passed")):
                         self._count("compiled_circuit_memory_binding_events")
+            real_llm_examples = self._real_exogenous_llm_examples()
+            if not real_llm_examples:
+                raise ValueError("P8 model-backed inference requires REAL_EXOGENOUS examples sourced from observed LLM input batches")
+            model_task = real_llm_examples[-1].task
+            model_inferred = self.inference.infer(model_task, forced_path=InferencePath.CAREFUL)
+            inference_results.append(model_inferred)
+            route_reports.append(model_inferred.to_dict())
+            record_model_backed_event(model_inferred)
+            self._count("inference_model_backed_forced_careful_events")
+            self._count("inference_careful_path_events")
+            self._count("inference_budget_predictions")
+            self._count("inference_early_exit_events")
+            self._count("inference_kernel_dispatches", len(model_inferred.kernel_dispatches))
+            if model_inferred.future_contract is not None:
+                self._count("inference_self_speculative_events")
+            if model_inferred.memory_reconstruction is not None:
+                self._count("inference_latent_kv_events")
             self._touch("P8")
             audit["inference"] = route_reports[0] if route_reports else {}
             audit["inference_routes"] = route_reports
+            audit["model_backed_inference_events"] = model_backed_events
             inferred = inference_results[-1]
             self.bit_ledger.ingest_cost(inferred.cost, note=f"P8:{inferred.route.path.value}:{inferred.task.skill}")
             self.uncertainty_ledger.record(inferred.task.skill, inferred.answer.confidence, bool(inferred.passed))
@@ -6862,6 +6996,10 @@ class CortexTrainingPhaseController:
                 "frontier_compiled_skill_count": int(frontier_registry_summary["compiled_skill_count"]),
                 **frontier_heldout_summary,
                 "frontier_compiled_fastsolve_events": int(self.frontier_compiled_fastsolve_events),
+                "inference_model_backed_events": int(self.integration_counts.get("inference_model_backed_events", 0)),
+                "inference_model_backed_generated_tokens": int(self.integration_counts.get("inference_model_backed_generated_tokens", 0)),
+                "inference_model_backed_verified_events": int(self.integration_counts.get("inference_model_backed_verified_events", 0)),
+                "inference_model_backed_forced_careful_events": int(self.integration_counts.get("inference_model_backed_forced_careful_events", 0)),
                 "sleep_frontier_fastsolve_events": int(self.integration_counts.get("sleep_frontier_fastsolve_events", 0)),
                 "restored_frontier_fastsolve_reports": _last_items(self.restored_frontier_fastsolve_reports, 3),
                 "frontier_repair_candidate_count": len(self.frontier_repair_candidates),
@@ -6994,6 +7132,10 @@ class CortexTrainingPhaseController:
                     "frontier_compiled_skill_count": int(frontier_registry_summary["compiled_skill_count"]),
                     **frontier_heldout_summary,
                     "frontier_compiled_fastsolve_events": int(self.frontier_compiled_fastsolve_events),
+                    "inference_model_backed_events": int(self.integration_counts.get("inference_model_backed_events", 0)),
+                    "inference_model_backed_generated_tokens": int(self.integration_counts.get("inference_model_backed_generated_tokens", 0)),
+                    "inference_model_backed_verified_events": int(self.integration_counts.get("inference_model_backed_verified_events", 0)),
+                    "inference_model_backed_forced_careful_events": int(self.integration_counts.get("inference_model_backed_forced_careful_events", 0)),
                     "sleep_frontier_fastsolve_events": int(self.integration_counts.get("sleep_frontier_fastsolve_events", 0)),
                     "restored_frontier_fastsolve_reports": _last_items(self.restored_frontier_fastsolve_reports, 3),
                     "frontier_repair_candidate_count": len(self.frontier_repair_candidates),
@@ -7109,6 +7251,10 @@ class CortexTrainingPhaseController:
                     "sleep_real_exogenous_llm_tokens": int(self.integration_counts.get("sleep_real_exogenous_llm_tokens", 0)),
                     **frontier_heldout_summary,
                     "sleep_frontier_fastsolve_events": int(self.integration_counts.get("sleep_frontier_fastsolve_events", 0)),
+                    "inference_model_backed_events": int(self.integration_counts.get("inference_model_backed_events", 0)),
+                    "inference_model_backed_generated_tokens": int(self.integration_counts.get("inference_model_backed_generated_tokens", 0)),
+                    "inference_model_backed_verified_events": int(self.integration_counts.get("inference_model_backed_verified_events", 0)),
+                    "inference_model_backed_forced_careful_events": int(self.integration_counts.get("inference_model_backed_forced_careful_events", 0)),
                     "regrowth_model_application_count": len(self.regrowth_model_applications),
                     "regrowth_model_parameter_delta_l1": float(self.regrowth_model_parameter_delta_l1),
                     "regrowth_model_repair_loss_delta": float(self.regrowth_model_repair_loss_delta),
