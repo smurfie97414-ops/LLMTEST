@@ -3501,14 +3501,16 @@ def _cortex_architecture_audit_from_summary(summary: Mapping[str, Any]) -> dict[
         phase_count("P8") > 0
         and integer("future_contract_decisions") > 0
         and trace_count("mtp_fsp_events") > 0
-        and integer("inference_model_backed_events") > 0,
+        and integer("inference_model_backed_events") > 0
+        and integer("inference_model_backed_replay_events") > 0,
         {
             "P8": phase_count("P8"),
             "future_contract_decisions": integer("future_contract_decisions"),
             "mtp_fsp_events": trace_count("mtp_fsp_events"),
             "inference_model_backed_events": integer("inference_model_backed_events"),
+            "inference_model_backed_replay_events": integer("inference_model_backed_replay_events"),
         },
-        "adaptive multi-token path must be active with MTP/FSP evidence and a real Transformer-backed answer source",
+        "adaptive multi-token path must be active with MTP/FSP evidence, a real Transformer-backed answer source and verified replay feedback",
     )
     add(
         "frontier_heldout_generalization_gate",
@@ -3983,7 +3985,8 @@ def _cortex_phase_deliverable_audit_from_summary(summary: Mapping[str, Any]) -> 
         and count("inference_kernel_dispatches") > 0
         and count("inference_latent_kv_events") > 0
         and count("inference_model_backed_events") > 0
-        and count("inference_model_backed_forced_careful_events") > 0,
+        and count("inference_model_backed_forced_careful_events") > 0
+        and count("inference_model_backed_replay_events") > 0,
         {
             "fast": count("inference_fast_path_events"),
             "normal": count("inference_normal_path_events"),
@@ -3995,8 +3998,11 @@ def _cortex_phase_deliverable_audit_from_summary(summary: Mapping[str, Any]) -> 
             "latent_kv_events": count("inference_latent_kv_events"),
             "model_backed_events": count("inference_model_backed_events"),
             "model_backed_forced_careful_events": count("inference_model_backed_forced_careful_events"),
+            "model_backed_replay_events": count("inference_model_backed_replay_events"),
+            "model_backed_repair_replay_events": count("inference_model_backed_repair_replay_events"),
+            "model_backed_verified_replay_events": count("inference_model_backed_verified_replay_events"),
         },
-        "all inference paths plus budget predictor, early exit, self-speculative MTP, latent KV, ternary dispatch and a real Transformer-backed answer source must run",
+        "all inference paths plus budget predictor, early exit, self-speculative MTP, latent KV, ternary dispatch, a real Transformer-backed answer source and verified feedback replay must run",
     )
     add(
         "P9",
@@ -6125,6 +6131,9 @@ class CortexTrainingPhaseController:
             "inference_model_backed_generated_tokens": int(self.integration_counts.get("inference_model_backed_generated_tokens", 0)),
             "inference_model_backed_verified_events": int(self.integration_counts.get("inference_model_backed_verified_events", 0)),
             "inference_model_backed_forced_careful_events": int(self.integration_counts.get("inference_model_backed_forced_careful_events", 0)),
+            "inference_model_backed_replay_events": int(self.integration_counts.get("inference_model_backed_replay_events", 0)),
+            "inference_model_backed_repair_replay_events": int(self.integration_counts.get("inference_model_backed_repair_replay_events", 0)),
+            "inference_model_backed_verified_replay_events": int(self.integration_counts.get("inference_model_backed_verified_replay_events", 0)),
             "frontier_registry_loaded_events": int(self.integration_counts.get("frontier_registry_loaded_events", 0)),
             "frontier_registry_loaded_circuits": int(self.integration_counts.get("frontier_registry_loaded_circuits", 0)),
             "frontier_restored_fastsolve_events": int(self.integration_counts.get("frontier_restored_fastsolve_events", 0)),
@@ -6562,6 +6571,33 @@ class CortexTrainingPhaseController:
                 if bool(inferred.passed):
                     self._count("inference_model_backed_verified_events")
 
+            def add_model_backed_replay(inferred: Any) -> None:
+                event = inferred.answer.raw.get("model_backed_inference") if hasattr(inferred.answer, "raw") else None
+                if not isinstance(event, Mapping):
+                    return
+                passed = bool(inferred.passed)
+                correction = inferred.answer if passed else self._answer_from_task_expected(inferred.task)
+                replay = self._add_verified_phase_replay(
+                    "P8",
+                    inferred.task,
+                    answer=correction,
+                    metadata={
+                        "model_backed_inference_replay": True,
+                        "model_backed_passed": passed,
+                        "route": inferred.route.path.value,
+                        "failed_model_answer": "" if passed else inferred.answer.text,
+                        "model_generated_token_count": int(dict(event).get("generated_token_count", 0) or 0),
+                        "model_generated_token_ids": tuple(dict(event).get("generated_token_ids", ())),
+                    },
+                )
+                if replay is None:
+                    return
+                self._count("inference_model_backed_replay_events")
+                if passed:
+                    self._count("inference_model_backed_verified_replay_events")
+                else:
+                    self._count("inference_model_backed_repair_replay_events")
+
             for forced_path in forced_paths:
                 inferred = self.inference.infer(task, forced_path=forced_path)
                 inference_results.append(inferred)
@@ -6588,6 +6624,7 @@ class CortexTrainingPhaseController:
             inference_results.append(model_inferred)
             route_reports.append(model_inferred.to_dict())
             record_model_backed_event(model_inferred)
+            add_model_backed_replay(model_inferred)
             self._count("inference_model_backed_forced_careful_events")
             self._count("inference_careful_path_events")
             self._count("inference_budget_predictions")
@@ -7000,6 +7037,9 @@ class CortexTrainingPhaseController:
                 "inference_model_backed_generated_tokens": int(self.integration_counts.get("inference_model_backed_generated_tokens", 0)),
                 "inference_model_backed_verified_events": int(self.integration_counts.get("inference_model_backed_verified_events", 0)),
                 "inference_model_backed_forced_careful_events": int(self.integration_counts.get("inference_model_backed_forced_careful_events", 0)),
+                "inference_model_backed_replay_events": int(self.integration_counts.get("inference_model_backed_replay_events", 0)),
+                "inference_model_backed_repair_replay_events": int(self.integration_counts.get("inference_model_backed_repair_replay_events", 0)),
+                "inference_model_backed_verified_replay_events": int(self.integration_counts.get("inference_model_backed_verified_replay_events", 0)),
                 "sleep_frontier_fastsolve_events": int(self.integration_counts.get("sleep_frontier_fastsolve_events", 0)),
                 "restored_frontier_fastsolve_reports": _last_items(self.restored_frontier_fastsolve_reports, 3),
                 "frontier_repair_candidate_count": len(self.frontier_repair_candidates),
@@ -7136,6 +7176,9 @@ class CortexTrainingPhaseController:
                     "inference_model_backed_generated_tokens": int(self.integration_counts.get("inference_model_backed_generated_tokens", 0)),
                     "inference_model_backed_verified_events": int(self.integration_counts.get("inference_model_backed_verified_events", 0)),
                     "inference_model_backed_forced_careful_events": int(self.integration_counts.get("inference_model_backed_forced_careful_events", 0)),
+                    "inference_model_backed_replay_events": int(self.integration_counts.get("inference_model_backed_replay_events", 0)),
+                    "inference_model_backed_repair_replay_events": int(self.integration_counts.get("inference_model_backed_repair_replay_events", 0)),
+                    "inference_model_backed_verified_replay_events": int(self.integration_counts.get("inference_model_backed_verified_replay_events", 0)),
                     "sleep_frontier_fastsolve_events": int(self.integration_counts.get("sleep_frontier_fastsolve_events", 0)),
                     "restored_frontier_fastsolve_reports": _last_items(self.restored_frontier_fastsolve_reports, 3),
                     "frontier_repair_candidate_count": len(self.frontier_repair_candidates),
@@ -7255,6 +7298,9 @@ class CortexTrainingPhaseController:
                     "inference_model_backed_generated_tokens": int(self.integration_counts.get("inference_model_backed_generated_tokens", 0)),
                     "inference_model_backed_verified_events": int(self.integration_counts.get("inference_model_backed_verified_events", 0)),
                     "inference_model_backed_forced_careful_events": int(self.integration_counts.get("inference_model_backed_forced_careful_events", 0)),
+                    "inference_model_backed_replay_events": int(self.integration_counts.get("inference_model_backed_replay_events", 0)),
+                    "inference_model_backed_repair_replay_events": int(self.integration_counts.get("inference_model_backed_repair_replay_events", 0)),
+                    "inference_model_backed_verified_replay_events": int(self.integration_counts.get("inference_model_backed_verified_replay_events", 0)),
                     "regrowth_model_application_count": len(self.regrowth_model_applications),
                     "regrowth_model_parameter_delta_l1": float(self.regrowth_model_parameter_delta_l1),
                     "regrowth_model_repair_loss_delta": float(self.regrowth_model_repair_loss_delta),

@@ -3349,6 +3349,12 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             self.assertGreater(influence["inference_model_backed_events"], 0)
             self.assertGreater(influence["inference_model_backed_generated_tokens"], 0)
             self.assertGreater(influence["inference_model_backed_forced_careful_events"], 0)
+            self.assertGreater(influence["inference_model_backed_replay_events"], 0)
+            self.assertEqual(
+                influence["inference_model_backed_replay_events"],
+                influence["inference_model_backed_repair_replay_events"]
+                + influence["inference_model_backed_verified_replay_events"],
+            )
             self.assertGreater(influence["sleep_frontier_fastsolve_events"], 0)
             self.assertGreater(influence["sleep_frontier_memory_binding_events"], 0)
             self.assertGreater(influence["frontier_repair_candidate_count"], 0)
@@ -3464,6 +3470,10 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             self.assertEqual(
                 persisted["training_influence"]["inference_model_backed_events"],
                 influence["inference_model_backed_events"],
+            )
+            self.assertEqual(
+                persisted["training_influence"]["inference_model_backed_replay_events"],
+                influence["inference_model_backed_replay_events"],
             )
             self.assertEqual(
                 persisted["training_influence"]["frontier_repair_accepted_events"],
@@ -3585,6 +3595,7 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 self.assertGreater(first_influence["ternary_core_forward_events"], 0)
                 self.assertGreater(first_influence["inference_model_backed_events"], 0)
                 self.assertGreater(first_influence["inference_model_backed_generated_tokens"], 0)
+                self.assertGreater(first_influence["inference_model_backed_replay_events"], 0)
                 self.assertGreater(first_influence["sleep_frontier_compiled_circuit_count"], 0)
                 self.assertGreater(first_influence["sleep_frontier_fastsolve_events"], 0)
                 self.assertGreater(first_influence["attribution_policy_updates"], 0)

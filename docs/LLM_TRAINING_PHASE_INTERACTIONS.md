@@ -564,7 +564,7 @@ P8 utilise :
 
 ### Impact Apprentissage
 
-P8 fournit des exemples verifies par route et mesure la capacite par cout effectif. Il aide le modele a apprendre une politique ou la qualite verifiee compte plus que le debit brut. Depuis C71, les rapports exigent aussi `inference_model_backed_events` et `inference_model_backed_generated_tokens`, ce qui prouve que P8 ne s'appuie plus seulement sur une reponse symbolique externe.
+P8 fournit des exemples verifies par route et mesure la capacite par cout effectif. Il aide le modele a apprendre une politique ou la qualite verifiee compte plus que le debit brut. Depuis C71, les rapports exigent aussi `inference_model_backed_events` et `inference_model_backed_generated_tokens`, ce qui prouve que P8 ne s'appuie plus seulement sur une reponse symbolique externe. Depuis C72, ces generations model-backed deviennent aussi du replay P8 verifie ou correctif (`inference_model_backed_replay_events`), donc elles influencent directement `replay_loss`.
 
 ## Phase 9 - Sleep / Consolidation
 
