@@ -41,7 +41,7 @@ from cortex3 import (
     Task,
     default_skill_specs,
 )
-from cortex3_attribution import CausalAttributionEngine
+from cortex3_attribution import AttributionPolicyMemory, CausalAttributionEngine
 from cortex3_certificates import CertificateHead, CertificateHeadOutput, CertificateType, CertificateVerifier, LatentProofState, RandomDelatentizer, build_certificate, certificate_contract_for_task, evaluate_certificate_efficiency
 from cortex3_cycle import CortexCycle
 from cortex3_frontier import CompiledFrontierAgent, FrontierCircuitRegistry, FrontierSkillDiscovery, compiled_circuit_id
@@ -3430,13 +3430,19 @@ def _cortex_architecture_audit_from_summary(summary: Mapping[str, Any]) -> dict[
     )
     add(
         "attribute_regression",
-        phase_count("P6") > 0 and integer("causal_ledger_traces") > 0 and replay_count("P6") > 0,
+        phase_count("P6") > 0
+        and integer("causal_ledger_traces") > 0
+        and replay_count("P6") > 0
+        and integer("attribution_policy_observations") > 0
+        and integer("attribution_policy_successes") > 0,
         {
             "P6": phase_count("P6"),
             "causal_ledger_traces": integer("causal_ledger_traces"),
             "phase_replay_P6": replay_count("P6"),
+            "attribution_policy_observations": integer("attribution_policy_observations"),
+            "attribution_policy_successes": integer("attribution_policy_successes"),
         },
-        "attribute regression phase must produce causal evidence and replay",
+        "attribute regression phase must produce causal evidence, replay and learned repair-outcome policy memory",
     )
     add(
         "minimal_regrowth",
@@ -3742,10 +3748,20 @@ def _cortex_phase_deliverable_audit_from_summary(summary: Mapping[str, Any]) -> 
     )
     add(
         "P6",
-        "causal_attribution_counterfactual_dimensions",
-        count("attribution_probe_events") > 0 and count("attribution_unique_dimensions") >= 7,
-        {"attribution_probe_events": count("attribution_probe_events"), "attribution_unique_dimensions": count("attribution_unique_dimensions")},
-        "causal attribution must run counterfactual probes over block/expert/KV/MTP/activation/FSP/routing dimensions",
+        "causal_attribution_counterfactual_dimensions_learned_policy",
+        count("attribution_probe_events") > 0
+        and count("attribution_unique_dimensions") >= 7
+        and count("attribution_policy_updates") > 0
+        and int(summary.get("attribution_policy_observations", 0) or 0) > 0,
+        {
+            "attribution_probe_events": count("attribution_probe_events"),
+            "attribution_unique_dimensions": count("attribution_unique_dimensions"),
+            "attribution_policy_updates": count("attribution_policy_updates"),
+            "attribution_policy_applied_events": count("attribution_policy_applied_events"),
+            "attribution_policy_observations": int(summary.get("attribution_policy_observations", 0) or 0),
+            "attribution_policy_successes": int(summary.get("attribution_policy_successes", 0) or 0),
+        },
+        "causal attribution must run counterfactual probes over block/expert/KV/MTP/activation/FSP/routing dimensions and learn from verified regrowth outcomes",
     )
     add(
         "P7",
@@ -3917,7 +3933,8 @@ class CortexTrainingPhaseController:
         )
         self.memory = CognitiveMemory(CognitiveMemoryConfig())
         self.certificate_verifier = CertificateVerifier()
-        self.attribution = CausalAttributionEngine(self.verifier)
+        self.attribution_policy = AttributionPolicyMemory()
+        self.attribution = CausalAttributionEngine(self.verifier, policy_memory=self.attribution_policy)
         self.regrowth = MinimalRegrowthEngine(self.verifier)
         self.inference = UltraFastInferenceEngine(
             self.verifier,
@@ -5115,6 +5132,7 @@ class CortexTrainingPhaseController:
             "objective_feedback_term_totals": dict(self.objective_feedback_term_totals),
             "objective_feedback_history": list(self.objective_feedback_history),
             "integration_counts": dict(self.integration_counts),
+            "attribution_policy": self.attribution_policy.to_dict(),
             "regrowth_model_applications": list(self.regrowth_model_applications),
             "regrowth_model_parameter_delta_l1": float(self.regrowth_model_parameter_delta_l1),
             "regrowth_model_repair_loss_delta": float(self.regrowth_model_repair_loss_delta),
@@ -5233,6 +5251,8 @@ class CortexTrainingPhaseController:
             str(key): int(value)
             for key, value in dict(payload.get("integration_counts") or {}).items()
         })
+        self.attribution_policy = AttributionPolicyMemory.from_dict(payload.get("attribution_policy"))
+        self.attribution.policy_memory = self.attribution_policy
         self.regrowth_model_applications = [
             dict(item)
             for item in payload.get("regrowth_model_applications", ())
@@ -5404,6 +5424,9 @@ class CortexTrainingPhaseController:
             "causal_ledger_traces": len(self.causal_ledger.traces),
             "uncertainty_ledger_observations": sum(len(pairs) for pairs in self.uncertainty_ledger.bins.values()),
             "uncertainty_ledger_ece": self.uncertainty_ledger.expected_calibration_error(),
+            "attribution_policy_observations": int(self.attribution_policy.observation_count),
+            "attribution_policy_successes": int(self.attribution_policy.success_count),
+            "attribution_policy_state": self.attribution_policy.to_dict(),
             "memory_recent_segments": len(self.memory.recent.segments),
             "memory_latent_segments": len(self.memory.latent.segments),
             "compiled_circuit_memory_binding_count": int(memory_report.get("compiled_circuit_memory_binding_count", 0) or 0),
@@ -5748,6 +5771,15 @@ class CortexTrainingPhaseController:
                     self.integration_counts.get("attribution_unique_dimensions", 0),
                     len(dimensions),
                 )
+                if attribution_report.policy_applied:
+                    self._count("attribution_policy_applied_events")
+                if attribution_report.policy_signals:
+                    self._count("attribution_policy_signal_events", len(attribution_report.policy_signals))
+                audit["attribution_policy"] = {
+                    "applied": bool(attribution_report.policy_applied),
+                    "signals": [signal.to_dict() for signal in attribution_report.policy_signals],
+                    "state": self.attribution_policy.to_dict(),
+                }
                 self._add_verified_phase_replay(
                     "P6",
                     attribution_report.failure.task,
@@ -5790,6 +5822,12 @@ class CortexTrainingPhaseController:
                 self._count("regrowth_candidate_actions", len(regrowth_plan.candidates))
                 model_regrowth = self._apply_model_regrowth(regrowth_plan, step=step)
                 audit["regrowth_model_application"] = model_regrowth
+                policy_signal = self.attribution_policy.observe_regrowth_plan(regrowth_plan)
+                if policy_signal is not None:
+                    self._count("attribution_policy_updates")
+                    if policy_signal.successes > 0:
+                        self._count("attribution_policy_success_events")
+                    audit["attribution_policy_update"] = policy_signal.to_dict()
                 self._add_verified_phase_replay(
                     "P7",
                     regrowth_plan.failure.task,
@@ -6125,6 +6163,10 @@ class CortexTrainingPhaseController:
                 and self.model.config.use_ternary_core
                 and self.model.config.use_native_ternary_kernel
             ),
+            "attribution_policy_observations": int(self.attribution_policy.observation_count),
+            "attribution_policy_successes": int(self.attribution_policy.success_count),
+            "attribution_policy_updates": int(self.integration_counts.get("attribution_policy_updates", 0)),
+            "attribution_policy_applied_events": int(self.integration_counts.get("attribution_policy_applied_events", 0)),
             "training_influence": {
                 "ternary_core_forward_events": trace_counts.get("layer_forward_events", 0),
                 "packed_ternary_dispatches": trace_counts.get("packed_ternary_dispatches", 0),
@@ -6168,6 +6210,10 @@ class CortexTrainingPhaseController:
                 "causal_ledger_traces": len(self.causal_ledger.traces),
                 "uncertainty_ledger_observations": sum(len(pairs) for pairs in self.uncertainty_ledger.bins.values()),
                 "uncertainty_ledger_ece": self.uncertainty_ledger.expected_calibration_error(),
+                "attribution_policy_observations": int(self.attribution_policy.observation_count),
+                "attribution_policy_successes": int(self.attribution_policy.success_count),
+                "attribution_policy_updates": int(self.integration_counts.get("attribution_policy_updates", 0)),
+                "attribution_policy_applied_events": int(self.integration_counts.get("attribution_policy_applied_events", 0)),
                 "confidence_regularization_steps": self.regularization_steps,
                 "sleep_replay_batches_available": len(self.replay_batches),
                 "sleep_replay_updates": self.replay_updates,
@@ -6277,6 +6323,10 @@ class CortexTrainingPhaseController:
                     "skill_ledger_states": len(self.skill_ledger.states),
                     "causal_ledger_traces": len(self.causal_ledger.traces),
                     "uncertainty_ledger_observations": sum(len(pairs) for pairs in self.uncertainty_ledger.bins.values()),
+                    "attribution_policy_observations": int(self.attribution_policy.observation_count),
+                    "attribution_policy_successes": int(self.attribution_policy.success_count),
+                    "attribution_policy_updates": int(self.integration_counts.get("attribution_policy_updates", 0)),
+                    "attribution_policy_applied_events": int(self.integration_counts.get("attribution_policy_applied_events", 0)),
                     "memory_recent_segments": len(self.memory.recent.segments),
                     "memory_latent_segments": len(self.memory.latent.segments),
                     "compiled_circuit_memory_binding_count": int(memory_report.get("compiled_circuit_memory_binding_count", 0) or 0),
@@ -6365,6 +6415,10 @@ class CortexTrainingPhaseController:
                     "skill_ledger_states": len(self.skill_ledger.states),
                     "causal_ledger_traces": len(self.causal_ledger.traces),
                     "uncertainty_ledger_observations": sum(len(pairs) for pairs in self.uncertainty_ledger.bins.values()),
+                    "attribution_policy_observations": int(self.attribution_policy.observation_count),
+                    "attribution_policy_successes": int(self.attribution_policy.success_count),
+                    "attribution_policy_updates": int(self.integration_counts.get("attribution_policy_updates", 0)),
+                    "attribution_policy_applied_events": int(self.integration_counts.get("attribution_policy_applied_events", 0)),
                     "memory_recent_segments": len(self.memory.recent.segments),
                     "memory_latent_segments": len(self.memory.latent.segments),
                     "compiled_circuit_memory_binding_count": int(memory_report.get("compiled_circuit_memory_binding_count", 0) or 0),

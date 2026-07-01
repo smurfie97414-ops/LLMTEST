@@ -1,6 +1,6 @@
 # Cortex-3 Architecture Self-Critique
 
-Etat: boucle d'audit 63 apres recentrage hors profiling/observabilite. La critique repart des 10 phases et vise les briques structurantes: SlowSolve -> verification -> compilation -> selection runtime -> reutilisation persistante -> evolution recursive. Le dernier correctif structurel fait maintenant evoluer P10 sur plusieurs generations bornees depuis l'archive persistante, avec filiation et pression de diversite.
+Etat: boucle d'audit 64 apres relecture P1-P10 hors profiling/observabilite. La critique repart des 10 phases et vise les briques structurantes: SlowSolve -> verification -> attribution -> regrowth -> compilation -> selection runtime -> reutilisation persistante -> evolution recursive. Le dernier correctif structurel ferme la boucle P6/P7: les attributions ne sont plus seulement des probes deterministes, elles apprennent des reparations P7 verifiees.
 
 Ce document sert de registre de critique et de correction. Il ne remplace pas les tests longs interdits pour cette iteration; il se limite aux preuves courtes disponibles, aux rapports du code et aux tests courts.
 
@@ -10,6 +10,7 @@ Mise a jour C60: P9 ne se limite plus au replay. Les exemples sleep acceptes son
 Mise a jour C61: P4 ne se limite plus aux batches observes. Les circuits Frontier compiles ont maintenant un `CompiledCircuitMemoryBinding`; P8/P9/P7 exigent sa reconstruction fidele avant reutilisation, et les certificats P5 portent ce binding.
 Mise a jour C62: P10 ne perd plus ses decisions detaillees hors checkpoint. `archive.json` et `rollback.json` persistent propositions, decisions, evaluations sandbox et tokens rollback; un controleur LLM neuf peut les recharger via `cortex_improvement_archive_dir`.
 Mise a jour C63: P10 ne reste plus sur une seule vague de propositions par audit. Les propositions acceptees deviennent des parents de propositions descendantes dans la meme execution P10, avec lineage, selection de type sous-represente et compteurs generationnels audites par le controleur LLM.
+Mise a jour C64: P6 n'est plus seulement un classement de probes. `AttributionPolicyMemory` apprend skill/cause/intervention depuis les reparations P7 acceptees, repondere les causes futures, persiste dans les checkpoints et devient obligatoire dans l'audit P6 du controleur LLM.
 
 ## Audit transversal haut enjeu apres C55
 
@@ -98,6 +99,14 @@ Mise a jour C63: P10 ne reste plus sur une seule vague de propositions par audit
 - Integration LLM: `TrainingConfig.cortex_phase_improvement_generations` vaut 2 par defaut. Le controleur P10 passe ce parametre au moteur, compte `recursive_generation_events` et `recursive_evolved_proposal_events`, les persiste dans le checkpoint/report et durcit l'audit livrable: si plusieurs generations sont configurees, au moins un evenement de proposition evoluee est exige.
 - Verification courte: `py_compile`, `tests.test_recursive_improvement.RecursiveImprovementTest.test_engine_evolves_accepted_proposals_across_generations`, `tests.test_recursive_improvement`, `tests.test_llm_pretraining.LLMPretrainingHarnessTest.test_full_cortex_phase_controller_uses_all_modules_during_training` et `tests.test_llm_pretraining.LLMPretrainingHarnessTest.test_cortex_phase_state_survives_checkpoint_resume` passent.
 - Statut: corrige pour la boucle P10 courte "archive persistante -> parent accepte -> descendant -> gate -> audit LLM". La prochaine cible haut enjeu ne doit pas etre du profiling: il faut soit scaler cette evolution sur cycles longs et vrais corpus, soit attaquer une autre phase structurelle comme P4 retention multi-cycle, P6 attribution apprise ou P5 certificats solveur-domaines.
+
+### C64. P6 attribuait mais n'apprenait pas encore de ses reparations
+
+- Critique: apres relecture de P1 a P10, le point faible haut enjeu n'etait pas un compteur supplementaire mais la boucle P6/P7. P6 produisait des causes via probes contrefactuels; P7 consommait ces causes et pouvait appliquer un patch parametrique verifie. Mais le resultat de P7 ne modifiait pas la politique future d'attribution. Une cause qui avait deja mene a une reparation peu couteuse et non-regressive n'etait pas privilegiee au prochain incident, et une cause sterile pouvait rester haut classee si la probe locale paraissait forte.
+- Correction: ajout de `AttributionPolicyMemory` et `AttributionPolicySignal`. La memoire suit, par skill et cause, tentatives, succes, echecs, intervention dominante, delta de score moyen, gain par cout, posterior de succes, poids de politique et confiance. `CausalAttributionEngine` applique cette politique sur les `CauseEstimate` avant le choix P7. Le controleur LLM partage une seule memoire P6/P7, met a jour cette memoire apres chaque regrowth accepte, persiste l'etat dans les checkpoints, expose observations/succes dans les sidecars et durcit l'audit: P6 doit maintenant prouver probes contrefactuelles et apprentissage depuis reparations verifiees.
+- Debug precis: le premier echec court venait d'une incoherence d'exposition: les compteurs P6 appris existaient dans `training_influence`, mais l'audit architecture lisait le niveau superieur et les dictionnaires internes d'audit. Les champs `attribution_policy_observations`, `attribution_policy_successes`, `attribution_policy_updates` et `attribution_policy_applied_events` sont maintenant exposes dans les trois chemins.
+- Verification courte: `py_compile`, `tests.test_causal_attribution`, `tests.test_regrowth`, `tests.test_llm_pretraining.LLMPretrainingHarnessTest.test_full_cortex_phase_controller_uses_all_modules_during_training` et `tests.test_llm_pretraining.LLMPretrainingHarnessTest.test_cortex_phase_state_survives_checkpoint_resume` passent.
+- Statut: corrige pour la boucle courte "P6 cause -> P7 patch verifie -> P6 politique apprise -> audit LLM". Reste a scaler la politique sur longues traces, causes multiples et cycles de training reels.
 
 ## Boucle 1 - Corrections executees maintenant
 
@@ -630,10 +639,10 @@ Mise a jour C63: P10 ne reste plus sur une seule vague de propositions par audit
 ### P6 - Causal Attribution
 
 - Ce qui est solide: ablations sur blocks, KV mode, FSP, precision activation, experts, clustering.
-- Preuve actuelle: tests causal attribution.
-- Faiblesse: attribution encore surtout sur traces/probes; peu de contrefactuels profonds sur LLM multi-couches larges.
+- Preuve actuelle: tests causal attribution, tests regrowth et test LLM complet avec politique apprise obligatoire.
+- Faiblesse: attribution encore surtout sur traces/probes et politique courte; peu de contrefactuels profonds sur LLM multi-couches larges et pas encore de long historique multi-corpus.
 - Risque architectural: P7 peut reparer le symptome dominant mais manquer la vraie cause quand plusieurs modules interagissent.
-- Correction prioritaire restante: connecter plus de traces layer-forward natives et learned-memory aux probes P6.
+- Correction prioritaire restante: scaler `AttributionPolicyMemory` sur des traces layer-forward natives, learned-memory, causes multiples et historiques de reparations longs.
 
 ### P7 - Minimal Regrowth
 

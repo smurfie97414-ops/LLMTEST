@@ -15,7 +15,7 @@ from cortex3 import (
     Task,
     default_skill_specs,
 )
-from cortex3_attribution import AblationDimension, CausalAttributionEngine, cluster_regressions
+from cortex3_attribution import AblationDimension, AttributionPolicyMemory, CausalAttributionEngine, cluster_regressions
 from cortex3_cycle import CortexCycle
 from cortex3_future import FutureContractEngine, MTPFSPConfig, MTPFSPHeads
 from cortex3_inference import InferencePath, UltraFastInferenceEngine
@@ -43,6 +43,38 @@ class CausalAttributionTest(unittest.TestCase):
         self.assertTrue(report.targeted_repair_is_cheaper)
         self.assertTrue(any(probe.spec.dimension == AblationDimension.ACTIVATION_PRECISION and probe.recovered for probe in report.probes))
         self.assertTrue(any(probe.spec.dimension == AblationDimension.BLOCK and probe.recovered for probe in report.probes))
+
+    def test_learned_attribution_policy_reweights_repeated_repair_successes(self):
+        task = Task("arith-policy", "arithmetic", "Compute exactly: 20 + 22. Return only the integer.", 42)
+        failure = ArithmeticSkill().verify(task, CandidateAnswer("43", confidence=0.82))
+        trace = CausalTrace(task_id=task.task_id, skill=task.skill, mtp_horizon=4, activation_bits=4, kv_mode="exact", uncertainty=0.18)
+        compression = CompressionTraceLedger()
+        _, decision = make_compression_decision("policy-block", [0.0, 0.01, 2.0, -3.0], certify_zeros=True)
+        compression.record_compression(decision)
+        base = CausalAttributionEngine(_verifier()).attribute(failure, trace=trace, compression_ledger=compression)
+        self.assertEqual(base.top_cause, "block_overcompressed")
+
+        policy = AttributionPolicyMemory()
+        for _ in range(5):
+            policy.observe(
+                skill="arithmetic",
+                cause="numeric_precision",
+                intervention="increase_local_activation_bits",
+                recovered=True,
+                score_delta=1.0,
+                gain_per_cost=1.0,
+            )
+        learned = CausalAttributionEngine(_verifier(), policy_memory=policy).attribute(
+            failure,
+            trace=trace,
+            compression_ledger=compression,
+        )
+
+        self.assertTrue(learned.policy_applied)
+        self.assertEqual(learned.top_cause, "numeric_precision")
+        numeric_signal = next(signal for signal in learned.policy_signals if signal.cause == "numeric_precision")
+        self.assertEqual(numeric_signal.successes, 5)
+        self.assertGreater(numeric_signal.policy_weight, 1.0)
 
     def test_real_forward_trace_drives_layer_block_and_activation_probes(self):
         verifier = _verifier()

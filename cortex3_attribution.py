@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import asdict, dataclass
 from enum import Enum
 from typing import Any, Iterable, Mapping, Sequence
@@ -64,12 +65,239 @@ class CauseEstimate:
 
 
 @dataclass(frozen=True)
+class AttributionPolicySignal:
+    skill: str
+    cause: str
+    dominant_intervention: str
+    attempts: int
+    successes: int
+    failures: int
+    mean_score_delta: float
+    mean_gain_per_cost: float
+    posterior_success: float
+    policy_weight: float
+    confidence: float
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+class AttributionPolicyMemory:
+    def __init__(
+        self,
+        *,
+        prior_success: float = 1.0,
+        prior_failure: float = 1.0,
+        min_weight: float = 0.35,
+        max_weight: float = 3.0,
+    ):
+        if prior_success <= 0.0 or prior_failure <= 0.0:
+            raise ValueError("attribution policy priors must be positive")
+        if min_weight <= 0.0 or max_weight < min_weight:
+            raise ValueError("invalid attribution policy weight bounds")
+        self.prior_success = float(prior_success)
+        self.prior_failure = float(prior_failure)
+        self.min_weight = float(min_weight)
+        self.max_weight = float(max_weight)
+        self._stats: dict[tuple[str, str], dict[str, Any]] = {}
+
+    def _key(self, skill: str, cause: str) -> tuple[str, str]:
+        return (str(skill), str(cause))
+
+    def _empty_stats(self) -> dict[str, Any]:
+        return {
+            "attempts": 0,
+            "successes": 0,
+            "failures": 0,
+            "score_delta_total": 0.0,
+            "gain_per_cost_total": 0.0,
+            "interventions": Counter(),
+        }
+
+    def _signal_from_stats(self, skill: str, cause: str, stats: Mapping[str, Any]) -> AttributionPolicySignal:
+        attempts = int(stats.get("attempts", 0) or 0)
+        successes = int(stats.get("successes", 0) or 0)
+        failures = int(stats.get("failures", 0) or 0)
+        interventions = Counter(dict(stats.get("interventions") or {}))
+        dominant = interventions.most_common(1)[0][0] if interventions else ""
+        mean_score = float(stats.get("score_delta_total", 0.0) or 0.0) / max(1, attempts)
+        mean_gain = float(stats.get("gain_per_cost_total", 0.0) or 0.0) / max(1, attempts)
+        posterior = (successes + self.prior_success) / max(
+            successes + failures + self.prior_success + self.prior_failure,
+            1e-9,
+        )
+        confidence = attempts / (attempts + 3.0) if attempts > 0 else 0.0
+        if attempts <= 0:
+            weight = 1.0
+        else:
+            success_pressure = 2.0 * posterior
+            gain_pressure = min(1.0, max(0.0, mean_gain))
+            weight = (1.0 - confidence) + confidence * (0.50 + success_pressure + 0.50 * gain_pressure)
+            weight = max(self.min_weight, min(self.max_weight, weight))
+        return AttributionPolicySignal(
+            skill=str(skill),
+            cause=str(cause),
+            dominant_intervention=str(dominant),
+            attempts=attempts,
+            successes=successes,
+            failures=failures,
+            mean_score_delta=mean_score,
+            mean_gain_per_cost=mean_gain,
+            posterior_success=posterior,
+            policy_weight=weight,
+            confidence=confidence,
+        )
+
+    def signal_for(self, skill: str, cause: str) -> AttributionPolicySignal:
+        return self._signal_from_stats(str(skill), str(cause), self._stats.get(self._key(skill, cause), self._empty_stats()))
+
+    def observe(
+        self,
+        *,
+        skill: str,
+        cause: str,
+        intervention: str,
+        recovered: bool,
+        score_delta: float,
+        gain_per_cost: float,
+        protected_regression: bool = False,
+    ) -> AttributionPolicySignal:
+        key = self._key(skill, cause)
+        stats = self._stats.setdefault(key, self._empty_stats())
+        stats["attempts"] = int(stats.get("attempts", 0)) + 1
+        success = bool(recovered) and not bool(protected_regression) and float(score_delta) > 0.0
+        if success:
+            stats["successes"] = int(stats.get("successes", 0)) + 1
+        else:
+            stats["failures"] = int(stats.get("failures", 0)) + 1
+        stats["score_delta_total"] = float(stats.get("score_delta_total", 0.0)) + max(0.0, float(score_delta))
+        stats["gain_per_cost_total"] = float(stats.get("gain_per_cost_total", 0.0)) + max(0.0, float(gain_per_cost))
+        interventions = Counter(stats.get("interventions") or {})
+        interventions.update((str(intervention),))
+        stats["interventions"] = interventions
+        return self._signal_from_stats(str(skill), str(cause), stats)
+
+    def observe_regrowth_plan(self, plan: Any) -> AttributionPolicySignal | None:
+        selected = getattr(plan, "selected", None)
+        if selected is None:
+            return None
+        action = getattr(selected, "action", None)
+        if action is None:
+            return None
+        metadata = dict(getattr(action, "metadata", {}) or {})
+        cause = str(metadata.get("cause") or "")
+        if not cause:
+            return None
+        non_regression = getattr(selected, "non_regression", None)
+        protected_regression = not bool(getattr(non_regression, "passed", False))
+        failure = getattr(plan, "failure", None)
+        task = getattr(failure, "task", None)
+        skill = str(getattr(task, "skill", getattr(action, "target", "")))
+        kind = getattr(action, "kind", "")
+        intervention = str(getattr(kind, "value", kind))
+        return self.observe(
+            skill=skill,
+            cause=cause,
+            intervention=intervention,
+            recovered=bool(getattr(selected, "recovered", False)),
+            score_delta=float(getattr(selected, "score_delta", 0.0)),
+            gain_per_cost=float(getattr(selected, "gain_per_cost", 0.0)),
+            protected_regression=protected_regression,
+        )
+
+    def apply(
+        self,
+        skill: str,
+        estimates: Sequence[CauseEstimate],
+    ) -> tuple[tuple[CauseEstimate, ...], tuple[AttributionPolicySignal, ...], bool]:
+        if not estimates:
+            return tuple(), tuple(), False
+        signals = tuple(self.signal_for(skill, estimate.cause) for estimate in estimates)
+        adjusted_mass = [
+            max(0.0, float(estimate.probability)) * max(0.0, signal.policy_weight)
+            for estimate, signal in zip(estimates, signals)
+        ]
+        total = sum(adjusted_mass)
+        if total <= 0.0:
+            adjusted_mass = [float(estimate.probability) for estimate in estimates]
+            total = sum(adjusted_mass) or 1.0
+        adjusted = tuple(
+            CauseEstimate(
+                cause=estimate.cause,
+                probability=mass / total,
+                best_dimension=estimate.best_dimension,
+                best_intervention=estimate.best_intervention,
+                recovered=estimate.recovered,
+                score_delta=estimate.score_delta,
+                gain_per_cost=estimate.gain_per_cost,
+            )
+            for estimate, mass in zip(estimates, adjusted_mass)
+        )
+        policy_applied = any(signal.attempts > 0 for signal in signals)
+        return tuple(sorted(adjusted, key=lambda estimate: estimate.probability, reverse=True)), signals, policy_applied
+
+    @property
+    def observation_count(self) -> int:
+        return sum(int(stats.get("attempts", 0) or 0) for stats in self._stats.values())
+
+    @property
+    def success_count(self) -> int:
+        return sum(int(stats.get("successes", 0) or 0) for stats in self._stats.values())
+
+    def to_dict(self) -> dict[str, Any]:
+        entries = []
+        for (skill, cause), stats in sorted(self._stats.items()):
+            signal = self._signal_from_stats(skill, cause, stats)
+            entries.append({
+                **signal.to_dict(),
+                "interventions": dict(Counter(stats.get("interventions") or {})),
+            })
+        return {
+            "schema_version": 1,
+            "prior_success": self.prior_success,
+            "prior_failure": self.prior_failure,
+            "min_weight": self.min_weight,
+            "max_weight": self.max_weight,
+            "observation_count": self.observation_count,
+            "success_count": self.success_count,
+            "entries": entries,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any] | None) -> "AttributionPolicyMemory":
+        data = dict(payload or {})
+        memory = cls(
+            prior_success=float(data.get("prior_success", 1.0)),
+            prior_failure=float(data.get("prior_failure", 1.0)),
+            min_weight=float(data.get("min_weight", 0.35)),
+            max_weight=float(data.get("max_weight", 3.0)),
+        )
+        for entry in data.get("entries", ()):
+            item = dict(entry)
+            skill = str(item.get("skill", ""))
+            cause = str(item.get("cause", ""))
+            if not skill or not cause:
+                continue
+            stats = memory._empty_stats()
+            stats["attempts"] = int(item.get("attempts", 0) or 0)
+            stats["successes"] = int(item.get("successes", 0) or 0)
+            stats["failures"] = int(item.get("failures", 0) or 0)
+            stats["score_delta_total"] = float(item.get("mean_score_delta", 0.0) or 0.0) * max(1, stats["attempts"])
+            stats["gain_per_cost_total"] = float(item.get("mean_gain_per_cost", 0.0) or 0.0) * max(1, stats["attempts"])
+            stats["interventions"] = Counter(dict(item.get("interventions") or {}))
+            memory._stats[memory._key(skill, cause)] = stats
+        return memory
+
+
+@dataclass(frozen=True)
 class CausalAttributionReport:
     failure: VerificationCaseResult
     probes: tuple[AblationProbeResult, ...]
     causes: tuple[CauseEstimate, ...]
     targeted_repair_cost: float
     global_retrain_cost: float = 100.0
+    policy_signals: tuple[AttributionPolicySignal, ...] = ()
+    policy_applied: bool = False
 
     @property
     def top_cause(self) -> str:
@@ -91,6 +319,8 @@ class CausalAttributionReport:
             "targeted_repair_cost": self.targeted_repair_cost,
             "global_retrain_cost": self.global_retrain_cost,
             "targeted_repair_is_cheaper": self.targeted_repair_is_cheaper,
+            "policy_applied": self.policy_applied,
+            "policy_signals": [signal.to_dict() for signal in self.policy_signals],
             "causes": [
                 {
                     "cause": cause.cause,
@@ -316,9 +546,15 @@ def _future_contract_specs(failure: VerificationCaseResult, future_ledger: Futur
 
 
 class CausalAttributionEngine:
-    def __init__(self, verifier: DynamicSkillVerifier, global_retrain_cost: float = 100.0):
+    def __init__(
+        self,
+        verifier: DynamicSkillVerifier,
+        global_retrain_cost: float = 100.0,
+        policy_memory: AttributionPolicyMemory | None = None,
+    ):
         self.verifier = verifier
         self.global_retrain_cost = global_retrain_cost
+        self.policy_memory = policy_memory or AttributionPolicyMemory()
 
     def build_probe_specs(
         self,
@@ -385,9 +621,18 @@ class CausalAttributionEngine:
         runner = CounterfactualAblationRunner(self.verifier)
         specs = self.build_probe_specs(failure, trace=trace, compression_ledger=compression_ledger, future_ledger=future_ledger)
         probes = tuple(runner.run(failure, spec) for spec in specs)
-        causes = self._estimate_causes(probes)
+        raw_causes = self._estimate_causes(probes)
+        causes, policy_signals, policy_applied = self.policy_memory.apply(failure.task.skill, raw_causes)
         targeted_cost = min((probe.cost.effective_cost() for probe in probes if probe.recovered), default=self.global_retrain_cost)
-        return CausalAttributionReport(failure, probes, causes, targeted_cost, self.global_retrain_cost)
+        return CausalAttributionReport(
+            failure,
+            probes,
+            causes,
+            targeted_cost,
+            self.global_retrain_cost,
+            policy_signals=policy_signals,
+            policy_applied=policy_applied,
+        )
 
     def _estimate_causes(self, probes: Sequence[AblationProbeResult]) -> tuple[CauseEstimate, ...]:
         best_by_cause: dict[str, AblationProbeResult] = {}

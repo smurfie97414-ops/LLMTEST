@@ -436,7 +436,8 @@ Elle produit :
 - probabilites ;
 - recovered/non-recovered ;
 - gain par cout ;
-- top cause.
+- top cause ;
+- signaux de politique apprise quand l'historique P7 existe.
 
 ### Interaction Avec Les Autres Phases
 
@@ -445,11 +446,12 @@ P6 est le pont entre detection et correction :
 - P1 detecte ;
 - P6 explique ;
 - P7 repare ;
+- P7 renvoie a P6 le resultat verifie de la reparation ;
 - P10 peut proposer une amelioration plus generale.
 
 ### Impact Apprentissage
 
-P6 evite de transformer toute regression en retraining global aveugle. Il donne une cible de correction, ce qui rend P7 possible et mesure le cout relatif d'une reparation locale.
+P6 evite de transformer toute regression en retraining global aveugle. Il donne une cible de correction, ce qui rend P7 possible et mesure le cout relatif d'une reparation locale. Le controleur LLM conserve maintenant une memoire de politique d'attribution : quand P7 applique une reparation non-regressive et ameliore la loss de reparation, le couple skill/cause gagne un signal de succes, de gain par cout et d'intervention dominante. Les attributions suivantes peuvent donc privilegier les causes qui ont deja produit des reparations verifiees, au lieu de rester sur un classement purement statique.
 
 ## Phase 7 - Minimal Regrowth
 
@@ -471,7 +473,8 @@ P7 :
 8. mesure repair loss avant/apres ;
 9. mesure protected loss ;
 10. requantifie le coeur ternaire ;
-11. rollback si le gate echoue.
+11. rollback si le gate echoue ;
+12. renvoie le resultat accepte a la politique P6.
 
 ### Interaction Avec Les Autres Phases
 
@@ -480,6 +483,7 @@ P7 depend de P1/P6 et agit sur P2 :
 - P1 donne la regression ;
 - P6 donne la cause ;
 - P7 choisit la correction ;
+- P6 apprend du resultat P7 ;
 - P2 est requantifie apres patch ;
 - P9 peut ensuite consolider des exemples lies.
 

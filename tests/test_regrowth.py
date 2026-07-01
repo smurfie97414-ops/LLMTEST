@@ -15,7 +15,7 @@ from cortex3 import (
     default_skill_specs,
     ternarize_values,
 )
-from cortex3_attribution import AblationDimension, CausalAttributionEngine, CausalAttributionReport, CauseEstimate
+from cortex3_attribution import AblationDimension, AttributionPolicyMemory, CausalAttributionEngine, CausalAttributionReport, CauseEstimate
 from cortex3_cycle import CortexCycle
 from cortex3_ledgers import CausalTrace
 from cortex3_regrowth import (
@@ -97,6 +97,31 @@ class RegrowthTest(unittest.TestCase):
         self.assertTrue(any(result.action.kind == RegrowthActionKind.UNZERO_BLOCK and result.recovered for result in plan.candidates))
         self.assertTrue(plan.annealing)
         self.assertTrue(plan.annealing[-1].retained)
+
+    def test_successful_regrowth_plan_updates_attribution_policy_memory(self):
+        verifier = _verifier()
+        task = Task("arith-policy-regrowth", "arithmetic", "Compute exactly 20 + 22.", 42)
+        failure = ArithmeticSkill().verify(task, CandidateAnswer("43", confidence=0.82))
+        trace = CausalTrace(task_id=task.task_id, skill=task.skill, mtp_horizon=4, activation_bits=4)
+        ledger = CompressionTraceLedger()
+        _, decision = make_compression_decision("policy-regrowth-block", [0.0, 0.01, 2.0, -3.0], certify_zeros=True)
+        ledger.record_compression(decision)
+        attribution = CausalAttributionEngine(verifier).attribute(failure, trace=trace, compression_ledger=ledger)
+        plan = MinimalRegrowthEngine(verifier).plan(attribution, _baseline_for_failure(failure), protected_tasks=(task,), budget=25.0)
+        policy = AttributionPolicyMemory()
+
+        signal = policy.observe_regrowth_plan(plan)
+
+        self.assertIsNotNone(signal)
+        assert signal is not None
+        self.assertEqual(signal.skill, "arithmetic")
+        self.assertEqual(signal.attempts, 1)
+        self.assertEqual(signal.successes, 1)
+        self.assertGreater(policy.observation_count, 0)
+        self.assertGreater(policy.success_count, 0)
+        round_tripped = AttributionPolicyMemory.from_dict(policy.to_dict())
+        self.assertEqual(round_tripped.observation_count, policy.observation_count)
+        self.assertEqual(round_tripped.success_count, policy.success_count)
 
     def test_force_exact_anchor_action_recovers_anchor_failure(self):
         verifier = _verifier()

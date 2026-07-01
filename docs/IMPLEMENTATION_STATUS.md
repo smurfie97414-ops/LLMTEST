@@ -145,12 +145,15 @@ Current executable coverage:
 - FSP probes consume `FutureContractLedger` decisions and test stricter contract re-verification.
 - Probe results record baseline score, counterfactual score, recovery, score delta, cost and gain per cost.
 - Cause estimates normalize measured probe evidence into probabilities and best interventions.
+- `AttributionPolicyMemory` learns which causal hypotheses actually led to verified P7 repairs, with posterior success, gain-per-cost weighting, confidence and dominant intervention tracking.
+- `CausalAttributionEngine` can reweight deterministic probe estimates through that learned policy before P7 chooses a repair.
 - `cluster_regressions` groups failures by top cause and skill with recommended intervention.
 - `write_cycle_run` can persist causal attribution reports and clusters into `summary.json`; `tools/run_cycle_report.py` writes a real-forward-trace attribution smoke by default and `--skip-attribution` disables it.
+- The full LLM Cortex phase controller persists the learned attribution policy in checkpoints, exposes observations/successes in architecture audits, and requires the P6 deliverable to include both counterfactual probe breadth and verified repair-outcome learning.
 
 Remaining:
 
-- Add repeated probe runs to estimate attribution variance.
+- Scale the learned policy beyond the short audit loop: repeated trace corpora, multi-cause regressions, long repair histories and larger held-out causal suites.
 
 ## Phase 7 - Minimal regrowth
 
@@ -169,6 +172,7 @@ Current executable coverage:
 - `write_cycle_run` persists regrowth plans into `summary.json`.
 - The full LLM Cortex phase controller converts verified regrowth outputs into causal replay examples, then applies the accepted repair to real Transformer parameters with a bounded gradient patch over targeted Cortex submodules.
 - The P7 model patch gate records before/after repair loss, protected loss, parameter L1 delta, updated parameter names, non-regression status, ternary requantization and rollback-on-failure evidence in `cortex_phase_report.json` and checkpoint sidecars.
+- Accepted P7 repairs now feed their real outcome back into `AttributionPolicyMemory`, closing the loop P6 hypothesis -> P7 repair -> learned future attribution prior.
 
 Remaining:
 

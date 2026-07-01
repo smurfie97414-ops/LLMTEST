@@ -3250,7 +3250,7 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 "P3:mtp_fsp_confidence_temporal_contract_gate",
                 "P4:learned_exact_latent_drop_memory_anchor_fidelity",
                 "P5:latent_certificate_delatentization_tool_verification",
-                "P6:causal_attribution_counterfactual_dimensions",
+                "P6:causal_attribution_counterfactual_dimensions_learned_policy",
                 "P7:minimal_regrowth_action_space_repair_plan_and_model_patch",
                 "P8:fast_normal_careful_budget_early_exit_mod_speculative_kernels",
                 "P9:sleep_replay_synthetic_real_reservoir_anti_collapse_schedule_frontier_compile",
@@ -3334,6 +3334,9 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             self.assertGreater(influence["sleep_frontier_memory_binding_events"], 0)
             self.assertGreater(influence["frontier_repair_candidate_count"], 0)
             self.assertGreater(influence["frontier_repair_accepted_events"], 0)
+            self.assertGreater(influence["attribution_policy_updates"], 0)
+            self.assertGreater(influence["attribution_policy_observations"], 0)
+            self.assertGreater(influence["attribution_policy_successes"], 0)
             self.assertGreater(influence["recursive_frontier_proposal_events"], 0)
             self.assertGreaterEqual(influence["recursive_improvement_generations_configured"], 2)
             self.assertGreaterEqual(influence["recursive_generation_events"], 2)
@@ -3546,6 +3549,9 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 self.assertGreater(first_influence["ternary_core_forward_events"], 0)
                 self.assertGreater(first_influence["sleep_frontier_compiled_circuit_count"], 0)
                 self.assertGreater(first_influence["sleep_frontier_fastsolve_events"], 0)
+                self.assertGreater(first_influence["attribution_policy_updates"], 0)
+                self.assertGreater(first_influence["attribution_policy_observations"], 0)
+                self.assertGreater(first_influence["attribution_policy_successes"], 0)
                 self.assertGreaterEqual(first_influence["recursive_improvement_generations_configured"], 2)
                 self.assertGreaterEqual(first_influence["recursive_generation_events"], 2)
                 self.assertGreater(first_influence["recursive_evolved_proposal_events"], 0)
@@ -3571,6 +3577,8 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 self.assertGreater(checkpoint["cortex_phase_state"]["ledgers"]["bit_ledger"]["total_effective_bits"], 0.0)
                 self.assertTrue(checkpoint["cortex_phase_state"]["ledgers"]["skill_ledger"]["states"])
                 self.assertGreater(checkpoint["cortex_phase_state"]["ledgers"]["causal_ledger"]["trace_count"], 0)
+                self.assertGreater(checkpoint["cortex_phase_state"]["attribution_policy"]["observation_count"], 0)
+                self.assertGreater(checkpoint["cortex_phase_state"]["attribution_policy"]["success_count"], 0)
                 self.assertGreater(
                     checkpoint["cortex_phase_state"]["ledgers"]["uncertainty_ledger"]["observation_count"],
                     0,
@@ -3646,6 +3654,8 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 self.assertGreater(sidecar["cortex_phase_state_summary"]["regrowth_model_parameter_delta_l1"], 0.0)
                 self.assertGreater(sidecar["cortex_phase_state_summary"]["regrowth_model_repair_loss_delta"], 0.0)
                 self.assertTrue(sidecar["cortex_phase_state_summary"]["regrowth_model_applications"])
+                self.assertGreater(sidecar["cortex_phase_state_summary"]["attribution_policy_observations"], 0)
+                self.assertGreater(sidecar["cortex_phase_state_summary"]["attribution_policy_successes"], 0)
                 self.assertGreater(sidecar["cortex_phase_state_summary"]["recursive_model_application_count"], 0)
                 self.assertGreaterEqual(sidecar["cortex_phase_state_summary"]["recursive_generation_events"], 2)
                 self.assertGreater(sidecar["cortex_phase_state_summary"]["recursive_evolved_proposal_events"], 0)
@@ -3747,6 +3757,14 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             self.assertGreaterEqual(
                 resumed_influence["regrowth_model_application_count"],
                 first_influence["regrowth_model_application_count"],
+            )
+            self.assertGreaterEqual(
+                resumed_influence["attribution_policy_observations"],
+                first_influence["attribution_policy_observations"],
+            )
+            self.assertGreaterEqual(
+                resumed_influence["attribution_policy_successes"],
+                first_influence["attribution_policy_successes"],
             )
             self.assertGreater(
                 resumed_influence["regrowth_model_parameter_delta_l1"],
