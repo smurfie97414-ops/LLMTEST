@@ -640,7 +640,7 @@ P10 :
 9. archive la decision ;
 10. cree des propositions descendantes depuis les parents acceptes de l'archive, avec filiation et pression de diversite ;
 11. persiste l'archive evolutive complete dans `archive.json` et les evenements rollback dans `rollback.json` ;
-12. recharge ces archives via `cortex_improvement_archive_dir` quand un run independant partage le meme dossier ;
+12. recharge ces archives via `cortex_improvement_archive_dir` quand un run independant partage le meme dossier, mais refuse les records sans rapports verifier complets ou sans rollback persistant ;
 13. cree rollback token ;
 14. applique une proposition acceptee comme patch signe sur vrais poids Transformer ;
 15. ecrit un artefact rollback executable `model_patch_rollbacks/<signed_patch_id>.pt` contenant les tensors pre-patch et les checksums pre/post ;
@@ -665,7 +665,7 @@ P10 agit par :
 - replay P10 ;
 - patch direct des poids ;
 - rollback executable des poids si un patch signe doit etre retire : verification du checksum post-patch, restauration des tensors pre-patch, puis requantification du coeur ternaire ;
-- archive evolutive durable qui influence les gates de diversite des runs suivants ;
+- archive evolutive durable, strictement restauree sans `fallback_score`, qui influence les gates de diversite des runs suivants ;
 - evolution multi-generation bornee depuis des parents acceptes, avec lineage et pression vers les types de propositions sous-representes ;
 - signaux vers `L_recursive_improvement_validity`.
 
@@ -861,6 +861,12 @@ Les tests courts pertinents sont :
 - `test_algebra_oracle_accepts_exact_symbolic_quadratic_root_sets`
   - prouve que le Verifier OS accepte le replay algebrique symbolique ;
   - rejette les racines fausses et les reponses avec texte extra.
+
+- `test_persistent_archive_rejects_missing_full_evaluation_reports`
+  - prouve que P10 refuse une archive tronquee au lieu de reconstruire un score de secours.
+
+- `test_persistent_archive_rejects_missing_rollback_file_for_accepted_records`
+  - prouve qu'une archive acceptee ne peut pas etre restauree sans `rollback.json`.
 
 - `test_training_config_rejects_strict_and_auto_resume_together`
   - verifie les configs dangereuses ;

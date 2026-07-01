@@ -2,6 +2,7 @@ import json
 import tempfile
 import unittest
 from dataclasses import replace
+from pathlib import Path
 
 from cortex3 import CorruptedCompressedAgent, DynamicSkillVerifier, ReferenceRuleAgent, default_skill_specs
 from cortex3_cycle import CortexCycle
@@ -323,8 +324,42 @@ class RecursiveImprovementTest(unittest.TestCase):
             restored_record.decision.evaluation.trial_report.aggregate_score,
             original_record.decision.evaluation.trial_report.aggregate_score,
         )
+        self.assertGreater(restored_record.decision.evaluation.baseline_report.total, 0)
+        self.assertGreater(restored_record.decision.evaluation.trial_report.total, 0)
+        self.assertGreater(restored_record.decision.evaluation.robustness_report.total, 0)
         self.assertEqual(restored.rollback.events[0].rollback_token, original_record.rollback_token)
         self.assertIn("post-run", restored.rollback.events[0].reason)
+
+    def test_persistent_archive_rejects_missing_full_evaluation_reports(self):
+        verifier, report = _cycle()
+        engine = RecursiveImprovementEngine(verifier)
+        improvement = engine.run(report, max_proposals=2, seed=3, n_per_skill=1)
+        self.assertTrue(improvement.archive.accepted)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            engine.save_persistent_state(tmp)
+            archive_path = Path(tmp) / "archive.json"
+            payload = json.loads(archive_path.read_text(encoding="utf-8"))
+            del payload["accepted"][0]["decision"]["evaluation"]["trial_report"]
+            archive_path.write_text(json.dumps(payload), encoding="utf-8")
+
+            restored = RecursiveImprovementEngine(verifier)
+            with self.assertRaisesRegex(ValueError, "trial_report"):
+                restored.load_persistent_state(tmp)
+
+    def test_persistent_archive_rejects_missing_rollback_file_for_accepted_records(self):
+        verifier, report = _cycle()
+        engine = RecursiveImprovementEngine(verifier)
+        improvement = engine.run(report, max_proposals=2, seed=3, n_per_skill=1)
+        self.assertTrue(improvement.archive.accepted)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            engine.save_persistent_state(tmp)
+            (Path(tmp) / "rollback.json").unlink()
+
+            restored = RecursiveImprovementEngine(verifier)
+            with self.assertRaisesRegex(FileNotFoundError, "rollback archive is missing"):
+                restored.load_persistent_state(tmp)
 
     def test_reporting_can_persist_recursive_improvement_report(self):
         verifier, report = _cycle(seed=4)

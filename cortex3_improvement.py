@@ -36,6 +36,18 @@ def _write_json(path: Path, payload: Mapping[str, Any]) -> Path:
     return path
 
 
+def _require_mapping(payload: Any, *, context: str) -> Mapping[str, Any]:
+    if not isinstance(payload, Mapping):
+        raise ValueError(f"{context} must be a persisted mapping")
+    return payload
+
+
+def _require_keys(payload: Mapping[str, Any], keys: Iterable[str], *, context: str) -> None:
+    missing = [key for key in keys if key not in payload]
+    if missing:
+        raise ValueError(f"{context} missing required fields: {', '.join(missing)}")
+
+
 def _cost_to_dict(cost: CostTrace) -> dict[str, Any]:
     return asdict(cost)
 
@@ -176,24 +188,29 @@ def _suite_report_to_dict(report: VerificationSuiteReport) -> dict[str, Any]:
     }
 
 
-def _minimal_suite_report(score: float) -> VerificationSuiteReport:
-    return VerificationSuiteReport({}, total=0, passed=0, aggregate_score=float(score), total_cost=CostTrace())
-
-
-def _suite_report_from_dict(payload: Mapping[str, Any] | None, *, fallback_score: float = 0.0) -> VerificationSuiteReport:
-    if not payload:
-        return _minimal_suite_report(fallback_score)
-    data = dict(payload)
+def _suite_report_from_dict(payload: Mapping[str, Any], *, context: str = "verification suite report") -> VerificationSuiteReport:
+    data = dict(_require_mapping(payload, context=context))
+    _require_keys(
+        data,
+        ("skill_reports", "total", "passed", "aggregate_score", "total_cost"),
+        context=context,
+    )
     skill_reports = {
         str(skill): _skill_report_from_dict(dict(skill_report))
-        for skill, skill_report in dict(data.get("skill_reports") or {}).items()
+        for skill, skill_report in dict(data["skill_reports"] or {}).items()
     }
+    total = int(data["total"])
+    passed = int(data["passed"])
+    if total <= 0 or not skill_reports:
+        raise ValueError(f"{context} must contain full non-empty verifier cases")
+    if passed < 0 or passed > total:
+        raise ValueError(f"{context} has invalid passed/total counts")
     return VerificationSuiteReport(
         skill_reports=skill_reports,
-        total=int(data.get("total", 0)),
-        passed=int(data.get("passed", 0)),
-        aggregate_score=float(data.get("aggregate_score", fallback_score)),
-        total_cost=_cost_from_dict(data.get("total_cost")),
+        total=total,
+        passed=passed,
+        aggregate_score=float(data["aggregate_score"]),
+        total_cost=_cost_from_dict(data["total_cost"]),
     )
 
 
@@ -718,37 +735,47 @@ class SandboxEvaluation:
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any], proposal: ImprovementProposal) -> "SandboxEvaluation":
-        data = dict(payload)
-        baseline_report = _suite_report_from_dict(
-            data.get("baseline_report"),
-            fallback_score=float(data.get("baseline_score", 0.0)),
+        data = dict(_require_mapping(payload, context="sandbox evaluation"))
+        _require_keys(
+            data,
+            (
+                "sandbox",
+                "baseline_report",
+                "trial_report",
+                "robustness_report",
+                "quality_delta",
+                "cost_delta",
+                "robustness_delta",
+                "baseline_calibration_gap",
+                "trial_calibration_gap",
+                "calibration_delta",
+                "protected_losses",
+                "reward_hacking_flags",
+                "collapse_flags",
+            ),
+            context="sandbox evaluation",
         )
-        trial_report = _suite_report_from_dict(
-            data.get("trial_report"),
-            fallback_score=float(data.get("trial_score", 0.0)),
-        )
-        robustness_report = _suite_report_from_dict(
-            data.get("robustness_report"),
-            fallback_score=float(data.get("robustness_score", 0.0)),
-        )
+        baseline_report = _suite_report_from_dict(data["baseline_report"], context="sandbox baseline_report")
+        trial_report = _suite_report_from_dict(data["trial_report"], context="sandbox trial_report")
+        robustness_report = _suite_report_from_dict(data["robustness_report"], context="sandbox robustness_report")
         return cls(
             proposal=proposal,
-            sandbox=SandboxTrial.from_dict(dict(data.get("sandbox") or {}), proposal),
+            sandbox=SandboxTrial.from_dict(dict(data["sandbox"]), proposal),
             baseline_report=baseline_report,
             trial_report=trial_report,
             robustness_report=robustness_report,
-            quality_delta=float(data.get("quality_delta", trial_report.aggregate_score - baseline_report.aggregate_score)),
-            cost_delta=float(data.get("cost_delta", 0.0)),
-            robustness_delta=float(data.get("robustness_delta", 0.0)),
-            baseline_calibration_gap=float(data.get("baseline_calibration_gap", 0.0)),
-            trial_calibration_gap=float(data.get("trial_calibration_gap", 0.0)),
-            calibration_delta=float(data.get("calibration_delta", 0.0)),
+            quality_delta=float(data["quality_delta"]),
+            cost_delta=float(data["cost_delta"]),
+            robustness_delta=float(data["robustness_delta"]),
+            baseline_calibration_gap=float(data["baseline_calibration_gap"]),
+            trial_calibration_gap=float(data["trial_calibration_gap"]),
+            calibration_delta=float(data["calibration_delta"]),
             protected_losses={
                 str(key): float(value)
-                for key, value in dict(data.get("protected_losses") or {}).items()
+                for key, value in dict(data["protected_losses"] or {}).items()
             },
-            reward_hacking_flags=tuple(str(item) for item in data.get("reward_hacking_flags", ())),
-            collapse_flags=tuple(str(item) for item in data.get("collapse_flags", ())),
+            reward_hacking_flags=tuple(str(item) for item in data["reward_hacking_flags"]),
+            collapse_flags=tuple(str(item) for item in data["collapse_flags"]),
         )
 
 
@@ -906,12 +933,17 @@ class AcceptanceDecision:
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any], proposal: ImprovementProposal) -> "AcceptanceDecision":
-        data = dict(payload)
+        data = dict(_require_mapping(payload, context="acceptance decision"))
+        _require_keys(
+            data,
+            ("accepted", "reason", "evaluation", "diversity_flags"),
+            context="acceptance decision",
+        )
         return cls(
-            accepted=bool(data.get("accepted", False)),
-            reason=str(data.get("reason", "")),
-            evaluation=SandboxEvaluation.from_dict(dict(data.get("evaluation") or {}), proposal),
-            diversity_flags=tuple(str(item) for item in data.get("diversity_flags", ())),
+            accepted=bool(data["accepted"]),
+            reason=str(data["reason"]),
+            evaluation=SandboxEvaluation.from_dict(dict(data["evaluation"]), proposal),
+            diversity_flags=tuple(str(item) for item in data["diversity_flags"]),
         )
 
 
@@ -954,14 +986,13 @@ class ArchiveRecord:
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> "ArchiveRecord":
-        data = dict(payload)
-        proposal = ImprovementProposal.from_dict(dict(data.get("proposal") or {}))
-        decision = AcceptanceDecision.from_dict(dict(data.get("decision") or {}), proposal)
-        rollback_token = str(
-            data.get("rollback_token")
-            or decision.evaluation.sandbox.rollback_token
-            or f"rollback-{proposal.proposal_id}"
-        )
+        data = dict(_require_mapping(payload, context="archive record"))
+        _require_keys(data, ("proposal", "decision", "rollback_token"), context="archive record")
+        proposal = ImprovementProposal.from_dict(dict(data["proposal"]))
+        decision = AcceptanceDecision.from_dict(dict(data["decision"]), proposal)
+        rollback_token = str(data["rollback_token"])
+        if not rollback_token:
+            raise ValueError("archive record rollback_token cannot be empty")
         return cls(proposal=proposal, decision=decision, rollback_token=rollback_token)
 
 
@@ -1013,16 +1044,27 @@ class EvolutionaryArchive:
         self.restored_accepted_kind_counts = restored_counts
 
     def restore_records(self, payload: Mapping[str, Any]) -> None:
-        data = dict(payload)
+        data = dict(_require_mapping(payload, context="evolutionary archive"))
+        schema = int(data.get("schema_version", -1))
+        if schema != PERSISTENT_IMPROVEMENT_ARCHIVE_SCHEMA_VERSION:
+            raise ValueError(
+                "unsupported evolutionary archive schema: "
+                f"{data.get('schema_version')!r}"
+            )
+        _require_keys(
+            data,
+            ("accepted", "rejected", "accepted_count", "rejected_count", "kind_counts"),
+            context="evolutionary archive",
+        )
         records = [
             ArchiveRecord.from_dict(item)
-            for item in tuple(data.get("accepted", ())) + tuple(data.get("rejected", ()))
+            for item in tuple(data["accepted"]) + tuple(data["rejected"])
         ]
         self.records = records
         self.restore_summary(
-            accepted_count=int(data.get("accepted_count", len(self.accepted))),
-            rejected_count=int(data.get("rejected_count", len(self.rejected))),
-            kind_counts=dict(data.get("kind_counts") or {}),
+            accepted_count=int(data["accepted_count"]),
+            rejected_count=int(data["rejected_count"]),
+            kind_counts=dict(data["kind_counts"] or {}),
         )
 
     def save(self, path: str | Path) -> Path:
@@ -1087,8 +1129,12 @@ class RollbackSystem:
         )
 
     def restore(self, payload: Mapping[str, Any] | None) -> None:
-        data = dict(payload or {})
-        self.events = [RollbackEvent.from_dict(item) for item in data.get("events", ())]
+        data = dict(_require_mapping(payload, context="rollback archive"))
+        schema = int(data.get("schema_version", -1))
+        if schema != PERSISTENT_IMPROVEMENT_ARCHIVE_SCHEMA_VERSION:
+            raise ValueError(f"unsupported rollback archive schema: {data.get('schema_version')!r}")
+        _require_keys(data, ("events",), context="rollback archive")
+        self.events = [RollbackEvent.from_dict(item) for item in data["events"]]
 
     def save(self, path: str | Path) -> Path:
         return _write_json(Path(path), self.to_dict())
@@ -1176,6 +1222,10 @@ class RecursiveImprovementEngine:
         rollback_loaded = rollback_path.exists()
         if archive_loaded:
             self.archive.restore_records(json.loads(archive_path.read_text(encoding="utf-8")))
+            if self.archive.accepted_count > 0 and not rollback_loaded:
+                raise FileNotFoundError(
+                    f"recursive improvement archive has accepted records but rollback archive is missing at {rollback_path}"
+                )
         if rollback_loaded:
             self.rollback.restore(json.loads(rollback_path.read_text(encoding="utf-8")))
         return {
