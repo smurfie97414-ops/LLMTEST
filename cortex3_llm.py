@@ -10402,6 +10402,15 @@ def run_llm_batch_profile_autosize(
     synthesized_refinement_seed_count = 0
     synthesized_confirmation_seed_count = 0
     confirmation_complete = False
+    confirmation_frontier_state: Mapping[str, Any] = {
+        "selected_shape_keys": (),
+        "selected_lower_confidence": 0.0,
+        "best_challenger_shape_key": "",
+        "best_challenger_upper_confidence": 0.0,
+        "decision_margin": 0.0,
+        "pending_shape_keys": (),
+        "pending_reasons": (),
+    }
     effective_measure_candidate_count = (
         max(requested_measure_candidate_count, int(selected_shape_count))
         if requested_measure_candidate_count > 0
@@ -10689,13 +10698,75 @@ def run_llm_batch_profile_autosize(
                     }
                 )
 
-        def selected_confirmation_missing() -> tuple[Mapping[str, Any], ...]:
+        def selected_confirmation_frontier_state() -> Mapping[str, Any]:
             passed = rank_measured_passed_candidates(aggregated_measurement_rows)
-            return tuple(
-                candidate
-                for candidate in passed[: int(selected_shape_count)]
-                if str(candidate["shape_key"]) not in confirmed_shape_keys
+            selected_count = max(1, int(selected_shape_count))
+            selected_candidates = passed[:selected_count]
+            challenger_candidates = passed[selected_count:]
+            selected_shape_keys = tuple(str(candidate["shape_key"]) for candidate in selected_candidates)
+            selected_lower_confidence = float(
+                min(
+                    (
+                        float(candidate.get("measured_score", 0.0))
+                        for candidate in selected_candidates
+                    ),
+                    default=0.0,
+                )
             )
+            best_challenger = max(
+                challenger_candidates,
+                key=lambda candidate: float(
+                    candidate.get(
+                        "measured_score_upper_confidence",
+                        candidate.get("measured_score", 0.0),
+                    )
+                ),
+                default=None,
+            )
+            best_challenger_upper_confidence = (
+                float(
+                    best_challenger.get(
+                        "measured_score_upper_confidence",
+                        best_challenger.get("measured_score", 0.0),
+                    )
+                )
+                if best_challenger is not None
+                else 0.0
+            )
+            pending: list[Mapping[str, Any]] = []
+            pending_reasons: list[str] = []
+            for candidate in selected_candidates:
+                if str(candidate["shape_key"]) not in confirmed_shape_keys:
+                    pending.append(candidate)
+                    pending_reasons.append("selected_finalist_unconfirmed")
+            for candidate in challenger_candidates:
+                shape_key = str(candidate["shape_key"])
+                challenger_upper = float(
+                    candidate.get(
+                        "measured_score_upper_confidence",
+                        candidate.get("measured_score", 0.0),
+                    )
+                )
+                if shape_key not in confirmed_shape_keys and challenger_upper >= selected_lower_confidence:
+                    pending.append(candidate)
+                    pending_reasons.append("decision_frontier_challenger_unconfirmed")
+            return {
+                "selected_shape_keys": selected_shape_keys,
+                "selected_lower_confidence": selected_lower_confidence,
+                "best_challenger_shape_key": (
+                    str(best_challenger["shape_key"])
+                    if best_challenger is not None
+                    else ""
+                ),
+                "best_challenger_upper_confidence": best_challenger_upper_confidence,
+                "decision_margin": float(selected_lower_confidence - best_challenger_upper_confidence),
+                "pending_candidates": tuple(pending),
+                "pending_shape_keys": tuple(str(candidate["shape_key"]) for candidate in pending),
+                "pending_reasons": tuple(pending_reasons),
+            }
+
+        def selected_confirmation_missing() -> tuple[Mapping[str, Any], ...]:
+            return tuple(selected_confirmation_frontier_state()["pending_candidates"])
 
         def confirm_selected_candidates(*, round_index: int) -> int:
             nonlocal measurement_inputs, confirmation_seeds, synthesized_confirmation_seed_count
@@ -10863,6 +10934,17 @@ def run_llm_batch_profile_autosize(
                     break
             if not selected_confirmation_missing():
                 confirmation_complete = True
+            confirmation_frontier_state = {
+                key: value
+                for key, value in selected_confirmation_frontier_state().items()
+                if key != "pending_candidates"
+            }
+        elif effective_measure_candidate_count > 0:
+            confirmation_frontier_state = {
+                key: value
+                for key, value in selected_confirmation_frontier_state().items()
+                if key != "pending_candidates"
+            }
         measured_candidates = tuple(aggregated_measurement_rows)
         measured_candidate_profile_count = sum(
             len(tuple(item.get("seed_measurements", ()))) for item in measured_candidates
@@ -11027,6 +11109,13 @@ def run_llm_batch_profile_autosize(
             "confirmation_seeds": confirmation_seeds,
             "confirmation_complete": confirmation_complete,
             "confirmed_shape_keys": tuple(sorted(confirmed_shape_keys)) if effective_measure_candidate_count > 0 else (),
+            "confirmation_selected_shape_keys": tuple(confirmation_frontier_state.get("selected_shape_keys", ())),
+            "confirmation_selected_lower_confidence": float(confirmation_frontier_state.get("selected_lower_confidence", 0.0)),
+            "confirmation_best_challenger_shape_key": str(confirmation_frontier_state.get("best_challenger_shape_key", "")),
+            "confirmation_best_challenger_upper_confidence": float(confirmation_frontier_state.get("best_challenger_upper_confidence", 0.0)),
+            "confirmation_decision_margin": float(confirmation_frontier_state.get("decision_margin", 0.0)),
+            "confirmation_pending_shape_keys": tuple(confirmation_frontier_state.get("pending_shape_keys", ())),
+            "confirmation_pending_reasons": tuple(confirmation_frontier_state.get("pending_reasons", ())),
             "synthesized_confirmation_seed_count": synthesized_confirmation_seed_count,
             "confirmation_rounds": tuple(confirmation_rounds),
             "measurement_input_shape_keys": tuple(str(item["shape_key"]) for item in measurement_inputs),
