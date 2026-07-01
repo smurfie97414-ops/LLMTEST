@@ -1,6 +1,6 @@
 # Cortex-3 Architecture Self-Critique
 
-Etat: boucle d'audit 79 apres relecture P1-P10 hors profiling/observabilite. La critique repart des 10 phases et vise les briques structurantes: SlowSolve -> verification -> attribution -> regrowth -> compilation -> selection runtime -> reutilisation persistante -> evolution recursive. Le dernier correctif structurel durcit P10: une archive recursive ne peut plus restaurer une decision acceptee/rejetee a partir de scores synthetiques ou de rapports manquants; elle doit contenir les rapports verifier complets et un rollback persistant explicite.
+Etat: boucle d'audit 80 apres relecture P1-P10 hors profiling/observabilite. La critique repart des 10 phases et vise les briques structurantes: SlowSolve -> verification -> attribution -> regrowth -> compilation -> selection runtime -> reutilisation persistante -> evolution recursive. Le dernier correctif structurel verrouille le contrat inter-phases: le rapport complet `cortex_phase_report.json` doit satisfaire un JSON Schema publie, prouver P1-P10, les 28 composants d'architecture, les 10 livrables, les replay des phases qui en produisent et les 17 termes d'objectif avant d'etre persiste.
 
 Ce document sert de registre de critique et de correction. Il ne remplace pas les tests longs interdits pour cette iteration; il se limite aux preuves courtes disponibles, aux rapports du code et aux tests courts.
 
@@ -26,6 +26,7 @@ Mise a jour C76: P4 n'apprend plus seulement sa retention depuis une heuristique
 Mise a jour C77: P10 ne promet plus seulement un rollback via token. Chaque patch modele accepte ecrit un artefact `.pt` de rollback executable avec tensors pre-patch, checksums pre/post et metadata de patch; `rollback_recursive_model_patch` refuse un modele deja divergent, restaure les poids, requantifie le coeur ternaire, enregistre l'evenement dans `rollback.json` et rend ces preuves obligatoires dans les audits.
 Mise a jour C78: P5 ne limite plus la verification outillee a `algebra_linear` et `code_tests`. Les taches algebriques quadratiques routent vers `sympy_symbolic`, le verifier P1 accepte les ensembles exacts de racines entieres, P5 ajoute un certificat/replay symbolique verifie, et les audits architecture/livrable/checkpoint exigent `certificate_symbolic_solver_events`.
 Mise a jour C79: P10 ne restaure plus d'archive incomplete avec `fallback_score`. Les records persistants exigent `baseline_report`, `trial_report`, `robustness_report`, deltas, flags, rollback token et schema d'archive/rollback valides; une archive acceptee sans `rollback.json` est rejetee.
+Mise a jour C80: P1 ne laisse plus les gates aval inferer implicitement la forme du rapport Cortex. `docs/CORTEX_PHASE_REPORT_SCHEMA.json` publie le contrat JSON Schema, `validate_cortex_phase_report_contract` le valide avec `jsonschema`, puis ajoute des checks semantiques P1-P10/architecture/livrables/replay des phases causales/objectifs avant l'ecriture finale de `training_report.json` et `cortex_phase_report.json`.
 
 ## Audit transversal haut enjeu apres C55
 

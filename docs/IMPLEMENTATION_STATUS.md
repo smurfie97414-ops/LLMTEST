@@ -17,6 +17,7 @@ Current executable coverage:
 - Persisted run artifacts: `cortex3_reporting.write_cycle_run` writes versioned `summary.json`, `report.md` and optional `fault_matrix.json`; per-skill reports include all cases, not only failures.
 - Oracle quality auditor: `OracleQualityAuditor` probes every default skill for false positives and false negatives using correct reference answers and deliberately wrong answers.
 - Strict exact-output oracles: arithmetic, algebra, long-context anchors, entity tracking and calibration reject embedded or extra-text answers when the task contract says “return only”.
+- Full phase report contract: `docs/CORTEX_PHASE_REPORT_SCHEMA.json` publishes the P1-P10 JSON Schema, and `validate_cortex_phase_report_contract` now gates final full-Cortex training reports before `training_report.json` / `cortex_phase_report.json` are written.
 - First domains: arithmetic, algebra, executable code unit tests, entity tracking, long context exact anchors, instruction following and calibration.
 - Injected defects: number alteration, variable inversion, latent KV corruption, MTP horizon overshoot, activation overquantization, expert misrouting, incomplete certificate and overconfident unknown.
 
@@ -30,11 +31,11 @@ Evidence:
 - `.\.venv\Scripts\python.exe -m unittest discover -s tests`
 - `.\.venv\Scripts\python.exe -m py_compile cortex3.py cortex3_analysis.py cortex3_cycle.py cortex3_ledgers.py cortex3_phases.py cortex3_selection.py cortex3_reporting.py cortex3_ternary.py cortex3_future.py cortex3_memory.py cortex3_certificates.py cortex3_attribution.py cortex3_regrowth.py tools\run_cycle_report.py`
 - Direct Torch validation in `.venv`: CUDA PyTorch `torch==2.11.0+cu128`, `numpy==2.5.0`, `BitLinear(...)(torch.ones(1, 3)) -> shape (1, 2)` with compression and activation logs recorded.
+- `tests.test_llm_pretraining.LLMPretrainingHarnessTest.test_cortex_phase_report_contract_accepts_complete_full_phase_payload`, `test_published_cortex_phase_report_schema_matches_runtime_contract`, `test_cortex_phase_report_contract_rejects_missing_phase_or_critical_key` and `test_full_cortex_phase_controller_uses_all_modules_during_training`.
 
 Remaining Phase 1 hardening:
 
 - Broaden generated grammars for code, algebra, entity tracking and calibration.
-- Add a published JSON schema document and compatibility tests for downstream phase gates.
 
 ## Phase 2 - Instrumented Ternary Core
 

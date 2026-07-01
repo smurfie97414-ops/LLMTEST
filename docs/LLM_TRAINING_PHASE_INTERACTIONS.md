@@ -39,6 +39,7 @@ Preuve post-integration des deux nouvelles briques :
 - `test_full_cortex_phase_controller_uses_all_modules_during_training` verifie aussi `latent_workspace_forward_events`, `latent_workspace_step_events` et `latent_workspace_certificate_binding_events`.
 - `test_full_cortex_phase_controller_uses_all_modules_during_training` verifie aussi que P5 execute les nouveaux certificats `algebra_linear` et code visible/cache/proprietes pendant le controleur P1-P10.
 - `test_cortex_phase_state_survives_checkpoint_resume` : reprise checkpoint avec restauration des decisions output-goal dans la ledger P3, maintien des evenements P5 algebra/code et maintien des audits architecture/livrables.
+- Le rapport final full-Cortex est maintenant gate par `validate_cortex_phase_report_contract` et le schema publie `docs/CORTEX_PHASE_REPORT_SCHEMA.json`: P1-P10, les composants architecture, les livrables, les replay des phases causales et les termes de l'objectif final doivent etre presents avant l'ecriture disque.
 
 Le long run devra produire un nouveau sidecar sous le commit de cette integration pour remplacer l'ancien audit `22/22` par l'audit courant plus strict incluant `native_ternary_cuda_kernel` et `future_output_goal_contracts`.
 

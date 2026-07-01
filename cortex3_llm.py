@@ -25,6 +25,7 @@ import psutil
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from jsonschema import Draft202012Validator
 from tokenizers import Tokenizer
 from tokenizers.decoders import ByteLevel as ByteLevelDecoder
 from tokenizers.models import BPE
@@ -117,6 +118,333 @@ def _write_json(path: Path, payload: Mapping[str, Any]) -> None:
     tmp_path = path.with_name(path.name + ".tmp")
     tmp_path.write_text(json.dumps(payload, indent=2, sort_keys=True, default=_json_default), encoding="utf-8")
     tmp_path.replace(path)
+
+
+CORTEX_PHASE_REPORT_SCHEMA_VERSION = 1
+CORTEX_PHASE_REPORT_SCHEMA_ID = "https://cortex3.local/schemas/cortex-phase-report-v1.schema.json"
+CORTEX_PHASE_REPORT_REQUIRED_PHASE_IDS: tuple[str, ...] = tuple(phase.id for phase in CORTEX3_PHASES)
+CORTEX_PHASE_REPORT_REQUIRED_REPLAY_PHASE_IDS: tuple[str, ...] = tuple(
+    phase_id
+    for phase_id in CORTEX_PHASE_REPORT_REQUIRED_PHASE_IDS
+    if phase_id != "P2"
+)
+CORTEX_PHASE_REPORT_REQUIRED_ARCHITECTURE_COMPONENTS: tuple[str, ...] = (
+    "p1_to_p10_phase_activity",
+    "variable_in_compressor",
+    "exact_anchor_ledger",
+    "latent_memory_kv",
+    "learned_cognitive_memory_policy",
+    "compiled_circuit_memory_retention",
+    "ternary_core",
+    "packed_ternary_hardware_runtime",
+    "native_ternary_cuda_kernel",
+    "skill_aware_experts",
+    "bit_ledger",
+    "skill_ledger",
+    "causal_ledger",
+    "uncertainty_ledger",
+    "future_contract_fsp",
+    "future_output_goal_contracts",
+    "adaptive_multi_token_decoding",
+    "frontier_heldout_generalization_gate",
+    "latent_reasoning_workspace",
+    "certificate_generator",
+    "hierarchical_dynamic_verifier",
+    "accept_reject_gate",
+    "attribute_regression",
+    "minimal_regrowth",
+    "sleep_consolidation_buffer",
+    "recursive_improvement",
+    "training_feedback_loop",
+    "final_objective_loss",
+)
+CORTEX_PHASE_REPORT_REQUIRED_DELIVERABLES: tuple[str, ...] = (
+    "P1:verifier_os_regression_harness",
+    "P2:ternary_sign_mask_activation_trace_logs_and_packed_dispatch",
+    "P3:mtp_fsp_confidence_temporal_contract_gate",
+    "P4:learned_exact_latent_drop_memory_anchor_fidelity",
+    "P5:latent_certificate_delatentization_tool_verification",
+    "P6:causal_attribution_counterfactual_dimensions_learned_policy",
+    "P7:minimal_regrowth_action_space_repair_plan_and_model_patch",
+    "P8:fast_normal_careful_budget_early_exit_mod_speculative_kernels",
+    "P9:sleep_replay_synthetic_real_reservoir_anti_collapse_schedule_frontier_compile",
+    "P10:recursive_improvement_sandbox_pareto_signed_model_patch_rollback_diversity",
+)
+CORTEX_PHASE_REPORT_REQUIRED_TRAINING_INFLUENCE_KEYS: tuple[str, ...] = (
+    "ternary_core_forward_events",
+    "packed_ternary_dispatches",
+    "native_ternary_kernel_dispatches",
+    "native_ternary_backend_requested",
+    "native_ternary_backend_counts",
+    "variable_input_compression_events",
+    "skill_expert_activations",
+    "skill_expert_context_events",
+    "skill_expert_replay_context_events",
+    "certificate_head_forward_events",
+    "certificate_algebra_tool_events",
+    "certificate_code_hidden_property_events",
+    "certificate_symbolic_solver_events",
+    "model_certificate_head_verified_events",
+    "latent_workspace_forward_events",
+    "latent_workspace_step_events",
+    "latent_workspace_certificate_binding_events",
+    "input_anchor_count",
+    "learned_memory_policy_events",
+    "learned_memory_retention_decisions",
+    "learned_memory_utility_credit_count",
+    "learned_memory_utility_positive_count",
+    "compiled_circuit_memory_binding_count",
+    "future_contract_decisions",
+    "output_goal_contract_decisions",
+    "output_goal_contract_accepted",
+    "bit_ledger_total_effective_bits",
+    "skill_ledger_states",
+    "causal_ledger_traces",
+    "uncertainty_ledger_observations",
+    "attribution_policy_observations",
+    "attribution_policy_successes",
+    "sleep_replay_batches_available",
+    "sleep_replay_updates",
+    "phase_replay_examples",
+    "phase_replay_examples_by_phase",
+    "memory_recent_segments",
+    "memory_latent_segments",
+    "sleep_real_exogenous_llm_examples",
+    "sleep_real_exogenous_llm_batch_events",
+    "sleep_frontier_fastsolve_events",
+    "sleep_frontier_memory_binding_events",
+    "frontier_compiled_circuit_count",
+    "frontier_heldout_total",
+    "frontier_heldout_passed",
+    "frontier_compiled_fastsolve_events",
+    "inference_model_backed_events",
+    "inference_model_backed_forced_careful_events",
+    "inference_model_backed_replay_events",
+    "inference_model_backed_adaptive_mtp_events",
+    "inference_model_backed_adaptive_mtp_contract_checks",
+    "inference_model_backed_adaptive_mtp_proposed_blocks",
+    "regrowth_model_application_count",
+    "regrowth_model_parameter_delta_l1",
+    "regrowth_model_repair_loss_delta",
+    "regrowth_model_applications",
+    "recursive_model_application_count",
+    "recursive_model_parameter_delta_l1",
+    "recursive_model_repair_loss_delta",
+    "recursive_model_applications",
+    "recursive_model_rollback_artifact_count",
+    "recursive_model_executable_rollback_count",
+    "recursive_model_rollback_artifacts",
+    "recursive_model_rollback_applications",
+    "recursive_verified_artifact_count",
+    "recursive_verified_artifacts",
+    "objective_feedback_events",
+    "objective_feedback_term_count",
+    "objective_feedback_term_names",
+    "last_objective_loss_weighted_total",
+    "error_count",
+)
+CORTEX_PHASE_REPORT_JSON_SCHEMA: dict[str, Any] = {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$id": CORTEX_PHASE_REPORT_SCHEMA_ID,
+    "title": "Cortex-3 Full Phase Report",
+    "type": "object",
+    "additionalProperties": True,
+    "required": [
+        "schema_version",
+        "enabled",
+        "all_phases_active",
+        "phases",
+        "phase_event_counts",
+        "training_influence",
+        "integration_counts",
+        "architecture_audit",
+        "phase_deliverable_audit",
+        "trace_counts",
+        "future_ledger",
+        "ledgers",
+        "memory_state_summary",
+        "sleep_state_summary",
+        "frontier_registry_summary",
+        "improvement_state_summary",
+        "errors",
+    ],
+    "properties": {
+        "schema_version": {"const": CORTEX_PHASE_REPORT_SCHEMA_VERSION},
+        "enabled": {"const": True},
+        "all_phases_active": {"const": True},
+        "phases": {
+            "type": "array",
+            "minItems": len(CORTEX_PHASE_REPORT_REQUIRED_PHASE_IDS),
+            "items": {
+                "type": "object",
+                "required": ["id", "title", "active_in_llm_training", "event_count"],
+                "properties": {
+                    "id": {"enum": list(CORTEX_PHASE_REPORT_REQUIRED_PHASE_IDS)},
+                    "title": {"type": "string", "minLength": 1},
+                    "active_in_llm_training": {"const": True},
+                    "event_count": {"type": "integer", "minimum": 1},
+                },
+                "additionalProperties": True,
+            },
+        },
+        "phase_event_counts": {
+            "type": "object",
+            "required": list(CORTEX_PHASE_REPORT_REQUIRED_PHASE_IDS),
+            "properties": {
+                phase_id: {"type": "integer", "minimum": 1}
+                for phase_id in CORTEX_PHASE_REPORT_REQUIRED_PHASE_IDS
+            },
+            "additionalProperties": True,
+        },
+        "training_influence": {
+            "type": "object",
+            "required": list(CORTEX_PHASE_REPORT_REQUIRED_TRAINING_INFLUENCE_KEYS),
+            "additionalProperties": True,
+        },
+        "integration_counts": {"type": "object"},
+        "trace_counts": {"type": "object"},
+        "future_ledger": {"type": "object"},
+        "ledgers": {"type": "object"},
+        "memory_state_summary": {"type": "object"},
+        "sleep_state_summary": {"type": "object"},
+        "frontier_registry_summary": {"type": "object"},
+        "improvement_state_summary": {"type": "object"},
+        "architecture_audit": {
+            "type": "object",
+            "required": [
+                "schema_version",
+                "passed",
+                "failed_checks",
+                "checks",
+                "checks_by_component",
+                "passed_count",
+                "component_count",
+            ],
+            "properties": {
+                "schema_version": {"const": 1},
+                "passed": {"const": True},
+                "failed_checks": {"type": "array", "maxItems": 0},
+                "checks": {
+                    "type": "array",
+                    "minItems": len(CORTEX_PHASE_REPORT_REQUIRED_ARCHITECTURE_COMPONENTS),
+                },
+                "checks_by_component": {
+                    "type": "object",
+                    "required": list(CORTEX_PHASE_REPORT_REQUIRED_ARCHITECTURE_COMPONENTS),
+                    "additionalProperties": True,
+                },
+                "passed_count": {
+                    "type": "integer",
+                    "minimum": len(CORTEX_PHASE_REPORT_REQUIRED_ARCHITECTURE_COMPONENTS),
+                },
+                "component_count": {
+                    "type": "integer",
+                    "minimum": len(CORTEX_PHASE_REPORT_REQUIRED_ARCHITECTURE_COMPONENTS),
+                },
+            },
+            "additionalProperties": True,
+        },
+        "phase_deliverable_audit": {
+            "type": "object",
+            "required": [
+                "schema_version",
+                "passed",
+                "failed_checks",
+                "checks",
+                "checks_by_deliverable",
+                "passed_count",
+                "deliverable_count",
+            ],
+            "properties": {
+                "schema_version": {"const": 1},
+                "passed": {"const": True},
+                "failed_checks": {"type": "array", "maxItems": 0},
+                "checks": {
+                    "type": "array",
+                    "minItems": len(CORTEX_PHASE_REPORT_REQUIRED_DELIVERABLES),
+                },
+                "checks_by_deliverable": {
+                    "type": "object",
+                    "required": list(CORTEX_PHASE_REPORT_REQUIRED_DELIVERABLES),
+                    "additionalProperties": True,
+                },
+                "passed_count": {
+                    "type": "integer",
+                    "minimum": len(CORTEX_PHASE_REPORT_REQUIRED_DELIVERABLES),
+                },
+                "deliverable_count": {
+                    "type": "integer",
+                    "minimum": len(CORTEX_PHASE_REPORT_REQUIRED_DELIVERABLES),
+                },
+            },
+            "additionalProperties": True,
+        },
+        "errors": {"type": "array", "maxItems": 0},
+    },
+}
+
+
+class CortexPhaseReportContractError(ValueError):
+    pass
+
+
+def _schema_error_path(error: Any) -> str:
+    path = ".".join(str(item) for item in error.absolute_path)
+    return path or "<root>"
+
+
+def validate_cortex_phase_report_contract(report: Mapping[str, Any]) -> Mapping[str, Any]:
+    payload = json.loads(json.dumps(dict(report), default=_json_default))
+    validator = Draft202012Validator(CORTEX_PHASE_REPORT_JSON_SCHEMA)
+    schema_errors = sorted(validator.iter_errors(payload), key=lambda item: list(item.absolute_path))
+    failures = [f"{_schema_error_path(error)}: {error.message}" for error in schema_errors]
+
+    phases = payload.get("phases") if isinstance(payload.get("phases"), list) else []
+    phase_rows = {str(item.get("id")): dict(item) for item in phases if isinstance(item, Mapping)}
+    phase_counts = dict(payload.get("phase_event_counts") or {})
+    replay_by_phase = dict(dict(payload.get("training_influence") or {}).get("phase_replay_examples_by_phase") or {})
+    for phase_id in CORTEX_PHASE_REPORT_REQUIRED_PHASE_IDS:
+        if phase_id not in phase_rows:
+            failures.append(f"phases: missing {phase_id}")
+            continue
+        if not bool(phase_rows[phase_id].get("active_in_llm_training")):
+            failures.append(f"phases.{phase_id}: inactive in LLM training")
+        if int(phase_rows[phase_id].get("event_count", 0) or 0) < 1:
+            failures.append(f"phases.{phase_id}: event_count must be >= 1")
+        if int(phase_counts.get(phase_id, 0) or 0) < 1:
+            failures.append(f"phase_event_counts.{phase_id}: count must be >= 1")
+        if phase_id in CORTEX_PHASE_REPORT_REQUIRED_REPLAY_PHASE_IDS and int(replay_by_phase.get(phase_id, 0) or 0) < 1:
+            failures.append(f"training_influence.phase_replay_examples_by_phase.{phase_id}: replay count must be >= 1")
+
+    architecture = dict(payload.get("architecture_audit") or {})
+    components = dict(architecture.get("checks_by_component") or {})
+    for component in CORTEX_PHASE_REPORT_REQUIRED_ARCHITECTURE_COMPONENTS:
+        check = dict(components.get(component) or {})
+        if not check:
+            failures.append(f"architecture_audit.checks_by_component.{component}: missing")
+        elif not bool(check.get("passed")):
+            failures.append(f"architecture_audit.checks_by_component.{component}: not passed")
+
+    deliverable_audit = dict(payload.get("phase_deliverable_audit") or {})
+    deliverables = dict(deliverable_audit.get("checks_by_deliverable") or {})
+    for deliverable in CORTEX_PHASE_REPORT_REQUIRED_DELIVERABLES:
+        check = dict(deliverables.get(deliverable) or {})
+        if not check:
+            failures.append(f"phase_deliverable_audit.checks_by_deliverable.{deliverable}: missing")
+        elif not bool(check.get("passed")):
+            failures.append(f"phase_deliverable_audit.checks_by_deliverable.{deliverable}: not passed")
+
+    training = dict(payload.get("training_influence") or {})
+    observed_terms = {str(term) for term in training.get("objective_feedback_term_names", ())}
+    for term in FINAL_LOSS_TERMS:
+        if term not in observed_terms:
+            failures.append(f"training_influence.objective_feedback_term_names: missing {term}")
+
+    if failures:
+        raise CortexPhaseReportContractError(
+            "invalid Cortex phase report contract: " + "; ".join(failures[:16])
+        )
+    return payload
 
 
 def _cost_trace_from_payload(payload: Mapping[str, Any] | None) -> CostTrace:
@@ -8248,6 +8576,7 @@ class CortexTrainingPhaseController:
                     float(term.get("weighted", 0.0))
                     for term in self.last_objective_loss_terms.values()
                 ),
+                "error_count": len(self.errors),
             },
             "integration_counts": dict(self.integration_counts),
             "architecture_audit": _cortex_architecture_audit_from_summary(
@@ -8926,6 +9255,8 @@ class LLMTrainer:
         cortex_phase_report: Mapping[str, Any] = phase_controller.summary() if phase_controller is not None else {"enabled": False}
         if cortex_phase_report.get("errors"):
             raise RuntimeError(f"Cortex phase integration errors: {cortex_phase_report['errors']}")
+        if phase_controller is not None:
+            cortex_phase_report = validate_cortex_phase_report_contract(cortex_phase_report)
         report = TrainingRunReport(
             name=name,
             model_kind=self.model_kind,

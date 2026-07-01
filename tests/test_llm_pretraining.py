@@ -12,6 +12,12 @@ import torch
 
 from cortex3_objective import FINAL_LOSS_TERMS
 from cortex3_llm import (
+    CORTEX_PHASE_REPORT_JSON_SCHEMA,
+    CORTEX_PHASE_REPORT_REQUIRED_ARCHITECTURE_COMPONENTS,
+    CORTEX_PHASE_REPORT_REQUIRED_DELIVERABLES,
+    CORTEX_PHASE_REPORT_REQUIRED_PHASE_IDS,
+    CORTEX_PHASE_REPORT_REQUIRED_TRAINING_INFLUENCE_KEYS,
+    CortexPhaseReportContractError,
     ComparisonConfig,
     DistributedRuntime,
     HFDatasetExportConfig,
@@ -45,6 +51,7 @@ from cortex3_llm import (
     inspect_llm_experiment,
     llm_doctor_report,
     main as llm_main,
+    validate_cortex_phase_report_contract,
     _profile_autosize_adaptive_measurement_inputs,
     run_llm_batch_profile_autosize,
     run_llm_batch_profile,
@@ -58,6 +65,132 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
     def _corpus(self, root: Path, *, repeats: int = 80) -> TextCorpusConfig:
         files = build_seed_corpus(root / "text", repeats=repeats)
         return TextCorpusConfig.from_paths(files, min_chars_per_chunk=512)
+
+    def _valid_cortex_phase_report_contract_payload(self):
+        architecture_checks = {
+            component: {
+                "component": component,
+                "passed": True,
+                "observed": {},
+                "requirement": "test contract",
+            }
+            for component in CORTEX_PHASE_REPORT_REQUIRED_ARCHITECTURE_COMPONENTS
+        }
+        deliverable_checks = {}
+        for key in CORTEX_PHASE_REPORT_REQUIRED_DELIVERABLES:
+            phase, deliverable = key.split(":", 1)
+            deliverable_checks[key] = {
+                "phase": phase,
+                "deliverable": deliverable,
+                "passed": True,
+                "observed": {},
+                "requirement": "test contract",
+            }
+        training_influence = {
+            key: 1
+            for key in CORTEX_PHASE_REPORT_REQUIRED_TRAINING_INFLUENCE_KEYS
+        }
+        training_influence.update(
+            {
+                "native_ternary_backend_requested": "extension",
+                "native_ternary_backend_counts": {"extension": 1},
+                "phase_replay_examples_by_phase": {
+                    phase_id: 1
+                    for phase_id in CORTEX_PHASE_REPORT_REQUIRED_PHASE_IDS
+                },
+                "objective_feedback_term_names": list(FINAL_LOSS_TERMS),
+                "regrowth_model_applications": [{"non_regression_passed": True}],
+                "recursive_model_applications": [{"non_regression_passed": True}],
+                "recursive_model_rollback_artifacts": [{"rollback_artifact_path": "rollback.pt"}],
+                "recursive_model_rollback_applications": [{"rollback_token": "rollback-p10"}],
+                "recursive_verified_artifacts": [{"recursive_improvement_artifact": True}],
+            }
+        )
+        return {
+            "schema_version": 1,
+            "enabled": True,
+            "all_phases_active": True,
+            "phases": [
+                {
+                    "id": phase_id,
+                    "title": f"{phase_id} title",
+                    "active_in_llm_training": True,
+                    "event_count": 1,
+                }
+                for phase_id in CORTEX_PHASE_REPORT_REQUIRED_PHASE_IDS
+            ],
+            "phase_event_counts": {
+                phase_id: 1
+                for phase_id in CORTEX_PHASE_REPORT_REQUIRED_PHASE_IDS
+            },
+            "training_influence": training_influence,
+            "integration_counts": {},
+            "trace_counts": {},
+            "future_ledger": {},
+            "ledgers": {},
+            "memory_state_summary": {},
+            "sleep_state_summary": {},
+            "frontier_registry_summary": {},
+            "improvement_state_summary": {},
+            "architecture_audit": {
+                "schema_version": 1,
+                "passed": True,
+                "failed_checks": [],
+                "checks": list(architecture_checks.values()),
+                "checks_by_component": architecture_checks,
+                "passed_count": len(architecture_checks),
+                "component_count": len(architecture_checks),
+            },
+            "phase_deliverable_audit": {
+                "schema_version": 1,
+                "passed": True,
+                "failed_checks": [],
+                "checks": list(deliverable_checks.values()),
+                "checks_by_deliverable": deliverable_checks,
+                "passed_count": len(deliverable_checks),
+                "deliverable_count": len(deliverable_checks),
+            },
+            "errors": [],
+        }
+
+    def test_cortex_phase_report_contract_accepts_complete_full_phase_payload(self):
+        payload = self._valid_cortex_phase_report_contract_payload()
+        normalized = validate_cortex_phase_report_contract(payload)
+
+        self.assertEqual(normalized["schema_version"], 1)
+        self.assertTrue(normalized["architecture_audit"]["passed"])
+        self.assertEqual(
+            set(normalized["phase_event_counts"]),
+            set(CORTEX_PHASE_REPORT_REQUIRED_PHASE_IDS),
+        )
+
+    def test_published_cortex_phase_report_schema_matches_runtime_contract(self):
+        schema_path = Path(__file__).resolve().parents[1] / "docs" / "CORTEX_PHASE_REPORT_SCHEMA.json"
+        schema = json.loads(schema_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(schema["$id"], CORTEX_PHASE_REPORT_JSON_SCHEMA["$id"])
+        self.assertEqual(schema["required"], CORTEX_PHASE_REPORT_JSON_SCHEMA["required"])
+        self.assertEqual(
+            set(schema["properties"]["phase_event_counts"]["required"]),
+            set(CORTEX_PHASE_REPORT_REQUIRED_PHASE_IDS),
+        )
+        self.assertEqual(
+            set(schema["properties"]["training_influence"]["required"]),
+            set(CORTEX_PHASE_REPORT_REQUIRED_TRAINING_INFLUENCE_KEYS),
+        )
+
+    def test_cortex_phase_report_contract_rejects_missing_phase_or_critical_key(self):
+        missing_phase = self._valid_cortex_phase_report_contract_payload()
+        missing_phase["phase_event_counts"].pop("P7")
+
+        with self.assertRaisesRegex(CortexPhaseReportContractError, "phase_event_counts"):
+            validate_cortex_phase_report_contract(missing_phase)
+
+        missing_key = self._valid_cortex_phase_report_contract_payload()
+        missing_key["training_influence"].pop("certificate_symbolic_solver_events")
+
+        with self.assertRaisesRegex(CortexPhaseReportContractError, "certificate_symbolic_solver_events"):
+            validate_cortex_phase_report_contract(missing_key)
 
     def test_llm_batch_profile_writes_throughput_resource_and_architecture_report(self):
         with tempfile.TemporaryDirectory() as tmp:
