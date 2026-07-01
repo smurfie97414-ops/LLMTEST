@@ -9569,6 +9569,8 @@ def _profile_autosize_measurement_summary(
     profile_path: Path,
     seed: int,
     profile_steps: int,
+    repeat_index: int,
+    repeat_count: int,
     metric: str,
     error: BaseException | None = None,
 ) -> Mapping[str, Any]:
@@ -9596,6 +9598,8 @@ def _profile_autosize_measurement_summary(
         "fits_budget": bool(candidate["fits_budget"]),
         "measurement_metric": metric,
         "measurement_steps": int(profile_steps),
+        "measurement_repeat_index": int(repeat_index),
+        "measurement_repeat_count": int(repeat_count),
     }
     if error is not None:
         return {
@@ -9693,8 +9697,11 @@ def _profile_autosize_aggregate_measurements(
     def _max_int(name: str) -> int:
         return int(max((int(row.get(name, 0)) for row in rows), default=0))
 
-    measurement_seeds = tuple(int(row.get("seed", 0)) for row in rows)
+    measurement_profile_seeds = tuple(int(row.get("seed", 0)) for row in rows)
+    measurement_seeds = tuple(dict.fromkeys(measurement_profile_seeds))
     measurement_steps = tuple(int(row.get("measurement_steps", 0)) for row in rows)
+    measurement_repeat_indices = tuple(int(row.get("measurement_repeat_index", 0)) for row in rows)
+    measurement_repeat_counts = tuple(int(row.get("measurement_repeat_count", 1)) for row in rows)
     profile_failed_checks = tuple(
         dict.fromkeys(
             str(check)
@@ -9712,6 +9719,7 @@ def _profile_autosize_aggregate_measurements(
     failed_checks_by_seed = tuple(
         {
             "seed": int(row.get("seed", 0)),
+            "measurement_repeat_index": int(row.get("measurement_repeat_index", 0)),
             "measurement_profile_failed_checks": tuple(str(item) for item in row.get("measurement_profile_failed_checks", ())),
             "measurement_failed_checks": tuple(str(item) for item in row.get("measurement_failed_checks", ())),
         }
@@ -9721,6 +9729,7 @@ def _profile_autosize_aggregate_measurements(
     measurement_errors = tuple(
         {
             "seed": int(row.get("seed", 0)),
+            "measurement_repeat_index": int(row.get("measurement_repeat_index", 0)),
             "measurement_error_type": str(row.get("measurement_error_type", "")),
             "measurement_error": str(row.get("measurement_error", "")),
             "profile_path": str(row.get("profile_path", "")),
@@ -9751,11 +9760,16 @@ def _profile_autosize_aggregate_measurements(
     return {
         "shape": dict(candidate["shape"]),
         "shape_key": str(candidate["shape_key"]),
+        "measurement_profile_count": len(rows),
+        "measurement_profile_seeds": measurement_profile_seeds,
         "measurement_seed_count": len(measurement_seeds),
         "measurement_seeds": measurement_seeds,
         "measurement_steps": measurement_steps,
         "measurement_step_count_min": min(measurement_steps, default=0),
         "measurement_step_count_max": max(measurement_steps, default=0),
+        "measurement_repeat_indices": measurement_repeat_indices,
+        "measurement_repeat_counts": measurement_repeat_counts,
+        "measurement_repeat_count_max": max(measurement_repeat_counts, default=0),
         "profile_path": str(rows[0].get("profile_path", "")),
         "profile_paths": tuple(str(row.get("profile_path", "")) for row in rows),
         "seed_measurements": rows,
@@ -10157,6 +10171,7 @@ def run_llm_batch_profile_autosize(
     refine_uncertain_candidate_count: int = 1,
     refine_uncertain_extra_seed_count: int = 1,
     refine_uncertain_step_multiplier: int = 2,
+    refine_uncertain_repeat_count: int = 2,
     measured_selection_metric: str = "throughput_gpu",
     min_cases: int = 1,
     require_multi_shape: bool = False,
@@ -10192,6 +10207,9 @@ def run_llm_batch_profile_autosize(
     requested_refine_uncertain_step_multiplier = int(refine_uncertain_step_multiplier)
     if requested_refine_uncertain_step_multiplier < 1:
         raise ValueError("refine_uncertain_step_multiplier must be positive")
+    requested_refine_uncertain_repeat_count = int(refine_uncertain_repeat_count)
+    if requested_refine_uncertain_repeat_count < 1:
+        raise ValueError("refine_uncertain_repeat_count must be positive")
     if measure_candidate_strategy not in PROFILE_AUTOSIZE_MEASUREMENT_STRATEGIES:
         raise ValueError(
             f"unknown measure_candidate_strategy {measure_candidate_strategy!r}; "
@@ -10342,57 +10360,69 @@ def run_llm_batch_profile_autosize(
             seed: int,
             seed_dir_prefix: str = "seed",
             profile_steps: int | None = None,
-        ) -> Mapping[str, Any]:
+            repeat_count: int = 1,
+        ) -> tuple[Mapping[str, Any], ...]:
             shape = dict(candidate["shape"])
             effective_profile_steps = int(steps if profile_steps is None else profile_steps)
-            seed_dir_name = (
-                f"{seed_dir_prefix}_{int(seed)}"
-                if profile_steps is None
-                else f"{seed_dir_prefix}_{int(seed)}_steps_{effective_profile_steps}"
-            )
-            measure_dir = (
-                output_dir
-                / "candidate_measurements"
-                / f"candidate_{candidate_index:03d}_{candidate['shape_key']}"
-                / seed_dir_name
-            )
-            profile: Mapping[str, Any] | None = None
-            error: BaseException | None = None
-            try:
-                profile = run_llm_batch_profile(
-                    out_dir=measure_dir,
-                    steps=effective_profile_steps,
-                    batch_size=int(shape["batch_size"]),
-                    gradient_accumulation_steps=int(shape.get("gradient_accumulation_steps", gradient_accumulation_steps)),
-                    seq_len=int(shape["seq_len"]),
-                    d_model=int(shape["d_model"]),
-                    n_heads=int(shape["n_heads"]),
-                    n_layers=int(shape["n_layers"]),
-                    vocab_size=vocab_size,
-                    precision=precision,
-                    device=device,
-                    require_cuda=require_cuda,
-                    native_ternary_backend=native_ternary_backend,
-                    resource_interval=resource_interval,
-                    min_resource_samples=min_resource_samples,
-                    seed=int(seed),
-                    corpus_repeats=corpus_repeats,
-                    max_corpus_tokens=max_corpus_tokens,
-                    overwrite=False,
+            if repeat_count < 1:
+                raise ValueError("repeat_count must be positive")
+            rows: list[Mapping[str, Any]] = []
+            for repeat_index in range(int(repeat_count)):
+                seed_dir_name = (
+                    f"{seed_dir_prefix}_{int(seed)}"
+                    if profile_steps is None
+                    else f"{seed_dir_prefix}_{int(seed)}_steps_{effective_profile_steps}"
                 )
-            except Exception as exc:
-                error = exc
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-            return _profile_autosize_measurement_summary(
-                candidate,
-                profile=profile,
-                profile_path=measure_dir / "llm_batch_profile.json",
-                seed=int(seed),
-                profile_steps=effective_profile_steps,
-                metric=measured_selection_metric,
-                error=error,
-            )
+                if repeat_count > 1:
+                    seed_dir_name = f"{seed_dir_name}_repeat_{repeat_index}"
+                measure_dir = (
+                    output_dir
+                    / "candidate_measurements"
+                    / f"candidate_{candidate_index:03d}_{candidate['shape_key']}"
+                    / seed_dir_name
+                )
+                profile: Mapping[str, Any] | None = None
+                error: BaseException | None = None
+                try:
+                    profile = run_llm_batch_profile(
+                        out_dir=measure_dir,
+                        steps=effective_profile_steps,
+                        batch_size=int(shape["batch_size"]),
+                        gradient_accumulation_steps=int(shape.get("gradient_accumulation_steps", gradient_accumulation_steps)),
+                        seq_len=int(shape["seq_len"]),
+                        d_model=int(shape["d_model"]),
+                        n_heads=int(shape["n_heads"]),
+                        n_layers=int(shape["n_layers"]),
+                        vocab_size=vocab_size,
+                        precision=precision,
+                        device=device,
+                        require_cuda=require_cuda,
+                        native_ternary_backend=native_ternary_backend,
+                        resource_interval=resource_interval,
+                        min_resource_samples=min_resource_samples,
+                        seed=int(seed),
+                        corpus_repeats=corpus_repeats,
+                        max_corpus_tokens=max_corpus_tokens,
+                        overwrite=False,
+                    )
+                except Exception as exc:
+                    error = exc
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                rows.append(
+                    _profile_autosize_measurement_summary(
+                        candidate,
+                        profile=profile,
+                        profile_path=measure_dir / "llm_batch_profile.json",
+                        seed=int(seed),
+                        profile_steps=effective_profile_steps,
+                        repeat_index=repeat_index,
+                        repeat_count=int(repeat_count),
+                        metric=measured_selection_metric,
+                        error=error,
+                    )
+                )
+            return tuple(rows)
 
         def measure_round(
             inputs: Sequence[Mapping[str, Any]],
@@ -10413,7 +10443,7 @@ def run_llm_batch_profile_autosize(
                 }
                 seed_measurement_rows: list[Mapping[str, Any]] = []
                 for seed in measurement_seeds:
-                    seed_measurement_rows.append(
+                    seed_measurement_rows.extend(
                         measure_candidate_seed(
                             candidate,
                             candidate_index=candidate_index,
@@ -10501,14 +10531,16 @@ def run_llm_batch_profile_autosize(
                     "measurement_seed_count": int(candidate.get("measurement_seed_count", len(previous_seed_rows))),
                 }
                 extra_rows = tuple(
-                    measure_candidate_seed(
+                    row
+                    for seed in extra_seeds
+                    for row in measure_candidate_seed(
                         candidate,
                         candidate_index=candidate_index,
                         seed=int(seed),
                         seed_dir_prefix="refine_seed",
                         profile_steps=refinement_profile_steps,
+                        repeat_count=requested_refine_uncertain_repeat_count,
                     )
-                    for seed in extra_seeds
                 )
                 refined = _profile_autosize_aggregate_measurements(
                     candidate,
@@ -10524,6 +10556,7 @@ def run_llm_batch_profile_autosize(
                         "candidate_index": candidate_index,
                         "extra_seeds": extra_seeds,
                         "refinement_steps": refinement_profile_steps,
+                        "refinement_repeat_count": requested_refine_uncertain_repeat_count,
                         "before": before,
                         "after": {
                             "measured_score": float(refined.get("measured_score", 0.0)),
@@ -10549,6 +10582,7 @@ def run_llm_batch_profile_autosize(
                         "extra_seed_count": len(extra_seeds),
                         "extra_seeds": extra_seeds,
                         "refinement_steps": refinement_profile_steps,
+                        "refinement_repeat_count": requested_refine_uncertain_repeat_count,
                         "details": tuple(refinement_details),
                     }
                 )
@@ -10733,10 +10767,11 @@ def run_llm_batch_profile_autosize(
             "refine_uncertain_candidate_count": requested_refine_uncertain_candidate_count,
             "refine_uncertain_extra_seed_count": requested_refine_uncertain_extra_seed_count,
             "refine_uncertain_step_multiplier": requested_refine_uncertain_step_multiplier,
+            "refine_uncertain_repeat_count": requested_refine_uncertain_repeat_count,
             "refinement_rounds_used": len(refinement_rounds),
             "refined_candidate_count": sum(int(round_["candidate_count"]) for round_ in refinement_rounds),
             "refinement_profile_count": sum(
-                int(round_["candidate_count"]) * int(round_["extra_seed_count"])
+                int(round_["candidate_count"]) * int(round_["extra_seed_count"]) * int(round_.get("refinement_repeat_count", 1))
                 for round_ in refinement_rounds
             ),
             "refinement_seed_count": len(refinement_seeds),
@@ -10995,6 +11030,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     profile_autosize.add_argument("--refine-uncertain-candidate-count", type=int, default=1, help="after candidate waves, add extra seeds to this many high-variance measured candidates before final selection")
     profile_autosize.add_argument("--refine-uncertain-extra-seed-count", type=int, default=1, help="extra measurement seeds per refined uncertain candidate")
     profile_autosize.add_argument("--refine-uncertain-step-multiplier", type=int, default=2, help="multiply profile steps for refinement seeds to reduce short-run overhead noise")
+    profile_autosize.add_argument("--refine-uncertain-repeat-count", type=int, default=2, help="repeat each refinement seed profile to reduce runtime jitter before final ranking")
     profile_autosize.add_argument("--measured-selection-metric", choices=PROFILE_AUTOSIZE_MEASURED_SELECTION_METRICS, default="throughput_gpu")
     profile_autosize.add_argument("--min-cases", type=int, default=1)
     profile_autosize.add_argument("--require-multi-shape", action="store_true")
@@ -11387,6 +11423,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             refine_uncertain_candidate_count=args.refine_uncertain_candidate_count,
             refine_uncertain_extra_seed_count=args.refine_uncertain_extra_seed_count,
             refine_uncertain_step_multiplier=args.refine_uncertain_step_multiplier,
+            refine_uncertain_repeat_count=args.refine_uncertain_repeat_count,
             measured_selection_metric=args.measured_selection_metric,
             min_cases=args.min_cases,
             require_multi_shape=args.require_multi_shape,
