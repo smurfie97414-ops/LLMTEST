@@ -10198,6 +10198,10 @@ def run_llm_batch_profile_autosize(
     refine_uncertain_extra_seed_count: int = 1,
     refine_uncertain_step_multiplier: int = 2,
     refine_uncertain_repeat_count: int = 2,
+    confirm_selected_candidate_count: int | None = None,
+    confirm_selected_extra_seed_count: int = 1,
+    confirm_selected_step_multiplier: int = 2,
+    confirm_selected_repeat_count: int = 2,
     measured_selection_metric: str = "throughput_gpu",
     min_cases: int = 1,
     require_multi_shape: bool = False,
@@ -10236,6 +10240,22 @@ def run_llm_batch_profile_autosize(
     requested_refine_uncertain_repeat_count = int(refine_uncertain_repeat_count)
     if requested_refine_uncertain_repeat_count < 1:
         raise ValueError("refine_uncertain_repeat_count must be positive")
+    requested_confirm_selected_candidate_count = (
+        int(selected_shape_count)
+        if confirm_selected_candidate_count is None
+        else int(confirm_selected_candidate_count)
+    )
+    if requested_confirm_selected_candidate_count < 0:
+        raise ValueError("confirm_selected_candidate_count must be >= 0")
+    requested_confirm_selected_extra_seed_count = int(confirm_selected_extra_seed_count)
+    if requested_confirm_selected_extra_seed_count < 0:
+        raise ValueError("confirm_selected_extra_seed_count must be >= 0")
+    requested_confirm_selected_step_multiplier = int(confirm_selected_step_multiplier)
+    if requested_confirm_selected_step_multiplier < 1:
+        raise ValueError("confirm_selected_step_multiplier must be positive")
+    requested_confirm_selected_repeat_count = int(confirm_selected_repeat_count)
+    if requested_confirm_selected_repeat_count < 1:
+        raise ValueError("confirm_selected_repeat_count must be positive")
     if measure_candidate_strategy not in PROFILE_AUTOSIZE_MEASUREMENT_STRATEGIES:
         raise ValueError(
             f"unknown measure_candidate_strategy {measure_candidate_strategy!r}; "
@@ -10368,8 +10388,11 @@ def run_llm_batch_profile_autosize(
     measurement_inputs: tuple[Mapping[str, Any], ...] = ()
     measurement_rounds: list[Mapping[str, Any]] = []
     refinement_rounds: list[Mapping[str, Any]] = []
+    confirmation_rounds: list[Mapping[str, Any]] = []
     refinement_seeds: tuple[int, ...] = ()
+    confirmation_seeds: tuple[int, ...] = ()
     synthesized_refinement_seed_count = 0
+    synthesized_confirmation_seed_count = 0
     effective_measure_candidate_count = (
         max(requested_measure_candidate_count, int(selected_shape_count))
         if requested_measure_candidate_count > 0
@@ -10378,6 +10401,49 @@ def run_llm_batch_profile_autosize(
     if effective_measure_candidate_count > 0:
         aggregated_measurement_rows: list[Mapping[str, Any]] = []
         already_measured_shape_keys: set[str] = set()
+
+        def rank_measured_passed_candidates(
+            rows: Sequence[Mapping[str, Any]],
+        ) -> tuple[Mapping[str, Any], ...]:
+            return tuple(
+                sorted(
+                    (item for item in rows if bool(item.get("measurement_passed"))),
+                    key=lambda item: (
+                        float(item["measured_score"]),
+                        int(item["estimated_peak_training_bytes"]),
+                        int(item["tokens_per_optimizer_step"]),
+                        str(item["shape_key"]),
+                    ),
+                    reverse=True,
+                )
+            )
+
+        def fresh_extra_seeds(
+            *,
+            used_seed_set: set[int],
+            requested_count: int,
+        ) -> tuple[int, ...]:
+            if requested_count <= 0:
+                return ()
+            requested_seed_total = max(
+                len(measurement_seeds),
+                len(used_seed_set) + int(requested_count),
+            )
+            while True:
+                expanded = _profile_autosize_measurement_seeds(
+                    normalized_seeds,
+                    requested_count=requested_seed_total,
+                )
+                extra = tuple(
+                    int(seed)
+                    for seed in expanded
+                    if int(seed) not in used_seed_set
+                )[: int(requested_count)]
+                if len(extra) >= int(requested_count):
+                    return extra
+                requested_seed_total += int(requested_count)
+                if requested_seed_total > len(used_seed_set) + int(requested_count) + 1024:
+                    raise RuntimeError("could not synthesize enough fresh autosize confirmation seeds")
 
         def measure_candidate_seed(
             candidate: Mapping[str, Any],
@@ -10613,6 +10679,120 @@ def run_llm_batch_profile_autosize(
                     }
                 )
 
+        def confirm_selected_candidates(*, round_index: int) -> None:
+            nonlocal measurement_inputs, confirmation_seeds, synthesized_confirmation_seed_count
+            if (
+                requested_confirm_selected_candidate_count <= 0
+                or requested_confirm_selected_extra_seed_count <= 0
+                or not aggregated_measurement_rows
+            ):
+                return
+            passed = rank_measured_passed_candidates(aggregated_measurement_rows)
+            if not passed:
+                return
+            confirmation_inputs = passed[
+                : min(
+                    int(requested_confirm_selected_candidate_count),
+                    int(selected_shape_count),
+                    len(passed),
+                )
+            ]
+            if not confirmation_inputs:
+                return
+            used_seed_set = {
+                int(row.get("seed", 0))
+                for candidate in aggregated_measurement_rows
+                for row in tuple(candidate.get("seed_measurements", ()))
+            }
+            extra_seeds = fresh_extra_seeds(
+                used_seed_set=used_seed_set,
+                requested_count=requested_confirm_selected_extra_seed_count,
+            )
+            if not extra_seeds:
+                return
+
+            confirmed_rows: list[Mapping[str, Any]] = []
+            confirmation_details: list[Mapping[str, Any]] = []
+            confirmation_profile_steps = max(1, int(steps) * requested_confirm_selected_step_multiplier)
+            for candidate in confirmation_inputs:
+                shape_key = str(candidate["shape_key"])
+                row_index = next(
+                    (
+                        index
+                        for index, row in enumerate(aggregated_measurement_rows)
+                        if str(row["shape_key"]) == shape_key
+                    ),
+                    None,
+                )
+                if row_index is None:
+                    continue
+                candidate_index = int(candidate.get("measurement_candidate_index", row_index))
+                previous_seed_rows = tuple(candidate.get("seed_measurements", ()))
+                before = {
+                    "measured_score": float(candidate.get("measured_score", 0.0)),
+                    "measured_score_mean": float(candidate.get("measured_score_mean", 0.0)),
+                    "measured_score_stddev": float(candidate.get("measured_score_stddev", 0.0)),
+                    "measured_score_lower_confidence": float(candidate.get("measured_score_lower_confidence", candidate.get("measured_score", 0.0))),
+                    "measured_score_upper_confidence": float(candidate.get("measured_score_upper_confidence", candidate.get("measured_score", 0.0))),
+                    "measurement_seed_count": int(candidate.get("measurement_seed_count", len(previous_seed_rows))),
+                }
+                extra_rows = tuple(
+                    row
+                    for seed in extra_seeds
+                    for row in measure_candidate_seed(
+                        candidate,
+                        candidate_index=candidate_index,
+                        seed=int(seed),
+                        seed_dir_prefix="confirm_seed",
+                        profile_steps=confirmation_profile_steps,
+                        repeat_count=requested_confirm_selected_repeat_count,
+                    )
+                )
+                confirmed = _profile_autosize_aggregate_measurements(
+                    candidate,
+                    seed_measurements=previous_seed_rows + extra_rows,
+                    metric=measured_selection_metric,
+                )
+                aggregated_measurement_rows[row_index] = confirmed
+                confirmed_rows.append(confirmed)
+                confirmation_details.append(
+                    {
+                        "shape_key": shape_key,
+                        "estimated_rank": int(candidate.get("estimated_rank", 0)),
+                        "candidate_index": candidate_index,
+                        "extra_seeds": extra_seeds,
+                        "confirmation_steps": confirmation_profile_steps,
+                        "confirmation_repeat_count": requested_confirm_selected_repeat_count,
+                        "before": before,
+                        "after": {
+                            "measured_score": float(confirmed.get("measured_score", 0.0)),
+                            "measured_score_mean": float(confirmed.get("measured_score_mean", 0.0)),
+                            "measured_score_stddev": float(confirmed.get("measured_score_stddev", 0.0)),
+                            "measured_score_lower_confidence": float(confirmed.get("measured_score_lower_confidence", confirmed.get("measured_score", 0.0))),
+                            "measured_score_upper_confidence": float(confirmed.get("measured_score_upper_confidence", confirmed.get("measured_score", 0.0))),
+                            "measurement_seed_count": int(confirmed.get("measurement_seed_count", 0)),
+                        },
+                    }
+                )
+            if confirmed_rows:
+                measurement_inputs = tuple(aggregated_measurement_rows)
+                confirmation_seeds = extra_seeds
+                synthesized_confirmation_seed_count = sum(1 for seed in confirmation_seeds if seed not in provided_seed_set)
+                confirmation_rounds.append(
+                    {
+                        "round_index": int(round_index),
+                        "round_kind": "selected_candidate_confirmation",
+                        "candidate_count": len(confirmed_rows),
+                        "shape_keys": tuple(str(item["shape_key"]) for item in confirmed_rows),
+                        "estimated_ranks": tuple(int(item.get("estimated_rank", 0)) for item in confirmed_rows),
+                        "extra_seed_count": len(extra_seeds),
+                        "extra_seeds": extra_seeds,
+                        "confirmation_steps": confirmation_profile_steps,
+                        "confirmation_repeat_count": requested_confirm_selected_repeat_count,
+                        "details": tuple(confirmation_details),
+                    }
+                )
+
         use_adaptive = (
             requested_measure_candidate_adaptive_rounds > 1
             and effective_measure_candidate_count > 2
@@ -10660,6 +10840,7 @@ def run_llm_batch_profile_autosize(
             )
             measure_round(remaining_inputs, round_index=round_index, round_kind=f"fill_{measure_candidate_strategy}")
         refine_uncertain_candidates(round_index=round_index + 1)
+        confirm_selected_candidates(round_index=round_index + 2)
         measured_candidates = tuple(aggregated_measurement_rows)
         measured_candidate_profile_count = sum(
             len(tuple(item.get("seed_measurements", ()))) for item in measured_candidates
@@ -10678,16 +10859,7 @@ def run_llm_batch_profile_autosize(
             if bool(row.get("measurement_passed"))
         )
         measured_passed_candidates = tuple(
-            sorted(
-                (item for item in measured_candidates if bool(item.get("measurement_passed"))),
-                key=lambda item: (
-                    float(item["measured_score"]),
-                    int(item["estimated_peak_training_bytes"]),
-                    int(item["tokens_per_optimizer_step"]),
-                    str(item["shape_key"]),
-                ),
-                reverse=True,
-            )
+            rank_measured_passed_candidates(measured_candidates)
         )
         selection_source = "measured"
         selection_pool = measured_passed_candidates
@@ -10804,6 +10976,25 @@ def run_llm_batch_profile_autosize(
             "refinement_seeds": refinement_seeds,
             "synthesized_refinement_seed_count": synthesized_refinement_seed_count,
             "refinement_rounds": tuple(refinement_rounds),
+            "confirmation_enabled": (
+                effective_measure_candidate_count > 0
+                and requested_confirm_selected_candidate_count > 0
+                and requested_confirm_selected_extra_seed_count > 0
+            ),
+            "confirm_selected_candidate_count": requested_confirm_selected_candidate_count,
+            "confirm_selected_extra_seed_count": requested_confirm_selected_extra_seed_count,
+            "confirm_selected_step_multiplier": requested_confirm_selected_step_multiplier,
+            "confirm_selected_repeat_count": requested_confirm_selected_repeat_count,
+            "confirmation_rounds_used": len(confirmation_rounds),
+            "confirmed_candidate_count": sum(int(round_["candidate_count"]) for round_ in confirmation_rounds),
+            "confirmation_profile_count": sum(
+                int(round_["candidate_count"]) * int(round_["extra_seed_count"]) * int(round_.get("confirmation_repeat_count", 1))
+                for round_ in confirmation_rounds
+            ),
+            "confirmation_seed_count": len(confirmation_seeds),
+            "confirmation_seeds": confirmation_seeds,
+            "synthesized_confirmation_seed_count": synthesized_confirmation_seed_count,
+            "confirmation_rounds": tuple(confirmation_rounds),
             "measurement_input_shape_keys": tuple(str(item["shape_key"]) for item in measurement_inputs),
             "measurement_input_estimated_ranks": tuple(int(item.get("estimated_rank", 0)) for item in measurement_inputs),
             "measured_selection_metric": measured_selection_metric,
@@ -11057,6 +11248,10 @@ def main(argv: Sequence[str] | None = None) -> None:
     profile_autosize.add_argument("--refine-uncertain-extra-seed-count", type=int, default=1, help="extra measurement seeds per refined uncertain candidate")
     profile_autosize.add_argument("--refine-uncertain-step-multiplier", type=int, default=2, help="multiply profile steps for refinement seeds to reduce short-run overhead noise")
     profile_autosize.add_argument("--refine-uncertain-repeat-count", type=int, default=2, help="repeat each refinement seed profile to reduce runtime jitter before final ranking")
+    profile_autosize.add_argument("--confirm-selected-candidate-count", type=int, default=None, help="final measured candidates to re-profile before selection; default confirms every requested selected shape")
+    profile_autosize.add_argument("--confirm-selected-extra-seed-count", type=int, default=1, help="fresh confirmation seeds per final selected candidate before final ranking")
+    profile_autosize.add_argument("--confirm-selected-step-multiplier", type=int, default=2, help="multiply profile steps for final selected candidate confirmation")
+    profile_autosize.add_argument("--confirm-selected-repeat-count", type=int, default=2, help="repeat each final selected confirmation seed profile to reduce runtime jitter")
     profile_autosize.add_argument("--measured-selection-metric", choices=PROFILE_AUTOSIZE_MEASURED_SELECTION_METRICS, default="throughput_gpu")
     profile_autosize.add_argument("--min-cases", type=int, default=1)
     profile_autosize.add_argument("--require-multi-shape", action="store_true")
@@ -11450,6 +11645,10 @@ def main(argv: Sequence[str] | None = None) -> None:
             refine_uncertain_extra_seed_count=args.refine_uncertain_extra_seed_count,
             refine_uncertain_step_multiplier=args.refine_uncertain_step_multiplier,
             refine_uncertain_repeat_count=args.refine_uncertain_repeat_count,
+            confirm_selected_candidate_count=args.confirm_selected_candidate_count,
+            confirm_selected_extra_seed_count=args.confirm_selected_extra_seed_count,
+            confirm_selected_step_multiplier=args.confirm_selected_step_multiplier,
+            confirm_selected_repeat_count=args.confirm_selected_repeat_count,
             measured_selection_metric=args.measured_selection_metric,
             min_cases=args.min_cases,
             require_multi_shape=args.require_multi_shape,

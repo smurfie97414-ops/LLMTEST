@@ -199,6 +199,7 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 max_corpus_tokens=2048,
                 memory_budget_mb=512,
                 min_measure_candidate_seed_count=1,
+                confirm_selected_extra_seed_count=0,
                 min_cases=1,
             )
 
@@ -245,6 +246,7 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 measure_candidate_count=2,
                 min_measure_candidate_seed_count=1,
                 measured_selection_metric="throughput_gpu",
+                confirm_selected_extra_seed_count=0,
                 min_cases=1,
             )
 
@@ -335,6 +337,7 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                     memory_budget_mb=512,
                     measure_candidate_count=2,
                     min_measure_candidate_seed_count=1,
+                    confirm_selected_extra_seed_count=0,
                     min_cases=1,
                     min_resource_samples=1,
                 )
@@ -429,6 +432,7 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                     measure_candidate_count=4,
                     min_measure_candidate_seed_count=1,
                     measure_candidate_adaptive_rounds=2,
+                    confirm_selected_extra_seed_count=0,
                     min_cases=1,
                     min_resource_samples=1,
                 )
@@ -523,6 +527,7 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                     measure_candidate_count=6,
                     min_measure_candidate_seed_count=1,
                     measure_candidate_adaptive_rounds=3,
+                    confirm_selected_extra_seed_count=0,
                     min_cases=1,
                     min_resource_samples=1,
                 )
@@ -659,6 +664,7 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                     memory_budget_mb=512,
                     measure_candidate_count=1,
                     min_measure_candidate_seed_count=1,
+                    confirm_selected_extra_seed_count=0,
                     min_cases=1,
                     min_resource_samples=1,
                 )
@@ -733,6 +739,7 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                     require_cuda=False,
                     memory_budget_mb=512,
                     measure_candidate_count=1,
+                    confirm_selected_extra_seed_count=0,
                     min_cases=2,
                     require_multi_seed=True,
                     min_resource_samples=1,
@@ -822,6 +829,7 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                     require_cuda=False,
                     memory_budget_mb=512,
                     measure_candidate_count=1,
+                    confirm_selected_extra_seed_count=0,
                     min_cases=1,
                     min_resource_samples=1,
                 )
@@ -912,6 +920,7 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                     measure_candidate_adaptive_rounds=1,
                     refine_uncertain_extra_seed_count=0,
                     measured_selection_metric="throughput",
+                    confirm_selected_extra_seed_count=0,
                     min_cases=2,
                     require_multi_seed=True,
                     min_resource_samples=1,
@@ -927,6 +936,122 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
         self.assertLess(measured_by_key[unstable_key]["measured_score"], measured_by_key[stable_key]["measured_score"])
         self.assertEqual(measured_by_key[stable_key]["measured_score"], measured_by_key[stable_key]["measured_score_lower_confidence"])
         self.assertEqual(len(profile_calls), 6)
+
+    def test_llm_batch_profile_autosize_confirms_selected_candidate_by_default(self):
+        profile_calls = []
+
+        def fake_profile(**kwargs):
+            profile_calls.append(dict(kwargs))
+            seq_len = int(kwargs["seq_len"])
+            seed = int(kwargs["seed"])
+            if seq_len == 64:
+                train_tokens_per_second = 1600.0 if seed in (11, 13) else 100.0
+            else:
+                train_tokens_per_second = 1000.0
+            planned = (
+                int(kwargs["steps"])
+                * int(kwargs["batch_size"])
+                * int(kwargs["gradient_accumulation_steps"])
+                * int(kwargs["seq_len"])
+            )
+            return {
+                "passed": True,
+                "failed_checks": (),
+                "throughput": {
+                    "train_tokens_per_second_wall": train_tokens_per_second,
+                    "planned_train_tokens": planned,
+                },
+                "resource_usage": {
+                    "sample_count": 1,
+                    "metrics": {
+                        "gpu_utilization_percent": {"avg": 10.0, "min": 10.0, "max": 10.0},
+                        "gpu_memory_used_mb": {"avg": 128.0, "min": 128.0, "max": 128.0},
+                        "gpu_power_draw_watts": {"avg": 45.0, "min": 45.0, "max": 45.0},
+                        "process_cpu_percent_of_total": {"avg": 1.0, "min": 1.0, "max": 1.0},
+                    },
+                },
+                "torch_cuda_memory": {
+                    "after": {
+                        "max_memory_allocated_bytes": 8 * 1024 * 1024,
+                    }
+                },
+                "kernel_evidence": {
+                    "native_ternary_kernel_required": False,
+                    "strict_extension_only": True,
+                },
+                "architecture": {"all_phases_active": True},
+            }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch("cortex3_llm.run_llm_batch_profile", side_effect=fake_profile):
+                report = run_llm_batch_profile_autosize(
+                    out_dir=root / "autosize-selected-confirmation",
+                    candidate_seq_lens=(32, 64),
+                    candidate_d_models=(32,),
+                    candidate_n_layers=(1,),
+                    candidate_batch_sizes=(2,),
+                    candidate_gradient_accumulation_steps=(1,),
+                    n_heads=4,
+                    selected_shape_count=1,
+                    min_selected_shapes=1,
+                    seeds=(11, 13),
+                    steps=1,
+                    gradient_accumulation_steps=1,
+                    vocab_size=128,
+                    precision="fp32",
+                    device="cpu",
+                    require_cuda=False,
+                    memory_budget_mb=512,
+                    measure_candidate_count=2,
+                    measure_candidate_adaptive_rounds=1,
+                    refine_uncertain_extra_seed_count=0,
+                    measured_selection_metric="throughput",
+                    min_cases=2,
+                    require_multi_seed=True,
+                    min_resource_samples=1,
+                )
+
+        stable_key = "seq32_d32_h4_l1_b2_g1"
+        fragile_key = "seq64_d32_h4_l1_b2_g1"
+        measured_by_key = {item["shape_key"]: item for item in report["measured_candidates"]}
+        confirmation_round = report["measurement"]["confirmation_rounds"][0]
+        detail = confirmation_round["details"][0]
+        self.assertTrue(report["passed"], report["failed_checks"])
+        self.assertEqual(report["selection"]["selected_shape_keys"], (stable_key,))
+        self.assertTrue(report["measurement"]["confirmation_enabled"])
+        self.assertEqual(report["measurement"]["confirmation_rounds_used"], 1)
+        self.assertEqual(report["measurement"]["confirmed_candidate_count"], 1)
+        self.assertEqual(report["measurement"]["confirmation_profile_count"], 2)
+        self.assertEqual(report["measurement"]["confirmation_seed_count"], 1)
+        self.assertEqual(report["measurement"]["confirmation_seeds"], (104742,))
+        self.assertEqual(confirmation_round["round_kind"], "selected_candidate_confirmation")
+        self.assertEqual(confirmation_round["shape_keys"], (fragile_key,))
+        self.assertEqual(confirmation_round["extra_seeds"], (104742,))
+        self.assertEqual(confirmation_round["confirmation_steps"], 2)
+        self.assertEqual(confirmation_round["confirmation_repeat_count"], 2)
+        self.assertEqual(detail["shape_key"], fragile_key)
+        self.assertGreater(detail["before"]["measured_score"], measured_by_key[stable_key]["measured_score"])
+        self.assertLess(detail["after"]["measured_score"], measured_by_key[stable_key]["measured_score"])
+        self.assertEqual(measured_by_key[fragile_key]["measurement_seeds"], (11, 13, 104742))
+        self.assertEqual(measured_by_key[fragile_key]["measurement_profile_seeds"], (11, 13, 104742, 104742))
+        self.assertEqual(measured_by_key[fragile_key]["measurement_steps"], (1, 1, 2, 2))
+        self.assertEqual(measured_by_key[fragile_key]["measurement_repeat_indices"], (0, 0, 0, 1))
+        self.assertEqual(measured_by_key[fragile_key]["measurement_repeat_count_max"], 2)
+        self.assertEqual(measured_by_key[fragile_key]["measured_score_profile_values"], (1600.0, 1600.0, 100.0, 100.0))
+        self.assertEqual(measured_by_key[fragile_key]["measured_score_observation_values"], (1600.0, 1600.0, 100.0))
+        self.assertEqual(measured_by_key[fragile_key]["measured_score_observation_count"], 3)
+        self.assertEqual(len(profile_calls), 8)
+        self.assertEqual(profile_calls[4]["seed"], 104742)
+        self.assertEqual(profile_calls[4]["seq_len"], 64)
+        self.assertEqual(profile_calls[4]["steps"], 2)
+        self.assertEqual(profile_calls[5]["seed"], 104742)
+        self.assertEqual(profile_calls[5]["seq_len"], 64)
+        self.assertEqual(profile_calls[5]["steps"], 2)
+        self.assertIn("confirm_seed_104742", str(profile_calls[4]["out_dir"]))
+        self.assertIn("steps_2", str(profile_calls[4]["out_dir"]))
+        self.assertIn("repeat_0", str(profile_calls[4]["out_dir"]))
+        self.assertIn("repeat_1", str(profile_calls[5]["out_dir"]))
 
     def test_llm_batch_profile_autosize_refines_uncertain_candidate_with_extra_seed(self):
         profile_calls = []
@@ -999,6 +1124,7 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                     refine_uncertain_candidate_count=1,
                     refine_uncertain_extra_seed_count=1,
                     measured_selection_metric="throughput",
+                    confirm_selected_extra_seed_count=0,
                     min_cases=2,
                     require_multi_seed=True,
                     min_resource_samples=1,
@@ -1135,6 +1261,7 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                     refine_uncertain_candidate_count=1,
                     refine_uncertain_extra_seed_count=1,
                     measured_selection_metric="throughput",
+                    confirm_selected_extra_seed_count=0,
                     min_cases=2,
                     require_multi_seed=True,
                     min_resource_samples=1,
@@ -1219,6 +1346,7 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                     memory_budget_mb=512,
                     measure_candidate_count=1,
                     min_measure_candidate_seed_count=1,
+                    confirm_selected_extra_seed_count=0,
                     min_cases=1,
                 )
 
