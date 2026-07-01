@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import hashlib
+import io
 import json
 import math
 import os
@@ -783,6 +784,12 @@ def _sha256_file(path: str | Path, *, chunk_size: int = 1024 * 1024) -> str:
 def _sha256_json(payload: Mapping[str, Any]) -> str:
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=_json_default).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _sha256_tensor(tensor: torch.Tensor) -> str:
+    buffer = io.BytesIO()
+    torch.save(tensor.detach().cpu(), buffer)
+    return hashlib.sha256(buffer.getvalue()).hexdigest()
 
 
 def _fingerprint_file(path: str | Path) -> dict[str, Any]:
@@ -3767,9 +3774,20 @@ def _cortex_architecture_audit_from_summary(summary: Mapping[str, Any]) -> dict[
         bool(item.get("non_regression_passed"))
         and bool(item.get("signed_patch_id"))
         and bool(item.get("rollback_token"))
+        and bool(item.get("rollback_executable"))
+        and bool(item.get("rollback_artifact_path"))
+        and bool(item.get("rollback_artifact_sha256"))
+        and int(item.get("rollback_artifact_parameter_count", 0) or 0) > 0
         and float(item.get("parameter_delta_l1", 0.0) or 0.0) > 0.0
         and float(item.get("repair_loss_delta", 0.0) or 0.0) > 0.0
         and float(item.get("protected_loss_delta", 0.0) or 0.0) <= float(item.get("protected_loss_tolerance", 0.0) or 0.0)
+        for item in recursive_model_applications
+    )
+    recursive_model_has_executable_rollback = any(
+        bool(item.get("rollback_executable"))
+        and bool(item.get("rollback_artifact_path"))
+        and bool(item.get("rollback_artifact_sha256"))
+        and int(item.get("rollback_artifact_parameter_count", 0) or 0) > 0
         for item in recursive_model_applications
     )
     recursive_verified_artifacts = tuple(
@@ -4163,6 +4181,8 @@ def _cortex_architecture_audit_from_summary(summary: Mapping[str, Any]) -> dict[
         and improvement_decisions > 0
         and integer("recursive_model_application_count") > 0
         and recursive_verified_artifact_count > 0
+        and integer("recursive_model_rollback_artifact_count") > 0
+        and recursive_model_has_executable_rollback
         and number("recursive_model_parameter_delta_l1") > 0.0
         and number("recursive_model_repair_loss_delta") > 0.0
         and recursive_model_non_regressing
@@ -4172,13 +4192,15 @@ def _cortex_architecture_audit_from_summary(summary: Mapping[str, Any]) -> dict[
             "improvement_decisions": improvement_decisions,
             "recursive_model_application_count": integer("recursive_model_application_count"),
             "recursive_verified_artifact_count": recursive_verified_artifact_count,
+            "recursive_model_rollback_artifact_count": integer("recursive_model_rollback_artifact_count"),
+            "recursive_model_has_executable_rollback": recursive_model_has_executable_rollback,
             "recursive_model_parameter_delta_l1": number("recursive_model_parameter_delta_l1"),
             "recursive_model_repair_loss_delta": number("recursive_model_repair_loss_delta"),
             "recursive_model_protected_loss_delta": number("recursive_model_protected_loss_delta"),
             "recursive_model_non_regressing": recursive_model_non_regressing,
             "recursive_artifact_verified": recursive_artifact_verified,
         },
-        "recursive improvement sandbox must evaluate a proposal, apply an accepted signed non-regressing patch to real Transformer state, and materialize a verified replay artifact",
+        "recursive improvement sandbox must evaluate a proposal, apply an accepted signed non-regressing patch to real Transformer state, persist an executable rollback artifact, and materialize a verified replay artifact",
     )
     add(
         "training_feedback_loop",
@@ -4296,9 +4318,20 @@ def _cortex_phase_deliverable_audit_from_summary(summary: Mapping[str, Any]) -> 
         bool(item.get("non_regression_passed"))
         and bool(item.get("signed_patch_id"))
         and bool(item.get("rollback_token"))
+        and bool(item.get("rollback_executable"))
+        and bool(item.get("rollback_artifact_path"))
+        and bool(item.get("rollback_artifact_sha256"))
+        and int(item.get("rollback_artifact_parameter_count", 0) or 0) > 0
         and float(item.get("parameter_delta_l1", 0.0) or 0.0) > 0.0
         and float(item.get("repair_loss_delta", 0.0) or 0.0) > 0.0
         and float(item.get("protected_loss_delta", 0.0) or 0.0) <= float(item.get("protected_loss_tolerance", 0.0) or 0.0)
+        for item in recursive_model_applications
+    )
+    recursive_model_has_executable_rollback = any(
+        bool(item.get("rollback_executable"))
+        and bool(item.get("rollback_artifact_path"))
+        and bool(item.get("rollback_artifact_sha256"))
+        and int(item.get("rollback_artifact_parameter_count", 0) or 0) > 0
         for item in recursive_model_applications
     )
     recursive_verified_artifacts = tuple(
@@ -4597,6 +4630,8 @@ def _cortex_phase_deliverable_audit_from_summary(summary: Mapping[str, Any]) -> 
         and int(number("improvement_persistent_archive_decisions")) > 0
         and int(number("recursive_model_application_count")) > 0
         and recursive_verified_artifact_count > 0
+        and int(number("recursive_model_rollback_artifact_count")) > 0
+        and recursive_model_has_executable_rollback
         and number("recursive_model_parameter_delta_l1") > 0.0
         and number("recursive_model_repair_loss_delta") > 0.0
         and recursive_model_non_regressing
@@ -4616,12 +4651,14 @@ def _cortex_phase_deliverable_audit_from_summary(summary: Mapping[str, Any]) -> 
             "improvement_persistent_rollback_events": int(number("improvement_persistent_rollback_events")),
             "recursive_model_application_count": int(number("recursive_model_application_count")),
             "recursive_verified_artifact_count": recursive_verified_artifact_count,
+            "recursive_model_rollback_artifact_count": int(number("recursive_model_rollback_artifact_count")),
+            "recursive_model_has_executable_rollback": recursive_model_has_executable_rollback,
             "recursive_model_parameter_delta_l1": number("recursive_model_parameter_delta_l1"),
             "recursive_model_repair_loss_delta": number("recursive_model_repair_loss_delta"),
             "recursive_model_non_regressing": recursive_model_non_regressing,
             "recursive_artifact_verified": recursive_artifact_verified,
         },
-        "recursive improvement must propose, sandbox, evolve across generations, evaluate, gate, persist evolutionary and rollback archives, apply a signed model patch, preserve rollback tokens, run diversity checks and materialize a verified replay artifact",
+        "recursive improvement must propose, sandbox, evolve across generations, evaluate, gate, persist evolutionary and executable rollback archives, apply a signed model patch, preserve rollback tokens, run diversity checks and materialize a verified replay artifact",
     )
 
     failed_checks = tuple(f"{check['phase']}:{check['deliverable']}" for check in checks if not check["passed"])
@@ -4774,6 +4811,8 @@ class CortexTrainingPhaseController:
         self.regrowth_model_protected_loss_delta = 0.0
         self.recursive_model_applications: list[dict[str, Any]] = []
         self.recursive_verified_artifacts: list[dict[str, Any]] = []
+        self.recursive_model_rollback_artifacts: list[dict[str, Any]] = []
+        self.recursive_model_rollback_applications: list[dict[str, Any]] = []
         self.recursive_model_parameter_delta_l1 = 0.0
         self.recursive_model_repair_loss_delta = 0.0
         self.recursive_model_protected_loss_delta = 0.0
@@ -6347,6 +6386,161 @@ class CortexTrainingPhaseController:
         )
         return artifact
 
+    def _recursive_model_rollback_dir(self) -> Path:
+        return self.improvement_archive_dir / "model_patch_rollbacks"
+
+    def _persist_recursive_model_rollback_artifact(
+        self,
+        accepted_report: Mapping[str, Any],
+        decision: AcceptanceDecision,
+        snapshots: Mapping[str, torch.Tensor],
+        parameters: Sequence[tuple[str, nn.Parameter]],
+    ) -> dict[str, Any]:
+        signed_patch_id = str(accepted_report.get("signed_patch_id") or "")
+        if not signed_patch_id:
+            raise ValueError("P10 rollback artifact requires a signed patch id")
+        parameter_names = tuple(str(name) for name, _ in parameters)
+        before_tensors = {
+            name: snapshots[name].detach().cpu().clone()
+            for name in parameter_names
+        }
+        before_checksums = {
+            name: _sha256_tensor(tensor)
+            for name, tensor in before_tensors.items()
+        }
+        after_checksums = {
+            name: _sha256_tensor(parameter.detach().cpu())
+            for name, parameter in parameters
+        }
+        payload = {
+            "schema_version": 1,
+            "signed_patch_id": signed_patch_id,
+            "proposal_id": decision.evaluation.proposal.proposal_id,
+            "proposal_kind": decision.evaluation.proposal.kind.value,
+            "rollback_token": decision.evaluation.sandbox.rollback_token,
+            "step": int(accepted_report.get("step", 0) or 0),
+            "parameter_names": parameter_names,
+            "parameter_shapes": {
+                name: tuple(int(dim) for dim in before_tensors[name].shape)
+                for name in parameter_names
+            },
+            "parameter_dtypes": {
+                name: str(before_tensors[name].dtype)
+                for name in parameter_names
+            },
+            "before_checksums": before_checksums,
+            "after_checksums": after_checksums,
+            "before_tensors": before_tensors,
+        }
+        directory = self._recursive_model_rollback_dir()
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / f"{signed_patch_id}.pt"
+        tmp_path = path.with_name(path.name + ".tmp")
+        torch.save(payload, tmp_path)
+        tmp_path.replace(path)
+        manifest = {
+            "schema_version": 1,
+            "signed_patch_id": signed_patch_id,
+            "proposal_id": decision.evaluation.proposal.proposal_id,
+            "proposal_kind": decision.evaluation.proposal.kind.value,
+            "rollback_token": decision.evaluation.sandbox.rollback_token,
+            "path": str(path),
+            "sha256": _sha256_file(path),
+            "size_bytes": int(path.stat().st_size),
+            "parameter_count": len(parameter_names),
+            "parameter_names": parameter_names,
+            "before_checksums": before_checksums,
+            "after_checksums": after_checksums,
+        }
+        self.recursive_model_rollback_artifacts.append(manifest)
+        self._count("recursive_model_rollback_artifact_events")
+        self._count("recursive_model_rollback_artifact_parameters", len(parameter_names))
+        return manifest
+
+    def rollback_recursive_model_patch(self, signed_patch_id: str, *, reason: str) -> dict[str, Any]:
+        patch_id = str(signed_patch_id)
+        application = next(
+            (
+                dict(item)
+                for item in reversed(self.recursive_model_applications)
+                if str(item.get("signed_patch_id", "")) == patch_id
+            ),
+            None,
+        )
+        if application is None:
+            raise ValueError(f"no recursive model patch application found for signed patch {patch_id}")
+        artifact_path = Path(str(application.get("rollback_artifact_path") or ""))
+        if not artifact_path.exists():
+            raise FileNotFoundError(f"rollback artifact for signed patch {patch_id} is missing at {artifact_path}")
+        expected_sha = str(application.get("rollback_artifact_sha256") or "")
+        if expected_sha and _sha256_file(artifact_path) != expected_sha:
+            raise ValueError(f"rollback artifact checksum mismatch for signed patch {patch_id}")
+        try:
+            artifact = torch.load(artifact_path, map_location="cpu", weights_only=False)
+        except TypeError:
+            artifact = torch.load(artifact_path, map_location="cpu")
+        if int(artifact.get("schema_version", 0) or 0) != 1:
+            raise ValueError(f"unsupported rollback artifact schema for signed patch {patch_id}")
+        if str(artifact.get("signed_patch_id", "")) != patch_id:
+            raise ValueError(f"rollback artifact signed patch id mismatch for {patch_id}")
+        before_tensors = dict(artifact.get("before_tensors") or {})
+        before_checksums = dict(artifact.get("before_checksums") or {})
+        after_checksums = dict(artifact.get("after_checksums") or {})
+        parameter_names = tuple(str(name) for name in artifact.get("parameter_names", ()))
+        named_parameters = dict(self.model.named_parameters())
+        current_delta_l1 = 0.0
+        with torch.no_grad():
+            for name in parameter_names:
+                if name not in named_parameters:
+                    raise ValueError(f"rollback artifact references missing parameter {name}")
+                if name not in before_tensors:
+                    raise ValueError(f"rollback artifact has no before tensor for {name}")
+                parameter = named_parameters[name]
+                before_tensor = before_tensors[name]
+                if tuple(before_tensor.shape) != tuple(parameter.shape):
+                    raise ValueError(f"rollback tensor shape mismatch for {name}")
+                current_checksum = _sha256_tensor(parameter.detach().cpu())
+                expected_after = str(after_checksums.get(name, ""))
+                if not expected_after:
+                    raise ValueError(f"rollback artifact has no post-patch checksum for {name}")
+                if current_checksum != expected_after:
+                    raise ValueError(
+                        f"cannot rollback signed patch {patch_id}: parameter {name} no longer matches post-patch state"
+                    )
+                expected_before = str(before_checksums.get(name, ""))
+                if expected_before and _sha256_tensor(before_tensor) != expected_before:
+                    raise ValueError(f"rollback artifact before tensor checksum mismatch for {name}")
+                current_delta_l1 += float(
+                    (parameter.detach().cpu().float() - before_tensor.float()).abs().sum().item()
+                )
+                parameter.copy_(before_tensor.to(device=parameter.device, dtype=parameter.dtype))
+        self.model.requantize_ternary_core(certify_zeros=False)
+        event = self.improvement.rollback.record_event(
+            proposal_id=str(artifact.get("proposal_id", application.get("proposal_id", ""))),
+            rollback_token=str(artifact.get("rollback_token", application.get("rollback_token", ""))),
+            reason=reason,
+        )
+        rollback_report = {
+            "schema_version": 1,
+            "signed_patch_id": patch_id,
+            "proposal_id": event.proposal_id,
+            "proposal_kind": str(artifact.get("proposal_kind", application.get("proposal_kind", ""))),
+            "rollback_token": event.rollback_token,
+            "reason": event.reason,
+            "parameter_count": len(parameter_names),
+            "parameter_names": parameter_names,
+            "parameter_delta_l1_restored": current_delta_l1,
+            "rollback_artifact_path": str(artifact_path),
+            "rollback_artifact_sha256": _sha256_file(artifact_path),
+            "requantized_ternary_core": bool(self.model.config.use_ternary_core),
+            "rolled_back": True,
+        }
+        self.recursive_model_rollback_applications.append(rollback_report)
+        self._count("recursive_model_executable_rollback_events")
+        self._count("recursive_model_executable_rollback_parameters", len(parameter_names))
+        self._persist_improvement_archive(step=int(application.get("step", 0) or 0))
+        return rollback_report
+
     def _apply_recursive_model_improvement(self, decision: AcceptanceDecision, cycle_report: Any, *, step: int) -> dict[str, Any]:
         if not decision.accepted:
             raise ValueError(f"P10 cannot apply rejected proposal {decision.evaluation.proposal.proposal_id}: {decision.reason}")
@@ -6462,6 +6656,19 @@ class CortexTrainingPhaseController:
             )
         if not was_training:
             self.model.eval()
+        rollback_artifact = self._persist_recursive_model_rollback_artifact(
+            accepted_report,
+            decision,
+            snapshots,
+            parameters,
+        )
+        accepted_report.update({
+            "rollback_executable": True,
+            "rollback_artifact_path": rollback_artifact["path"],
+            "rollback_artifact_sha256": rollback_artifact["sha256"],
+            "rollback_artifact_size_bytes": rollback_artifact["size_bytes"],
+            "rollback_artifact_parameter_count": rollback_artifact["parameter_count"],
+        })
         self.recursive_model_applications.append(accepted_report)
         self.recursive_model_parameter_delta_l1 += float(accepted_report["parameter_delta_l1"])
         self.recursive_model_repair_loss_delta += float(accepted_report["repair_loss_delta"])
@@ -6526,6 +6733,8 @@ class CortexTrainingPhaseController:
             "regrowth_model_protected_loss_delta": float(self.regrowth_model_protected_loss_delta),
             "recursive_model_applications": list(self.recursive_model_applications),
             "recursive_verified_artifacts": list(self.recursive_verified_artifacts),
+            "recursive_model_rollback_artifacts": list(self.recursive_model_rollback_artifacts),
+            "recursive_model_rollback_applications": list(self.recursive_model_rollback_applications),
             "recursive_model_parameter_delta_l1": float(self.recursive_model_parameter_delta_l1),
             "recursive_model_repair_loss_delta": float(self.recursive_model_repair_loss_delta),
             "recursive_model_protected_loss_delta": float(self.recursive_model_protected_loss_delta),
@@ -6673,6 +6882,14 @@ class CortexTrainingPhaseController:
         self.recursive_verified_artifacts = [
             dict(item)
             for item in payload.get("recursive_verified_artifacts", ())
+        ]
+        self.recursive_model_rollback_artifacts = [
+            dict(item)
+            for item in payload.get("recursive_model_rollback_artifacts", ())
+        ]
+        self.recursive_model_rollback_applications = [
+            dict(item)
+            for item in payload.get("recursive_model_rollback_applications", ())
         ]
         self.recursive_model_parameter_delta_l1 = float(payload.get("recursive_model_parameter_delta_l1", 0.0))
         self.recursive_model_repair_loss_delta = float(payload.get("recursive_model_repair_loss_delta", 0.0))
@@ -6981,6 +7198,10 @@ class CortexTrainingPhaseController:
             "recursive_model_repair_loss_delta": float(self.recursive_model_repair_loss_delta),
             "recursive_model_protected_loss_delta": float(self.recursive_model_protected_loss_delta),
             "recursive_model_applications": _last_items(self.recursive_model_applications, 5),
+            "recursive_model_rollback_artifact_count": len(self.recursive_model_rollback_artifacts),
+            "recursive_model_rollback_artifacts": _last_items(self.recursive_model_rollback_artifacts, 5),
+            "recursive_model_executable_rollback_count": len(self.recursive_model_rollback_applications),
+            "recursive_model_rollback_applications": _last_items(self.recursive_model_rollback_applications, 5),
             "recursive_verified_artifact_count": len(self.recursive_verified_artifacts),
             "recursive_verified_artifacts": _last_items(self.recursive_verified_artifacts, 5),
             "error_count": len(self.errors),
@@ -7938,6 +8159,10 @@ class CortexTrainingPhaseController:
                 "recursive_model_repair_loss_delta": float(self.recursive_model_repair_loss_delta),
                 "recursive_model_protected_loss_delta": float(self.recursive_model_protected_loss_delta),
                 "recursive_model_applications": _last_items(self.recursive_model_applications, 5),
+                "recursive_model_rollback_artifact_count": len(self.recursive_model_rollback_artifacts),
+                "recursive_model_rollback_artifacts": _last_items(self.recursive_model_rollback_artifacts, 5),
+                "recursive_model_executable_rollback_count": len(self.recursive_model_rollback_applications),
+                "recursive_model_rollback_applications": _last_items(self.recursive_model_rollback_applications, 5),
                 "recursive_verified_artifact_count": len(self.recursive_verified_artifacts),
                 "recursive_verified_artifacts": _last_items(self.recursive_verified_artifacts, 5),
                 "improvement_archive_accepted": self.improvement.archive.accepted_count,
@@ -8102,6 +8327,10 @@ class CortexTrainingPhaseController:
                     "recursive_model_repair_loss_delta": float(self.recursive_model_repair_loss_delta),
                     "recursive_model_protected_loss_delta": float(self.recursive_model_protected_loss_delta),
                     "recursive_model_applications": _last_items(self.recursive_model_applications, 5),
+                    "recursive_model_rollback_artifact_count": len(self.recursive_model_rollback_artifacts),
+                    "recursive_model_rollback_artifacts": _last_items(self.recursive_model_rollback_artifacts, 5),
+                    "recursive_model_executable_rollback_count": len(self.recursive_model_rollback_applications),
+                    "recursive_model_rollback_applications": _last_items(self.recursive_model_rollback_applications, 5),
                     "recursive_verified_artifact_count": len(self.recursive_verified_artifacts),
                     "recursive_verified_artifacts": _last_items(self.recursive_verified_artifacts, 5),
                     "improvement_archive_accepted": self.improvement.archive.accepted_count,
@@ -8245,6 +8474,10 @@ class CortexTrainingPhaseController:
                     "recursive_model_repair_loss_delta": float(self.recursive_model_repair_loss_delta),
                     "recursive_model_protected_loss_delta": float(self.recursive_model_protected_loss_delta),
                     "recursive_model_applications": _last_items(self.recursive_model_applications, 5),
+                    "recursive_model_rollback_artifact_count": len(self.recursive_model_rollback_artifacts),
+                    "recursive_model_rollback_artifacts": _last_items(self.recursive_model_rollback_artifacts, 5),
+                    "recursive_model_executable_rollback_count": len(self.recursive_model_rollback_applications),
+                    "recursive_model_rollback_applications": _last_items(self.recursive_model_rollback_applications, 5),
                     "recursive_verified_artifact_count": len(self.recursive_verified_artifacts),
                     "recursive_verified_artifacts": _last_items(self.recursive_verified_artifacts, 5),
                     "improvement_archive_accepted": self.improvement.archive.accepted_count,
@@ -8289,6 +8522,10 @@ class CortexTrainingPhaseController:
             "improvement_persistent_archive_state": dict(self.improvement_persistent_archive_state),
             "regrowth_model_applications": _last_items(self.regrowth_model_applications, 5),
             "recursive_model_applications": _last_items(self.recursive_model_applications, 5),
+            "recursive_model_rollback_artifact_count": len(self.recursive_model_rollback_artifacts),
+            "recursive_model_rollback_artifacts": _last_items(self.recursive_model_rollback_artifacts, 5),
+            "recursive_model_executable_rollback_count": len(self.recursive_model_rollback_applications),
+            "recursive_model_rollback_applications": _last_items(self.recursive_model_rollback_applications, 5),
             "recursive_verified_artifacts": _last_items(self.recursive_verified_artifacts, 5),
             "phase_audits": _last_items(self.phase_audits, 2),
             "batch_contract_samples": _last_items(self.batch_contract_samples, 5),

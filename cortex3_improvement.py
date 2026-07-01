@@ -1074,10 +1074,17 @@ class RollbackSystem:
     def __init__(self) -> None:
         self.events: list[RollbackEvent] = []
 
-    def rollback(self, record: ArchiveRecord, *, reason: str) -> RollbackEvent:
-        event = RollbackEvent(record.proposal.proposal_id, record.rollback_token, reason)
+    def record_event(self, *, proposal_id: str, rollback_token: str, reason: str) -> RollbackEvent:
+        event = RollbackEvent(str(proposal_id), str(rollback_token), str(reason))
         self.events.append(event)
         return event
+
+    def rollback(self, record: ArchiveRecord, *, reason: str) -> RollbackEvent:
+        return self.record_event(
+            proposal_id=record.proposal.proposal_id,
+            rollback_token=record.rollback_token,
+            reason=reason,
+        )
 
     def restore(self, payload: Mapping[str, Any] | None) -> None:
         data = dict(payload or {})

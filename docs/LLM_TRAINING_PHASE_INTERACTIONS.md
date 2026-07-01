@@ -640,7 +640,8 @@ P10 :
 12. recharge ces archives via `cortex_improvement_archive_dir` quand un run independant partage le meme dossier ;
 13. cree rollback token ;
 14. applique une proposition acceptee comme patch signe sur vrais poids Transformer ;
-15. mesure repair loss, protected loss et delta de poids.
+15. ecrit un artefact rollback executable `model_patch_rollbacks/<signed_patch_id>.pt` contenant les tensors pre-patch et les checksums pre/post ;
+16. mesure repair loss, protected loss et delta de poids.
 
 ### Interaction Avec Les Autres Phases
 
@@ -660,6 +661,7 @@ P10 agit par :
 
 - replay P10 ;
 - patch direct des poids ;
+- rollback executable des poids si un patch signe doit etre retire : verification du checksum post-patch, restauration des tensors pre-patch, puis requantification du coeur ternaire ;
 - archive evolutive durable qui influence les gates de diversite des runs suivants ;
 - evolution multi-generation bornee depuis des parents acceptes, avec lineage et pression vers les types de propositions sous-representes ;
 - signaux vers `L_recursive_improvement_validity`.
@@ -679,6 +681,7 @@ Checkpoint `step 175` :
 - protected loss tolerance : `0.861335`
 - signed patch id : `c5c1e64a504bc61f407d380b0664978382fe1225c0c40a967a8f48957bfb0139`
 - rollback token : `rollback-proposal-0-mtp_head-arithmetic`
+- rollback executable : `model_patch_rollbacks/<signed_patch_id>.pt`, checksum d'artefact et checksums de parametres pre/post exiges par l'audit P10 depuis C77
 - gate : `accepted`
 
 ## Objectif Final 17 Termes

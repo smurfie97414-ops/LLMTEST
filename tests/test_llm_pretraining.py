@@ -3488,6 +3488,10 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             self.assertTrue(latest_recursive["proposal_patch_payload"]["frontier_output_goal_contract_passed"], latest_recursive)
             self.assertTrue(latest_recursive["signed_patch_id"], latest_recursive)
             self.assertTrue(latest_recursive["rollback_token"], latest_recursive)
+            self.assertTrue(latest_recursive["rollback_executable"], latest_recursive)
+            self.assertTrue(Path(latest_recursive["rollback_artifact_path"]).exists(), latest_recursive)
+            self.assertTrue(latest_recursive["rollback_artifact_sha256"], latest_recursive)
+            self.assertGreater(latest_recursive["rollback_artifact_parameter_count"], 0, latest_recursive)
             self.assertGreater(latest_recursive["parameter_delta_l1"], 0.0)
             self.assertGreater(latest_recursive["repair_loss_delta"], 0.0)
             self.assertLessEqual(
@@ -3527,8 +3531,11 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             self.assertEqual(set(persisted["last_objective_loss_terms"]), set(FINAL_LOSS_TERMS))
             self.assertTrue(persisted["regrowth_model_applications"], persisted)
             self.assertTrue(persisted["recursive_model_applications"], persisted)
+            self.assertGreater(persisted["recursive_model_rollback_artifact_count"], 0, persisted)
+            self.assertTrue(persisted["recursive_model_rollback_artifacts"], persisted)
             self.assertTrue(persisted["recursive_verified_artifacts"], persisted)
             self.assertGreater(persisted["training_influence"]["recursive_verified_artifact_count"], 0)
+            self.assertGreater(persisted["training_influence"]["recursive_model_rollback_artifact_count"], 0)
             self.assertGreater(persisted["training_influence"]["learned_memory_utility_credit_count"], 0)
             self.assertGreater(persisted["training_influence"]["learned_memory_utility_prior_updates"], 0)
             self.assertTrue(persisted["training_influence"]["learned_memory_last_utility_prior"])
@@ -3629,6 +3636,104 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             observed = controller._observed_contract_tokens(future_targets, 8)
 
             self.assertEqual(observed, list(range(80, 88)))
+
+    def test_recursive_model_patch_has_executable_weight_rollback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            corpus = self._corpus(root, repeats=24)
+            tokenizer = LLMTokenizer.train(corpus, vocab_size=128, min_frequency=1)
+            model = CortexTransformerLM(
+                TransformerConfig(
+                    vocab_size=128,
+                    seq_len=16,
+                    d_model=32,
+                    n_heads=4,
+                    n_layers=1,
+                    dropout=0.0,
+                    horizons=(1, 2, 4, 8),
+                    use_cortex_heads=True,
+                    use_ternary_core=True,
+                    use_skill_aware_experts=True,
+                    use_variable_in_compressor=True,
+                    use_learned_memory_policy=True,
+                    use_certificate_head=True,
+                    use_latent_reasoning_workspace=True,
+                )
+            )
+            controller = CortexTrainingPhaseController(
+                model,
+                tokenizer,
+                TrainingConfig(
+                    steps=1,
+                    batch_size=1,
+                    eval_interval=1,
+                    checkpoint_interval=1,
+                    seed=17,
+                    num_threads=1,
+                    cortex_phase_probe_tasks=1,
+                    cortex_phase_max_proposals=4,
+                    cortex_improvement_archive_dir=str(root / "p10-archive"),
+                ),
+                run_dir=root / "run",
+            )
+            cycle_report = controller.cycle.run(
+                controller.reference_agent,
+                controller.trial_agent,
+                seed=17,
+                n_per_skill=1,
+            )
+            improvement = controller.improvement.run(
+                cycle_report,
+                baseline_agent=controller.trial_agent,
+                reference_agent=controller.reference_agent,
+                max_proposals=4,
+                generations=1,
+                seed=17,
+                n_per_skill=1,
+            )
+            accepted = [decision for decision in improvement.decisions if decision.accepted]
+            self.assertTrue(accepted, improvement.to_dict())
+
+            original_parameters = {
+                name: parameter.detach().cpu().clone()
+                for name, parameter in model.named_parameters()
+            }
+            patch_report = None
+            last_error: Exception | None = None
+            for decision in accepted:
+                try:
+                    patch_report = controller._apply_recursive_model_improvement(decision, cycle_report, step=0)
+                    break
+                except ValueError as exc:
+                    last_error = exc
+            self.assertIsNotNone(patch_report, last_error)
+            assert patch_report is not None
+            self.assertTrue(patch_report["rollback_executable"], patch_report)
+            self.assertTrue(Path(patch_report["rollback_artifact_path"]).exists(), patch_report)
+            self.assertGreater(patch_report["rollback_artifact_parameter_count"], 0, patch_report)
+            named_after_patch = dict(model.named_parameters())
+            changed_names = [
+                name
+                for name in patch_report["updated_parameter_names"]
+                if not torch.equal(named_after_patch[name].detach().cpu(), original_parameters[name])
+            ]
+            self.assertTrue(changed_names, patch_report)
+
+            rollback_report = controller.rollback_recursive_model_patch(
+                patch_report["signed_patch_id"],
+                reason="unit-test-protected-regression",
+            )
+
+            self.assertTrue(rollback_report["rolled_back"], rollback_report)
+            self.assertEqual(rollback_report["rollback_token"], patch_report["rollback_token"])
+            named_after_rollback = dict(model.named_parameters())
+            for name in patch_report["updated_parameter_names"]:
+                self.assertTrue(
+                    torch.equal(named_after_rollback[name].detach().cpu(), original_parameters[name]),
+                    name,
+                )
+            self.assertGreater(controller.improvement_persistent_archive_state["rollback_event_count"], 0)
+            self.assertGreater(controller.checkpoint_state_summary()["recursive_model_executable_rollback_count"], 0)
 
     def test_cortex_phase_state_survives_checkpoint_resume(self):
         with tempfile.TemporaryDirectory() as tmp:
