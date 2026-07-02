@@ -124,6 +124,7 @@ Current executable coverage:
 - `CortexObjective` includes `latent_workspace` loss, binding the workspace summary to the certificate latent state while keeping latent steps stable and trainable.
 - The full LLM controller now materializes real `CertificateHead` outputs into verified `ShortCertificate` artifacts with model-token consistency, latent checksum verification, target-match metadata, checkpoint persistence and P5 audit gates.
 - Model-head certificates now carry latent-workspace checksum, step count and binding claims; full Cortex training requires `use_latent_reasoning_workspace=True`, persists workspace counters through checkpoints, and fails P5/full-architecture audits if workspace forward/steps/certificate binding are absent.
+- Exact-match task certificates now bind to the task contract target (`task.expected`) when it exists instead of using the produced answer as its own expected value; P8 inference certificate verification builds claims/tool args through `certificate_contract_for_task`.
 - `CertificateHeadCalibrator` trains the certificate head on verifier micro-task answers, certificate types and uncertainty targets.
 - `ShortCertificate` carries answer, claims, uncertainty, latent checksum, anchors and optional tool contract.
 - `CertificateVerifier` checks uncertainty bounds, latent checksum and tool-backed verification.
@@ -228,6 +229,7 @@ Evidence:
 - `tests/test_llm_pretraining.py::LLMPretrainingHarnessTest::test_resume_selects_highest_complete_checkpoint_over_stale_final` verifies that resume chooses a newer complete intermediate checkpoint over an older complete final checkpoint, and keeps doing so when the final sidecar is corrupt.
 - `python -m unittest tests.test_inference` verifies that P8 `kernel_dispatches` match the P2 `packed_ternary_dispatches` ledger backend/layer/native fields instead of generic pre-forward labels.
 - `python -m unittest tests.test_frontier_discovery.FrontierSkillDiscoveryTest.test_frontier_discovery_slow_solves_distills_and_compiles_fragile_skill` verifies that P8 creates and uses an internal P4 memory binding for compiled FastSolve when no memory instance is explicitly supplied.
+- `python -m unittest tests.test_certificates` and `python -m unittest tests.test_inference` verify that exact-match certificates reject wrong answers such as `OK extra` against the real task target.
 
 Remaining:
 

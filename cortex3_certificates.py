@@ -889,6 +889,7 @@ def _arithmetic_expression_from_task(task: Task) -> str | None:
 
 def certificate_contract_for_task(task: Task, answer: str, certificate_type: CertificateType | None = None) -> tuple[Mapping[str, Any], str, Mapping[str, Any], tuple[Anchor, ...]]:
     cert_type = certificate_type or certificate_type_for_task(task)
+    expected_answer = answer if task.expected is None else str(task.expected)
     if task.skill == "code_unit_tests":
         visible_tests = tuple(task.metadata.get("tests", ()))
         hidden_tests = tuple(task.metadata.get("hidden_tests", ()))
@@ -976,27 +977,27 @@ def certificate_contract_for_task(task: Task, answer: str, certificate_type: Cer
                 "constraint": "reported value must match verifier target",
             },
             "exact_match",
-            {"expected": answer},
+            {"expected": expected_answer},
             tuple(task.anchors),
         )
     if cert_type == CertificateType.FORMAT:
         return (
             {"format": "exact output contract", "extra_text_allowed": False},
             "exact_match",
-            {"expected": answer},
+            {"expected": expected_answer},
             tuple(task.anchors),
         )
     if task.skill == "calibration":
         return (
             {"verification": "exact calibrated answer", "calibrated_uncertainty": True},
             "exact_match",
-            {"expected": answer},
+            {"expected": expected_answer},
             tuple(task.anchors),
         )
     return (
         {"verification": "exact answer match"},
         "exact_match",
-        {"expected": answer},
+        {"expected": expected_answer},
         tuple(task.anchors),
     )
 

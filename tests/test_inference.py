@@ -209,6 +209,16 @@ class UltraFastInferenceTest(unittest.TestCase):
         self.assertEqual(result.layers_ran, result.route.layers_to_run)
         self.assertTrue(result.trace_summary["expert_activations"])
 
+    def test_inference_certificate_uses_task_contract_not_answer_as_expected(self):
+        task = Task("cert-contract", "instruction_following", "Output OK exactly.", "OK")
+        engine = _engine()
+        signal = engine.router.signal(task, 0.99)
+        route = engine.router.route(signal, InferencePath.CAREFUL)
+        hidden = torch.zeros(1, engine.config.hidden_size)
+
+        self.assertFalse(engine._certificate_verified(hidden, task, CandidateAnswer("OK extra", confidence=0.99), route))
+        self.assertTrue(engine._certificate_verified(hidden, task, CandidateAnswer("OK", confidence=0.99), route))
+
     def test_inference_gate_rejects_tampered_proof_carrying_answer(self):
         task = Task("proof-gate", "arithmetic", "Compute exactly: 20 + 22. Return only the integer.", 42, {"kind": "add", "a": 20, "b": 22})
         state = LatentProofState("proof-gate-latent", task.task_id, task.skill, tensor=torch.tensor([[0.1, 0.2, 0.3, 0.4]], dtype=torch.float32), latent_steps=1)

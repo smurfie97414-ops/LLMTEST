@@ -8,7 +8,15 @@ import torch
 import torch.nn as nn
 
 from cortex3 import CandidateAnswer, CostTrace, DynamicSkillVerifier, Task, VerificationCaseResult
-from cortex3_certificates import CertificateHead, CertificateType, CertificateVerifier, LatentProofState, ShortCertificate, build_certificate
+from cortex3_certificates import (
+    CertificateHead,
+    CertificateVerifier,
+    LatentProofState,
+    ShortCertificate,
+    build_certificate,
+    certificate_contract_for_task,
+    certificate_type_for_task,
+)
 from cortex3_frontier import CompiledFrontierAgent, FrontierCircuitRegistry
 from cortex3_future import FutureContractEngine, MTPFSPConfig, MTPFSPHeads
 from cortex3_memory import CognitiveMemory, MemoryReconstruction, embed_text, tokenize
@@ -505,19 +513,18 @@ class UltraFastInferenceEngine:
             return True
         head_out = self.certificate_head(hidden.detach())
         state = LatentProofState(f"{task.task_id}-inference", task.task_id, task.skill, head_out.latent_state.detach(), latent_steps=max(1, route.latent_loops))
-        cert_type = CertificateType.EXACT_MATCH if task.skill != "code_unit_tests" else CertificateType.CODE_TESTS
-        tool = "exact_match" if cert_type == CertificateType.EXACT_MATCH else "code_tests"
-        tool_args: Mapping[str, Any] = {"expected": answer.text} if tool == "exact_match" else {"function_name": "solve", "tests": tuple(task.metadata.get("tests", ()))}
+        cert_type = certificate_type_for_task(task)
+        claims, tool, tool_args, anchors = certificate_contract_for_task(task, answer.text, cert_type)
         cert = build_certificate(
             certificate_id=f"{task.task_id}-inference-cert",
             task_id=task.task_id,
             skill=task.skill,
             certificate_type=cert_type,
             answer=answer.text,
-            claims={"route": route.path.value},
+            claims={**dict(claims), "route": route.path.value},
             uncertainty=max(0.0, min(1.0, 1.0 - answer.confidence)),
             latent_state=state,
-            anchors=task.anchors,
+            anchors=anchors,
             tool=tool,
             tool_args=tool_args,
         )

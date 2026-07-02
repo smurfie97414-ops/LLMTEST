@@ -26,6 +26,7 @@ from cortex3_certificates import (
     compiled_circuit_tool,
     default_tool_registry,
     evaluate_certificate_efficiency,
+    exact_match_tool,
     model_token_certificate_tool,
     sympy_symbolic_tool,
 )
@@ -167,6 +168,26 @@ class CertificatesTest(unittest.TestCase):
         self.assertTrue(CertificateVerifier().verify(cert, state).passed)
         self.assertTrue(model_token_certificate_tool(cert).passed)
         self.assertFalse(model_token_certificate_tool(bad).passed)
+
+    def test_task_certificate_contract_exact_match_binds_to_expected_not_answer(self):
+        task = Task("format-contract", "instruction_following", "Output OK exactly.", "OK")
+        claims, tool, tool_args, anchors = certificate_contract_for_task(task, "OK extra")
+        cert = build_certificate(
+            certificate_id="format-contract-cert",
+            task_id=task.task_id,
+            skill=task.skill,
+            certificate_type=CertificateType.FORMAT,
+            answer="OK extra",
+            claims=claims,
+            uncertainty=0.10,
+            latent_state=_latent_state(),
+            anchors=anchors,
+            tool=tool,
+            tool_args=tool_args,
+        )
+
+        self.assertEqual(tool_args["expected"], "OK")
+        self.assertFalse(exact_match_tool(cert).passed)
 
     def test_code_certificate_runs_real_unit_tests(self):
         state = _latent_state()

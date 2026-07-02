@@ -2,7 +2,7 @@
 
 Etat long-run verifie le 2026-07-01 depuis le run local `runs/cortex3-c4-cuda-large-fullphases-20260630_133618`.
 
-Etat court actualise le 2026-07-02: les corrections C87/C88/C89 ont ete validees par tests courts sans relancer de run long. C87 branche les circuits compiles Frontier dans la memoire cognitive learned avec retention latente et utility credit. C88 aligne P8 sur le vrai dispatch P2 execute par `BitLinear` apres forward. C89 oblige P8 a utiliser un binding P4 pour les circuits compiles meme quand sa memoire est interne.
+Etat court actualise le 2026-07-02: les corrections C87/C88/C89/C90 ont ete validees par tests courts sans relancer de run long. C87 branche les circuits compiles Frontier dans la memoire cognitive learned avec retention latente et utility credit. C88 aligne P8 sur le vrai dispatch P2 execute par `BitLinear` apres forward. C89 oblige P8 a utiliser un binding P4 pour les circuits compiles meme quand sa memoire est interne. C90 lie les certificats exact-match P5/P8 au target de tache au lieu de la reponse produite.
 
 Ce document explique comment l'architecture Cortex-3 complete agit pendant un entrainement LLM reel. Le but est de separer clairement trois niveaux :
 
@@ -47,6 +47,7 @@ Preuve post-integration des deux nouvelles briques :
 - `tests.test_cognitive_memory` prouve que le binding de circuit compile survit en memoire latente, porte une decision `learned_memory_compiled_circuit_policy` et recoit un credit d'utilite positif sur le segment reconstruit.
 - `tests.test_inference` prouve que `kernel_dispatches` P8 recopie le backend/layer/native fields du `packed_ternary_dispatches` P2 reel, au lieu d'un mode CPU/CUDA generique calcule avant le forward.
 - `test_frontier_discovery_slow_solves_distills_and_compiles_fragile_skill` prouve que `UltraFastInferenceEngine` sans memoire explicite cree quand meme un binding P4 interne avant d'utiliser une FastSolve compilee.
+- `tests.test_certificates` et `tests.test_inference` prouvent qu'une mauvaise reponse ne peut plus passer un certificat exact-match en utilisant sa propre sortie comme expected.
 - `test_full_cortex_phase_controller_uses_all_modules_during_training` a ete relance apres correction du build CUDA local et passe en test court garde; il verifie les nouveaux champs de retention/utility compiled-circuit et l'architecture P1-P10.
 
 Le long run devra produire un nouveau sidecar sous le commit de cette integration pour remplacer l'ancien audit `22/22` par l'audit courant plus strict incluant `native_ternary_cuda_kernel` et `future_output_goal_contracts`.
