@@ -85,6 +85,11 @@ class FrontierSkillDiscoveryTest(unittest.TestCase):
         self.assertTrue(inferred.answer.certificate["output_goal_contract_passed"])
         self.assertTrue(inferred.future_contract["output_goal_contract"]["accepted"])
         self.assertTrue(inferred.passed)
+        engine_internal_memory = UltraFastInferenceEngine(verifier, CorruptedCompressedAgent(), compiled_frontier_registry=registry)
+        inferred_internal = engine_internal_memory.infer(task, forced_path=InferencePath.FAST)
+        self.assertTrue(inferred_internal.answer.raw["frontier_compiled_selected"])
+        self.assertTrue(inferred_internal.answer.certificate["frontier_memory_binding_passed"])
+        self.assertIn(circuit_id, engine_internal_memory.memory.compiled_circuit_bindings)
 
     def test_frontier_discovery_report_is_persisted(self):
         verifier = DynamicSkillVerifier(default_skill_specs())

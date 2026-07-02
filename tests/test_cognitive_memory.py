@@ -275,12 +275,31 @@ class CognitiveMemoryTest(unittest.TestCase):
         memory.ingest("recent", "Nouveau segment qui force le circuit compile en latent KV.")
 
         restored_binding, reconstruction = memory.reconstruct_compiled_circuit_binding("circuit-alpha-123")
+        credits = memory.record_utility(
+            reconstruction,
+            phase="P9",
+            source="compiled-circuit-unit",
+            reason="compiled_circuit_reuse",
+        )
 
         self.assertEqual(restored_binding.binding_id, binding.binding_id)
         self.assertTrue(reconstruction.fidelity.passed)
         self.assertIn(binding.segment_id, reconstruction.selected_segment_ids)
         self.assertIn("circuit-alpha-123", reconstruction.rendered_context)
+        self.assertIn(binding.segment_id, [segment.segment_id for segment in memory.latent.segments])
+        self.assertTrue(credits)
+        compiled_credit = next((credit for credit in credits if credit.segment_id == binding.segment_id), None)
+        self.assertIsNotNone(compiled_credit)
+        self.assertEqual(compiled_credit.retention_source, "learned_memory_compiled_circuit_policy")
+        self.assertEqual(compiled_credit.applied_mode, MemoryMode.LATENT)
+        self.assertGreater(compiled_credit.utility, 0.0)
         report = memory.compression_report()
+        self.assertEqual(report["compiled_circuit_learned_retention_count"], 1)
+        self.assertEqual(report["compiled_circuit_learned_retention_requested_latent"], 1)
+        self.assertEqual(report["compiled_circuit_learned_retention_applied_latent"], 1)
+        self.assertEqual(report["compiled_circuit_memory_utility_credit_count"], 1)
+        self.assertEqual(report["compiled_circuit_memory_utility_positive_count"], 1)
+        self.assertEqual(report["compiled_circuit_memory_utility_latent_count"], 1)
         self.assertEqual(report["compiled_circuit_memory_binding_count"], 1)
         self.assertTrue(report["compiled_circuit_memory_bindings"][0]["passed"])
 

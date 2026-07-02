@@ -90,6 +90,15 @@ class TernaryKernelDispatch:
     active_weights: int
     total_weights: int
     reason: str
+    source_layer_id: str = ""
+    device: str = ""
+    native_kernel: bool = False
+    kernel_variant: str = ""
+    native_backend: str = ""
+    requantize_backend: str = ""
+    autotuned: bool = False
+    autotune_cache_hit: bool = False
+    autotune_candidate_ms: tuple[tuple[str, float], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -234,15 +243,53 @@ class EarlyExitPolicy:
 
 class TernaryKernelDispatcher:
     def dispatch(self, layer: BitLinear, layer_index: int, route: InferenceRoute) -> TernaryKernelDispatch:
-        active = int(layer.mask.detach().sum().item())
-        total = int(layer.mask.numel())
-        scale_bits = int(layer.scales.numel()) * 16
-        packed_bits = total + active + scale_bits
-        if layer.bias is not None:
-            packed_bits += int(layer.bias.numel()) * 16
-        mode = "cuda_ternary_packed" if torch.cuda.is_available() and layer.float_weight.is_cuda else "cpu_ternary_reference"
-        reason = f"{route.path.value} path uses sign+mask packed ternary dispatch"
-        return TernaryKernelDispatch(layer_index, mode, packed_bits / 8.0, active, total, reason)
+        source_layer_id = layer.config.log_prefix
+        runtime_event = next(
+            (
+                event
+                for event in reversed(layer.ledger.packed_ternary_dispatches)
+                if event.layer_id == source_layer_id
+            ),
+            None,
+        )
+        if runtime_event is None:
+            raise RuntimeError(
+                f"BitLinear layer {source_layer_id!r} completed inference without a packed ternary runtime dispatch event"
+            )
+        requantize_backend = str(getattr(layer, "_last_requantize_backend", ""))
+        native_detail = (
+            f" native_backend={runtime_event.native_backend} kernel_variant={runtime_event.kernel_variant}"
+            if runtime_event.native_kernel
+            else " torch_unpack_linear"
+        )
+        autotune_detail = (
+            " autotune=cache_hit"
+            if runtime_event.autotune_cache_hit
+            else " autotune=measured"
+            if runtime_event.autotuned
+            else ""
+        )
+        reason = (
+            f"{route.path.value} path executed BitLinear runtime backend={runtime_event.backend};"
+            f"{native_detail}; requantize_backend={requantize_backend or 'unknown'}{autotune_detail}"
+        )
+        return TernaryKernelDispatch(
+            layer_index=layer_index,
+            mode=runtime_event.backend,
+            packed_weight_bytes=float(runtime_event.packed_weight_bytes),
+            active_weights=int(runtime_event.active_weights),
+            total_weights=int(runtime_event.total_weights),
+            reason=reason,
+            source_layer_id=source_layer_id,
+            device=runtime_event.device,
+            native_kernel=bool(runtime_event.native_kernel),
+            kernel_variant=runtime_event.kernel_variant,
+            native_backend=runtime_event.native_backend,
+            requantize_backend=requantize_backend,
+            autotuned=bool(runtime_event.autotuned),
+            autotune_cache_hit=bool(runtime_event.autotune_cache_hit),
+            autotune_candidate_ms=tuple(runtime_event.autotune_candidate_ms),
+        )
 
 
 class MixtureOfDepthsCore(nn.Module):
@@ -268,8 +315,8 @@ class MixtureOfDepthsCore(nn.Module):
         dispatches: list[TernaryKernelDispatch] = []
         for idx in range(route.layers_to_run):
             self.layers[idx].requantize()
-            dispatches.append(self.kernel_dispatcher.dispatch(self.layers[idx], idx, route))
             hidden = torch.tanh(self.layers[idx](hidden))
+            dispatches.append(self.kernel_dispatcher.dispatch(self.layers[idx], idx, route))
             hidden = self.norm(hidden)
             confidence = float(torch.sigmoid(self.confidence_head(hidden)).detach().mean())
             decision = early_exit.decide(route, idx, confidence, self.config)
@@ -322,14 +369,14 @@ class UltraFastInferenceEngine:
         self.verifier = verifier
         self.agent = agent
         self.config = config or InferenceConfig()
-        self._compiled_frontier_requires_memory = memory is not None
         self.memory = memory or CognitiveMemory()
         self.compiled_frontier_registry = compiled_frontier_registry
         self.compiled_frontier_agent = (
             CompiledFrontierAgent(
                 compiled_frontier_registry,
                 verifier=verifier,
-                memory=self.memory if self._compiled_frontier_requires_memory else None,
+                memory=self.memory,
+                require_memory_binding=True,
             )
             if compiled_frontier_registry is not None
             else None
@@ -349,7 +396,8 @@ class UltraFastInferenceEngine:
             CompiledFrontierAgent(
                 registry,
                 verifier=self.verifier,
-                memory=self.memory if self._compiled_frontier_requires_memory else None,
+                memory=self.memory,
+                require_memory_binding=True,
             )
             if registry is not None
             else None

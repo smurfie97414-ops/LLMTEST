@@ -1,6 +1,8 @@
 # Cortex-3 LLM Training Phase Interactions
 
-Etat verifie le 2026-07-01 depuis le run local `runs/cortex3-c4-cuda-large-fullphases-20260630_133618`.
+Etat long-run verifie le 2026-07-01 depuis le run local `runs/cortex3-c4-cuda-large-fullphases-20260630_133618`.
+
+Etat court actualise le 2026-07-02: les corrections C87/C88/C89 ont ete validees par tests courts sans relancer de run long. C87 branche les circuits compiles Frontier dans la memoire cognitive learned avec retention latente et utility credit. C88 aligne P8 sur le vrai dispatch P2 execute par `BitLinear` apres forward. C89 oblige P8 a utiliser un binding P4 pour les circuits compiles meme quand sa memoire est interne.
 
 Ce document explique comment l'architecture Cortex-3 complete agit pendant un entrainement LLM reel. Le but est de separer clairement trois niveaux :
 
@@ -42,6 +44,10 @@ Preuve post-integration des deux nouvelles briques :
 - Le rapport final full-Cortex est maintenant gate par `validate_cortex_phase_report_contract` et le schema publie `docs/CORTEX_PHASE_REPORT_SCHEMA.json`: P1-P10, les composants architecture, les livrables, les replay des phases causales et les termes de l'objectif final doivent etre presents avant l'ecriture disque.
 - `test_local_external_provenance_adapter_streams_deduplicates_and_oracle_verifies` et `test_phase_controller_ingests_configured_external_provenance_into_p9_reservoir` prouvent que P9 consomme des sources externes locales `.txt/.jsonl`, deduplique par hash, rejette les records non valides par oracle et les branche dans le reservoir `REAL_EXOGENOUS` du controleur LLM avant training.
 - `test_resume_selects_highest_complete_checkpoint_over_stale_final` prouve que l'auto-resume choisit le checkpoint complet au step le plus eleve entre `checkpoint_final.pt` et `checkpoint_step_*.pt`, et ignore un final au sidecar corrompu si un intermediaire complet plus recent existe.
+- `tests.test_cognitive_memory` prouve que le binding de circuit compile survit en memoire latente, porte une decision `learned_memory_compiled_circuit_policy` et recoit un credit d'utilite positif sur le segment reconstruit.
+- `tests.test_inference` prouve que `kernel_dispatches` P8 recopie le backend/layer/native fields du `packed_ternary_dispatches` P2 reel, au lieu d'un mode CPU/CUDA generique calcule avant le forward.
+- `test_frontier_discovery_slow_solves_distills_and_compiles_fragile_skill` prouve que `UltraFastInferenceEngine` sans memoire explicite cree quand meme un binding P4 interne avant d'utiliser une FastSolve compilee.
+- `test_full_cortex_phase_controller_uses_all_modules_during_training` a ete relance apres correction du build CUDA local et passe en test court garde; il verifie les nouveaux champs de retention/utility compiled-circuit et l'architecture P1-P10.
 
 Le long run devra produire un nouveau sidecar sous le commit de cette integration pour remplacer l'ancien audit `22/22` par l'audit courant plus strict incluant `native_ternary_cuda_kernel` et `future_output_goal_contracts`.
 

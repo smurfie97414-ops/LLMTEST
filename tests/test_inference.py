@@ -52,7 +52,17 @@ class UltraFastInferenceTest(unittest.TestCase):
         self.assertEqual(len(fast.kernel_dispatches), fast.layers_ran)
         self.assertEqual(len(fast.trace_summary["compression_decisions"]), fast.layers_ran)
         self.assertEqual(len(fast.trace_summary["activation_quantizations"]), fast.layers_ran)
-        self.assertIn("ternary", fast.kernel_dispatches[0].mode)
+        runtime_dispatches = fast.trace_summary["packed_ternary_dispatches"]
+        self.assertEqual(len(runtime_dispatches), fast.layers_ran)
+        self.assertEqual(fast.kernel_dispatches[0].mode, runtime_dispatches[0]["backend"])
+        self.assertEqual(fast.kernel_dispatches[0].source_layer_id, runtime_dispatches[0]["layer_id"])
+        self.assertEqual(fast.kernel_dispatches[0].packed_weight_bytes, runtime_dispatches[0]["packed_weight_bytes"])
+        self.assertEqual(fast.kernel_dispatches[0].native_kernel, runtime_dispatches[0]["native_kernel"])
+        self.assertEqual(fast.kernel_dispatches[0].kernel_variant, runtime_dispatches[0]["kernel_variant"])
+        self.assertEqual(fast.kernel_dispatches[0].native_backend, runtime_dispatches[0]["native_backend"])
+        self.assertIn("runtime backend=", fast.kernel_dispatches[0].reason)
+        self.assertIn("requantize_backend=", fast.kernel_dispatches[0].reason)
+        self.assertNotIn(fast.kernel_dispatches[0].mode, {"cuda_ternary_packed", "cpu_ternary_reference"})
 
     def test_fast_path_verified_cost_rejects_confident_wrong_answer(self):
         verifier = _verifier()

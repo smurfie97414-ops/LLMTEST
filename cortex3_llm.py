@@ -196,6 +196,9 @@ CORTEX_PHASE_REPORT_REQUIRED_TRAINING_INFLUENCE_KEYS: tuple[str, ...] = (
     "learned_memory_utility_negative_count",
     "learned_memory_utility_unselected_count",
     "compiled_circuit_memory_binding_count",
+    "compiled_circuit_learned_retention_count",
+    "compiled_circuit_memory_utility_credit_count",
+    "compiled_circuit_memory_utility_positive_count",
     "future_contract_decisions",
     "output_goal_contract_decisions",
     "output_goal_contract_accepted",
@@ -4276,6 +4279,9 @@ def _cortex_architecture_audit_from_summary(summary: Mapping[str, Any]) -> dict[
         "compiled_circuit_memory_retention",
         integer("compiled_circuit_memory_binding_count") > 0
         and integer("compiled_circuit_memory_binding_events") > 0
+        and integer("compiled_circuit_learned_retention_count") > 0
+        and integer("compiled_circuit_memory_utility_credit_count") > 0
+        and integer("compiled_circuit_memory_utility_positive_count") > 0
         and integer("compiled_circuit_memory_fidelity_failures") == 0
         and (
             integer("frontier_registry_loaded_events") == 0
@@ -4287,12 +4293,15 @@ def _cortex_architecture_audit_from_summary(summary: Mapping[str, Any]) -> dict[
         {
             "compiled_circuit_memory_binding_count": integer("compiled_circuit_memory_binding_count"),
             "compiled_circuit_memory_binding_events": integer("compiled_circuit_memory_binding_events"),
+            "compiled_circuit_learned_retention_count": integer("compiled_circuit_learned_retention_count"),
+            "compiled_circuit_memory_utility_credit_count": integer("compiled_circuit_memory_utility_credit_count"),
+            "compiled_circuit_memory_utility_positive_count": integer("compiled_circuit_memory_utility_positive_count"),
             "compiled_circuit_memory_fidelity_failures": integer("compiled_circuit_memory_fidelity_failures"),
             "frontier_registry_loaded_events": integer("frontier_registry_loaded_events"),
             "frontier_restored_fastsolve_events": integer("frontier_restored_fastsolve_events"),
             "compiled_circuit_memory_restored_reuse_events": integer("compiled_circuit_memory_restored_reuse_events"),
         },
-        "P4 memory must retain, restore and reconstruct compiled Frontier circuits before FastSolve/P7/P9/P10 reuse",
+        "P4 memory must retain compiled Frontier circuits through learned exact/latent/drop policy, credit their real reuse, restore them and reconstruct them before FastSolve/P7/P9/P10 reuse",
     )
     add(
         "ternary_core",
@@ -4860,6 +4869,9 @@ def _cortex_phase_deliverable_audit_from_summary(summary: Mapping[str, Any]) -> 
         and int(summary.get("learned_memory_utility_feedback_events", 0) or 0) > 0
         and int(summary.get("compiled_circuit_memory_binding_count", 0) or 0) > 0
         and int(summary.get("compiled_circuit_memory_binding_events", 0) or 0) > 0
+        and int(summary.get("compiled_circuit_learned_retention_count", 0) or 0) > 0
+        and int(summary.get("compiled_circuit_memory_utility_credit_count", 0) or 0) > 0
+        and int(summary.get("compiled_circuit_memory_utility_positive_count", 0) or 0) > 0
         and int(summary.get("compiled_circuit_memory_fidelity_failures", 0) or 0) == 0
         and (
             count("frontier_registry_loaded_events") == 0
@@ -4888,12 +4900,15 @@ def _cortex_phase_deliverable_audit_from_summary(summary: Mapping[str, Any]) -> 
             "learned_memory_last_utility_prior": tuple(summary.get("learned_memory_last_utility_prior", ()) or ()),
             "compiled_circuit_memory_binding_count": int(summary.get("compiled_circuit_memory_binding_count", 0) or 0),
             "compiled_circuit_memory_binding_events": int(summary.get("compiled_circuit_memory_binding_events", 0) or 0),
+            "compiled_circuit_learned_retention_count": int(summary.get("compiled_circuit_learned_retention_count", 0) or 0),
+            "compiled_circuit_memory_utility_credit_count": int(summary.get("compiled_circuit_memory_utility_credit_count", 0) or 0),
+            "compiled_circuit_memory_utility_positive_count": int(summary.get("compiled_circuit_memory_utility_positive_count", 0) or 0),
             "compiled_circuit_memory_fidelity_failures": int(summary.get("compiled_circuit_memory_fidelity_failures", 0) or 0),
             "frontier_registry_loaded_events": count("frontier_registry_loaded_events"),
             "frontier_restored_fastsolve_events": count("frontier_restored_fastsolve_events"),
             "compiled_circuit_memory_restored_reuse_events": count("compiled_circuit_memory_restored_reuse_events"),
         },
-        "Cognitive memory must preserve exact anchors, learn exact/latent/drop retention decisions from downstream utility, and retain restored compiled Frontier circuits for reuse",
+        "Cognitive memory must preserve exact anchors, learn exact/latent/drop retention decisions from downstream utility, and retain restored compiled Frontier circuits through the learned retention/utility loop before reuse",
     )
     add(
         "P5",
@@ -7863,6 +7878,11 @@ class CortexTrainingPhaseController:
             "memory_latent_segments": len(self.memory.latent.segments),
             "compiled_circuit_memory_binding_count": int(memory_report.get("compiled_circuit_memory_binding_count", 0) or 0),
             "compiled_circuit_memory_binding_events": int(self.integration_counts.get("compiled_circuit_memory_binding_events", 0)),
+            "compiled_circuit_learned_retention_count": int(memory_report.get("compiled_circuit_learned_retention_count", 0) or 0),
+            "compiled_circuit_learned_retention_applied_latent": int(memory_report.get("compiled_circuit_learned_retention_applied_latent", 0) or 0),
+            "compiled_circuit_memory_utility_credit_count": int(memory_report.get("compiled_circuit_memory_utility_credit_count", 0) or 0),
+            "compiled_circuit_memory_utility_positive_count": int(memory_report.get("compiled_circuit_memory_utility_positive_count", 0) or 0),
+            "compiled_circuit_memory_utility_latent_count": int(memory_report.get("compiled_circuit_memory_utility_latent_count", 0) or 0),
             "compiled_circuit_memory_fidelity_failures": int(self.integration_counts.get("compiled_circuit_memory_fidelity_failures", 0)),
             "sleep_frontier_memory_binding_events": int(self.integration_counts.get("sleep_frontier_memory_binding_events", 0)),
             "compiled_circuit_memory_bindings": _last_items(memory_report.get("compiled_circuit_memory_bindings", ()), 5),
@@ -8898,6 +8918,11 @@ class CortexTrainingPhaseController:
                 "memory_latent_segments": len(self.memory.latent.segments),
                 "compiled_circuit_memory_binding_count": int(memory_report.get("compiled_circuit_memory_binding_count", 0) or 0),
                 "compiled_circuit_memory_binding_events": int(self.integration_counts.get("compiled_circuit_memory_binding_events", 0)),
+                "compiled_circuit_learned_retention_count": int(memory_report.get("compiled_circuit_learned_retention_count", 0) or 0),
+                "compiled_circuit_learned_retention_applied_latent": int(memory_report.get("compiled_circuit_learned_retention_applied_latent", 0) or 0),
+                "compiled_circuit_memory_utility_credit_count": int(memory_report.get("compiled_circuit_memory_utility_credit_count", 0) or 0),
+                "compiled_circuit_memory_utility_positive_count": int(memory_report.get("compiled_circuit_memory_utility_positive_count", 0) or 0),
+                "compiled_circuit_memory_utility_latent_count": int(memory_report.get("compiled_circuit_memory_utility_latent_count", 0) or 0),
                 "compiled_circuit_memory_fidelity_failures": int(self.integration_counts.get("compiled_circuit_memory_fidelity_failures", 0)),
                 "sleep_frontier_memory_binding_events": int(self.integration_counts.get("sleep_frontier_memory_binding_events", 0)),
                 "frontier_registry_loaded_events": int(self.integration_counts.get("frontier_registry_loaded_events", 0)),
@@ -9082,6 +9107,11 @@ class CortexTrainingPhaseController:
                     "memory_latent_segments": len(self.memory.latent.segments),
                     "compiled_circuit_memory_binding_count": int(memory_report.get("compiled_circuit_memory_binding_count", 0) or 0),
                     "compiled_circuit_memory_binding_events": int(self.integration_counts.get("compiled_circuit_memory_binding_events", 0)),
+                    "compiled_circuit_learned_retention_count": int(memory_report.get("compiled_circuit_learned_retention_count", 0) or 0),
+                    "compiled_circuit_learned_retention_applied_latent": int(memory_report.get("compiled_circuit_learned_retention_applied_latent", 0) or 0),
+                    "compiled_circuit_memory_utility_credit_count": int(memory_report.get("compiled_circuit_memory_utility_credit_count", 0) or 0),
+                    "compiled_circuit_memory_utility_positive_count": int(memory_report.get("compiled_circuit_memory_utility_positive_count", 0) or 0),
+                    "compiled_circuit_memory_utility_latent_count": int(memory_report.get("compiled_circuit_memory_utility_latent_count", 0) or 0),
                     "compiled_circuit_memory_fidelity_failures": int(self.integration_counts.get("compiled_circuit_memory_fidelity_failures", 0)),
                     "sleep_frontier_memory_binding_events": int(self.integration_counts.get("sleep_frontier_memory_binding_events", 0)),
                     "frontier_registry_loaded_events": int(self.integration_counts.get("frontier_registry_loaded_events", 0)),
@@ -9249,6 +9279,11 @@ class CortexTrainingPhaseController:
                     "memory_latent_segments": len(self.memory.latent.segments),
                     "compiled_circuit_memory_binding_count": int(memory_report.get("compiled_circuit_memory_binding_count", 0) or 0),
                     "compiled_circuit_memory_binding_events": int(self.integration_counts.get("compiled_circuit_memory_binding_events", 0)),
+                    "compiled_circuit_learned_retention_count": int(memory_report.get("compiled_circuit_learned_retention_count", 0) or 0),
+                    "compiled_circuit_learned_retention_applied_latent": int(memory_report.get("compiled_circuit_learned_retention_applied_latent", 0) or 0),
+                    "compiled_circuit_memory_utility_credit_count": int(memory_report.get("compiled_circuit_memory_utility_credit_count", 0) or 0),
+                    "compiled_circuit_memory_utility_positive_count": int(memory_report.get("compiled_circuit_memory_utility_positive_count", 0) or 0),
+                    "compiled_circuit_memory_utility_latent_count": int(memory_report.get("compiled_circuit_memory_utility_latent_count", 0) or 0),
                     "compiled_circuit_memory_fidelity_failures": int(self.integration_counts.get("compiled_circuit_memory_fidelity_failures", 0)),
                     "sleep_frontier_memory_binding_events": int(self.integration_counts.get("sleep_frontier_memory_binding_events", 0)),
                     "frontier_registry_loaded_events": int(self.integration_counts.get("frontier_registry_loaded_events", 0)),

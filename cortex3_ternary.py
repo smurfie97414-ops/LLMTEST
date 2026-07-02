@@ -5,6 +5,7 @@ import os
 import platform
 import shutil
 import subprocess
+import time
 import warnings
 from dataclasses import asdict, dataclass, field
 from math import fsum
@@ -1943,6 +1944,42 @@ def _torch_cuda_home_candidate() -> Path | None:
     return Path.home() / ".codex" / f"cuda-{torch_cuda}" / "Library"
 
 
+def _repo_local_codex_dir() -> Path:
+    return Path(__file__).resolve().parent / ".codex"
+
+
+def _force_repo_local_cuda_build_environment() -> None:
+    local = _repo_local_codex_dir()
+    local.mkdir(parents=True, exist_ok=True)
+    for child in ("tmp", "cuda_cache", "torch_extensions_cortex3"):
+        (local / child).mkdir(parents=True, exist_ok=True)
+    os.environ["TORCH_EXTENSIONS_DIR"] = str(local / "torch_extensions_cortex3")
+    os.environ["CUDA_CACHE_PATH"] = str(local / "cuda_cache")
+    os.environ["TMP"] = str(local / "tmp")
+    os.environ["TEMP"] = str(local / "tmp")
+
+
+def _remove_stale_ternary_extension_locks() -> None:
+    extensions_dir = Path(os.environ["TORCH_EXTENSIONS_DIR"])
+    extension_dir = extensions_dir / "cortex3_ternary_cuda_extension_v7"
+    if not extension_dir.exists():
+        return
+    stale_after = float(os.environ.get("CORTEX3_TERNARY_EXTENSION_STALE_LOCK_SECONDS", "30"))
+    now = time.time()
+    for lock_name in ("lock", ".ninja_lock"):
+        lock_path = extension_dir / lock_name
+        if not lock_path.exists():
+            continue
+        age = now - lock_path.stat().st_mtime
+        if age >= stale_after:
+            lock_path.unlink(missing_ok=True)
+            continue
+        raise RuntimeError(
+            "Cortex-3 ternary CUDA extension build lock is active; "
+            f"{lock_path} is {age:.1f}s old. Stop the active build or retry shortly."
+        )
+
+
 def _candidate_vsdevcmd_paths() -> tuple[Path, ...]:
     candidates: list[Path] = []
     explicit = os.environ.get("CORTEX3_VSDEVCMD")
@@ -1996,15 +2033,23 @@ def _merge_vsdevcmd_environment(vsdevcmd: Path) -> None:
         errors="replace",
         timeout=30.0,
     )
+    merged: dict[str, tuple[str, str]] = {}
     for line in dump.splitlines():
         if "=" not in line:
             continue
         key, value = line.split("=", 1)
-        if key:
-            os.environ[key] = value
+        if not key:
+            continue
+        normalized = key.upper() if platform.system() == "Windows" else key
+        if normalized == "PATH" and normalized in merged:
+            continue
+        merged[normalized] = ("PATH" if normalized == "PATH" else key, value)
+    for key, value in merged.values():
+        os.environ[key] = value
 
 
 def _ensure_ternary_extension_build_environment() -> None:
+    _force_repo_local_cuda_build_environment()
     preferred_cuda_home = _torch_cuda_home_candidate()
     if preferred_cuda_home is not None and (preferred_cuda_home / "bin" / "nvcc.exe").exists():
         cuda_home = preferred_cuda_home
@@ -2032,7 +2077,7 @@ def _ensure_ternary_extension_build_environment() -> None:
             except Exception:
                 continue
     os.environ.setdefault("MAX_JOBS", "1")
-    os.environ.setdefault("TORCH_EXTENSIONS_DIR", str(Path.home() / ".codex" / "torch_extensions_cortex3"))
+    _remove_stale_ternary_extension_locks()
 
 
 def _load_ternary_cuda_extension() -> Any:

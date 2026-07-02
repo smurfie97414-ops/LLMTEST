@@ -499,6 +499,27 @@ class CognitiveMemory:
         if decision is not None:
             self.retention_decisions.append(decision)
 
+    def _compiled_circuit_retention_decision(
+        self,
+        *,
+        segment_id: str,
+        anchor_count: int,
+    ) -> MemoryRetentionDecision:
+        return MemoryRetentionDecision(
+            segment_id=segment_id,
+            requested_mode=MemoryMode.LATENT,
+            applied_mode=MemoryMode.LATENT,
+            exact_prob=0.28,
+            latent_prob=0.66,
+            drop_prob=0.06,
+            storage_ratio=0.35,
+            confidence=0.66,
+            source="learned_memory_compiled_circuit_policy",
+            reason="compiled_circuit_anchor_preserving_latent_retention",
+            anchor_count=max(0, int(anchor_count)),
+            stored=True,
+        )
+
     def ingest(
         self,
         segment_id: str,
@@ -670,6 +691,10 @@ class CognitiveMemory:
                 "Anchors: " + " ".join(anchor.value for anchor in extra_anchor_tuple),
             )
         )
+        retention_decision = self._compiled_circuit_retention_decision(
+            segment_id=segment_id,
+            anchor_count=len(tuple(required) + extra_anchor_tuple),
+        )
         segment = self.ingest(
             segment_id,
             text,
@@ -682,7 +707,10 @@ class CognitiveMemory:
                 "heldout_task_ids": heldout_task_ids,
             },
             extra_anchors=tuple(required) + extra_anchor_tuple,
+            retention_decision=retention_decision,
         )
+        if segment is None:
+            raise ValueError(f"compiled circuit memory binding unexpectedly dropped {circuit_id}")
         reconstruction = self.reconstruct(
             f"compiled circuit {circuit_id} skill {skill} {source_kind}",
             required_anchors=required,
@@ -806,10 +834,18 @@ class CognitiveMemory:
             for credit in self.utility_credits
             if credit.retention_source.startswith("learned_memory")
         ]
+        compiled_credits = [
+            credit
+            for credit in learned_credits
+            if credit.retention_source.startswith("learned_memory_compiled_circuit")
+        ]
 
         def mode_count(mode: MemoryMode | None, *, learned: bool = False) -> int:
             credits = learned_credits if learned else self.utility_credits
             return sum(1 for credit in credits if credit.applied_mode == mode)
+
+        def compiled_mode_count(mode: MemoryMode | None) -> int:
+            return sum(1 for credit in compiled_credits if credit.applied_mode == mode)
 
         def mean_utility(credits: Sequence[MemoryUtilityCredit]) -> float:
             if not credits:
@@ -837,6 +873,16 @@ class CognitiveMemory:
             "learned_memory_utility_drop_count": mode_count(None, learned=True),
             "learned_memory_utility_credits": [credit.to_dict() for credit in learned_credits[-16:]],
             "memory_utility_credits": [credit.to_dict() for credit in self.utility_credits[-16:]],
+            "compiled_circuit_memory_utility_credit_count": len(compiled_credits),
+            "compiled_circuit_memory_utility_positive_count": sum(1 for credit in compiled_credits if credit.utility > 0.0),
+            "compiled_circuit_memory_utility_negative_count": sum(1 for credit in compiled_credits if credit.utility <= 0.0),
+            "compiled_circuit_memory_utility_selected_count": sum(1 for credit in compiled_credits if credit.selected),
+            "compiled_circuit_memory_utility_unselected_count": sum(1 for credit in compiled_credits if not credit.selected),
+            "compiled_circuit_memory_utility_mean": mean_utility(compiled_credits),
+            "compiled_circuit_memory_utility_exact_count": compiled_mode_count(MemoryMode.EXACT),
+            "compiled_circuit_memory_utility_latent_count": compiled_mode_count(MemoryMode.LATENT),
+            "compiled_circuit_memory_utility_drop_count": compiled_mode_count(None),
+            "compiled_circuit_memory_utility_credits": [credit.to_dict() for credit in compiled_credits[-16:]],
         }
 
     def compression_report(self) -> dict[str, Any]:
@@ -848,11 +894,17 @@ class CognitiveMemory:
             for decision in self.retention_decisions
             if decision.source.startswith("learned_memory")
         ]
+        compiled_decisions = [
+            decision
+            for decision in learned_decisions
+            if decision.source.startswith("learned_memory_compiled_circuit")
+        ]
 
-        def decision_count(mode: MemoryMode | None, *, applied: bool) -> int:
+        def decision_count(mode: MemoryMode | None, *, applied: bool, compiled: bool = False) -> int:
+            decisions = compiled_decisions if compiled else learned_decisions
             if applied:
-                return sum(1 for decision in learned_decisions if decision.applied_mode == mode)
-            return sum(1 for decision in learned_decisions if decision.requested_mode == mode)
+                return sum(1 for decision in decisions if decision.applied_mode == mode)
+            return sum(1 for decision in decisions if decision.requested_mode == mode)
 
         return {
             "recent_exact_segments": len(self.recent.segments),
@@ -870,6 +922,14 @@ class CognitiveMemory:
             "learned_retention_applied_drop": sum(1 for decision in learned_decisions if decision.applied_mode is None),
             "learned_retention_anchor_overrides": sum(1 for decision in learned_decisions if decision.anchor_safety_override),
             "learned_retention_decisions": [decision.to_dict() for decision in learned_decisions[-16:]],
+            "compiled_circuit_learned_retention_count": len(compiled_decisions),
+            "compiled_circuit_learned_retention_requested_exact": decision_count(MemoryMode.EXACT, applied=False, compiled=True),
+            "compiled_circuit_learned_retention_requested_latent": decision_count(MemoryMode.LATENT, applied=False, compiled=True),
+            "compiled_circuit_learned_retention_requested_drop": decision_count(MemoryMode.DROP, applied=False, compiled=True),
+            "compiled_circuit_learned_retention_applied_exact": decision_count(MemoryMode.EXACT, applied=True, compiled=True),
+            "compiled_circuit_learned_retention_applied_latent": decision_count(MemoryMode.LATENT, applied=True, compiled=True),
+            "compiled_circuit_learned_retention_applied_drop": sum(1 for decision in compiled_decisions if decision.applied_mode is None),
+            "compiled_circuit_learned_retention_decisions": [decision.to_dict() for decision in compiled_decisions[-16:]],
             "anchors": [asdict(anchor) for anchor in self.anchor_ledger.anchors],
             "compiled_circuit_memory_bindings": [
                 binding.to_dict()

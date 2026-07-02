@@ -3677,6 +3677,11 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             self.assertGreater(influence["memory_recent_segments"], 0)
             self.assertGreater(influence["compiled_circuit_memory_binding_count"], 0)
             self.assertGreater(influence["compiled_circuit_memory_binding_events"], 0)
+            self.assertGreater(influence["compiled_circuit_learned_retention_count"], 0)
+            self.assertGreater(influence["compiled_circuit_learned_retention_applied_latent"], 0)
+            self.assertGreater(influence["compiled_circuit_memory_utility_credit_count"], 0)
+            self.assertGreater(influence["compiled_circuit_memory_utility_positive_count"], 0)
+            self.assertGreater(influence["compiled_circuit_memory_utility_latent_count"], 0)
             self.assertEqual(influence["compiled_circuit_memory_fidelity_failures"], 0)
             self.assertTrue(influence["compiled_circuit_memory_bindings"])
             self.assertGreater(influence["sleep_replay_examples"], 0)
@@ -3848,6 +3853,9 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             self.assertGreater(phase_report["memory_state_summary"]["learned_retention_decision_count"], 0)
             self.assertGreater(phase_report["memory_state_summary"]["learned_memory_utility_credit_count"], 0)
             self.assertGreater(phase_report["memory_state_summary"]["learned_memory_utility_positive_count"], 0)
+            self.assertGreater(phase_report["memory_state_summary"]["compiled_circuit_learned_retention_count"], 0)
+            self.assertGreater(phase_report["memory_state_summary"]["compiled_circuit_memory_utility_credit_count"], 0)
+            self.assertGreater(phase_report["memory_state_summary"]["compiled_circuit_memory_utility_positive_count"], 0)
             for sample in phase_report["batch_contract_samples"]:
                 self.assertGreaterEqual(sample["observed_token_count"], sample["horizon"])
             self.assertTrue((run_dir / "cortex_phase_report.json").exists())
@@ -4244,6 +4252,9 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 self.assertGreater(first_influence["learned_memory_utility_positive_count"], 0)
                 self.assertGreater(first_influence["learned_memory_utility_prior_updates"], 0)
                 self.assertGreater(first_influence["learned_memory_utility_feedback_events"], 0)
+                self.assertGreater(first_influence["compiled_circuit_learned_retention_count"], 0)
+                self.assertGreater(first_influence["compiled_circuit_memory_utility_credit_count"], 0)
+                self.assertGreater(first_influence["compiled_circuit_memory_utility_positive_count"], 0)
                 self.assertTrue(first_influence["learned_memory_last_utility_prior"], first_influence)
                 checkpoint = torch.load(run_dir / "checkpoint_final.pt", map_location="cpu", weights_only=False)
                 self.assertIn("cortex_phase_state", checkpoint)
@@ -4322,6 +4333,14 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 )
                 self.assertGreater(
                     checkpoint["cortex_phase_state"]["memory_state"]["compression_report"]["learned_memory_utility_credit_count"],
+                    0,
+                )
+                self.assertGreater(
+                    checkpoint["cortex_phase_state"]["memory_state"]["compression_report"]["compiled_circuit_learned_retention_count"],
+                    0,
+                )
+                self.assertGreater(
+                    checkpoint["cortex_phase_state"]["memory_state"]["compression_report"]["compiled_circuit_memory_utility_credit_count"],
                     0,
                 )
                 self.assertGreater(
@@ -4478,6 +4497,9 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                     + sidecar["cortex_phase_state_summary"]["learned_memory_retention_applied_drop"],
                 )
                 self.assertGreater(sidecar["cortex_phase_state_summary"]["learned_memory_utility_credit_count"], 0)
+                self.assertGreater(sidecar["cortex_phase_state_summary"]["compiled_circuit_learned_retention_count"], 0)
+                self.assertGreater(sidecar["cortex_phase_state_summary"]["compiled_circuit_memory_utility_credit_count"], 0)
+                self.assertGreater(sidecar["cortex_phase_state_summary"]["compiled_circuit_memory_utility_positive_count"], 0)
                 self.assertGreater(sidecar["cortex_phase_state_summary"]["learned_memory_utility_prior_updates"], 0)
                 self.assertTrue(sidecar["cortex_phase_state_summary"]["learned_memory_last_utility_prior"])
                 self.assertGreater(sidecar["cortex_phase_state_summary"]["bit_ledger_total_effective_bits"], 0.0)
@@ -4663,6 +4685,14 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             self.assertGreaterEqual(
                 resumed_influence["learned_memory_utility_feedback_events"],
                 first_influence["learned_memory_utility_feedback_events"],
+            )
+            self.assertGreaterEqual(
+                resumed_influence["compiled_circuit_learned_retention_count"],
+                first_influence["compiled_circuit_learned_retention_count"],
+            )
+            self.assertGreaterEqual(
+                resumed_influence["compiled_circuit_memory_utility_credit_count"],
+                first_influence["compiled_circuit_memory_utility_credit_count"],
             )
             self.assertTrue(resumed_influence["learned_memory_last_utility_prior"], resumed_influence)
             self.assertGreaterEqual(
