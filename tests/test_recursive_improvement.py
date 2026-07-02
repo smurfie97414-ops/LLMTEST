@@ -134,7 +134,19 @@ class RecursiveImprovementTest(unittest.TestCase):
                 "frontier_task_ids": (failure.task.task_id, f"{failure.task.task_id}-frontier"),
                 "repair_score_delta": 1.0,
                 "protected_checked": 2,
+                "frontier_compiled_selected": True,
                 "frontier_compiled_verified": True,
+                "frontier_heldout_gate_passed": True,
+                "frontier_heldout_passed": 2,
+                "frontier_heldout_total": 2,
+                "frontier_heldout_pass_rate": 1.0,
+                "frontier_output_goal_contract_passed": True,
+                "frontier_output_goal_contract": {"accepted": True, "task_id": failure.task.task_id},
+                "frontier_compiled_contract_verified": True,
+                "frontier_compiled_contract_checksum": "compiled-frontier-checksum",
+                "frontier_memory_binding_id": "frontier-memory-binding",
+                "frontier_memory_binding_passed": True,
+                "frontier_memory_binding_fidelity": 1.0,
             },
         ))
 
@@ -152,6 +164,25 @@ class RecursiveImprovementTest(unittest.TestCase):
         self.assertEqual(proposal.patch_payload["action"], "compile_frontier_repair")
         self.assertEqual(proposal.patch_payload["task_id"], failure.task.task_id)
         self.assertTrue(improvement.decisions[0].accepted, improvement.decisions[0].reason)
+
+    def test_frontier_repair_proposals_require_complete_compiled_contract(self):
+        _, report = _cycle()
+        failure = report.regressions[0]
+
+        proposals = ProposalGenerator().from_frontier_repairs((
+            {
+                "accepted": True,
+                "task_id": failure.task.task_id,
+                "skill": failure.task.skill,
+                "source_failure_ids": (failure.task.task_id,),
+                "frontier_task_ids": (failure.task.task_id,),
+                "repair_score_delta": 1.0,
+                "protected_checked": 2,
+                "frontier_compiled_verified": True,
+            },
+        ))
+
+        self.assertEqual(proposals, ())
 
     def test_sleep_frontier_proposals_require_anti_collapse_proof(self):
         base_circuit = {

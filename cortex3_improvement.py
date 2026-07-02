@@ -359,6 +359,26 @@ class ProposalGenerator:
             skill = str(payload.get("skill") or payload.get("circuit_skill") or "")
             if not task_id or not skill:
                 continue
+            heldout_passed = int(payload.get("frontier_heldout_passed", 0) or 0)
+            heldout_total = int(payload.get("frontier_heldout_total", 0) or 0)
+            output_goal_contract = dict(payload.get("frontier_output_goal_contract") or {})
+            compiled_contract_checksum = str(payload.get("frontier_compiled_contract_checksum", ""))
+            memory_binding_id = str(payload.get("frontier_memory_binding_id", ""))
+            if not (
+                bool(payload.get("frontier_compiled_selected"))
+                and bool(payload.get("frontier_compiled_verified"))
+                and bool(payload.get("frontier_heldout_gate_passed"))
+                and heldout_total > 0
+                and heldout_passed == heldout_total
+                and bool(payload.get("frontier_output_goal_contract_passed"))
+                and bool(output_goal_contract.get("accepted"))
+                and bool(payload.get("frontier_compiled_contract_verified"))
+                and bool(compiled_contract_checksum)
+                and bool(payload.get("frontier_memory_binding_passed"))
+                and bool(memory_binding_id)
+                and float(payload.get("frontier_memory_binding_fidelity", 0.0) or 0.0) > 0.0
+            ):
+                continue
             proposal_id = f"frontier-repair-{skill}-{task_id}"
             if proposal_id in seen:
                 continue
@@ -383,15 +403,21 @@ class ProposalGenerator:
                     "frontier_task_ids": tuple(str(item) for item in payload.get("frontier_task_ids", ())),
                     "repair_score_delta": float(payload.get("repair_score_delta", 0.0)),
                     "protected_checked": int(payload.get("protected_checked", 0)),
+                    "frontier_compiled_selected": True,
                     "frontier_compiled_verified": bool(payload.get("frontier_compiled_verified")),
                     "frontier_heldout_gate_passed": bool(payload.get("frontier_heldout_gate_passed")),
-                    "frontier_heldout_passed": int(payload.get("frontier_heldout_passed", 0) or 0),
-                    "frontier_heldout_total": int(payload.get("frontier_heldout_total", 0) or 0),
+                    "frontier_heldout_passed": heldout_passed,
+                    "frontier_heldout_total": heldout_total,
                     "frontier_heldout_pass_rate": float(payload.get("frontier_heldout_pass_rate", 0.0) or 0.0),
                     "frontier_output_goal_contract_passed": bool(payload.get("frontier_output_goal_contract_passed")),
-                    "frontier_output_goal_contract": dict(payload.get("frontier_output_goal_contract") or {}),
+                    "frontier_output_goal_contract": output_goal_contract,
                     "frontier_compiled_contract_verified": bool(payload.get("frontier_compiled_contract_verified")),
-                    "frontier_compiled_contract_checksum": str(payload.get("frontier_compiled_contract_checksum", "")),
+                    "frontier_compiled_contract_checksum": compiled_contract_checksum,
+                    "frontier_memory_binding_id": memory_binding_id,
+                    "frontier_memory_binding_passed": True,
+                    "frontier_memory_binding_fidelity": float(
+                        payload.get("frontier_memory_binding_fidelity", 0.0) or 0.0
+                    ),
                 },
             ))
             if len(proposals) >= max_proposals:
