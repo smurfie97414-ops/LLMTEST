@@ -4155,15 +4155,26 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 for name, parameter in model.named_parameters()
             }
             patch_report = None
+            accepted_decision = None
             last_error: Exception | None = None
             for decision in accepted:
                 try:
                     patch_report = controller._apply_recursive_model_improvement(decision, cycle_report, step=0)
+                    accepted_decision = decision
                     break
                 except ValueError as exc:
                     last_error = exc
             self.assertIsNotNone(patch_report, last_error)
             assert patch_report is not None
+            assert accepted_decision is not None
+            artifact_report = controller._materialize_recursive_improvement_artifact(
+                accepted_decision,
+                cycle_report,
+                step=0,
+                model_patch=patch_report,
+            )
+            self.assertEqual(artifact_report["signed_patch_id"], patch_report["signed_patch_id"])
+            self.assertEqual(artifact_report["proposal_id"], patch_report["proposal_id"])
             self.assertTrue(patch_report["rollback_executable"], patch_report)
             self.assertTrue(patch_report["p10_decision_accepted"], patch_report)
             self.assertTrue(patch_report["p10_decision_reason"], patch_report)
@@ -4195,7 +4206,87 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                     name,
                 )
             self.assertGreater(controller.improvement_persistent_archive_state["rollback_event_count"], 0)
+            self.assertTrue(controller.improvement_persistent_archive_state["model_materialization_required"])
+            self.assertTrue(controller.improvement_persistent_archive_state["model_materialization_complete"])
+            self.assertGreater(controller.improvement_persistent_archive_state["materialized_accepted_count"], 0)
             self.assertGreater(controller.checkpoint_state_summary()["recursive_model_executable_rollback_count"], 0)
+            manifest = json.loads((root / "p10-archive" / "manifest.json").read_text(encoding="utf-8"))
+            self.assertTrue(manifest["model_materialization_required"])
+            self.assertTrue(manifest["model_materialization_complete"])
+            self.assertIn(patch_report["proposal_id"], manifest["materialized_accepted_proposal_ids"])
+
+    def test_persistent_p10_archive_rejects_unmaterialized_accepted_decision(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            corpus = self._corpus(root, repeats=50)
+            tokenizer = LLMTokenizer.train(corpus, vocab_size=128, min_frequency=1)
+            model_config = TransformerConfig(
+                vocab_size=128,
+                seq_len=16,
+                d_model=32,
+                n_heads=4,
+                n_layers=1,
+                dropout=0.0,
+                horizons=(1, 2, 4, 8),
+                use_cortex_heads=True,
+                use_ternary_core=True,
+                use_skill_aware_experts=True,
+                use_variable_in_compressor=True,
+                use_learned_memory_policy=True,
+                use_certificate_head=True,
+                use_latent_reasoning_workspace=True,
+            )
+            archive_dir = root / "unsafe-p10-archive"
+            controller = CortexTrainingPhaseController(
+                CortexTransformerLM(model_config),
+                tokenizer,
+                TrainingConfig(
+                    steps=1,
+                    batch_size=1,
+                    eval_interval=1,
+                    checkpoint_interval=1,
+                    seed=19,
+                    num_threads=1,
+                    cortex_phase_probe_tasks=1,
+                    cortex_phase_max_proposals=4,
+                    cortex_improvement_archive_dir=str(archive_dir),
+                ),
+                run_dir=root / "run",
+            )
+            cycle_report = controller.cycle.run(
+                controller.reference_agent,
+                controller.trial_agent,
+                seed=19,
+                n_per_skill=1,
+            )
+            improvement = controller.improvement.run(
+                cycle_report,
+                baseline_agent=controller.trial_agent,
+                reference_agent=controller.reference_agent,
+                max_proposals=4,
+                generations=1,
+                seed=19,
+                n_per_skill=1,
+            )
+            self.assertTrue([decision for decision in improvement.decisions if decision.accepted], improvement.to_dict())
+            saved = controller.improvement.save_persistent_state(archive_dir)
+            self.assertGreater(saved["accepted_count"], 0)
+            self.assertFalse(saved["model_materialization_required"])
+            self.assertFalse(saved["model_materialization_complete"])
+
+            with self.assertRaisesRegex(ValueError, "without model-materialization"):
+                CortexTrainingPhaseController(
+                    CortexTransformerLM(model_config),
+                    tokenizer,
+                    TrainingConfig(
+                        steps=1,
+                        batch_size=1,
+                        eval_interval=1,
+                        checkpoint_interval=1,
+                        cortex_improvement_archive_dir=str(archive_dir),
+                    ),
+                    run_dir=root / "independent",
+                )
 
     def test_cortex_phase_state_survives_checkpoint_resume(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -4409,6 +4500,16 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 persistent_archive = json.loads((archive_dir / "archive.json").read_text(encoding="utf-8"))
                 self.assertTrue(persistent_archive["accepted"])
                 self.assertTrue(persistent_archive["accepted"][0]["decision"]["evaluation"]["trial_report"])
+                materialized_manifest = json.loads((archive_dir / "manifest.json").read_text(encoding="utf-8"))
+                self.assertTrue(materialized_manifest["model_materialization_required"])
+                self.assertTrue(materialized_manifest["model_materialization_complete"])
+                self.assertGreater(materialized_manifest["materialized_accepted_count"], 0)
+                accepted_ids = [
+                    item["proposal"]["proposal_id"]
+                    for item in persistent_archive["accepted"]
+                ]
+                for proposal_id in accepted_ids:
+                    self.assertIn(proposal_id, materialized_manifest["materialized_accepted_proposal_ids"])
                 independent_controller = CortexTrainingPhaseController(
                     CortexTransformerLM(model_config),
                     tokenizer,

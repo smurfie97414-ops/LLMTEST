@@ -1067,8 +1067,8 @@ class EvolutionaryArchive:
             kind_counts=dict(data["kind_counts"] or {}),
         )
 
-    def save(self, path: str | Path) -> Path:
-        return _write_json(Path(path), self.to_dict())
+    def save(self, path: str | Path, *, accepted_proposal_ids: Iterable[str] | None = None) -> Path:
+        return _write_json(Path(path), self.to_dict(accepted_proposal_ids=accepted_proposal_ids))
 
     @classmethod
     def load(cls, path: str | Path) -> "EvolutionaryArchive":
@@ -1076,18 +1076,29 @@ class EvolutionaryArchive:
         archive.restore_records(json.loads(Path(path).read_text(encoding="utf-8")))
         return archive
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self, *, accepted_proposal_ids: Iterable[str] | None = None) -> dict[str, Any]:
+        accepted_records = self.accepted
+        if accepted_proposal_ids is not None:
+            allowed = {str(item) for item in accepted_proposal_ids}
+            accepted_records = tuple(
+                record
+                for record in accepted_records
+                if record.proposal.proposal_id in allowed
+            )
+        accepted_kind_counts = Counter(self.restored_accepted_kind_counts)
+        accepted_kind_counts.update(record.proposal.kind for record in accepted_records)
         kind_counts = {
             kind.value: count
-            for kind, count in self.accepted_kind_counts().items()
+            for kind, count in accepted_kind_counts.items()
         }
+        accepted_count = self.restored_accepted_count + len(accepted_records)
         return {
             "schema_version": PERSISTENT_IMPROVEMENT_ARCHIVE_SCHEMA_VERSION,
-            "accepted": [record.to_dict() for record in self.accepted],
+            "accepted": [record.to_dict() for record in accepted_records],
             "rejected": [record.to_dict() for record in self.rejected],
             "restored_accepted_count": self.restored_accepted_count,
             "restored_rejected_count": self.restored_rejected_count,
-            "accepted_count": self.accepted_count,
+            "accepted_count": accepted_count,
             "rejected_count": self.rejected_count,
             "kind_counts": kind_counts,
         }
@@ -1218,8 +1229,11 @@ class RecursiveImprovementEngine:
         directory = Path(archive_dir)
         archive_path = directory / "archive.json"
         rollback_path = directory / "rollback.json"
+        manifest_path = directory / "manifest.json"
         archive_loaded = archive_path.exists()
         rollback_loaded = rollback_path.exists()
+        manifest_loaded = manifest_path.exists()
+        manifest: dict[str, Any] = {}
         if archive_loaded:
             self.archive.restore_records(json.loads(archive_path.read_text(encoding="utf-8")))
             if self.archive.accepted_count > 0 and not rollback_loaded:
@@ -1228,13 +1242,20 @@ class RecursiveImprovementEngine:
                 )
         if rollback_loaded:
             self.rollback.restore(json.loads(rollback_path.read_text(encoding="utf-8")))
+        if manifest_loaded:
+            manifest = dict(_require_mapping(
+                json.loads(manifest_path.read_text(encoding="utf-8")),
+                context="recursive improvement manifest",
+            ))
         return {
             "schema_version": PERSISTENT_IMPROVEMENT_ARCHIVE_SCHEMA_VERSION,
             "archive_dir": str(directory),
             "archive_path": str(archive_path),
             "rollback_path": str(rollback_path),
+            "manifest_path": str(manifest_path),
             "archive_loaded": archive_loaded,
             "rollback_loaded": rollback_loaded,
+            "manifest_loaded": manifest_loaded,
             "accepted_count": self.archive.accepted_count,
             "rejected_count": self.archive.rejected_count,
             "decision_count": self.archive.accepted_count + self.archive.rejected_count,
@@ -1243,21 +1264,98 @@ class RecursiveImprovementEngine:
                 kind.value: int(count)
                 for kind, count in self.archive.accepted_kind_counts().items()
             },
+            "model_materialization_required": bool(manifest.get("model_materialization_required", False)),
+            "model_materialization_complete": bool(manifest.get("model_materialization_complete", False)),
+            "accepted_proposal_ids": tuple(
+                str(item)
+                for item in manifest.get("accepted_proposal_ids", ())
+            ),
+            "materialized_accepted_count": int(manifest.get("materialized_accepted_count", 0) or 0),
+            "materialized_accepted_proposal_ids": tuple(
+                str(item)
+                for item in manifest.get("materialized_accepted_proposal_ids", ())
+            ),
+            "model_materializations": tuple(
+                dict(item)
+                for item in manifest.get("model_materializations", ())
+                if isinstance(item, Mapping)
+            ),
         }
 
-    def save_persistent_state(self, archive_dir: str | Path) -> dict[str, Any]:
+    def save_persistent_state(
+        self,
+        archive_dir: str | Path,
+        *,
+        model_materializations: Iterable[Mapping[str, Any]] = (),
+        require_model_materialization: bool = False,
+    ) -> dict[str, Any]:
         directory = Path(archive_dir)
-        archive_path = self.archive.save(directory / "archive.json")
+        materializations = tuple(dict(item) for item in model_materializations)
+        materialized_ids = tuple(
+            str(item.get("proposal_id", ""))
+            for item in materializations
+            if bool(item.get("model_patch_applied"))
+            and bool(item.get("signed_patch_id"))
+            and bool(item.get("recursive_verified_artifact_id"))
+            and bool(item.get("rollback_artifact_path"))
+        )
+        live_accepted_proposal_ids = tuple(record.proposal.proposal_id for record in self.archive.accepted)
+        persisted_accepted_id_filter = set(materialized_ids) if require_model_materialization else None
+        if require_model_materialization and self.archive.accepted_count > 0 and not materialized_ids:
+            raise ValueError(
+                "recursive improvement persistent archive requires at least one model-materialized accepted proposal"
+            )
+        archive_path = self.archive.save(
+            directory / "archive.json",
+            accepted_proposal_ids=persisted_accepted_id_filter,
+        )
         rollback_path = self.rollback.save(directory / "rollback.json")
+        persisted_archive = self.archive.to_dict(accepted_proposal_ids=persisted_accepted_id_filter)
+        accepted_proposal_ids = tuple(
+            str(record["proposal"]["proposal_id"])
+            for record in persisted_archive.get("accepted", ())
+        )
+        missing_materialized_ids = tuple(
+            proposal_id
+            for proposal_id in accepted_proposal_ids
+            if proposal_id not in set(materialized_ids)
+        )
+        materialization_complete = not missing_materialized_ids
+        if require_model_materialization and not materialization_complete:
+            raise ValueError(
+                "recursive improvement persistent archive requires model-materialized accepted proposals; "
+                f"missing {missing_materialized_ids}"
+            )
         manifest = {
             "schema_version": PERSISTENT_IMPROVEMENT_ARCHIVE_SCHEMA_VERSION,
             "archive_path": str(archive_path),
             "rollback_path": str(rollback_path),
-            "accepted_count": self.archive.accepted_count,
-            "rejected_count": self.archive.rejected_count,
-            "decision_count": self.archive.accepted_count + self.archive.rejected_count,
+            "accepted_count": int(persisted_archive.get("accepted_count", 0) or 0),
+            "rejected_count": int(persisted_archive.get("rejected_count", 0) or 0),
+            "decision_count": int(persisted_archive.get("accepted_count", 0) or 0)
+            + int(persisted_archive.get("rejected_count", 0) or 0),
+            "persistent_accepted_count": int(persisted_archive.get("accepted_count", 0) or 0),
+            "persistent_rejected_count": int(persisted_archive.get("rejected_count", 0) or 0),
+            "persistent_decision_count": int(persisted_archive.get("accepted_count", 0) or 0)
+            + int(persisted_archive.get("rejected_count", 0) or 0),
             "rollback_event_count": len(self.rollback.events),
-            "kind_counts": {
+            "accepted_proposal_ids": accepted_proposal_ids,
+            "sandbox_accepted_count": self.archive.accepted_count,
+            "sandbox_rejected_count": self.archive.rejected_count,
+            "sandbox_decision_count": self.archive.accepted_count + self.archive.rejected_count,
+            "unmaterialized_sandbox_accepted_proposal_ids": tuple(
+                proposal_id
+                for proposal_id in live_accepted_proposal_ids
+                if proposal_id not in set(accepted_proposal_ids)
+            ),
+            "model_materialization_required": bool(require_model_materialization),
+            "model_materialization_complete": materialization_complete,
+            "materialized_accepted_count": len(materialized_ids),
+            "materialized_accepted_proposal_ids": materialized_ids,
+            "missing_materialized_accepted_proposal_ids": missing_materialized_ids,
+            "model_materializations": materializations,
+            "kind_counts": dict(persisted_archive.get("kind_counts") or {}),
+            "sandbox_kind_counts": {
                 kind.value: int(count)
                 for kind, count in self.archive.accepted_kind_counts().items()
             },

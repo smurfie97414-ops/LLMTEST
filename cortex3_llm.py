@@ -253,6 +253,11 @@ CORTEX_PHASE_REPORT_REQUIRED_TRAINING_INFLUENCE_KEYS: tuple[str, ...] = (
     "recursive_model_rollback_applications",
     "recursive_verified_artifact_count",
     "recursive_verified_artifacts",
+    "improvement_persistent_archive_accepted_count",
+    "improvement_persistent_archive_rejected_count",
+    "improvement_persistent_archive_materialized_accepted_count",
+    "improvement_persistent_archive_model_materialization_complete",
+    "improvement_persistent_archive_model_materialization_required",
     "objective_feedback_events",
     "objective_feedback_term_count",
     "objective_feedback_term_names",
@@ -4212,6 +4217,12 @@ def _cortex_architecture_audit_from_summary(summary: Mapping[str, Any]) -> dict[
         and bool(item.get("training_contract_frontier_memory_binding_passed"))
         for item in recursive_verified_artifacts
     )
+    improvement_archive_materialized = (
+        int(number("improvement_persistent_archive_materialized_accepted_count"))
+        >= max(1, int(number("improvement_persistent_archive_accepted_count")))
+        and bool(summary.get("improvement_persistent_archive_model_materialization_required"))
+        and bool(summary.get("improvement_persistent_archive_model_materialization_complete"))
+    )
     checks: list[dict[str, Any]] = []
 
     def add(component: str, passed: bool, observed: Mapping[str, Any], requirement: str) -> None:
@@ -4621,10 +4632,16 @@ def _cortex_architecture_audit_from_summary(summary: Mapping[str, Any]) -> dict[
         and recursive_model_reward_hacking_cleared
         and recursive_artifact_verified
         and recursive_compiled_frontier_training_contract_grounded
-        and recursive_compiled_frontier_artifact_grounded,
+        and recursive_compiled_frontier_artifact_grounded
+        and improvement_archive_materialized,
         {
             "P10": phase_count("P10"),
             "improvement_decisions": improvement_decisions,
+            "improvement_persistent_archive_accepted_count": integer("improvement_persistent_archive_accepted_count"),
+            "improvement_archive_materialized": improvement_archive_materialized,
+            "improvement_persistent_archive_materialized_accepted_count": integer("improvement_persistent_archive_materialized_accepted_count"),
+            "improvement_persistent_archive_model_materialization_required": bool(summary.get("improvement_persistent_archive_model_materialization_required")),
+            "improvement_persistent_archive_model_materialization_complete": bool(summary.get("improvement_persistent_archive_model_materialization_complete")),
             "recursive_model_application_count": integer("recursive_model_application_count"),
             "recursive_verified_artifact_count": recursive_verified_artifact_count,
             "recursive_model_rollback_artifact_count": integer("recursive_model_rollback_artifact_count"),
@@ -4638,7 +4655,7 @@ def _cortex_architecture_audit_from_summary(summary: Mapping[str, Any]) -> dict[
             "recursive_compiled_frontier_training_contract_grounded": recursive_compiled_frontier_training_contract_grounded,
             "recursive_compiled_frontier_artifact_grounded": recursive_compiled_frontier_artifact_grounded,
         },
-        "recursive improvement sandbox must evaluate a proposal, apply an accepted signed non-regressing anti-reward-hacking-cleared patch to real Transformer state, ground compiled Frontier patches in FastSolve/P4/P5 contracts, persist an executable rollback artifact, and materialize a verified replay artifact",
+        "recursive improvement sandbox must evaluate a proposal, apply an accepted signed non-regressing anti-reward-hacking-cleared patch to real Transformer state, ground compiled Frontier patches in FastSolve/P4/P5 contracts, persist only model-materialized accepted archives, persist an executable rollback artifact, and materialize a verified replay artifact",
     )
     add(
         "training_feedback_loop",
@@ -4836,6 +4853,12 @@ def _cortex_phase_deliverable_audit_from_summary(summary: Mapping[str, Any]) -> 
         and bool(item.get("training_contract_frontier_memory_binding_id"))
         and bool(item.get("training_contract_frontier_memory_binding_passed"))
         for item in recursive_verified_artifacts
+    )
+    improvement_archive_materialized = (
+        int(number("improvement_persistent_archive_materialized_accepted_count"))
+        >= max(1, int(number("improvement_persistent_archive_accepted_count")))
+        and bool(summary.get("improvement_persistent_archive_model_materialization_required"))
+        and bool(summary.get("improvement_persistent_archive_model_materialization_complete"))
     )
 
     checks: list[dict[str, Any]] = []
@@ -5151,7 +5174,8 @@ def _cortex_phase_deliverable_audit_from_summary(summary: Mapping[str, Any]) -> 
         and recursive_model_reward_hacking_cleared
         and recursive_artifact_verified
         and recursive_compiled_frontier_training_contract_grounded
-        and recursive_compiled_frontier_artifact_grounded,
+        and recursive_compiled_frontier_artifact_grounded
+        and improvement_archive_materialized,
         {
             "recursive_proposal_events": count("recursive_proposal_events"),
             "recursive_sandbox_trials": count("recursive_sandbox_trials"),
@@ -5164,6 +5188,7 @@ def _cortex_phase_deliverable_audit_from_summary(summary: Mapping[str, Any]) -> 
             "recursive_evolved_proposal_events": count("recursive_evolved_proposal_events"),
             "recursive_persistent_archive_saves": count("recursive_persistent_archive_saves"),
             "improvement_persistent_archive_decisions": int(number("improvement_persistent_archive_decisions")),
+            "improvement_persistent_archive_accepted_count": int(number("improvement_persistent_archive_accepted_count")),
             "improvement_persistent_rollback_events": int(number("improvement_persistent_rollback_events")),
             "recursive_model_application_count": int(number("recursive_model_application_count")),
             "recursive_verified_artifact_count": recursive_verified_artifact_count,
@@ -5176,8 +5201,12 @@ def _cortex_phase_deliverable_audit_from_summary(summary: Mapping[str, Any]) -> 
             "recursive_artifact_verified": recursive_artifact_verified,
             "recursive_compiled_frontier_training_contract_grounded": recursive_compiled_frontier_training_contract_grounded,
             "recursive_compiled_frontier_artifact_grounded": recursive_compiled_frontier_artifact_grounded,
+            "improvement_archive_materialized": improvement_archive_materialized,
+            "improvement_persistent_archive_materialized_accepted_count": int(number("improvement_persistent_archive_materialized_accepted_count")),
+            "improvement_persistent_archive_model_materialization_required": bool(summary.get("improvement_persistent_archive_model_materialization_required")),
+            "improvement_persistent_archive_model_materialization_complete": bool(summary.get("improvement_persistent_archive_model_materialization_complete")),
         },
-        "recursive improvement must propose, sandbox, evolve across generations, evaluate, gate against reward hacking, persist evolutionary and executable rollback archives, apply a signed model patch grounded in FastSolve/P4/P5 compiled Frontier contracts, preserve rollback tokens, run diversity checks and materialize a verified replay artifact",
+        "recursive improvement must propose, sandbox, evolve across generations, evaluate, gate against reward hacking, persist only model-materialized evolutionary archives plus executable rollback archives, apply a signed model patch grounded in FastSolve/P4/P5 compiled Frontier contracts, preserve rollback tokens, run diversity checks and materialize a verified replay artifact",
     )
 
     failed_checks = tuple(f"{check['phase']}:{check['deliverable']}" for check in checks if not check["passed"])
@@ -5349,6 +5378,7 @@ class CortexTrainingPhaseController:
 
     def _load_persistent_improvement_archive(self) -> None:
         state = self.improvement.load_persistent_state(self.improvement_archive_dir)
+        self._validate_persistent_improvement_materialization(state)
         self.improvement_persistent_archive_state = dict(state)
         if bool(state.get("archive_loaded")):
             self.integration_counts["recursive_persistent_archive_loads"] = (
@@ -5357,14 +5387,118 @@ class CortexTrainingPhaseController:
             self.integration_counts["recursive_persistent_archive_loaded_decisions"] = int(state.get("decision_count", 0))
         if bool(state.get("rollback_loaded")):
             self.integration_counts["recursive_persistent_rollback_loaded_events"] = int(state.get("rollback_event_count", 0))
+        if int(state.get("materialized_accepted_count", 0) or 0) > 0:
+            self._count("recursive_persistent_archive_materialized_loads")
+            self.integration_counts["recursive_persistent_archive_materialized_acceptances"] = int(
+                state.get("materialized_accepted_count", 0) or 0
+            )
 
-    def _persist_improvement_archive(self, *, step: int) -> dict[str, Any]:
-        state = self.improvement.save_persistent_state(self.improvement_archive_dir)
+    def _recursive_model_materializations(self) -> tuple[dict[str, Any], ...]:
+        artifacts_by_patch = {
+            str(item.get("signed_patch_id", "")): dict(item)
+            for item in self.recursive_verified_artifacts
+            if isinstance(item, Mapping) and str(item.get("signed_patch_id", ""))
+        }
+        materializations: list[dict[str, Any]] = []
+        for application in self.recursive_model_applications:
+            item = dict(application)
+            signed_patch_id = str(item.get("signed_patch_id", ""))
+            if not signed_patch_id:
+                continue
+            artifact = artifacts_by_patch.get(signed_patch_id, {})
+            materializations.append({
+                "schema_version": 1,
+                "proposal_id": str(item.get("proposal_id", "")),
+                "proposal_kind": str(item.get("proposal_kind", "")),
+                "signed_patch_id": signed_patch_id,
+                "rollback_token": str(item.get("rollback_token", "")),
+                "model_patch_applied": bool(item.get("non_regression_passed"))
+                and float(item.get("parameter_delta_l1", 0.0) or 0.0) > 0.0
+                and float(item.get("repair_loss_delta", 0.0) or 0.0) > 0.0,
+                "rollback_executable": bool(item.get("rollback_executable")),
+                "rollback_artifact_path": str(item.get("rollback_artifact_path", "")),
+                "rollback_artifact_sha256": str(item.get("rollback_artifact_sha256", "")),
+                "recursive_verified_artifact_id": str(artifact.get("artifact_id", "")),
+                "recursive_verified_example_id": str(artifact.get("example_id", "")),
+                "recursive_verified_artifact_kind": str(artifact.get("artifact_type", "")),
+                "training_contract_source": str(
+                    item.get("training_contract_source")
+                    or artifact.get("training_contract_source", "")
+                ),
+            })
+        return tuple(materializations)
+
+    def _validate_persistent_improvement_materialization(self, state: Mapping[str, Any]) -> None:
+        if not bool(state.get("archive_loaded")):
+            return
+        accepted_count = int(state.get("accepted_count", 0) or 0)
+        if accepted_count <= 0:
+            return
+        if not bool(state.get("manifest_loaded")):
+            raise FileNotFoundError(
+                "recursive improvement archive has accepted records but no materialization manifest at "
+                f"{state.get('manifest_path')}"
+            )
+        if not bool(state.get("model_materialization_required")):
+            raise ValueError(
+                "recursive improvement archive contains accepted sandbox decisions without "
+                "model-materialization requirement; refusing to reuse unmaterialized P10 parents"
+            )
+        if not bool(state.get("model_materialization_complete")):
+            raise ValueError("recursive improvement archive materialization manifest is incomplete")
+        materializations = tuple(
+            dict(item)
+            for item in state.get("model_materializations", ())
+            if isinstance(item, Mapping)
+        )
+        materialized_by_proposal = {
+            str(item.get("proposal_id", "")): item
+            for item in materializations
+            if str(item.get("proposal_id", ""))
+        }
+        accepted_ids = tuple(str(item) for item in state.get("accepted_proposal_ids", ()) if str(item))
+        if not accepted_ids:
+            accepted_ids = tuple(record.proposal.proposal_id for record in self.improvement.archive.accepted)
+        missing = tuple(proposal_id for proposal_id in accepted_ids if proposal_id not in materialized_by_proposal)
+        if missing:
+            raise ValueError(f"recursive improvement archive has unmaterialized accepted proposals: {missing}")
+        for proposal_id in accepted_ids:
+            materialized = materialized_by_proposal[proposal_id]
+            if not bool(materialized.get("model_patch_applied")):
+                raise ValueError(f"persistent P10 proposal {proposal_id} is not marked as model-applied")
+            if not bool(materialized.get("rollback_executable")):
+                raise ValueError(f"persistent P10 proposal {proposal_id} has no executable rollback")
+            if not str(materialized.get("signed_patch_id", "")):
+                raise ValueError(f"persistent P10 proposal {proposal_id} has no signed patch id")
+            if not str(materialized.get("recursive_verified_artifact_id", "")):
+                raise ValueError(f"persistent P10 proposal {proposal_id} has no verified replay artifact")
+            rollback_artifact_path = Path(str(materialized.get("rollback_artifact_path", "")))
+            if not rollback_artifact_path.exists():
+                raise FileNotFoundError(
+                    f"persistent P10 proposal {proposal_id} rollback artifact is missing at {rollback_artifact_path}"
+                )
+
+    def _persist_improvement_archive(self, *, step: int, require_model_materialization: bool = False) -> dict[str, Any]:
+        state = self.improvement.save_persistent_state(
+            self.improvement_archive_dir,
+            model_materializations=self._recursive_model_materializations(),
+            require_model_materialization=require_model_materialization,
+        )
         state = {**state, "step": int(step)}
+        self._validate_persistent_improvement_materialization({
+            **state,
+            "archive_loaded": True,
+            "manifest_loaded": True,
+        })
         self.improvement_persistent_archive_state = dict(state)
         self._count("recursive_persistent_archive_saves")
         self.integration_counts["recursive_persistent_archive_decisions"] = int(state.get("decision_count", 0))
         self.integration_counts["recursive_persistent_rollback_events"] = int(state.get("rollback_event_count", 0))
+        self.integration_counts["recursive_persistent_archive_materialized_acceptances"] = int(
+            state.get("materialized_accepted_count", 0) or 0
+        )
+        if bool(state.get("model_materialization_complete")) and int(state.get("materialized_accepted_count", 0) or 0) > 0:
+            self._count("recursive_persistent_archive_materialized_saves")
         return state
 
     def _record_error(self, phase_id: str, exc: Exception) -> None:
@@ -7418,7 +7552,10 @@ class CortexTrainingPhaseController:
         self.recursive_model_rollback_applications.append(rollback_report)
         self._count("recursive_model_executable_rollback_events")
         self._count("recursive_model_executable_rollback_parameters", len(parameter_names))
-        self._persist_improvement_archive(step=int(application.get("step", 0) or 0))
+        self._persist_improvement_archive(
+            step=int(application.get("step", 0) or 0),
+            require_model_materialization=True,
+        )
         return rollback_report
 
     def _apply_recursive_model_improvement(self, decision: AcceptanceDecision, cycle_report: Any, *, step: int) -> dict[str, Any]:
@@ -8144,11 +8281,26 @@ class CortexTrainingPhaseController:
             "error_count": len(self.errors),
             "improvement_archive_dir": str(self.improvement_archive_dir),
             "improvement_persistent_archive_state": dict(self.improvement_persistent_archive_state),
+            "improvement_persistent_archive_accepted_count": int(
+                self.improvement_persistent_archive_state.get("accepted_count", 0) or 0
+            ),
+            "improvement_persistent_archive_rejected_count": int(
+                self.improvement_persistent_archive_state.get("rejected_count", 0) or 0
+            ),
             "improvement_persistent_archive_decisions": int(
                 self.improvement_persistent_archive_state.get("decision_count", 0) or 0
             ),
             "improvement_persistent_rollback_events": int(
                 self.improvement_persistent_archive_state.get("rollback_event_count", 0) or 0
+            ),
+            "improvement_persistent_archive_materialized_accepted_count": int(
+                self.improvement_persistent_archive_state.get("materialized_accepted_count", 0) or 0
+            ),
+            "improvement_persistent_archive_model_materialization_complete": bool(
+                self.improvement_persistent_archive_state.get("model_materialization_complete", False)
+            ),
+            "improvement_persistent_archive_model_materialization_required": bool(
+                self.improvement_persistent_archive_state.get("model_materialization_required", False)
             ),
         }
         summary["architecture_audit"] = _cortex_architecture_audit_from_summary(summary)
@@ -8883,8 +9035,6 @@ class CortexTrainingPhaseController:
                 )
                 self._count("recursive_diversity_checks", len(improvement_report.decisions))
                 self._count("recursive_reward_hacking_checks", len(improvement_report.decisions))
-                persistent_archive = self._persist_improvement_archive(step=step)
-                audit["recursive_improvement"]["persistent_archive"] = persistent_archive
                 if improvement_report.decisions:
                     accepted_decision = next((decision for decision in improvement_report.decisions if decision.accepted), None)
                     if accepted_decision is None:
@@ -8902,6 +9052,11 @@ class CortexTrainingPhaseController:
                     )
                     audit["recursive_model_application"] = recursive_model_patch
                     audit["recursive_verified_artifact"] = recursive_verified_artifact
+                    persistent_archive = self._persist_improvement_archive(
+                        step=step,
+                        require_model_materialization=True,
+                    )
+                    audit["recursive_improvement"]["persistent_archive"] = persistent_archive
                     selected_decision = accepted_decision or improvement_report.decisions[0]
                     gate_label = (
                         selected_decision.evaluation.proposal.proposal_id
@@ -9244,11 +9399,26 @@ class CortexTrainingPhaseController:
                 "recursive_evolved_proposal_events": int(self.integration_counts.get("recursive_evolved_proposal_events", 0)),
                 "improvement_archive_dir": str(self.improvement_archive_dir),
                 "improvement_persistent_archive_state": dict(self.improvement_persistent_archive_state),
+                "improvement_persistent_archive_accepted_count": int(
+                    self.improvement_persistent_archive_state.get("accepted_count", 0) or 0
+                ),
+                "improvement_persistent_archive_rejected_count": int(
+                    self.improvement_persistent_archive_state.get("rejected_count", 0) or 0
+                ),
                 "improvement_persistent_archive_decisions": int(
                     self.improvement_persistent_archive_state.get("decision_count", 0) or 0
                 ),
                 "improvement_persistent_rollback_events": int(
                     self.improvement_persistent_archive_state.get("rollback_event_count", 0) or 0
+                ),
+                "improvement_persistent_archive_materialized_accepted_count": int(
+                    self.improvement_persistent_archive_state.get("materialized_accepted_count", 0) or 0
+                ),
+                "improvement_persistent_archive_model_materialization_complete": bool(
+                    self.improvement_persistent_archive_state.get("model_materialization_complete", False)
+                ),
+                "improvement_persistent_archive_model_materialization_required": bool(
+                    self.improvement_persistent_archive_state.get("model_materialization_required", False)
                 ),
                 "objective_feedback_events": self.objective_feedback_events,
                 "objective_feedback_average_loss": (
@@ -9430,11 +9600,26 @@ class CortexTrainingPhaseController:
                     "recursive_improvement_generations_configured": int(self.config.cortex_phase_improvement_generations),
                     "recursive_generation_events": int(self.integration_counts.get("recursive_generation_events", 0)),
                     "recursive_evolved_proposal_events": int(self.integration_counts.get("recursive_evolved_proposal_events", 0)),
+                    "improvement_persistent_archive_accepted_count": int(
+                        self.improvement_persistent_archive_state.get("accepted_count", 0) or 0
+                    ),
+                    "improvement_persistent_archive_rejected_count": int(
+                        self.improvement_persistent_archive_state.get("rejected_count", 0) or 0
+                    ),
                     "improvement_persistent_archive_decisions": int(
                         self.improvement_persistent_archive_state.get("decision_count", 0) or 0
                     ),
                     "improvement_persistent_rollback_events": int(
                         self.improvement_persistent_archive_state.get("rollback_event_count", 0) or 0
+                    ),
+                    "improvement_persistent_archive_materialized_accepted_count": int(
+                        self.improvement_persistent_archive_state.get("materialized_accepted_count", 0) or 0
+                    ),
+                    "improvement_persistent_archive_model_materialization_complete": bool(
+                        self.improvement_persistent_archive_state.get("model_materialization_complete", False)
+                    ),
+                    "improvement_persistent_archive_model_materialization_required": bool(
+                        self.improvement_persistent_archive_state.get("model_materialization_required", False)
                     ),
                     "error_count": len(self.errors),
                 }
@@ -9596,11 +9781,26 @@ class CortexTrainingPhaseController:
                     "recursive_improvement_generations_configured": int(self.config.cortex_phase_improvement_generations),
                     "recursive_generation_events": int(self.integration_counts.get("recursive_generation_events", 0)),
                     "recursive_evolved_proposal_events": int(self.integration_counts.get("recursive_evolved_proposal_events", 0)),
+                    "improvement_persistent_archive_accepted_count": int(
+                        self.improvement_persistent_archive_state.get("accepted_count", 0) or 0
+                    ),
+                    "improvement_persistent_archive_rejected_count": int(
+                        self.improvement_persistent_archive_state.get("rejected_count", 0) or 0
+                    ),
                     "improvement_persistent_archive_decisions": int(
                         self.improvement_persistent_archive_state.get("decision_count", 0) or 0
                     ),
                     "improvement_persistent_rollback_events": int(
                         self.improvement_persistent_archive_state.get("rollback_event_count", 0) or 0
+                    ),
+                    "improvement_persistent_archive_materialized_accepted_count": int(
+                        self.improvement_persistent_archive_state.get("materialized_accepted_count", 0) or 0
+                    ),
+                    "improvement_persistent_archive_model_materialization_complete": bool(
+                        self.improvement_persistent_archive_state.get("model_materialization_complete", False)
+                    ),
+                    "improvement_persistent_archive_model_materialization_required": bool(
+                        self.improvement_persistent_archive_state.get("model_materialization_required", False)
                     ),
                     "error_count": len(self.errors),
                 }
