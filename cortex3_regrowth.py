@@ -129,10 +129,12 @@ class RegrowthPlan:
                 "reason": self.failure.reason,
             },
             "selected_action": self.selected_action,
+            "selected_metadata": dict(self.selected.action.metadata) if self.selected else {},
             "candidates": [
                 {
                     "action": result.action.kind.value,
                     "target": result.action.target,
+                    "metadata": dict(result.action.metadata),
                     "score_delta": result.score_delta,
                     "recovered": result.recovered,
                     "non_regression_passed": result.non_regression.passed,
@@ -144,6 +146,37 @@ class RegrowthPlan:
             ],
             "annealing": [asdict(step) for step in self.annealing],
         }
+
+
+def _dimension_value(dimension: Any) -> str:
+    return str(getattr(dimension, "value", dimension))
+
+
+def _causal_action_metadata(report: CausalAttributionReport, cause: Any) -> dict[str, Any]:
+    recovered_probe_count = sum(1 for probe in report.probes if bool(getattr(probe, "recovered", False)))
+    return {
+        "cause": str(getattr(cause, "cause", report.top_cause)),
+        "attribution_source": "CausalAttributionEngine",
+        "attribution_failure_task_id": report.failure.task.task_id,
+        "attribution_failure_skill": report.failure.task.skill,
+        "attribution_failure_reason": report.failure.reason,
+        "attribution_top_cause": report.top_cause,
+        "attribution_selected_cause": str(getattr(cause, "cause", report.top_cause)),
+        "attribution_selected_matches_top": str(getattr(cause, "cause", "")) == report.top_cause,
+        "attribution_selected_cause_probability": float(getattr(cause, "probability", 0.0) or 0.0),
+        "attribution_selected_best_dimension": _dimension_value(getattr(cause, "best_dimension", "")),
+        "attribution_selected_best_intervention": str(getattr(cause, "best_intervention", "")),
+        "attribution_selected_recovered": bool(getattr(cause, "recovered", False)),
+        "attribution_selected_score_delta": float(getattr(cause, "score_delta", 0.0) or 0.0),
+        "attribution_selected_gain_per_cost": float(getattr(cause, "gain_per_cost", 0.0) or 0.0),
+        "attribution_targeted_repair_cost": float(report.targeted_repair_cost),
+        "attribution_global_retrain_cost": float(report.global_retrain_cost),
+        "attribution_targeted_repair_is_cheaper": bool(report.targeted_repair_is_cheaper),
+        "attribution_probe_count": len(report.probes),
+        "attribution_recovering_probe_count": recovered_probe_count,
+        "attribution_policy_applied": bool(report.policy_applied),
+        "attribution_policy_signal_count": len(report.policy_signals),
+    }
 
 
 class TargetedRepairAgent:
@@ -192,27 +225,54 @@ class RegrowthActionSpace:
             if cause.probability <= 0.0 and not cause.recovered:
                 continue
             target = report.failure.task.skill
+            metadata = _causal_action_metadata(report, cause)
             if cause.cause == "block_overcompressed":
                 actions.extend([
-                    ExecutableRegrowthAction(RegrowthActionKind.UNZERO_BLOCK, target, cause.score_delta or 0.30, 2.0, "restore zeroed structure", {"cause": cause.cause}),
-                    ExecutableRegrowthAction(RegrowthActionKind.CHANGE_SIGN, target, 0.18, 2.5, "flip suspect ternary signs", {"cause": cause.cause}),
-                    ExecutableRegrowthAction(RegrowthActionKind.INCREASE_SCALE_PRECISION, target, 0.16, 2.0, "increase shared scale precision", {"cause": cause.cause}),
+                    ExecutableRegrowthAction(RegrowthActionKind.UNZERO_BLOCK, target, cause.score_delta or 0.30, 2.0, "restore zeroed structure", metadata),
+                    ExecutableRegrowthAction(RegrowthActionKind.CHANGE_SIGN, target, 0.18, 2.5, "flip suspect ternary signs", metadata),
+                    ExecutableRegrowthAction(RegrowthActionKind.INCREASE_SCALE_PRECISION, target, 0.16, 2.0, "increase shared scale precision", metadata),
                 ])
             elif cause.cause in {"numeric_precision", "activation_overquantized"}:
-                actions.append(ExecutableRegrowthAction(RegrowthActionKind.INCREASE_LOCAL_ACTIVATION_BITS, target, cause.score_delta or 0.25, 1.5, "increase local activation precision", {"cause": cause.cause}))
+                actions.append(ExecutableRegrowthAction(RegrowthActionKind.INCREASE_LOCAL_ACTIVATION_BITS, target, cause.score_delta or 0.25, 1.5, "increase local activation precision", metadata))
             elif cause.cause == "memory_or_anchor_loss":
-                actions.append(ExecutableRegrowthAction(RegrowthActionKind.FORCE_EXACT_ANCHOR, target, cause.score_delta or 0.35, 2.0, "force exact anchor copy", {"cause": cause.cause}))
+                actions.append(ExecutableRegrowthAction(RegrowthActionKind.FORCE_EXACT_ANCHOR, target, cause.score_delta or 0.35, 2.0, "force exact anchor copy", metadata))
             elif cause.cause == "future_horizon_too_long":
-                actions.append(ExecutableRegrowthAction(RegrowthActionKind.REDUCE_MTP_HORIZON, target, cause.score_delta or 0.20, 1.0, "reduce speculative horizon", {"cause": cause.cause}))
+                actions.append(ExecutableRegrowthAction(RegrowthActionKind.REDUCE_MTP_HORIZON, target, cause.score_delta or 0.20, 1.0, "reduce speculative horizon", metadata))
             elif cause.cause == "missing_specialist_path" or (cause.cause == "routing" and target in {"arithmetic", "algebra", "code_unit_tests"}):
-                actions.append(ExecutableRegrowthAction(RegrowthActionKind.ROUTE_SPECIALIST_EXPERT, target, cause.score_delta or 0.25, 3.0, "route through specialist expert", {"cause": cause.cause}))
+                actions.append(ExecutableRegrowthAction(RegrowthActionKind.ROUTE_SPECIALIST_EXPERT, target, cause.score_delta or 0.25, 3.0, "route through specialist expert", metadata))
             elif cause.cause == "routing":
-                actions.append(ExecutableRegrowthAction(RegrowthActionKind.ADD_CERTIFICATE_FIELD, target, cause.score_delta or 0.20, 1.5, "add output-goal certificate field after routing failure", {"cause": cause.cause}))
+                actions.append(ExecutableRegrowthAction(RegrowthActionKind.ADD_CERTIFICATE_FIELD, target, cause.score_delta or 0.20, 1.5, "add output-goal certificate field after routing failure", metadata))
             elif cause.cause in {"output_goal_missed", "fsp_contract_too_weak"}:
-                actions.append(ExecutableRegrowthAction(RegrowthActionKind.ADD_CERTIFICATE_FIELD, target, cause.score_delta or 0.20, 1.5, "add output-goal certificate field", {"cause": cause.cause}))
+                actions.append(ExecutableRegrowthAction(RegrowthActionKind.ADD_CERTIFICATE_FIELD, target, cause.score_delta or 0.20, 1.5, "add output-goal certificate field", metadata))
             elif cause.cause in {"code_oracle_failure", "calibration_loss"}:
-                actions.append(ExecutableRegrowthAction(RegrowthActionKind.ADD_VERIFIER_CHECK, target, cause.score_delta or 0.30, 2.0, "add stronger verifier check", {"cause": cause.cause}))
-        actions.append(ExecutableRegrowthAction(RegrowthActionKind.ADD_TRAINING_MICRO_FAMILY, report.failure.task.skill, 0.12, 4.0, "add verified micro-family replay", {"cause": report.top_cause}))
+                actions.append(ExecutableRegrowthAction(RegrowthActionKind.ADD_VERIFIER_CHECK, target, cause.score_delta or 0.30, 2.0, "add stronger verifier check", metadata))
+        top_cause = report.causes[0] if report.causes else None
+        micro_metadata = (
+            _causal_action_metadata(report, top_cause)
+            if top_cause is not None
+            else {
+                "cause": report.top_cause,
+                "attribution_source": "CausalAttributionEngine",
+                "attribution_failure_task_id": report.failure.task.task_id,
+                "attribution_failure_skill": report.failure.task.skill,
+                "attribution_top_cause": report.top_cause,
+                "attribution_selected_cause": report.top_cause,
+                "attribution_selected_cause_probability": 0.0,
+                "attribution_selected_best_dimension": "",
+                "attribution_selected_best_intervention": "",
+                "attribution_selected_recovered": False,
+                "attribution_selected_score_delta": 0.0,
+                "attribution_selected_gain_per_cost": 0.0,
+                "attribution_targeted_repair_cost": float(report.targeted_repair_cost),
+                "attribution_global_retrain_cost": float(report.global_retrain_cost),
+                "attribution_targeted_repair_is_cheaper": bool(report.targeted_repair_is_cheaper),
+                "attribution_probe_count": len(report.probes),
+                "attribution_recovering_probe_count": sum(1 for probe in report.probes if bool(getattr(probe, "recovered", False))),
+                "attribution_policy_applied": bool(report.policy_applied),
+                "attribution_policy_signal_count": len(report.policy_signals),
+            }
+        )
+        actions.append(ExecutableRegrowthAction(RegrowthActionKind.ADD_TRAINING_MICRO_FAMILY, report.failure.task.skill, 0.12, 4.0, "add verified micro-family replay", micro_metadata))
         dedup: dict[tuple[RegrowthActionKind, str], ExecutableRegrowthAction] = {}
         for action in actions:
             key = (action.kind, action.target)

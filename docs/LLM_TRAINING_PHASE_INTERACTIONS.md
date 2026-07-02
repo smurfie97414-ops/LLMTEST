@@ -2,7 +2,7 @@
 
 Etat long-run verifie le 2026-07-01 depuis le run local `runs/cortex3-c4-cuda-large-fullphases-20260630_133618`.
 
-Etat court actualise le 2026-07-02: les corrections C87/C88/C89/C90/C91/C92/C93/C94 ont ete validees par tests courts sans relancer de run long. C87 branche les circuits compiles Frontier dans la memoire cognitive learned avec retention latente et utility credit. C88 aligne P8 sur le vrai dispatch P2 execute par `BitLinear` apres forward. C89 oblige P8 a utiliser un binding P4 pour les circuits compiles meme quand sa memoire est interne. C90 lie les certificats exact-match P5/P8 au target de tache au lieu de la reponse produite. C91 force le FSP P8 generique a comparer ses contrats aux tokens observes depuis la reponse reelle. C92 force les patchs P10 `compiled_frontier` a etre entraines depuis le FastSolve certifie avec binding P4, output-goal et certificat P5 au lieu d'une cible de reference generique. C93 ajoute un vrai chemin oracle/certificat SymPy pour les systemes lineaires 2x2 exacts. C94 filtre l'archive persistante P10 aux propositions acceptees qui ont vraiment ete appliquees au modele, signees, rejouees et rollbackables.
+Etat court actualise le 2026-07-02: les corrections C87/C88/C89/C90/C91/C92/C93/C94/C95 ont ete validees par tests courts sans relancer de run long. C87 branche les circuits compiles Frontier dans la memoire cognitive learned avec retention latente et utility credit. C88 aligne P8 sur le vrai dispatch P2 execute par `BitLinear` apres forward. C89 oblige P8 a utiliser un binding P4 pour les circuits compiles meme quand sa memoire est interne. C90 lie les certificats exact-match P5/P8 au target de tache au lieu de la reponse produite. C91 force le FSP P8 generique a comparer ses contrats aux tokens observes depuis la reponse reelle. C92 force les patchs P10 `compiled_frontier` a etre entraines depuis le FastSolve certifie avec binding P4, output-goal et certificat P5 au lieu d'une cible de reference generique. C93 ajoute un vrai chemin oracle/certificat SymPy pour les systemes lineaires 2x2 exacts. C94 filtre l'archive persistante P10 aux propositions acceptees qui ont vraiment ete appliquees au modele, signees, rejouees et rollbackables. C95 force chaque patch modele P7 a etre signe par une preuve causale P6 complete et persistante dans le rollback.
 
 Ce document explique comment l'architecture Cortex-3 complete agit pendant un entrainement LLM reel. Le but est de separer clairement trois niveaux :
 
@@ -53,6 +53,7 @@ Preuve post-integration des deux nouvelles briques :
 - `test_full_cortex_phase_controller_uses_all_modules_during_training` verifie maintenant aussi que l'application modele P10 `compiled_frontier` et son artefact replay portent `training_contract_source=compiled_frontier_fastsolve`, le checksum du certificat `compiled_circuit`, le binding memoire P4, la fidelite memoire, l'output-goal accepte et le gate held-out.
 - `tests.test_cortex3`, `tests.test_certificates`, `test_full_cortex_phase_controller_uses_all_modules_during_training` et `test_cortex_phase_state_survives_checkpoint_resume` verifient maintenant que `certificate_symbolic_system_solver_events` est produit, checkpointé et restaure.
 - `test_persistent_p10_archive_rejects_unmaterialized_accepted_decision`, `test_recursive_model_patch_has_executable_weight_rollback`, `test_full_cortex_phase_controller_uses_all_modules_during_training` et `test_cortex_phase_state_survives_checkpoint_resume` verifient maintenant que l'archive persistante P10 refuse les acceptations sandbox non materialisees et ne recharge que des parents acceptes couverts par patch modele signe, artefact replay verifie et rollback executable.
+- `tests.test_regrowth`, `test_regrowth_model_patch_has_executable_weight_rollback`, `test_full_cortex_phase_controller_uses_all_modules_during_training` et `test_cortex_phase_state_survives_checkpoint_resume` verifient maintenant que P7 transporte la preuve P6 complete, refuse les patchs non causalement fondes, signe `causal_evidence_id`, persiste cette preuve dans le rollback et expose `regrowth_model_causal_grounded_count`.
 
 Le long run devra produire un nouveau sidecar sous le commit de cette integration pour remplacer l'ancien audit `22/22` par l'audit courant plus strict incluant `native_ternary_cuda_kernel` et `future_output_goal_contracts`.
 
@@ -91,7 +92,7 @@ Donc :
 
 - un `repair_loss_delta` positif signifie une amelioration de la loss sur la cible de reparation ;
 - un `protected_loss_delta` positif signifie une hausse de loss sur les batchs proteges ;
-- le gate accepte seulement si `repair_loss_delta > 0`, `protected_loss_delta <= protected_loss_tolerance` et `parameter_delta_l1 > 0`.
+- le gate accepte seulement si `repair_loss_delta > 0`, `protected_loss_delta <= protected_loss_tolerance`, `parameter_delta_l1 > 0` et, pour P7, `causal_attribution_grounded == true`.
 
 Dans le dernier sidecar inspecte, P7 ameliore aussi les batchs proteges (`protected_delta=-1.311447`). P10 augmente legerement la loss protegee (`+0.069435`), mais reste sous la tolerance (`0.861335`) et passe donc le gate de non-regression.
 
@@ -192,9 +193,11 @@ P7 :
 
 - part d'une regression attribuee ;
 - choisit une action de regrowth ;
+- exige une preuve causale P6 complete et recuperante ;
 - calcule un patch cible ;
 - mesure loss avant/apres ;
 - verifie la non-regression sur batchs proteges ;
+- signe `causal_evidence_id` dans le patch ;
 - requantifie le coeur ternaire ;
 - rollback si le gate echoue.
 
@@ -506,14 +509,15 @@ P7 :
 4. verifie non-regression ;
 5. choisit l'action recouvrante la moins couteuse ;
 6. genere replay P7 ;
-7. applique un patch borne aux vrais parametres du Transformer ;
-8. mesure repair loss avant/apres ;
-9. mesure protected loss ;
-10. requantifie le coeur ternaire ;
-11. signe le patch accepte ;
-12. ecrit un artefact rollback executable avec tensors pre-patch et checksums ;
-13. rollback si le gate echoue ou via `rollback_regrowth_model_patch` si le patch accepte doit etre annule ;
-14. renvoie le rapport du patch modele applique a la politique P6.
+7. valide que l'action selectionnee porte source P6, task/skill, cause selectionnee, probabilite, dimension, intervention, recovery, score delta et probes recuperantes ;
+8. applique un patch borne aux vrais parametres du Transformer ;
+9. mesure repair loss avant/apres ;
+10. mesure protected loss ;
+11. requantifie le coeur ternaire ;
+12. signe le patch accepte avec `causal_evidence_id` ;
+13. ecrit un artefact rollback executable avec tensors pre-patch, checksums et preuve causale ;
+14. rollback si le gate echoue ou via `rollback_regrowth_model_patch` si le patch accepte doit etre annule ;
+15. renvoie le rapport du patch modele applique a la politique P6.
 
 ### Interaction Avec Les Autres Phases
 

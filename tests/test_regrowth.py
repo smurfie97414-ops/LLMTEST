@@ -77,6 +77,17 @@ class RegrowthTest(unittest.TestCase):
         self.assertEqual(kinds, set(RegrowthActionKind))
         activation_action = next(action for action in actions if action.kind == RegrowthActionKind.INCREASE_LOCAL_ACTIVATION_BITS)
         self.assertEqual(activation_action.metadata["cause"], "activation_overquantized")
+        self.assertEqual(activation_action.metadata["attribution_source"], "CausalAttributionEngine")
+        self.assertEqual(activation_action.metadata["attribution_failure_task_id"], task.task_id)
+        self.assertEqual(activation_action.metadata["attribution_failure_skill"], "arithmetic")
+        self.assertEqual(activation_action.metadata["attribution_selected_cause"], "activation_overquantized")
+        self.assertEqual(activation_action.metadata["attribution_selected_best_dimension"], "activation_precision")
+        self.assertEqual(activation_action.metadata["attribution_selected_best_intervention"], "increase_activation")
+        self.assertTrue(activation_action.metadata["attribution_selected_recovered"])
+        self.assertGreater(activation_action.metadata["attribution_selected_cause_probability"], 0.0)
+        micro_action = next(action for action in actions if action.kind == RegrowthActionKind.ADD_TRAINING_MICRO_FAMILY)
+        self.assertEqual(micro_action.metadata["attribution_source"], "CausalAttributionEngine")
+        self.assertEqual(micro_action.metadata["attribution_selected_cause"], "block_overcompressed")
 
     def test_minimal_regrowth_selects_recovering_block_action_with_non_regression(self):
         verifier = _verifier()
@@ -97,6 +108,8 @@ class RegrowthTest(unittest.TestCase):
         self.assertTrue(any(result.action.kind == RegrowthActionKind.UNZERO_BLOCK and result.recovered for result in plan.candidates))
         self.assertTrue(plan.annealing)
         self.assertTrue(plan.annealing[-1].retained)
+        self.assertEqual(plan.to_dict()["selected_metadata"]["attribution_source"], "CausalAttributionEngine")
+        self.assertTrue(plan.to_dict()["selected_metadata"]["attribution_selected_recovered"])
 
     def test_successful_regrowth_plan_updates_attribution_policy_memory(self):
         verifier = _verifier()

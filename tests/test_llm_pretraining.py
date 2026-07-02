@@ -113,6 +113,19 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                         "repair_loss_delta": 1.0,
                         "protected_loss_delta": 0.0,
                         "protected_loss_tolerance": 0.1,
+                        "causal_attribution_grounded": True,
+                        "causal_evidence_id": "p7-causal",
+                        "causal_attribution_source": "CausalAttributionEngine",
+                        "causal_top_cause": "block_overcompressed",
+                        "causal_selected_cause": "block_overcompressed",
+                        "causal_selected_cause_probability": 1.0,
+                        "causal_selected_best_dimension": "block",
+                        "causal_selected_best_intervention": "restore_block",
+                        "causal_selected_recovered": True,
+                        "causal_selected_score_delta": 1.0,
+                        "causal_probe_count": 1,
+                        "causal_recovering_probe_count": 1,
+                        "causal_evidence": {"causal_evidence_id": "p7-causal"},
                     }
                 ],
                 "regrowth_model_rollback_artifacts": [{"rollback_artifact_path": "p7-rollback.pt"}],
@@ -3659,6 +3672,7 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             self.assertGreater(influence["sleep_replay_updates"], 0)
             self.assertGreater(influence["phase_replay_examples"], 0)
             self.assertGreater(influence["regrowth_model_application_count"], 0)
+            self.assertGreater(influence["regrowth_model_causal_grounded_count"], 0)
             self.assertGreater(influence["regrowth_model_parameter_delta_l1"], 0.0)
             self.assertGreater(influence["regrowth_model_repair_loss_delta"], 0.0)
             self.assertGreater(influence["recursive_model_application_count"], 0)
@@ -3795,6 +3809,22 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             self.assertTrue(Path(latest_regrowth["rollback_artifact_path"]).exists(), latest_regrowth)
             self.assertTrue(latest_regrowth["rollback_artifact_sha256"], latest_regrowth)
             self.assertGreater(latest_regrowth["rollback_artifact_parameter_count"], 0, latest_regrowth)
+            self.assertTrue(latest_regrowth["causal_attribution_grounded"], latest_regrowth)
+            self.assertTrue(latest_regrowth["causal_evidence_id"], latest_regrowth)
+            self.assertEqual(latest_regrowth["causal_attribution_source"], "CausalAttributionEngine")
+            self.assertTrue(latest_regrowth["causal_top_cause"], latest_regrowth)
+            self.assertTrue(latest_regrowth["causal_selected_cause"], latest_regrowth)
+            self.assertGreater(latest_regrowth["causal_selected_cause_probability"], 0.0)
+            self.assertTrue(latest_regrowth["causal_selected_best_dimension"], latest_regrowth)
+            self.assertTrue(latest_regrowth["causal_selected_best_intervention"], latest_regrowth)
+            self.assertTrue(latest_regrowth["causal_selected_recovered"], latest_regrowth)
+            self.assertGreater(latest_regrowth["causal_selected_score_delta"], 0.0)
+            self.assertGreater(latest_regrowth["causal_probe_count"], 0)
+            self.assertGreater(latest_regrowth["causal_recovering_probe_count"], 0)
+            self.assertEqual(
+                latest_regrowth["causal_evidence"]["causal_evidence_id"],
+                latest_regrowth["causal_evidence_id"],
+            )
             self.assertGreater(latest_regrowth["parameter_delta_l1"], 0.0)
             self.assertGreater(latest_regrowth["repair_loss_delta"], 0.0)
             self.assertLessEqual(
@@ -3900,12 +3930,15 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             self.assertEqual(tuple(persisted["objective_feedback_term_names"]), FINAL_LOSS_TERMS)
             self.assertEqual(set(persisted["last_objective_loss_terms"]), set(FINAL_LOSS_TERMS))
             self.assertTrue(persisted["regrowth_model_applications"], persisted)
+            self.assertTrue(persisted["regrowth_model_applications"][-1]["causal_attribution_grounded"], persisted)
+            self.assertTrue(persisted["regrowth_model_applications"][-1]["causal_evidence_id"], persisted)
             self.assertGreater(persisted["regrowth_model_rollback_artifact_count"], 0, persisted)
             self.assertTrue(persisted["regrowth_model_rollback_artifacts"], persisted)
             self.assertTrue(persisted["recursive_model_applications"], persisted)
             self.assertGreater(persisted["recursive_model_rollback_artifact_count"], 0, persisted)
             self.assertTrue(persisted["recursive_model_rollback_artifacts"], persisted)
             self.assertTrue(persisted["recursive_verified_artifacts"], persisted)
+            self.assertGreater(persisted["training_influence"]["regrowth_model_causal_grounded_count"], 0)
             self.assertGreater(persisted["training_influence"]["regrowth_model_rollback_artifact_count"], 0)
             self.assertGreater(persisted["training_influence"]["recursive_verified_artifact_count"], 0)
             self.assertGreater(persisted["training_influence"]["recursive_model_rollback_artifact_count"], 0)
@@ -4070,6 +4103,19 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             self.assertTrue(patch_report["rollback_token"], patch_report)
             self.assertTrue(Path(patch_report["rollback_artifact_path"]).exists(), patch_report)
             self.assertGreater(patch_report["rollback_artifact_parameter_count"], 0, patch_report)
+            self.assertTrue(patch_report["causal_attribution_grounded"], patch_report)
+            self.assertTrue(patch_report["causal_evidence_id"], patch_report)
+            self.assertEqual(patch_report["causal_attribution_source"], "CausalAttributionEngine")
+            self.assertGreater(patch_report["causal_selected_cause_probability"], 0.0)
+            self.assertTrue(patch_report["causal_selected_best_dimension"], patch_report)
+            self.assertTrue(patch_report["causal_selected_best_intervention"], patch_report)
+            self.assertTrue(patch_report["causal_selected_recovered"], patch_report)
+            self.assertGreater(patch_report["causal_probe_count"], 0)
+            self.assertGreater(patch_report["causal_recovering_probe_count"], 0)
+            self.assertEqual(
+                patch_report["causal_evidence"]["causal_evidence_id"],
+                patch_report["causal_evidence_id"],
+            )
             named_after_patch = dict(model.named_parameters())
             changed_names = [
                 name
@@ -4085,6 +4131,8 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
 
             self.assertTrue(rollback_report["rolled_back"], rollback_report)
             self.assertEqual(rollback_report["rollback_token"], patch_report["rollback_token"])
+            self.assertTrue(rollback_report["causal_attribution_grounded"], rollback_report)
+            self.assertEqual(rollback_report["causal_evidence_id"], patch_report["causal_evidence_id"])
             named_after_rollback = dict(model.named_parameters())
             for name in patch_report["updated_parameter_names"]:
                 self.assertTrue(
@@ -4559,6 +4607,7 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 )
                 self.assertGreater(sidecar["cortex_phase_state_summary"]["replay_batch_count"], 0)
                 self.assertGreater(sidecar["cortex_phase_state_summary"]["regrowth_model_application_count"], 0)
+                self.assertGreater(sidecar["cortex_phase_state_summary"]["regrowth_model_causal_grounded_count"], 0)
                 self.assertGreater(sidecar["cortex_phase_state_summary"]["regrowth_model_parameter_delta_l1"], 0.0)
                 self.assertGreater(sidecar["cortex_phase_state_summary"]["regrowth_model_repair_loss_delta"], 0.0)
                 self.assertTrue(sidecar["cortex_phase_state_summary"]["regrowth_model_applications"])
@@ -4699,6 +4748,10 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             self.assertGreaterEqual(
                 resumed_influence["regrowth_model_application_count"],
                 first_influence["regrowth_model_application_count"],
+            )
+            self.assertGreaterEqual(
+                resumed_influence["regrowth_model_causal_grounded_count"],
+                first_influence["regrowth_model_causal_grounded_count"],
             )
             self.assertGreaterEqual(
                 resumed_influence["regrowth_model_rollback_artifact_count"],

@@ -200,6 +200,7 @@
         "inference_model_backed_adaptive_mtp_contract_checks",
         "inference_model_backed_adaptive_mtp_proposed_blocks",
         "regrowth_model_application_count",
+        "regrowth_model_causal_grounded_count",
         "regrowth_model_parameter_delta_l1",
         "regrowth_model_repair_loss_delta",
         "regrowth_model_applications",

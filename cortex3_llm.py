@@ -236,6 +236,7 @@ CORTEX_PHASE_REPORT_REQUIRED_TRAINING_INFLUENCE_KEYS: tuple[str, ...] = (
     "inference_model_backed_adaptive_mtp_contract_checks",
     "inference_model_backed_adaptive_mtp_proposed_blocks",
     "regrowth_model_application_count",
+    "regrowth_model_causal_grounded_count",
     "regrowth_model_parameter_delta_l1",
     "regrowth_model_repair_loss_delta",
     "regrowth_model_applications",
@@ -4050,6 +4051,24 @@ def _frontier_heldout_summary(registry_payload: Mapping[str, Any]) -> dict[str, 
     }
 
 
+def _regrowth_model_causal_grounded_from_applications(applications: Sequence[Mapping[str, Any]]) -> bool:
+    return any(
+        bool(item.get("causal_attribution_grounded"))
+        and str(item.get("causal_attribution_source", "")) == "CausalAttributionEngine"
+        and bool(item.get("causal_evidence_id"))
+        and bool(item.get("causal_top_cause"))
+        and bool(item.get("causal_selected_cause"))
+        and float(item.get("causal_selected_cause_probability", 0.0) or 0.0) > 0.0
+        and bool(item.get("causal_selected_best_dimension"))
+        and bool(item.get("causal_selected_best_intervention"))
+        and bool(item.get("causal_selected_recovered"))
+        and float(item.get("causal_selected_score_delta", 0.0) or 0.0) > 0.0
+        and int(item.get("causal_probe_count", 0) or 0) > 0
+        and int(item.get("causal_recovering_probe_count", 0) or 0) > 0
+        for item in applications
+    )
+
+
 def _cortex_architecture_audit_from_summary(summary: Mapping[str, Any]) -> dict[str, Any]:
     phase_counts = {str(key): int(value) for key, value in dict(summary.get("phase_event_counts") or {}).items()}
     trace_counts = {str(key): int(value) for key, value in dict(summary.get("compression_trace_counts") or {}).items()}
@@ -4132,6 +4151,9 @@ def _cortex_architecture_audit_from_summary(summary: Mapping[str, Any]) -> dict[
         and float(item.get("repair_loss_delta", 0.0) or 0.0) > 0.0
         and float(item.get("protected_loss_delta", 0.0) or 0.0) <= float(item.get("protected_loss_tolerance", 0.0) or 0.0)
         for item in regrowth_model_applications
+    )
+    regrowth_model_causal_grounded = _regrowth_model_causal_grounded_from_applications(
+        regrowth_model_applications
     )
     regrowth_model_has_executable_rollback = any(
         bool(item.get("rollback_executable"))
@@ -4567,19 +4589,22 @@ def _cortex_architecture_audit_from_summary(summary: Mapping[str, Any]) -> dict[
         and number("regrowth_model_repair_loss_delta") > 0.0
         and integer("regrowth_model_rollback_artifact_count") > 0
         and regrowth_model_has_executable_rollback
-        and regrowth_model_non_regressing,
+        and regrowth_model_non_regressing
+        and regrowth_model_causal_grounded,
         {
             "P7": phase_count("P7"),
             "phase_replay_P7": replay_count("P7"),
             "regrowth_model_application_count": integer("regrowth_model_application_count"),
+            "regrowth_model_causal_grounded_count": integer("regrowth_model_causal_grounded_count"),
             "regrowth_model_parameter_delta_l1": number("regrowth_model_parameter_delta_l1"),
             "regrowth_model_repair_loss_delta": number("regrowth_model_repair_loss_delta"),
             "regrowth_model_protected_loss_delta": number("regrowth_model_protected_loss_delta"),
             "regrowth_model_rollback_artifact_count": integer("regrowth_model_rollback_artifact_count"),
             "regrowth_model_has_executable_rollback": regrowth_model_has_executable_rollback,
             "regrowth_model_non_regressing": regrowth_model_non_regressing,
+            "regrowth_model_causal_grounded": regrowth_model_causal_grounded,
         },
-        "minimal regrowth must apply a verified bounded repair to real Transformer state, persist executable rollback, and keep protected loss non-regressing",
+        "minimal regrowth must apply a verified bounded repair to real Transformer state from signed P6 causal evidence, persist executable rollback, and keep protected loss non-regressing",
     )
     add(
         "sleep_consolidation_buffer",
@@ -4769,6 +4794,9 @@ def _cortex_phase_deliverable_audit_from_summary(summary: Mapping[str, Any]) -> 
         and float(item.get("repair_loss_delta", 0.0) or 0.0) > 0.0
         and float(item.get("protected_loss_delta", 0.0) or 0.0) <= float(item.get("protected_loss_tolerance", 0.0) or 0.0)
         for item in regrowth_model_applications
+    )
+    regrowth_model_causal_grounded = _regrowth_model_causal_grounded_from_applications(
+        regrowth_model_applications
     )
     regrowth_model_has_executable_rollback = any(
         bool(item.get("rollback_executable"))
@@ -5052,19 +5080,22 @@ def _cortex_phase_deliverable_audit_from_summary(summary: Mapping[str, Any]) -> 
         and number("regrowth_model_repair_loss_delta") > 0.0
         and int(number("regrowth_model_rollback_artifact_count")) > 0
         and regrowth_model_has_executable_rollback
-        and regrowth_model_non_regressing,
+        and regrowth_model_non_regressing
+        and regrowth_model_causal_grounded,
         {
             "regrowth_plan_events": count("regrowth_plan_events"),
             "regrowth_candidate_actions": count("regrowth_candidate_actions"),
             "phase_replay_P7": replay_by_phase.get("P7", 0),
             "regrowth_model_application_count": int(number("regrowth_model_application_count")),
+            "regrowth_model_causal_grounded_count": int(number("regrowth_model_causal_grounded_count")),
             "regrowth_model_parameter_delta_l1": number("regrowth_model_parameter_delta_l1"),
             "regrowth_model_repair_loss_delta": number("regrowth_model_repair_loss_delta"),
             "regrowth_model_rollback_artifact_count": int(number("regrowth_model_rollback_artifact_count")),
             "regrowth_model_has_executable_rollback": regrowth_model_has_executable_rollback,
             "regrowth_model_non_regressing": regrowth_model_non_regressing,
+            "regrowth_model_causal_grounded": regrowth_model_causal_grounded,
         },
-        "minimal regrowth must evaluate candidate repair actions, feed verified replay, apply a verified bounded patch to real model state, and persist an executable rollback artifact",
+        "minimal regrowth must evaluate candidate repair actions from causal attribution, feed verified replay, apply a signed causally grounded bounded patch to real model state, and persist an executable rollback artifact",
     )
     add(
         "P8",
@@ -6847,6 +6878,80 @@ class CortexTrainingPhaseController:
             )
         return report
 
+    def _regrowth_model_causal_grounded_count(self) -> int:
+        return sum(
+            1
+            for item in self.regrowth_model_applications
+            if bool(item.get("causal_attribution_grounded")) and bool(item.get("causal_evidence_id"))
+        )
+
+    def _regrowth_causal_evidence(self, plan: RegrowthPlan) -> dict[str, Any]:
+        if plan.selected is None:
+            raise ValueError("P7 regrowth requires a selected action before causal evidence can be signed")
+        selected = plan.selected
+        metadata = dict(selected.action.metadata or {})
+        source = str(metadata.get("attribution_source", ""))
+        if source != "CausalAttributionEngine":
+            raise ValueError("P7 model regrowth requires a CausalAttributionEngine-backed P6 action")
+        cause = str(metadata.get("cause") or "")
+        selected_cause = str(metadata.get("attribution_selected_cause") or "")
+        if not cause or selected_cause != cause:
+            raise ValueError("P7 model regrowth causal evidence has inconsistent selected cause metadata")
+        failure_task_id = str(metadata.get("attribution_failure_task_id") or "")
+        failure_skill = str(metadata.get("attribution_failure_skill") or "")
+        if failure_task_id != plan.failure.task.task_id or failure_skill != plan.failure.task.skill:
+            raise ValueError("P7 model regrowth causal evidence does not match the failed task being repaired")
+        probability = float(metadata.get("attribution_selected_cause_probability", 0.0) or 0.0)
+        score_delta = float(metadata.get("attribution_selected_score_delta", 0.0) or 0.0)
+        gain_per_cost = float(metadata.get("attribution_selected_gain_per_cost", 0.0) or 0.0)
+        best_dimension = str(metadata.get("attribution_selected_best_dimension") or "")
+        best_intervention = str(metadata.get("attribution_selected_best_intervention") or "")
+        probe_count = int(metadata.get("attribution_probe_count", 0) or 0)
+        recovering_probe_count = int(metadata.get("attribution_recovering_probe_count", 0) or 0)
+        if probability <= 0.0:
+            raise ValueError("P7 model regrowth causal evidence has zero selected-cause probability")
+        if not best_dimension or not best_intervention:
+            raise ValueError("P7 model regrowth causal evidence is missing the counterfactual dimension/intervention")
+        if not bool(metadata.get("attribution_selected_recovered")) or score_delta <= 0.0:
+            raise ValueError("P7 model regrowth causal evidence did not recover the failed case")
+        if probe_count <= 0 or recovering_probe_count <= 0:
+            raise ValueError("P7 model regrowth causal evidence requires at least one recovering P6 probe")
+        if not selected.recovered or not selected.non_regression.passed:
+            raise ValueError("P7 model regrowth causal evidence cannot sign an unrecovered or regressing plan")
+        evidence = {
+            "schema_version": 1,
+            "phase": "P7",
+            "source": source,
+            "failure_task_id": failure_task_id,
+            "failure_skill": failure_skill,
+            "failure_reason": str(metadata.get("attribution_failure_reason") or plan.failure.reason),
+            "action": selected.action.kind.value,
+            "target": selected.action.target,
+            "top_cause": str(metadata.get("attribution_top_cause") or cause),
+            "selected_cause": selected_cause,
+            "selected_matches_top": bool(metadata.get("attribution_selected_matches_top")),
+            "selected_cause_probability": probability,
+            "selected_best_dimension": best_dimension,
+            "selected_best_intervention": best_intervention,
+            "selected_recovered": bool(metadata.get("attribution_selected_recovered")),
+            "selected_score_delta": score_delta,
+            "selected_gain_per_cost": gain_per_cost,
+            "targeted_repair_cost": float(metadata.get("attribution_targeted_repair_cost", 0.0) or 0.0),
+            "global_retrain_cost": float(metadata.get("attribution_global_retrain_cost", 0.0) or 0.0),
+            "targeted_repair_is_cheaper": bool(metadata.get("attribution_targeted_repair_is_cheaper")),
+            "probe_count": probe_count,
+            "recovering_probe_count": recovering_probe_count,
+            "policy_applied": bool(metadata.get("attribution_policy_applied")),
+            "policy_signal_count": int(metadata.get("attribution_policy_signal_count", 0) or 0),
+            "regrowth_score_delta": float(selected.score_delta),
+            "regrowth_gain_per_cost": float(selected.gain_per_cost),
+            "regrowth_total_cost": float(selected.total_cost),
+            "non_regression_checked": int(selected.non_regression.checked),
+            "non_regression_passed": bool(selected.non_regression.passed),
+        }
+        evidence["causal_evidence_id"] = _sha256_json(evidence)
+        return evidence
+
     def _regrowth_model_rollback_dir(self) -> Path:
         return self.improvement_archive_dir / "regrowth_model_patch_rollbacks"
 
@@ -6884,6 +6989,10 @@ class CortexTrainingPhaseController:
             "action": str(accepted_report.get("action", "")),
             "target": str(accepted_report.get("target", "")),
             "failure_task_id": str(accepted_report.get("failure_task_id", "")),
+            "causal_attribution_grounded": bool(accepted_report.get("causal_attribution_grounded")),
+            "causal_evidence_id": str(accepted_report.get("causal_evidence_id", "")),
+            "causal_selected_cause": str(accepted_report.get("causal_selected_cause", "")),
+            "causal_evidence": dict(accepted_report.get("causal_evidence") or {}),
             "parameter_names": parameter_names,
             "parameter_shapes": {
                 name: tuple(int(dim) for dim in before_tensors[name].shape)
@@ -6912,6 +7021,10 @@ class CortexTrainingPhaseController:
             "action": str(accepted_report.get("action", "")),
             "target": str(accepted_report.get("target", "")),
             "failure_task_id": str(accepted_report.get("failure_task_id", "")),
+            "causal_attribution_grounded": bool(accepted_report.get("causal_attribution_grounded")),
+            "causal_evidence_id": str(accepted_report.get("causal_evidence_id", "")),
+            "causal_selected_cause": str(accepted_report.get("causal_selected_cause", "")),
+            "causal_evidence": dict(accepted_report.get("causal_evidence") or {}),
             "path": str(path),
             "sha256": _sha256_file(path),
             "size_bytes": int(path.stat().st_size),
@@ -6992,6 +7105,13 @@ class CortexTrainingPhaseController:
             "action": str(artifact.get("action", application.get("action", ""))),
             "target": str(artifact.get("target", application.get("target", ""))),
             "failure_task_id": str(artifact.get("failure_task_id", application.get("failure_task_id", ""))),
+            "causal_attribution_grounded": bool(
+                artifact.get("causal_attribution_grounded", application.get("causal_attribution_grounded", False))
+            ),
+            "causal_evidence_id": str(artifact.get("causal_evidence_id", application.get("causal_evidence_id", ""))),
+            "causal_selected_cause": str(
+                artifact.get("causal_selected_cause", application.get("causal_selected_cause", ""))
+            ),
             "parameter_count": len(parameter_names),
             "parameter_names": parameter_names,
             "parameter_delta_l1_restored": current_delta_l1,
@@ -7012,6 +7132,7 @@ class CortexTrainingPhaseController:
         patch = selected.patch
         if not selected.recovered or not selected.non_regression.passed:
             raise ValueError(f"P7 selected action is not verified recovered/non-regressing: {selected.action.kind.value}")
+        causal_evidence = self._regrowth_causal_evidence(plan)
         answer = patch.answer_for(plan.failure.task, self.trial_agent(plan.failure.task))
         repair_batch = self._batch_from_task(plan.failure.task, answer)
         protected_batches = tuple(self.replay_batches[-4:])
@@ -7085,6 +7206,7 @@ class CortexTrainingPhaseController:
                     "parameter_names": parameter_names,
                     "repair_loss_delta": repair_delta,
                     "protected_loss_delta": protected_delta,
+                    "causal_evidence": causal_evidence,
                 }
                 accepted_report = {
                     "step": step,
@@ -7111,6 +7233,26 @@ class CortexTrainingPhaseController:
                     "protected_loss_tolerance": protected_tolerance,
                     "non_regression_passed": True,
                     "requantized_ternary_core": bool(self.model.config.use_ternary_core),
+                    "causal_attribution_grounded": True,
+                    "causal_evidence_id": causal_evidence["causal_evidence_id"],
+                    "causal_attribution_source": causal_evidence["source"],
+                    "causal_top_cause": causal_evidence["top_cause"],
+                    "causal_selected_cause": causal_evidence["selected_cause"],
+                    "causal_selected_matches_top": causal_evidence["selected_matches_top"],
+                    "causal_selected_cause_probability": causal_evidence["selected_cause_probability"],
+                    "causal_selected_best_dimension": causal_evidence["selected_best_dimension"],
+                    "causal_selected_best_intervention": causal_evidence["selected_best_intervention"],
+                    "causal_selected_recovered": causal_evidence["selected_recovered"],
+                    "causal_selected_score_delta": causal_evidence["selected_score_delta"],
+                    "causal_selected_gain_per_cost": causal_evidence["selected_gain_per_cost"],
+                    "causal_targeted_repair_cost": causal_evidence["targeted_repair_cost"],
+                    "causal_global_retrain_cost": causal_evidence["global_retrain_cost"],
+                    "causal_targeted_repair_is_cheaper": causal_evidence["targeted_repair_is_cheaper"],
+                    "causal_probe_count": causal_evidence["probe_count"],
+                    "causal_recovering_probe_count": causal_evidence["recovering_probe_count"],
+                    "causal_policy_applied": causal_evidence["policy_applied"],
+                    "causal_policy_signal_count": causal_evidence["policy_signal_count"],
+                    "causal_evidence": causal_evidence,
                 }
                 break
 
@@ -7143,6 +7285,7 @@ class CortexTrainingPhaseController:
         self.regrowth_model_repair_loss_delta += float(accepted_report["repair_loss_delta"])
         self.regrowth_model_protected_loss_delta += float(accepted_report["protected_loss_delta"])
         self._count("regrowth_model_applications")
+        self._count("regrowth_model_causal_grounded_events")
         self._count("regrowth_model_updated_parameters", int(accepted_report["updated_parameter_count"]))
         self.bit_ledger.ingest_cost(
             CostTrace(
@@ -8259,6 +8402,7 @@ class CortexTrainingPhaseController:
             "recursive_generation_events": int(self.integration_counts.get("recursive_generation_events", 0)),
             "recursive_evolved_proposal_events": int(self.integration_counts.get("recursive_evolved_proposal_events", 0)),
             "regrowth_model_application_count": len(self.regrowth_model_applications),
+            "regrowth_model_causal_grounded_count": self._regrowth_model_causal_grounded_count(),
             "regrowth_model_parameter_delta_l1": float(self.regrowth_model_parameter_delta_l1),
             "regrowth_model_repair_loss_delta": float(self.regrowth_model_repair_loss_delta),
             "regrowth_model_protected_loss_delta": float(self.regrowth_model_protected_loss_delta),
@@ -9373,6 +9517,7 @@ class CortexTrainingPhaseController:
                 "recursive_frontier_proposal_events": int(self.integration_counts.get("recursive_frontier_proposal_events", 0)),
                 "frontier_registry_path": str(self.run_dir / "frontier_registry"),
                 "regrowth_model_application_count": len(self.regrowth_model_applications),
+                "regrowth_model_causal_grounded_count": self._regrowth_model_causal_grounded_count(),
                 "regrowth_model_parameter_delta_l1": float(self.regrowth_model_parameter_delta_l1),
                 "regrowth_model_repair_loss_delta": float(self.regrowth_model_repair_loss_delta),
                 "regrowth_model_protected_loss_delta": float(self.regrowth_model_protected_loss_delta),
@@ -9576,6 +9721,7 @@ class CortexTrainingPhaseController:
                     "frontier_repair_accepted_events": int(self.frontier_repair_accepted_events),
                     "recursive_frontier_proposal_events": int(self.integration_counts.get("recursive_frontier_proposal_events", 0)),
                     "regrowth_model_application_count": len(self.regrowth_model_applications),
+                    "regrowth_model_causal_grounded_count": self._regrowth_model_causal_grounded_count(),
                     "regrowth_model_parameter_delta_l1": float(self.regrowth_model_parameter_delta_l1),
                     "regrowth_model_repair_loss_delta": float(self.regrowth_model_repair_loss_delta),
                     "regrowth_model_protected_loss_delta": float(self.regrowth_model_protected_loss_delta),
@@ -9757,6 +9903,7 @@ class CortexTrainingPhaseController:
                     "inference_model_backed_adaptive_mtp_rejected_tokens": int(self.integration_counts.get("inference_model_backed_adaptive_mtp_rejected_tokens", 0)),
                     "inference_model_backed_adaptive_mtp_accepted_mtp_tokens": int(self.integration_counts.get("inference_model_backed_adaptive_mtp_accepted_mtp_tokens", 0)),
                     "regrowth_model_application_count": len(self.regrowth_model_applications),
+                    "regrowth_model_causal_grounded_count": self._regrowth_model_causal_grounded_count(),
                     "regrowth_model_parameter_delta_l1": float(self.regrowth_model_parameter_delta_l1),
                     "regrowth_model_repair_loss_delta": float(self.regrowth_model_repair_loss_delta),
                     "regrowth_model_protected_loss_delta": float(self.regrowth_model_protected_loss_delta),
