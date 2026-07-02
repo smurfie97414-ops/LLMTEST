@@ -246,6 +246,7 @@ class Cortex3Test(unittest.TestCase):
 
         self.assertIsNotNone(transfer)
         assert transfer is not None
+        self.assertIn("item", {anchor.kind for anchor in transfer.anchors})
         self.assertTrue(skill.verify(transfer, CandidateAnswer(str(transfer.expected))).passed)
         self.assertFalse(skill.verify(transfer, CandidateAnswer(str(transfer.metadata["carrier"]))).passed)
         variant = skill.anti_metamorphic(transfer, random.Random(9))[0]

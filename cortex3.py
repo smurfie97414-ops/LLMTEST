@@ -705,7 +705,7 @@ class EntityTrackingSkill(SkillSpec):
                 prompt = f"Read the story and answer only with the person holding the {item} at the end.\n\n{story}"
                 anchors = (
                     Anchor("person", final_holder, f"entity-{idx}"),
-                    Anchor("object", item, f"entity-{idx}"),
+                    Anchor("item", item, f"entity-{idx}"),
                 )
                 metadata = {
                     "kind": "transfer_chain",
@@ -766,7 +766,7 @@ class EntityTrackingSkill(SkillSpec):
                 prompt,
                 new_holder,
                 {**meta, "final_holder": new_holder, "final": new_holder, "anti_metamorphic": "changed_final_holder"},
-                (Anchor("person", new_holder, task.task_id), Anchor("object", item, task.task_id)),
+                (Anchor("person", new_holder, task.task_id), Anchor("item", item, task.task_id)),
             )]
         new_final = rng.choice([place for place in self.places if place != meta["final"]])
         person = str(meta["person"])
