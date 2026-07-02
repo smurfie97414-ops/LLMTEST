@@ -237,6 +237,7 @@ CORTEX_PHASE_REPORT_REQUIRED_TRAINING_INFLUENCE_KEYS: tuple[str, ...] = (
     "inference_model_backed_adaptive_mtp_proposed_blocks",
     "regrowth_model_application_count",
     "regrowth_model_causal_grounded_count",
+    "regrowth_model_protected_replay_phase_count",
     "regrowth_model_parameter_delta_l1",
     "regrowth_model_repair_loss_delta",
     "regrowth_model_applications",
@@ -245,6 +246,7 @@ CORTEX_PHASE_REPORT_REQUIRED_TRAINING_INFLUENCE_KEYS: tuple[str, ...] = (
     "regrowth_model_rollback_artifacts",
     "regrowth_model_rollback_applications",
     "recursive_model_application_count",
+    "recursive_model_protected_replay_phase_count",
     "recursive_model_parameter_delta_l1",
     "recursive_model_repair_loss_delta",
     "recursive_model_applications",
@@ -4069,6 +4071,28 @@ def _regrowth_model_causal_grounded_from_applications(applications: Sequence[Map
     )
 
 
+def _phase_balanced_model_patch_protection(
+    applications: Sequence[Mapping[str, Any]],
+    *,
+    min_phase_count: int,
+) -> bool:
+    return any(
+        bool(item.get("protected_replay_phase_balanced"))
+        and bool(item.get("protected_replay_complete_phase_coverage"))
+        and str(item.get("protected_replay_source", "")) == "phase_balanced_replay"
+        and int(item.get("protected_replay_phase_count", 0) or 0) >= int(min_phase_count)
+        and int(item.get("protected_batch_count", 0) or 0) >= int(item.get("protected_replay_phase_count", 0) or 0)
+        for item in applications
+    )
+
+
+def _max_protected_replay_phase_count(applications: Sequence[Mapping[str, Any]]) -> int:
+    return max(
+        (int(item.get("protected_replay_phase_count", 0) or 0) for item in applications),
+        default=0,
+    )
+
+
 def _cortex_architecture_audit_from_summary(summary: Mapping[str, Any]) -> dict[str, Any]:
     phase_counts = {str(key): int(value) for key, value in dict(summary.get("phase_event_counts") or {}).items()}
     trace_counts = {str(key): int(value) for key, value in dict(summary.get("compression_trace_counts") or {}).items()}
@@ -4155,6 +4179,10 @@ def _cortex_architecture_audit_from_summary(summary: Mapping[str, Any]) -> dict[
     regrowth_model_causal_grounded = _regrowth_model_causal_grounded_from_applications(
         regrowth_model_applications
     )
+    regrowth_model_phase_balanced_protected = _phase_balanced_model_patch_protection(
+        regrowth_model_applications,
+        min_phase_count=5,
+    )
     regrowth_model_has_executable_rollback = any(
         bool(item.get("rollback_executable"))
         and bool(item.get("rollback_artifact_path"))
@@ -4179,6 +4207,10 @@ def _cortex_architecture_audit_from_summary(summary: Mapping[str, Any]) -> dict[
         and float(item.get("repair_loss_delta", 0.0) or 0.0) > 0.0
         and float(item.get("protected_loss_delta", 0.0) or 0.0) <= float(item.get("protected_loss_tolerance", 0.0) or 0.0)
         for item in recursive_model_applications
+    )
+    recursive_model_phase_balanced_protected = _phase_balanced_model_patch_protection(
+        recursive_model_applications,
+        min_phase_count=6,
     )
     recursive_model_reward_hacking_cleared = any(
         bool(item.get("p10_decision_accepted"))
@@ -4590,7 +4622,8 @@ def _cortex_architecture_audit_from_summary(summary: Mapping[str, Any]) -> dict[
         and integer("regrowth_model_rollback_artifact_count") > 0
         and regrowth_model_has_executable_rollback
         and regrowth_model_non_regressing
-        and regrowth_model_causal_grounded,
+        and regrowth_model_causal_grounded
+        and regrowth_model_phase_balanced_protected,
         {
             "P7": phase_count("P7"),
             "phase_replay_P7": replay_count("P7"),
@@ -4599,12 +4632,14 @@ def _cortex_architecture_audit_from_summary(summary: Mapping[str, Any]) -> dict[
             "regrowth_model_parameter_delta_l1": number("regrowth_model_parameter_delta_l1"),
             "regrowth_model_repair_loss_delta": number("regrowth_model_repair_loss_delta"),
             "regrowth_model_protected_loss_delta": number("regrowth_model_protected_loss_delta"),
+            "regrowth_model_protected_replay_phase_count": integer("regrowth_model_protected_replay_phase_count"),
             "regrowth_model_rollback_artifact_count": integer("regrowth_model_rollback_artifact_count"),
             "regrowth_model_has_executable_rollback": regrowth_model_has_executable_rollback,
             "regrowth_model_non_regressing": regrowth_model_non_regressing,
             "regrowth_model_causal_grounded": regrowth_model_causal_grounded,
+            "regrowth_model_phase_balanced_protected": regrowth_model_phase_balanced_protected,
         },
-        "minimal regrowth must apply a verified bounded repair to real Transformer state from signed P6 causal evidence, persist executable rollback, and keep protected loss non-regressing",
+        "minimal regrowth must apply a verified bounded repair to real Transformer state from signed P6 causal evidence, persist executable rollback, and keep protected loss non-regressing across phase-balanced replay",
     )
     add(
         "sleep_consolidation_buffer",
@@ -4658,6 +4693,7 @@ def _cortex_architecture_audit_from_summary(summary: Mapping[str, Any]) -> dict[
         and recursive_artifact_verified
         and recursive_compiled_frontier_training_contract_grounded
         and recursive_compiled_frontier_artifact_grounded
+        and recursive_model_phase_balanced_protected
         and improvement_archive_materialized,
         {
             "P10": phase_count("P10"),
@@ -4674,13 +4710,15 @@ def _cortex_architecture_audit_from_summary(summary: Mapping[str, Any]) -> dict[
             "recursive_model_parameter_delta_l1": number("recursive_model_parameter_delta_l1"),
             "recursive_model_repair_loss_delta": number("recursive_model_repair_loss_delta"),
             "recursive_model_protected_loss_delta": number("recursive_model_protected_loss_delta"),
+            "recursive_model_protected_replay_phase_count": integer("recursive_model_protected_replay_phase_count"),
             "recursive_model_non_regressing": recursive_model_non_regressing,
             "recursive_model_reward_hacking_cleared": recursive_model_reward_hacking_cleared,
             "recursive_artifact_verified": recursive_artifact_verified,
             "recursive_compiled_frontier_training_contract_grounded": recursive_compiled_frontier_training_contract_grounded,
             "recursive_compiled_frontier_artifact_grounded": recursive_compiled_frontier_artifact_grounded,
+            "recursive_model_phase_balanced_protected": recursive_model_phase_balanced_protected,
         },
-        "recursive improvement sandbox must evaluate a proposal, apply an accepted signed non-regressing anti-reward-hacking-cleared patch to real Transformer state, ground compiled Frontier patches in FastSolve/P4/P5 contracts, persist only model-materialized accepted archives, persist an executable rollback artifact, and materialize a verified replay artifact",
+        "recursive improvement sandbox must evaluate a proposal, apply an accepted signed non-regressing anti-reward-hacking-cleared patch to real Transformer state, protect it across phase-balanced replay, ground compiled Frontier patches in FastSolve/P4/P5 contracts, persist only model-materialized accepted archives, persist an executable rollback artifact, and materialize a verified replay artifact",
     )
     add(
         "training_feedback_loop",
@@ -4798,6 +4836,10 @@ def _cortex_phase_deliverable_audit_from_summary(summary: Mapping[str, Any]) -> 
     regrowth_model_causal_grounded = _regrowth_model_causal_grounded_from_applications(
         regrowth_model_applications
     )
+    regrowth_model_phase_balanced_protected = _phase_balanced_model_patch_protection(
+        regrowth_model_applications,
+        min_phase_count=5,
+    )
     regrowth_model_has_executable_rollback = any(
         bool(item.get("rollback_executable"))
         and bool(item.get("rollback_artifact_path"))
@@ -4822,6 +4864,10 @@ def _cortex_phase_deliverable_audit_from_summary(summary: Mapping[str, Any]) -> 
         and float(item.get("repair_loss_delta", 0.0) or 0.0) > 0.0
         and float(item.get("protected_loss_delta", 0.0) or 0.0) <= float(item.get("protected_loss_tolerance", 0.0) or 0.0)
         for item in recursive_model_applications
+    )
+    recursive_model_phase_balanced_protected = _phase_balanced_model_patch_protection(
+        recursive_model_applications,
+        min_phase_count=6,
     )
     recursive_model_reward_hacking_cleared = any(
         bool(item.get("p10_decision_accepted"))
@@ -5081,21 +5127,24 @@ def _cortex_phase_deliverable_audit_from_summary(summary: Mapping[str, Any]) -> 
         and int(number("regrowth_model_rollback_artifact_count")) > 0
         and regrowth_model_has_executable_rollback
         and regrowth_model_non_regressing
-        and regrowth_model_causal_grounded,
+        and regrowth_model_causal_grounded
+        and regrowth_model_phase_balanced_protected,
         {
             "regrowth_plan_events": count("regrowth_plan_events"),
             "regrowth_candidate_actions": count("regrowth_candidate_actions"),
             "phase_replay_P7": replay_by_phase.get("P7", 0),
             "regrowth_model_application_count": int(number("regrowth_model_application_count")),
             "regrowth_model_causal_grounded_count": int(number("regrowth_model_causal_grounded_count")),
+            "regrowth_model_protected_replay_phase_count": int(number("regrowth_model_protected_replay_phase_count")),
             "regrowth_model_parameter_delta_l1": number("regrowth_model_parameter_delta_l1"),
             "regrowth_model_repair_loss_delta": number("regrowth_model_repair_loss_delta"),
             "regrowth_model_rollback_artifact_count": int(number("regrowth_model_rollback_artifact_count")),
             "regrowth_model_has_executable_rollback": regrowth_model_has_executable_rollback,
             "regrowth_model_non_regressing": regrowth_model_non_regressing,
             "regrowth_model_causal_grounded": regrowth_model_causal_grounded,
+            "regrowth_model_phase_balanced_protected": regrowth_model_phase_balanced_protected,
         },
-        "minimal regrowth must evaluate candidate repair actions from causal attribution, feed verified replay, apply a signed causally grounded bounded patch to real model state, and persist an executable rollback artifact",
+        "minimal regrowth must evaluate candidate repair actions from causal attribution, feed verified replay, apply a signed causally grounded bounded patch to real model state, protect it across phase-balanced replay, and persist an executable rollback artifact",
     )
     add(
         "P8",
@@ -5206,6 +5255,7 @@ def _cortex_phase_deliverable_audit_from_summary(summary: Mapping[str, Any]) -> 
         and recursive_artifact_verified
         and recursive_compiled_frontier_training_contract_grounded
         and recursive_compiled_frontier_artifact_grounded
+        and recursive_model_phase_balanced_protected
         and improvement_archive_materialized,
         {
             "recursive_proposal_events": count("recursive_proposal_events"),
@@ -5227,17 +5277,19 @@ def _cortex_phase_deliverable_audit_from_summary(summary: Mapping[str, Any]) -> 
             "recursive_model_has_executable_rollback": recursive_model_has_executable_rollback,
             "recursive_model_parameter_delta_l1": number("recursive_model_parameter_delta_l1"),
             "recursive_model_repair_loss_delta": number("recursive_model_repair_loss_delta"),
+            "recursive_model_protected_replay_phase_count": int(number("recursive_model_protected_replay_phase_count")),
             "recursive_model_non_regressing": recursive_model_non_regressing,
             "recursive_model_reward_hacking_cleared": recursive_model_reward_hacking_cleared,
             "recursive_artifact_verified": recursive_artifact_verified,
             "recursive_compiled_frontier_training_contract_grounded": recursive_compiled_frontier_training_contract_grounded,
             "recursive_compiled_frontier_artifact_grounded": recursive_compiled_frontier_artifact_grounded,
+            "recursive_model_phase_balanced_protected": recursive_model_phase_balanced_protected,
             "improvement_archive_materialized": improvement_archive_materialized,
             "improvement_persistent_archive_materialized_accepted_count": int(number("improvement_persistent_archive_materialized_accepted_count")),
             "improvement_persistent_archive_model_materialization_required": bool(summary.get("improvement_persistent_archive_model_materialization_required")),
             "improvement_persistent_archive_model_materialization_complete": bool(summary.get("improvement_persistent_archive_model_materialization_complete")),
         },
-        "recursive improvement must propose, sandbox, evolve across generations, evaluate, gate against reward hacking, persist only model-materialized evolutionary archives plus executable rollback archives, apply a signed model patch grounded in FastSolve/P4/P5 compiled Frontier contracts, preserve rollback tokens, run diversity checks and materialize a verified replay artifact",
+        "recursive improvement must propose, sandbox, evolve across generations, evaluate, gate against reward hacking, persist only model-materialized evolutionary archives plus executable rollback archives, apply a signed model patch protected across phase-balanced replay and grounded in FastSolve/P4/P5 compiled Frontier contracts, preserve rollback tokens, run diversity checks and materialize a verified replay artifact",
     )
 
     failed_checks = tuple(f"{check['phase']}:{check['deliverable']}" for check in checks if not check["passed"])
@@ -5348,6 +5400,7 @@ class CortexTrainingPhaseController:
         self.frontier_repair_accepted_events = 0
         self.replay_batches: list[torch.Tensor] = []
         self.replay_skill_contexts: list[tuple[float, ...]] = []
+        self.replay_phase_ids: list[str] = []
         self.replay_cursor = 0
         self.regularization_steps = 0
         self.replay_updates = 0
@@ -6453,6 +6506,7 @@ class CortexTrainingPhaseController:
         )
         self.replay_batches.append(self._batch_from_example(example))
         self.replay_skill_contexts.append(self._skill_context_for_task(example))
+        self.replay_phase_ids.append(str(phase_id))
         self.phase_replay_examples[phase_id] = self.phase_replay_examples.get(phase_id, 0) + 1
         self.phase_replay_example_ids.append(example.example_id)
         self._record_training_example_ledgers(example, phase_id=phase_id)
@@ -6462,6 +6516,7 @@ class CortexTrainingPhaseController:
         for example in examples[:8]:
             self.replay_batches.append(self._batch_from_example(example))
             self.replay_skill_contexts.append(self._skill_context_for_task(example))
+            self.replay_phase_ids.append("P9")
             self.phase_replay_examples["P9"] = self.phase_replay_examples.get("P9", 0) + 1
             self.phase_replay_example_ids.append(f"llm-p9-{self.phase_replay_examples['P9']}-{example.example_id}")
             self._record_training_example_ledgers(example, phase_id="P9")
@@ -6885,6 +6940,86 @@ class CortexTrainingPhaseController:
             if bool(item.get("causal_attribution_grounded")) and bool(item.get("causal_evidence_id"))
         )
 
+    def _known_replay_phase_id(self, phase_id: str) -> str:
+        phase = str(phase_id)
+        known = {item.id for item in CORTEX3_PHASES}
+        return phase if phase in known else "unknown"
+
+    def _infer_replay_phase_id(self, example_id: str) -> str:
+        text = str(example_id).lower()
+        for phase in CORTEX3_PHASES:
+            marker = f"llm-{phase.id.lower()}-"
+            if marker in text:
+                return phase.id
+        return "unknown"
+
+    def _sync_replay_phase_ids(self) -> None:
+        while len(self.replay_phase_ids) < len(self.replay_batches):
+            index = len(self.replay_phase_ids)
+            if index < len(self.phase_replay_example_ids):
+                self.replay_phase_ids.append(self._infer_replay_phase_id(self.phase_replay_example_ids[index]))
+            else:
+                self.replay_phase_ids.append("unknown")
+        if len(self.replay_phase_ids) > len(self.replay_batches):
+            self.replay_phase_ids = self.replay_phase_ids[:len(self.replay_batches)]
+
+    def _phase_balanced_protected_batches(
+        self,
+        fallback_task: Task,
+        fallback_answer: CandidateAnswer,
+        *,
+        fallback_phase: str,
+    ) -> tuple[tuple[torch.Tensor, ...], dict[str, Any]]:
+        self._sync_replay_phase_ids()
+        phase_order = tuple(phase.id for phase in CORTEX3_PHASES if phase.id != "P2")
+        known_phases = set(phase_order)
+        phase_to_indices: dict[str, list[int]] = {}
+        for index, phase_id in enumerate(self.replay_phase_ids):
+            if index >= len(self.replay_batches):
+                break
+            known_phase = self._known_replay_phase_id(phase_id)
+            if known_phase in known_phases:
+                phase_to_indices.setdefault(known_phase, []).append(index)
+        available_phases = tuple(phase_id for phase_id in phase_order if phase_id in phase_to_indices)
+        selected_indices = [phase_to_indices[phase_id][-1] for phase_id in available_phases]
+        target_count = max(4, len(selected_indices))
+        selected_set = set(selected_indices)
+        for index in range(len(self.replay_batches) - 1, -1, -1):
+            if len(selected_indices) >= target_count:
+                break
+            if index not in selected_set:
+                selected_indices.append(index)
+                selected_set.add(index)
+        if not selected_indices:
+            batch = self._batch_from_task(fallback_task, fallback_answer)
+            summary = {
+                "protected_replay_source": "synthetic_bootstrap",
+                "protected_replay_phase_ids": (str(fallback_phase),),
+                "protected_replay_available_phase_ids": (),
+                "protected_replay_phase_count": 0,
+                "protected_batch_count": 1,
+                "protected_replay_phase_balanced": False,
+                "protected_replay_complete_phase_coverage": False,
+            }
+            return (batch,), summary
+        selected_phase_ids = tuple(
+            self._known_replay_phase_id(self.replay_phase_ids[index])
+            for index in selected_indices
+        )
+        selected_known = {phase_id for phase_id in selected_phase_ids if phase_id in known_phases}
+        selected_unique_phases = tuple(phase_id for phase_id in phase_order if phase_id in selected_known)
+        summary = {
+            "protected_replay_source": "phase_balanced_replay",
+            "protected_replay_phase_ids": selected_phase_ids,
+            "protected_replay_available_phase_ids": available_phases,
+            "protected_replay_phase_count": len(selected_unique_phases),
+            "protected_batch_count": len(selected_indices),
+            "protected_replay_phase_balanced": bool(available_phases)
+            and set(available_phases).issubset(selected_known),
+            "protected_replay_complete_phase_coverage": set(available_phases).issubset(selected_known),
+        }
+        return tuple(self.replay_batches[index] for index in selected_indices), summary
+
     def _regrowth_causal_evidence(self, plan: RegrowthPlan) -> dict[str, Any]:
         if plan.selected is None:
             raise ValueError("P7 regrowth requires a selected action before causal evidence can be signed")
@@ -7135,15 +7270,17 @@ class CortexTrainingPhaseController:
         causal_evidence = self._regrowth_causal_evidence(plan)
         answer = patch.answer_for(plan.failure.task, self.trial_agent(plan.failure.task))
         repair_batch = self._batch_from_task(plan.failure.task, answer)
-        protected_batches = tuple(self.replay_batches[-4:])
-        if not protected_batches:
-            protected_task = Task(
-                f"phase-p7-protected-{step}",
-                "instruction_following",
-                "Output protected regrowth status exactly: STABLE",
-                "STABLE",
-            )
-            protected_batches = (self._batch_from_task(protected_task, self._answer_from_task_expected(protected_task)),)
+        protected_task = Task(
+            f"phase-p7-protected-{step}",
+            "instruction_following",
+            "Output protected regrowth status exactly: STABLE",
+            "STABLE",
+        )
+        protected_batches, protected_summary = self._phase_balanced_protected_batches(
+            protected_task,
+            self._answer_from_task_expected(protected_task),
+            fallback_phase="P7",
+        )
 
         was_training = self.model.training
         self.model.train()
@@ -7207,6 +7344,7 @@ class CortexTrainingPhaseController:
                     "repair_loss_delta": repair_delta,
                     "protected_loss_delta": protected_delta,
                     "causal_evidence": causal_evidence,
+                    "protected_replay": protected_summary,
                 }
                 accepted_report = {
                     "step": step,
@@ -7231,6 +7369,7 @@ class CortexTrainingPhaseController:
                     "protected_loss_after": protected_after,
                     "protected_loss_delta": protected_delta,
                     "protected_loss_tolerance": protected_tolerance,
+                    **protected_summary,
                     "non_regression_passed": True,
                     "requantized_ternary_core": bool(self.model.config.use_ternary_core),
                     "causal_attribution_grounded": True,
@@ -7711,15 +7850,17 @@ class CortexTrainingPhaseController:
             step=step,
         )
         repair_batch = self._batch_from_task(task, proposal_answer)
-        protected_batches = tuple(self.replay_batches[-4:])
-        if not protected_batches:
-            protected_task = Task(
-                f"phase-p10-protected-{step}",
-                "instruction_following",
-                "Output protected recursive improvement status exactly: STABLE",
-                "STABLE",
-            )
-            protected_batches = (self._batch_from_task(protected_task, self._answer_from_task_expected(protected_task)),)
+        protected_task = Task(
+            f"phase-p10-protected-{step}",
+            "instruction_following",
+            "Output protected recursive improvement status exactly: STABLE",
+            "STABLE",
+        )
+        protected_batches, protected_summary = self._phase_balanced_protected_batches(
+            protected_task,
+            self._answer_from_task_expected(protected_task),
+            fallback_phase="P10",
+        )
 
         was_training = self.model.training
         self.model.train()
@@ -7792,6 +7933,7 @@ class CortexTrainingPhaseController:
                     "protected_loss_delta": protected_delta,
                     "decision_proof": decision_proof,
                     "training_contract": training_contract,
+                    "protected_replay": protected_summary,
                 }
                 accepted_report = {
                     "step": step,
@@ -7813,6 +7955,7 @@ class CortexTrainingPhaseController:
                     "protected_loss_after": protected_after,
                     "protected_loss_delta": protected_delta,
                     "protected_loss_tolerance": protected_tolerance,
+                    **protected_summary,
                     "non_regression_passed": True,
                     "requantized_ternary_core": bool(self.model.config.use_ternary_core),
                     **training_contract,
@@ -7891,6 +8034,7 @@ class CortexTrainingPhaseController:
             "frontier_registry_summary": self.frontier_registry.to_dict(),
             "replay_batches": [batch.detach().cpu() for batch in self.replay_batches],
             "replay_skill_contexts": [tuple(float(value) for value in context) for context in self.replay_skill_contexts],
+            "replay_phase_ids": list(self.replay_phase_ids),
             "replay_cursor": int(self.replay_cursor),
             "regularization_steps": int(self.regularization_steps),
             "replay_updates": int(self.replay_updates),
@@ -7998,6 +8142,7 @@ class CortexTrainingPhaseController:
         ]
         while len(self.replay_skill_contexts) < len(self.replay_batches):
             self.replay_skill_contexts.append(())
+        self.replay_phase_ids = [str(item) for item in payload.get("replay_phase_ids", ())]
         self.replay_cursor = int(payload.get("replay_cursor", 0))
         self.regularization_steps = int(payload.get("regularization_steps", 0))
         self.replay_updates = int(payload.get("replay_updates", 0))
@@ -8006,6 +8151,7 @@ class CortexTrainingPhaseController:
             for key, value in dict(payload.get("phase_replay_examples", {})).items()
         })
         self.phase_replay_example_ids = [str(item) for item in payload.get("phase_replay_example_ids", ())]
+        self._sync_replay_phase_ids()
         self.objective_feedback_events = int(payload.get("objective_feedback_events", 0))
         self.objective_feedback_total = float(payload.get("objective_feedback_total", 0.0))
         self.last_objective_loss_total = float(payload.get("last_objective_loss_total", 0.0))
@@ -8401,9 +8547,10 @@ class CortexTrainingPhaseController:
             "recursive_improvement_generations_configured": int(self.config.cortex_phase_improvement_generations),
             "recursive_generation_events": int(self.integration_counts.get("recursive_generation_events", 0)),
             "recursive_evolved_proposal_events": int(self.integration_counts.get("recursive_evolved_proposal_events", 0)),
-            "regrowth_model_application_count": len(self.regrowth_model_applications),
-            "regrowth_model_causal_grounded_count": self._regrowth_model_causal_grounded_count(),
-            "regrowth_model_parameter_delta_l1": float(self.regrowth_model_parameter_delta_l1),
+                "regrowth_model_application_count": len(self.regrowth_model_applications),
+                "regrowth_model_causal_grounded_count": self._regrowth_model_causal_grounded_count(),
+                "regrowth_model_protected_replay_phase_count": _max_protected_replay_phase_count(self.regrowth_model_applications),
+                "regrowth_model_parameter_delta_l1": float(self.regrowth_model_parameter_delta_l1),
             "regrowth_model_repair_loss_delta": float(self.regrowth_model_repair_loss_delta),
             "regrowth_model_protected_loss_delta": float(self.regrowth_model_protected_loss_delta),
             "regrowth_model_applications": _last_items(self.regrowth_model_applications, 5),
@@ -8411,8 +8558,9 @@ class CortexTrainingPhaseController:
             "regrowth_model_rollback_artifacts": _last_items(self.regrowth_model_rollback_artifacts, 5),
             "regrowth_model_executable_rollback_count": len(self.regrowth_model_rollback_applications),
             "regrowth_model_rollback_applications": _last_items(self.regrowth_model_rollback_applications, 5),
-            "recursive_model_application_count": len(self.recursive_model_applications),
-            "recursive_model_parameter_delta_l1": float(self.recursive_model_parameter_delta_l1),
+                "recursive_model_application_count": len(self.recursive_model_applications),
+                "recursive_model_protected_replay_phase_count": _max_protected_replay_phase_count(self.recursive_model_applications),
+                "recursive_model_parameter_delta_l1": float(self.recursive_model_parameter_delta_l1),
             "recursive_model_repair_loss_delta": float(self.recursive_model_repair_loss_delta),
             "recursive_model_protected_loss_delta": float(self.recursive_model_protected_loss_delta),
             "recursive_model_applications": _last_items(self.recursive_model_applications, 5),
@@ -9516,9 +9664,10 @@ class CortexTrainingPhaseController:
                 "frontier_repair_accepted_events": int(self.frontier_repair_accepted_events),
                 "recursive_frontier_proposal_events": int(self.integration_counts.get("recursive_frontier_proposal_events", 0)),
                 "frontier_registry_path": str(self.run_dir / "frontier_registry"),
-                "regrowth_model_application_count": len(self.regrowth_model_applications),
-                "regrowth_model_causal_grounded_count": self._regrowth_model_causal_grounded_count(),
-                "regrowth_model_parameter_delta_l1": float(self.regrowth_model_parameter_delta_l1),
+            "regrowth_model_application_count": len(self.regrowth_model_applications),
+            "regrowth_model_causal_grounded_count": self._regrowth_model_causal_grounded_count(),
+            "regrowth_model_protected_replay_phase_count": _max_protected_replay_phase_count(self.regrowth_model_applications),
+            "regrowth_model_parameter_delta_l1": float(self.regrowth_model_parameter_delta_l1),
                 "regrowth_model_repair_loss_delta": float(self.regrowth_model_repair_loss_delta),
                 "regrowth_model_protected_loss_delta": float(self.regrowth_model_protected_loss_delta),
                 "regrowth_model_applications": _last_items(self.regrowth_model_applications, 5),
@@ -9526,8 +9675,9 @@ class CortexTrainingPhaseController:
                 "regrowth_model_rollback_artifacts": _last_items(self.regrowth_model_rollback_artifacts, 5),
                 "regrowth_model_executable_rollback_count": len(self.regrowth_model_rollback_applications),
                 "regrowth_model_rollback_applications": _last_items(self.regrowth_model_rollback_applications, 5),
-                "recursive_model_application_count": len(self.recursive_model_applications),
-                "recursive_model_parameter_delta_l1": float(self.recursive_model_parameter_delta_l1),
+            "recursive_model_application_count": len(self.recursive_model_applications),
+            "recursive_model_protected_replay_phase_count": _max_protected_replay_phase_count(self.recursive_model_applications),
+            "recursive_model_parameter_delta_l1": float(self.recursive_model_parameter_delta_l1),
                 "recursive_model_repair_loss_delta": float(self.recursive_model_repair_loss_delta),
                 "recursive_model_protected_loss_delta": float(self.recursive_model_protected_loss_delta),
                 "recursive_model_applications": _last_items(self.recursive_model_applications, 5),
@@ -9722,6 +9872,7 @@ class CortexTrainingPhaseController:
                     "recursive_frontier_proposal_events": int(self.integration_counts.get("recursive_frontier_proposal_events", 0)),
                     "regrowth_model_application_count": len(self.regrowth_model_applications),
                     "regrowth_model_causal_grounded_count": self._regrowth_model_causal_grounded_count(),
+                    "regrowth_model_protected_replay_phase_count": _max_protected_replay_phase_count(self.regrowth_model_applications),
                     "regrowth_model_parameter_delta_l1": float(self.regrowth_model_parameter_delta_l1),
                     "regrowth_model_repair_loss_delta": float(self.regrowth_model_repair_loss_delta),
                     "regrowth_model_protected_loss_delta": float(self.regrowth_model_protected_loss_delta),
@@ -9731,6 +9882,7 @@ class CortexTrainingPhaseController:
                     "regrowth_model_executable_rollback_count": len(self.regrowth_model_rollback_applications),
                     "regrowth_model_rollback_applications": _last_items(self.regrowth_model_rollback_applications, 5),
                     "recursive_model_application_count": len(self.recursive_model_applications),
+                    "recursive_model_protected_replay_phase_count": _max_protected_replay_phase_count(self.recursive_model_applications),
                     "recursive_model_parameter_delta_l1": float(self.recursive_model_parameter_delta_l1),
                     "recursive_model_repair_loss_delta": float(self.recursive_model_repair_loss_delta),
                     "recursive_model_protected_loss_delta": float(self.recursive_model_protected_loss_delta),
@@ -9904,6 +10056,7 @@ class CortexTrainingPhaseController:
                     "inference_model_backed_adaptive_mtp_accepted_mtp_tokens": int(self.integration_counts.get("inference_model_backed_adaptive_mtp_accepted_mtp_tokens", 0)),
                     "regrowth_model_application_count": len(self.regrowth_model_applications),
                     "regrowth_model_causal_grounded_count": self._regrowth_model_causal_grounded_count(),
+                    "regrowth_model_protected_replay_phase_count": _max_protected_replay_phase_count(self.regrowth_model_applications),
                     "regrowth_model_parameter_delta_l1": float(self.regrowth_model_parameter_delta_l1),
                     "regrowth_model_repair_loss_delta": float(self.regrowth_model_repair_loss_delta),
                     "regrowth_model_protected_loss_delta": float(self.regrowth_model_protected_loss_delta),
@@ -9913,6 +10066,7 @@ class CortexTrainingPhaseController:
                     "regrowth_model_executable_rollback_count": len(self.regrowth_model_rollback_applications),
                     "regrowth_model_rollback_applications": _last_items(self.regrowth_model_rollback_applications, 5),
                     "recursive_model_application_count": len(self.recursive_model_applications),
+                    "recursive_model_protected_replay_phase_count": _max_protected_replay_phase_count(self.recursive_model_applications),
                     "recursive_model_parameter_delta_l1": float(self.recursive_model_parameter_delta_l1),
                     "recursive_model_repair_loss_delta": float(self.recursive_model_repair_loss_delta),
                     "recursive_model_protected_loss_delta": float(self.recursive_model_protected_loss_delta),

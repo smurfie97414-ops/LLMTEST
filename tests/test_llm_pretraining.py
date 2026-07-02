@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 import torch
 
+from cortex3 import Task
 from cortex3_objective import FINAL_LOSS_TERMS
 from cortex3_sleep import ExampleOrigin
 from cortex3_llm import (
@@ -113,6 +114,13 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                         "repair_loss_delta": 1.0,
                         "protected_loss_delta": 0.0,
                         "protected_loss_tolerance": 0.1,
+                        "protected_replay_source": "phase_balanced_replay",
+                        "protected_replay_phase_ids": ["P1", "P3", "P4", "P5", "P6"],
+                        "protected_replay_available_phase_ids": ["P1", "P3", "P4", "P5", "P6"],
+                        "protected_replay_phase_count": 5,
+                        "protected_batch_count": 5,
+                        "protected_replay_phase_balanced": True,
+                        "protected_replay_complete_phase_coverage": True,
                         "causal_attribution_grounded": True,
                         "causal_evidence_id": "p7-causal",
                         "causal_attribution_source": "CausalAttributionEngine",
@@ -136,7 +144,28 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 "sleep_external_provenance_rejected_records": 0,
                 "sleep_external_provenance_duplicate_records": 0,
                 "sleep_external_provenance_reports": [],
-                "recursive_model_applications": [{"non_regression_passed": True}],
+                "recursive_model_applications": [
+                    {
+                        "non_regression_passed": True,
+                        "signed_patch_id": "p10-signed",
+                        "rollback_token": "rollback-p10",
+                        "rollback_executable": True,
+                        "rollback_artifact_path": "rollback.pt",
+                        "rollback_artifact_sha256": "sha256",
+                        "rollback_artifact_parameter_count": 1,
+                        "parameter_delta_l1": 1.0,
+                        "repair_loss_delta": 1.0,
+                        "protected_loss_delta": 0.0,
+                        "protected_loss_tolerance": 0.1,
+                        "protected_replay_source": "phase_balanced_replay",
+                        "protected_replay_phase_ids": ["P1", "P3", "P4", "P5", "P6", "P7"],
+                        "protected_replay_available_phase_ids": ["P1", "P3", "P4", "P5", "P6", "P7"],
+                        "protected_replay_phase_count": 6,
+                        "protected_batch_count": 6,
+                        "protected_replay_phase_balanced": True,
+                        "protected_replay_complete_phase_coverage": True,
+                    }
+                ],
                 "recursive_model_rollback_artifacts": [{"rollback_artifact_path": "rollback.pt"}],
                 "recursive_model_rollback_applications": [{"rollback_token": "rollback-p10"}],
                 "recursive_verified_artifacts": [{"recursive_improvement_artifact": True}],
@@ -3494,6 +3523,58 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
         self.assertEqual(restored.external_provenance_reports[-1]["accepted_count"], 1)
         self.assertEqual(restored.integration_counts["sleep_external_provenance_accepted_examples"], 1)
 
+    def test_cortex_phase_state_infers_replay_phase_ids_for_legacy_checkpoints(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            corpus = self._corpus(root, repeats=8)
+            tokenizer = LLMTokenizer.train(corpus, vocab_size=128, min_frequency=1)
+            model_config = TransformerConfig(
+                vocab_size=128,
+                seq_len=16,
+                d_model=32,
+                n_heads=4,
+                n_layers=1,
+                dropout=0.0,
+                horizons=(1, 2, 4, 8),
+                use_cortex_heads=True,
+                use_ternary_core=True,
+                use_skill_aware_experts=True,
+                use_variable_in_compressor=True,
+                use_learned_memory_policy=True,
+                use_certificate_head=True,
+                use_latent_reasoning_workspace=True,
+            )
+            controller = CortexTrainingPhaseController(
+                CortexTransformerLM(model_config),
+                tokenizer,
+                TrainingConfig(steps=1, batch_size=1),
+                run_dir=root / "run",
+            )
+            for phase_id, expected in (("P1", "LEGACY-P1"), ("P3", "LEGACY-P3")):
+                example = controller._add_verified_phase_replay(
+                    phase_id,
+                    Task(
+                        f"legacy-{phase_id.lower()}",
+                        "instruction_following",
+                        f"Output exactly: {expected}",
+                        expected,
+                    ),
+                )
+                self.assertIsNotNone(example)
+            legacy_state = controller.state_dict()
+            legacy_state.pop("replay_phase_ids")
+
+            restored = CortexTrainingPhaseController(
+                CortexTransformerLM(model_config),
+                tokenizer,
+                TrainingConfig(steps=1, batch_size=1),
+                run_dir=root / "restored",
+            )
+            restored.load_state_dict(legacy_state)
+
+        self.assertEqual(restored.replay_phase_ids, ["P1", "P3"])
+        self.assertEqual(len(restored.replay_phase_ids), len(restored.replay_batches))
+
     def test_full_cortex_phase_controller_uses_all_modules_during_training(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -3673,9 +3754,11 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             self.assertGreater(influence["phase_replay_examples"], 0)
             self.assertGreater(influence["regrowth_model_application_count"], 0)
             self.assertGreater(influence["regrowth_model_causal_grounded_count"], 0)
+            self.assertGreaterEqual(influence["regrowth_model_protected_replay_phase_count"], 5)
             self.assertGreater(influence["regrowth_model_parameter_delta_l1"], 0.0)
             self.assertGreater(influence["regrowth_model_repair_loss_delta"], 0.0)
             self.assertGreater(influence["recursive_model_application_count"], 0)
+            self.assertGreaterEqual(influence["recursive_model_protected_replay_phase_count"], 6)
             self.assertGreater(influence["recursive_model_parameter_delta_l1"], 0.0)
             self.assertGreater(influence["recursive_model_repair_loss_delta"], 0.0)
             self.assertGreater(influence["recursive_verified_artifact_count"], 0)
@@ -3825,6 +3908,15 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 latest_regrowth["causal_evidence"]["causal_evidence_id"],
                 latest_regrowth["causal_evidence_id"],
             )
+            self.assertEqual(latest_regrowth["protected_replay_source"], "phase_balanced_replay", latest_regrowth)
+            self.assertTrue(latest_regrowth["protected_replay_phase_balanced"], latest_regrowth)
+            self.assertTrue(latest_regrowth["protected_replay_complete_phase_coverage"], latest_regrowth)
+            self.assertGreaterEqual(latest_regrowth["protected_replay_phase_count"], 5, latest_regrowth)
+            self.assertGreaterEqual(latest_regrowth["protected_batch_count"], latest_regrowth["protected_replay_phase_count"], latest_regrowth)
+            self.assertTrue(
+                {"P1", "P3", "P4", "P5", "P6"}.issubset(set(latest_regrowth["protected_replay_phase_ids"])),
+                latest_regrowth,
+            )
             self.assertGreater(latest_regrowth["parameter_delta_l1"], 0.0)
             self.assertGreater(latest_regrowth["repair_loss_delta"], 0.0)
             self.assertLessEqual(
@@ -3878,6 +3970,11 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             self.assertTrue(Path(latest_recursive["rollback_artifact_path"]).exists(), latest_recursive)
             self.assertTrue(latest_recursive["rollback_artifact_sha256"], latest_recursive)
             self.assertGreater(latest_recursive["rollback_artifact_parameter_count"], 0, latest_recursive)
+            self.assertEqual(latest_recursive["protected_replay_source"], "phase_balanced_replay", latest_recursive)
+            self.assertTrue(latest_recursive["protected_replay_phase_balanced"], latest_recursive)
+            self.assertTrue(latest_recursive["protected_replay_complete_phase_coverage"], latest_recursive)
+            self.assertGreaterEqual(latest_recursive["protected_replay_phase_count"], 6, latest_recursive)
+            self.assertGreaterEqual(latest_recursive["protected_batch_count"], latest_recursive["protected_replay_phase_count"], latest_recursive)
             self.assertGreater(latest_recursive["parameter_delta_l1"], 0.0)
             self.assertGreater(latest_recursive["repair_loss_delta"], 0.0)
             self.assertLessEqual(
@@ -3939,8 +4036,10 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             self.assertTrue(persisted["recursive_model_rollback_artifacts"], persisted)
             self.assertTrue(persisted["recursive_verified_artifacts"], persisted)
             self.assertGreater(persisted["training_influence"]["regrowth_model_causal_grounded_count"], 0)
+            self.assertGreaterEqual(persisted["training_influence"]["regrowth_model_protected_replay_phase_count"], 5)
             self.assertGreater(persisted["training_influence"]["regrowth_model_rollback_artifact_count"], 0)
             self.assertGreater(persisted["training_influence"]["recursive_verified_artifact_count"], 0)
+            self.assertGreaterEqual(persisted["training_influence"]["recursive_model_protected_replay_phase_count"], 6)
             self.assertGreater(persisted["training_influence"]["recursive_model_rollback_artifact_count"], 0)
             self.assertGreater(persisted["training_influence"]["learned_memory_utility_credit_count"], 0)
             self.assertGreater(persisted["training_influence"]["learned_memory_utility_prior_updates"], 0)
@@ -4116,6 +4215,10 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 patch_report["causal_evidence"]["causal_evidence_id"],
                 patch_report["causal_evidence_id"],
             )
+            self.assertEqual(patch_report["protected_replay_source"], "synthetic_bootstrap", patch_report)
+            self.assertFalse(patch_report["protected_replay_phase_balanced"], patch_report)
+            self.assertEqual(tuple(patch_report["protected_replay_phase_ids"]), ("P7",), patch_report)
+            self.assertEqual(patch_report["protected_batch_count"], 1, patch_report)
             named_after_patch = dict(model.named_parameters())
             changed_names = [
                 name
@@ -4232,6 +4335,10 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             self.assertGreaterEqual(patch_report["robustness_delta"], 0.0, patch_report)
             self.assertTrue(Path(patch_report["rollback_artifact_path"]).exists(), patch_report)
             self.assertGreater(patch_report["rollback_artifact_parameter_count"], 0, patch_report)
+            self.assertEqual(patch_report["protected_replay_source"], "synthetic_bootstrap", patch_report)
+            self.assertFalse(patch_report["protected_replay_phase_balanced"], patch_report)
+            self.assertEqual(tuple(patch_report["protected_replay_phase_ids"]), ("P10",), patch_report)
+            self.assertEqual(patch_report["protected_batch_count"], 1, patch_report)
             named_after_patch = dict(model.named_parameters())
             changed_names = [
                 name
@@ -4432,6 +4539,14 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 checkpoint = torch.load(run_dir / "checkpoint_final.pt", map_location="cpu", weights_only=False)
                 self.assertIn("cortex_phase_state", checkpoint)
                 self.assertGreater(len(checkpoint["cortex_phase_state"]["replay_batches"]), 0)
+                self.assertEqual(
+                    len(checkpoint["cortex_phase_state"]["replay_phase_ids"]),
+                    len(checkpoint["cortex_phase_state"]["replay_batches"]),
+                )
+                self.assertTrue(
+                    {"P1", "P3", "P4", "P5", "P6"}.issubset(set(checkpoint["cortex_phase_state"]["replay_phase_ids"])),
+                    checkpoint["cortex_phase_state"]["replay_phase_ids"],
+                )
                 self.assertGreater(checkpoint["cortex_phase_state"]["objective_feedback_events"], 0)
                 self.assertGreater(checkpoint["cortex_phase_state"]["last_objective_loss_total"], 0.0)
                 self.assertEqual(tuple(checkpoint["cortex_phase_state"]["last_objective_loss_terms"]), FINAL_LOSS_TERMS)
@@ -4608,12 +4723,14 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 self.assertGreater(sidecar["cortex_phase_state_summary"]["replay_batch_count"], 0)
                 self.assertGreater(sidecar["cortex_phase_state_summary"]["regrowth_model_application_count"], 0)
                 self.assertGreater(sidecar["cortex_phase_state_summary"]["regrowth_model_causal_grounded_count"], 0)
+                self.assertGreaterEqual(sidecar["cortex_phase_state_summary"]["regrowth_model_protected_replay_phase_count"], 5)
                 self.assertGreater(sidecar["cortex_phase_state_summary"]["regrowth_model_parameter_delta_l1"], 0.0)
                 self.assertGreater(sidecar["cortex_phase_state_summary"]["regrowth_model_repair_loss_delta"], 0.0)
                 self.assertTrue(sidecar["cortex_phase_state_summary"]["regrowth_model_applications"])
                 self.assertGreater(sidecar["cortex_phase_state_summary"]["attribution_policy_observations"], 0)
                 self.assertGreater(sidecar["cortex_phase_state_summary"]["attribution_policy_successes"], 0)
                 self.assertGreater(sidecar["cortex_phase_state_summary"]["recursive_model_application_count"], 0)
+                self.assertGreaterEqual(sidecar["cortex_phase_state_summary"]["recursive_model_protected_replay_phase_count"], 6)
                 self.assertGreaterEqual(sidecar["cortex_phase_state_summary"]["recursive_generation_events"], 2)
                 self.assertGreater(sidecar["cortex_phase_state_summary"]["recursive_evolved_proposal_events"], 0)
                 self.assertGreater(sidecar["cortex_phase_state_summary"]["recursive_model_parameter_delta_l1"], 0.0)
@@ -4754,6 +4871,10 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 first_influence["regrowth_model_causal_grounded_count"],
             )
             self.assertGreaterEqual(
+                resumed_influence["regrowth_model_protected_replay_phase_count"],
+                first_influence["regrowth_model_protected_replay_phase_count"],
+            )
+            self.assertGreaterEqual(
                 resumed_influence["regrowth_model_rollback_artifact_count"],
                 first_influence["regrowth_model_rollback_artifact_count"],
             )
@@ -4773,6 +4894,10 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             self.assertGreaterEqual(
                 resumed_influence["recursive_model_application_count"],
                 first_influence["recursive_model_application_count"],
+            )
+            self.assertGreaterEqual(
+                resumed_influence["recursive_model_protected_replay_phase_count"],
+                first_influence["recursive_model_protected_replay_phase_count"],
             )
             self.assertGreaterEqual(
                 resumed_influence["recursive_verified_artifact_count"],
