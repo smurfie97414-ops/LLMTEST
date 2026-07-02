@@ -677,7 +677,23 @@ def model_token_certificate_tool(certificate: ShortCertificate) -> ToolVerificat
 
 
 _CODE_FENCE_RE = re.compile(r"```(?:python)?\s*(.*?)```", re.IGNORECASE | re.DOTALL)
-_SAFE_BUILTINS = {"abs": abs, "all": all, "any": any, "bool": bool, "enumerate": enumerate, "len": len, "max": max, "min": min, "range": range, "sum": sum}
+_SAFE_BUILTINS = {
+    "abs": abs,
+    "all": all,
+    "any": any,
+    "bool": bool,
+    "dict": dict,
+    "enumerate": enumerate,
+    "len": len,
+    "list": list,
+    "max": max,
+    "min": min,
+    "range": range,
+    "set": set,
+    "sorted": sorted,
+    "sum": sum,
+    "tuple": tuple,
+}
 _BANNED_CODE_TOKENS = ("import ", "__", "open(", "eval(", "exec(", "compile(", "globals(", "locals(", "input(", "breakpoint(")
 
 
@@ -1032,13 +1048,15 @@ def certificate_contract_for_task(task: Task, answer: str, certificate_type: Cer
         visible_tests = tuple(task.metadata.get("tests", ()))
         hidden_tests = tuple(task.metadata.get("hidden_tests", ()))
         all_tests = visible_tests + hidden_tests
+        properties = tuple(task.metadata.get("properties", ("deterministic", "no_argument_mutation")))
+        require_hidden_tests = bool(task.metadata.get("require_hidden_tests", bool(hidden_tests)))
         return (
             {
                 "specification": str(task.metadata.get("prompt", task.prompt)),
                 "invariant": "generated function must satisfy visible, hidden and property tests",
                 "visible_tests": len(visible_tests),
                 "hidden_tests": len(hidden_tests),
-                "properties": ("deterministic", "no_argument_mutation"),
+                "properties": properties,
                 "minimal_tests": len(all_tests),
             },
             "code_tests",
@@ -1046,9 +1064,9 @@ def certificate_contract_for_task(task: Task, answer: str, certificate_type: Cer
                 "function_name": str(task.metadata.get("function_name", "solve")),
                 "tests": visible_tests,
                 "hidden_tests": hidden_tests,
-                "require_hidden_tests": True,
+                "require_hidden_tests": require_hidden_tests,
                 "min_tests": len(all_tests),
-                "properties": ("deterministic", "no_argument_mutation"),
+                "properties": properties,
             },
             tuple(task.anchors),
         )

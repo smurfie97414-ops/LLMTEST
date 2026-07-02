@@ -1,6 +1,6 @@
 # Cortex-3 Architecture Self-Critique
 
-Etat: boucle d'audit 96 apres relecture P1-P10 hors profiling/observabilite. La critique repart des 10 phases et vise les briques structurantes: SlowSolve -> verification -> attribution -> regrowth -> compilation -> selection runtime -> reutilisation persistante -> evolution recursive. Les derniers correctifs structurels ferment dix ponts critiques: les circuits compiles Frontier sont maintenant traites comme objets de memoire cognitive learned avec retention/utility credit, P8 consomme le vrai dispatch runtime P2 apres execution BitLinear, P8 ne peut plus executer une FastSolve compilee sans binding P4, les certificats exact-match P5/P8 sont lies au contrat de tache, le FSP P8 compare maintenant le contrat aux tokens observes depuis la sortie reelle au lieu de se verifier contre ses propres predictions, P10 entraine les patchs `compiled_frontier` depuis le contrat FastSolve/P4/P5 verifie au lieu d'une reponse de reference generique, P1/P5 couvrent maintenant aussi les systemes lineaires 2x2 exacts via oracle + certificat SymPy, l'archive persistante P10 ne reutilise plus des acceptations sandbox non materialisees dans le modele, P7 ne peut plus signer un patch modele sans preuve causale P6 complete et rattachee au rollback, et P7/P10 ne peuvent plus accepter un patch parametrique protege seulement par les derniers batches au lieu d'un replay equilibre par phase.
+Etat: boucle d'audit 97 apres relecture P1-P10 hors profiling/observabilite. La critique repart des 10 phases et vise les briques structurantes: SlowSolve -> verification -> attribution -> regrowth -> compilation -> selection runtime -> reutilisation persistante -> evolution recursive. Les derniers correctifs structurels ferment onze ponts critiques: les circuits compiles Frontier sont maintenant traites comme objets de memoire cognitive learned avec retention/utility credit, P8 consomme le vrai dispatch runtime P2 apres execution BitLinear, P8 ne peut plus executer une FastSolve compilee sans binding P4, les certificats exact-match P5/P8 sont lies au contrat de tache, le FSP P8 compare maintenant le contrat aux tokens observes depuis la sortie reelle au lieu de se verifier contre ses propres predictions, P10 entraine les patchs `compiled_frontier` depuis le contrat FastSolve/P4/P5 verifie au lieu d'une reponse de reference generique, P1/P5 couvrent maintenant aussi les systemes lineaires 2x2 exacts via oracle + certificat SymPy, l'archive persistante P10 ne reutilise plus des acceptations sandbox non materialisees dans le modele, P7 ne peut plus signer un patch modele sans preuve causale P6 complete et rattachee au rollback, P7/P10 ne peuvent plus accepter un patch parametrique protege seulement par les derniers batches au lieu d'un replay equilibre par phase, et P1 durcit ses generateurs/oracles code + entity tracking avec contrats caches/proprietes et chaines de transfert multi-entites.
 
 Ce document sert de registre de critique et de correction. Il ne remplace pas les tests longs interdits pour cette iteration; il se limite aux preuves courtes disponibles, aux rapports du code et aux tests courts.
 
@@ -43,6 +43,7 @@ Mise a jour C93: P1/P5 ne limitent plus le symbolique a lineaire univarie et qua
 Mise a jour C94: P10 ne persiste plus une acceptation sandbox comme parent evolutif durable avant preuve modele. Le controleur sauvegarde l'archive persistante apres patch modele signe + artefact replay verifie, filtre les acceptations sauvegardees aux propositions materialisees, ecrit un manifeste `model_materialization_required`, et refuse a la recharge toute archive acceptee sans patch signe, artefact P10, rollback executable et fichier rollback modele existant.
 Mise a jour C95: P7 ne transporte plus seulement `cause` depuis P6. `RegrowthActionSpace` attache a chaque action les champs d'attribution complets: source P6, task/skill/reason, top cause, cause selectionnee, probabilite, dimension, intervention, recovery, score delta, gain/cout, couts targeted/global, probes et politique. `_apply_model_regrowth` refuse tout patch modele sans preuve causale P6 recuperante, insere cette preuve dans le payload signe, le rapport, le compteur `regrowth_model_causal_grounded_count`, l'artefact rollback et les audits architecture/livrable.
 Mise a jour C96: P7/P10 ne calculent plus la non-regression modele sur `replay_batches[-4:]`. Le controleur garde `replay_phase_ids` en parallele des batches, les persiste/restaure avec compatibilite anciens checkpoints, selectionne le dernier replay disponible de chaque phase avant d'ajouter un remplissage recent, signe cette couverture dans les payloads P7/P10 et expose `*_protected_replay_phase_count`. Les audits architecture/livrable exigent maintenant une protection `phase_balanced_replay` complete: au moins 5 phases pour P7 et 6 phases pour P10 dans le chemin full controller.
+Mise a jour C97: P1 ne limite plus les generateurs code a de petites fonctions visibles ni `entity_tracking` a un dernier lieu simple. `CodeUnitTestSkill` genere maintenant des contrats stateful `dedupe_preserve_order` et `merge_counts`, transporte des tests caches obligatoires, puis verifie determinisme et absence de mutation d'arguments avec copies profondes. `EntityTrackingSkill` genere aussi des chaines de transfert multi-personnes avec distracteurs et anti-metamorphes qui changent le detenteur final. P5 `code_tests` partage les builtins et proprietes de ces contrats pour que le certificat reste aligne avec l'oracle P1.
 
 ## Audit transversal haut enjeu apres C91
 
@@ -861,10 +862,10 @@ Mise a jour C96: P7/P10 ne calculent plus la non-regression modele sur `replay_b
 ### P1 - Verifier OS
 
 - Ce qui est solide: familles arithmetic, algebra, long_context_anchor, entity_tracking, instruction_following, code_unit_tests, calibration; oracles stricts; metamorphic/anti-metamorphic; fault matrix; cout verifier par cas.
-- Preuve actuelle: tests P1 et full Cortex court activent P1; rapports de cycle persistent les resultats.
-- Faiblesse: generateurs encore limites, peu de domaines held-out, pas assez de bruit naturel, pas assez de faux positifs/faux negatifs hors familles internes.
-- Risque architectural: si P1 est trop petit, P6/P7/P10 optimisent contre un monde trop facile.
-- Correction prioritaire restante: elargir les generateurs et ajouter un audit de couverture d'oracles par domaine.
+- Preuve actuelle: tests P1 et full Cortex court activent P1; rapports de cycle persistent les resultats; C97 ajoute tests caches/proprietes code et transferts multi-entites.
+- Faiblesse: generateurs encore limites cote algebra/calibration, peu de domaines held-out larges, pas assez de bruit naturel, pas assez de faux positifs/faux negatifs hors familles internes.
+- Risque architectural: si P1 reste trop petit, P6/P7/P10 optimisent contre un monde trop facile; C97 reduit ce risque sur code et entity tracking mais ne remplace pas une suite held-out large.
+- Correction prioritaire restante: elargir algebra/calibration et ajouter un audit de couverture d'oracles par domaine.
 
 ### P2 - Ternary Core
 
@@ -1019,7 +1020,7 @@ Mise a jour C96: P7/P10 ne calculent plus la non-regression modele sur `replay_b
 3. P4: scaler l'ablation learned memory vs deterministic memory sur anchors long-context synthetiques puis held-out.
 4. P6/P7: afficher partout `repair_loss_before`, `repair_loss_after`, `protected_loss_before`, `protected_loss_after`, delta et convention.
 5. P8: aligner `TernaryKernelDispatcher` inference avec les variants `BitLinear` natifs.
-6. P1: ajouter un audit de couverture oracle/generateur par famille.
+6. P1: elargir algebra/calibration puis ajouter un audit de couverture oracle/generateur par famille.
 7. P9: audit diversity drift replay/sleep court.
 8. P10: renforcer reward-hacking probes.
 9. Training: produire un nouveau sidecar sous le commit courant quand les tests longs seront autorises.

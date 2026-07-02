@@ -18,6 +18,8 @@ Current executable coverage:
 - Oracle quality auditor: `OracleQualityAuditor` probes every default skill for false positives and false negatives using correct reference answers and deliberately wrong answers.
 - Strict exact-output oracles: arithmetic, algebra, long-context anchors, entity tracking and calibration reject embedded or extra-text answers when the task contract says “return only”.
 - Algebra symbolic oracle coverage now includes exact 2x2 linear systems in addition to scalar linear equations and quadratic roots: generated tasks require ordered assignments such as `x=5, y=-1`, metamorphic variants swap/scale equations, anti-metamorphic variants change the RHS, and unlabeled or reordered answers are rejected.
+- Entity tracking now includes transfer-chain tasks that track final object holders across multiple people, distractor people and distractor places; anti-metamorphic variants change the final holder and must be re-verified exactly.
+- Code unit-test tasks now include richer stateful contracts (`dedupe_preserve_order`, `merge_counts`) and the P1 oracle executes visible tests, hidden tests, deterministic checks and no-argument-mutation checks instead of only example matching.
 - Full phase report contract: `docs/CORTEX_PHASE_REPORT_SCHEMA.json` publishes the P1-P10 JSON Schema, and `validate_cortex_phase_report_contract` now gates final full-Cortex training reports before `training_report.json` / `cortex_phase_report.json` are written.
 - First domains: arithmetic, algebra, executable code unit tests, entity tracking, long context exact anchors, instruction following and calibration.
 - Injected defects: number alteration, variable inversion, latent KV corruption, MTP horizon overshoot, activation overquantization, expert misrouting, incomplete certificate and overconfident unknown.
@@ -34,10 +36,11 @@ Evidence:
 - Direct Torch validation in `.venv`: CUDA PyTorch `torch==2.11.0+cu128`, `numpy==2.5.0`, `BitLinear(...)(torch.ones(1, 3)) -> shape (1, 2)` with compression and activation logs recorded.
 - `tests.test_llm_pretraining.LLMPretrainingHarnessTest.test_cortex_phase_report_contract_accepts_complete_full_phase_payload`, `test_published_cortex_phase_report_schema_matches_runtime_contract`, `test_cortex_phase_report_contract_rejects_missing_phase_or_critical_key` and `test_full_cortex_phase_controller_uses_all_modules_during_training`.
 - `tests.test_cortex3.Cortex3Test.test_algebra_oracle_accepts_exact_symbolic_linear_system_assignments` verifies exact ordered 2x2 assignment acceptance and rejection of unlabeled, reordered or wrong assignments.
+- `tests.test_cortex3.Cortex3Test.test_code_unit_test_oracle_checks_hidden_and_property_contracts`, `test_code_unit_test_generator_includes_rich_stateful_templates` and `test_entity_tracking_generator_includes_transfer_chain_oracle` verify hidden/property code contracts and multi-entity transfer tracking.
 
 Remaining Phase 1 hardening:
 
-- Broaden generated grammars for code, algebra, entity tracking and calibration.
+- Continue broadening algebra/calibration grammars and add a domain coverage audit for generated oracle families.
 
 ## Phase 2 - Instrumented Ternary Core
 

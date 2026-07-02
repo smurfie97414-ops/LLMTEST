@@ -191,6 +191,67 @@ class Cortex3Test(unittest.TestCase):
         wrong = CandidateAnswer(str(task.metadata["wrong_impl"]))
         self.assertFalse(skill.verify(task, wrong).passed)
 
+    def test_code_unit_test_oracle_checks_hidden_and_property_contracts(self):
+        skill = CodeUnitTestSkill()
+        task = Task(
+            "code-property-contract",
+            "code_unit_tests",
+            "Write solve(values) that returns a copy of values without mutating it.",
+            "def solve(values):\n    return list(values)\n",
+            {
+                "function_name": "solve",
+                "tests": ((([1, 2],), [1, 2]),),
+                "hidden_tests": ((([3],), [3]),),
+                "properties": ("deterministic", "no_argument_mutation"),
+                "require_hidden_tests": True,
+            },
+        )
+
+        self.assertTrue(skill.verify(task, CandidateAnswer(str(task.expected))).passed)
+        mutating = "def solve(values):\n    values.append(99)\n    return values[:-1]\n"
+        nondeterministic = "def solve(values, _state=[]):\n    _state.append(1)\n    return list(values) if len(_state) == 1 else values[::-1]\n"
+        missing_hidden = Task(
+            "code-property-no-hidden",
+            "code_unit_tests",
+            task.prompt,
+            task.expected,
+            {**dict(task.metadata), "hidden_tests": tuple()},
+        )
+        self.assertFalse(skill.verify(task, CandidateAnswer(mutating)).passed)
+        self.assertFalse(skill.verify(task, CandidateAnswer(nondeterministic)).passed)
+        self.assertFalse(skill.verify(missing_hidden, CandidateAnswer(str(task.expected))).passed)
+
+    def test_code_unit_test_generator_includes_rich_stateful_templates(self):
+        skill = CodeUnitTestSkill()
+        tasks = []
+        for seed in range(8):
+            tasks.extend(skill.generate(12, random.Random(seed)))
+        by_title = {str(task.metadata["title"]): task for task in tasks}
+
+        for title in ("dedupe_preserve_order", "merge_counts"):
+            task = by_title[title]
+            self.assertTrue(skill.verify(task, CandidateAnswer(str(task.expected))).passed)
+            self.assertFalse(skill.verify(task, CandidateAnswer(str(task.metadata["wrong_impl"]))).passed)
+
+    def test_entity_tracking_generator_includes_transfer_chain_oracle(self):
+        skill = EntityTrackingSkill()
+        transfer = None
+        for seed in range(8):
+            for task in skill.generate(12, random.Random(seed)):
+                if task.metadata.get("kind") == "transfer_chain":
+                    transfer = task
+                    break
+            if transfer is not None:
+                break
+
+        self.assertIsNotNone(transfer)
+        assert transfer is not None
+        self.assertTrue(skill.verify(transfer, CandidateAnswer(str(transfer.expected))).passed)
+        self.assertFalse(skill.verify(transfer, CandidateAnswer(str(transfer.metadata["carrier"]))).passed)
+        variant = skill.anti_metamorphic(transfer, random.Random(9))[0]
+        self.assertNotEqual(variant.expected, transfer.expected)
+        self.assertTrue(skill.verify(variant, CandidateAnswer(str(variant.expected))).passed)
+
     def test_anti_metamorphic_variants_change_expected_answers(self):
         for skill in [AlgebraSkill(), EntityTrackingSkill(), CalibrationSkill()]:
             base = skill.generate(1, random.Random(8))[0]

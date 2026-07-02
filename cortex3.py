@@ -5,6 +5,7 @@ import random
 import re
 import time
 from collections import defaultdict
+from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from math import fsum
@@ -685,10 +686,42 @@ class EntityTrackingSkill(SkillSpec):
     name = "entity_tracking"
     people = ["Mira", "Noah", "Lina", "Sofia", "Eli", "Rami"]
     places = ["atelier", "bibliothèque", "laboratoire", "gare", "bureau", "archive"]
+    items = ["badge", "dossier", "cle", "carnet", "prototype"]
 
     def generate(self, n: int, rng: random.Random) -> list[Task]:
         tasks: list[Task] = []
         for idx in range(n):
+            if rng.choice(["location_chain", "transfer_chain"]) == "transfer_chain":
+                starter, carrier, final_holder, distractor = rng.sample(self.people, 4)
+                start_place, carrier_place, distractor_place = rng.sample(self.places, 3)
+                item = rng.choice(self.items)
+                story = (
+                    f"{starter} takes the {item} in {start_place}. "
+                    f"{distractor} mentions {distractor_place}, but never touches the {item}. "
+                    f"{starter} gives the {item} to {carrier}. "
+                    f"{carrier} moves to {carrier_place} with the {item}. "
+                    f"Before the end, {carrier} gives the {item} to {final_holder}."
+                )
+                prompt = f"Read the story and answer only with the person holding the {item} at the end.\n\n{story}"
+                anchors = (
+                    Anchor("person", final_holder, f"entity-{idx}"),
+                    Anchor("object", item, f"entity-{idx}"),
+                )
+                metadata = {
+                    "kind": "transfer_chain",
+                    "starter": starter,
+                    "carrier": carrier,
+                    "final_holder": final_holder,
+                    "final": final_holder,
+                    "distractor": distractor,
+                    "distractor_place": distractor_place,
+                    "item": item,
+                    "start_place": start_place,
+                    "carrier_place": carrier_place,
+                    "ask_kind": "final_holder",
+                }
+                tasks.append(Task(f"entity-transfer-{idx}-{rng.randrange(10**9)}", self.name, prompt, final_holder, metadata, anchors, f"entity-transfer-group-{idx}-{item}"))
+                continue
             person = rng.choice(self.people)
             other = rng.choice([p for p in self.people if p != person])
             start, middle, final, distractor_place = rng.sample(self.places, 4)
@@ -700,7 +733,7 @@ class EntityTrackingSkill(SkillSpec):
             )
             prompt = f"Lis l'histoire et réponds seulement avec le dernier lieu de {person}.\n\n{story}"
             anchors = (Anchor("person", person, f"entity-{idx}"), Anchor("location", final, f"entity-{idx}"))
-            metadata = {"person": person, "other": other, "start": start, "middle": middle, "final": final, "distractor": distractor_place}
+            metadata = {"kind": "location_chain", "person": person, "other": other, "start": start, "middle": middle, "final": final, "distractor": distractor_place, "ask_kind": "final_location"}
             tasks.append(Task(f"entity-{idx}-{rng.randrange(10**9)}", self.name, prompt, final, metadata, anchors, f"entity-group-{idx}-{person}"))
         return tasks
 
@@ -722,6 +755,19 @@ class EntityTrackingSkill(SkillSpec):
 
     def anti_metamorphic(self, task: Task, rng: random.Random) -> list[Task]:
         meta = dict(task.metadata)
+        if str(meta.get("kind")) == "transfer_chain":
+            current = str(meta.get("final_holder", task.expected))
+            new_holder = rng.choice([person for person in self.people if person != current])
+            item = str(meta.get("item", "object"))
+            prompt = f"{task.prompt}\nFinal correction: after all that, {new_holder} takes back the {item}. Answer with the final holder only."
+            return [Task(
+                task.task_id + "-changed-final-holder",
+                self.name,
+                prompt,
+                new_holder,
+                {**meta, "final_holder": new_holder, "final": new_holder, "anti_metamorphic": "changed_final_holder"},
+                (Anchor("person", new_holder, task.task_id), Anchor("object", item, task.task_id)),
+            )]
         new_final = rng.choice([place for place in self.places if place != meta["final"]])
         person = str(meta["person"])
         prompt = f"{task.prompt}\nCorrection finale: après tout cela, {person} retourne dans {new_final}. Réponds avec le dernier lieu réel."
@@ -742,7 +788,23 @@ class EntityTrackingSkill(SkillSpec):
 
 
 _CODE_FENCE_RE = re.compile(r"```(?:python)?\s*(.*?)```", re.IGNORECASE | re.DOTALL)
-_SAFE_BUILTINS = {"abs": abs, "all": all, "any": any, "bool": bool, "enumerate": enumerate, "len": len, "max": max, "min": min, "range": range, "sum": sum}
+_SAFE_BUILTINS = {
+    "abs": abs,
+    "all": all,
+    "any": any,
+    "bool": bool,
+    "dict": dict,
+    "enumerate": enumerate,
+    "len": len,
+    "list": list,
+    "max": max,
+    "min": min,
+    "range": range,
+    "set": set,
+    "sorted": sorted,
+    "sum": sum,
+    "tuple": tuple,
+}
 _BANNED_CODE_TOKENS = ("import ", "__", "open(", "eval(", "exec(", "compile(", "globals(", "locals(", "input(", "breakpoint(")
 
 
@@ -763,6 +825,7 @@ class CodeUnitTestSkill(SkillSpec):
                 "expected": "def solve(x):\n    return x + 1\n",
                 "tests": [((1,), 2), ((-2,), -1), ((0,), 1)],
                 "hidden_tests": [((41,), 42), ((-100,), -99)],
+                "properties": ("deterministic", "no_argument_mutation"),
                 "wrong_impl": "def solve(x):\n    return x\n",
             },
             {
@@ -772,6 +835,7 @@ class CodeUnitTestSkill(SkillSpec):
                 "expected": "def solve(value, low, high):\n    return max(low, min(value, high))\n",
                 "tests": [((5, 1, 10), 5), ((-3, 0, 9), 0), ((12, 0, 9), 9)],
                 "hidden_tests": [((7, 7, 7), 7), ((100, -4, 4), 4)],
+                "properties": ("deterministic", "no_argument_mutation"),
                 "wrong_impl": "def solve(value, low, high):\n    return value\n",
             },
             {
@@ -781,6 +845,7 @@ class CodeUnitTestSkill(SkillSpec):
                 "expected": "def solve(text):\n    return sum(1 for ch in text if ch in 'aeiou')\n",
                 "tests": [(("cortex",), 2), (("rhythm",), 0), (("ledger",), 2)],
                 "hidden_tests": [(("aeiou",), 5), (("bitnet",), 2)],
+                "properties": ("deterministic", "no_argument_mutation"),
                 "wrong_impl": "def solve(text):\n    return len(text)\n",
             },
             {
@@ -790,7 +855,28 @@ class CodeUnitTestSkill(SkillSpec):
                 "expected": "def solve(values):\n    for value in values:\n        if value % 2 == 0:\n            return value\n    return None\n",
                 "tests": [(([1, 3, 4, 6],), 4), (([7, 9],), None), (([2, 3],), 2)],
                 "hidden_tests": [(([5, 8, 10],), 8), (([],), None)],
+                "properties": ("deterministic", "no_argument_mutation"),
                 "wrong_impl": "def solve(values):\n    return values[-1]\n",
+            },
+            {
+                "title": "dedupe_preserve_order",
+                "function_name": "solve",
+                "prompt": "Write Python function solve(values) that returns a new list with duplicates removed while preserving first-seen order. Do not mutate values.",
+                "expected": "def solve(values):\n    seen = set()\n    out = []\n    for value in values:\n        if value not in seen:\n            seen.add(value)\n            out.append(value)\n    return out\n",
+                "tests": [(([3, 1, 3, 2, 1],), [3, 1, 2]), (([],), []), (([1, 1, 1],), [1])],
+                "hidden_tests": [((["b", "a", "b", "c"],), ["b", "a", "c"]), (([0, -1, 0, -1, 2],), [0, -1, 2])],
+                "properties": ("deterministic", "no_argument_mutation"),
+                "wrong_impl": "def solve(values):\n    return sorted(set(values))\n",
+            },
+            {
+                "title": "merge_counts",
+                "function_name": "solve",
+                "prompt": "Write Python function solve(pairs) that receives (name, count) pairs and returns a dict summing counts by name. Do not mutate pairs.",
+                "expected": "def solve(pairs):\n    totals = {}\n    for name, count in pairs:\n        totals[name] = totals.get(name, 0) + count\n    return totals\n",
+                "tests": [(([("a", 2), ("b", 1), ("a", 3)],), {"a": 5, "b": 1}), (([],), {}), (([("x", -1), ("x", 4)],), {"x": 3})],
+                "hidden_tests": [(([("m", 0), ("n", 7), ("m", 5)],), {"m": 5, "n": 7}), (((("q", 1), ("q", 2)),), {"q": 3})],
+                "properties": ("deterministic", "no_argument_mutation"),
+                "wrong_impl": "def solve(pairs):\n    return dict(pairs)\n",
             },
         )
 
@@ -801,7 +887,13 @@ class CodeUnitTestSkill(SkillSpec):
             template = dict(rng.choice(templates))
             visible = "; ".join(f"{template['function_name']}{args} -> {expected!r}" for args, expected in template["tests"])
             prompt = f"{template['prompt']}\nReturn only code. Visible tests: {visible}."
-            metadata = {**template, "tests": tuple(template["tests"]), "hidden_tests": tuple(template["hidden_tests"])}
+            metadata = {
+                **template,
+                "tests": tuple(template["tests"]),
+                "hidden_tests": tuple(template["hidden_tests"]),
+                "properties": tuple(template.get("properties", ("deterministic", "no_argument_mutation"))),
+                "require_hidden_tests": bool(template.get("hidden_tests")),
+            }
             tasks.append(Task(f"code-{idx}-{template['title']}-{rng.randrange(10**9)}", self.name, prompt, template["expected"], metadata, group_id=f"code-group-{idx}-{template['title']}"))
         return tasks
 
@@ -839,7 +931,7 @@ class CodeUnitTestSkill(SkillSpec):
             self.name,
             prompt,
             expected,
-            {**meta, "tests": tests, "hidden_tests": tuple(), "anti_metamorphic": "changed_code_contract"},
+            {**meta, "tests": tests, "hidden_tests": tuple(), "require_hidden_tests": False, "anti_metamorphic": "changed_code_contract"},
         )]
 
     def verify(self, task: Task, answer: CandidateAnswer) -> VerificationCaseResult:
@@ -853,14 +945,27 @@ class CodeUnitTestSkill(SkillSpec):
             fn = namespace.get(str(task.metadata["function_name"]))
             if not callable(fn):
                 return _result(task, answer, False, 0.0, f"function {task.metadata['function_name']!r} not defined")
-            tests = tuple(task.metadata.get("tests", ())) + tuple(task.metadata.get("hidden_tests", ()))
+            visible_tests = tuple(task.metadata.get("tests", ()))
+            hidden_tests = tuple(task.metadata.get("hidden_tests", ()))
+            if bool(task.metadata.get("require_hidden_tests", False)) and not hidden_tests:
+                return _result(task, answer, False, 0.0, "missing required hidden code tests")
+            tests = visible_tests + hidden_tests
+            properties = set(str(item) for item in task.metadata.get("properties", ()))
             for args, expected in tests:
-                actual = fn(*args)
+                call_args = deepcopy(args)
+                frozen_before = repr(call_args)
+                actual = fn(*call_args)
                 if actual != expected:
                     return _result(task, answer, False, 0.0, f"unit test failed for args={args!r}: expected {expected!r}, got {actual!r}")
+                if "no_argument_mutation" in properties and repr(call_args) != frozen_before:
+                    return _result(task, answer, False, 0.0, f"property failed for args={args!r}: function mutated input arguments")
+                if "deterministic" in properties:
+                    second_actual = fn(*deepcopy(args))
+                    if second_actual != actual:
+                        return _result(task, answer, False, 0.0, f"property failed for args={args!r}: function is not deterministic")
         except Exception as exc:
             return _result(task, answer, False, 0.0, f"code execution failed: {exc!r}")
-        return _result(task, answer, True, 1.0, "all visible and hidden unit tests passed")
+        return _result(task, answer, True, 1.0, "all visible, hidden and property unit tests passed")
 
 
 class CalibrationSkill(SkillSpec):
