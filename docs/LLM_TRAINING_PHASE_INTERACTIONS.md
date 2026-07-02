@@ -2,7 +2,7 @@
 
 Etat long-run verifie le 2026-07-01 depuis le run local `runs/cortex3-c4-cuda-large-fullphases-20260630_133618`.
 
-Etat court actualise le 2026-07-02: les corrections C87/C88/C89/C90/C91/C92 ont ete validees par tests courts sans relancer de run long. C87 branche les circuits compiles Frontier dans la memoire cognitive learned avec retention latente et utility credit. C88 aligne P8 sur le vrai dispatch P2 execute par `BitLinear` apres forward. C89 oblige P8 a utiliser un binding P4 pour les circuits compiles meme quand sa memoire est interne. C90 lie les certificats exact-match P5/P8 au target de tache au lieu de la reponse produite. C91 force le FSP P8 generique a comparer ses contrats aux tokens observes depuis la reponse reelle. C92 force les patchs P10 `compiled_frontier` a etre entraines depuis le FastSolve certifie avec binding P4, output-goal et certificat P5 au lieu d'une cible de reference generique.
+Etat court actualise le 2026-07-02: les corrections C87/C88/C89/C90/C91/C92/C93 ont ete validees par tests courts sans relancer de run long. C87 branche les circuits compiles Frontier dans la memoire cognitive learned avec retention latente et utility credit. C88 aligne P8 sur le vrai dispatch P2 execute par `BitLinear` apres forward. C89 oblige P8 a utiliser un binding P4 pour les circuits compiles meme quand sa memoire est interne. C90 lie les certificats exact-match P5/P8 au target de tache au lieu de la reponse produite. C91 force le FSP P8 generique a comparer ses contrats aux tokens observes depuis la reponse reelle. C92 force les patchs P10 `compiled_frontier` a etre entraines depuis le FastSolve certifie avec binding P4, output-goal et certificat P5 au lieu d'une cible de reference generique. C93 ajoute un vrai chemin oracle/certificat SymPy pour les systemes lineaires 2x2 exacts.
 
 Ce document explique comment l'architecture Cortex-3 complete agit pendant un entrainement LLM reel. Le but est de separer clairement trois niveaux :
 
@@ -51,6 +51,7 @@ Preuve post-integration des deux nouvelles briques :
 - `tests.test_future_contracts` et `tests.test_inference` prouvent qu'un bloc FSP observe incomplet est rejete et que le P8 generique publie `observed_tokens_source=answer_text` au lieu d'un auto-gate sur `contract.token_ids`.
 - `test_full_cortex_phase_controller_uses_all_modules_during_training` a ete relance apres correction du build CUDA local et passe en test court garde; il verifie les nouveaux champs de retention/utility compiled-circuit et l'architecture P1-P10.
 - `test_full_cortex_phase_controller_uses_all_modules_during_training` verifie maintenant aussi que l'application modele P10 `compiled_frontier` et son artefact replay portent `training_contract_source=compiled_frontier_fastsolve`, le checksum du certificat `compiled_circuit`, le binding memoire P4, la fidelite memoire, l'output-goal accepte et le gate held-out.
+- `tests.test_cortex3`, `tests.test_certificates`, `test_full_cortex_phase_controller_uses_all_modules_during_training` et `test_cortex_phase_state_survives_checkpoint_resume` verifient maintenant que `certificate_symbolic_system_solver_events` est produit, checkpointé et restaure.
 
 Le long run devra produire un nouveau sidecar sous le commit de cette integration pour remplacer l'ancien audit `22/22` par l'audit courant plus strict incluant `native_ternary_cuda_kernel` et `future_output_goal_contracts`.
 
@@ -240,7 +241,7 @@ Correspondance runtime :
 | Future Contract / FSP | `FutureContractEngine` + observed tokens | P3 replay + contract decisions |
 | Adaptive Multi-Token Decoding | MTP horizons + inference route + model-backed adaptive block gate | audit `adaptive_multi_token_decoding`, `inference_model_backed_adaptive_mtp_*` |
 | Latent Reasoning Workspace | `LatentReasoningWorkspace` multi-step + binding cert head | audits `latent_reasoning_workspace`, P5 et checkpoint |
-| Certificate Generator | `CertificateHead` + verifier + `sympy_symbolic` | P5 certificate verification, symbolic solver replay |
+| Certificate Generator | `CertificateHead` + verifier + `sympy_symbolic` | P5 certificate verification, quadratic + 2x2 symbolic solver replay |
 | Frontier FastSolve persistant | `FrontierCircuitRegistry` + `CompiledFrontierAgent` | registre restaure, binding P4 restaure, output-goal et certificat compile |
 | Hierarchical Dynamic Verifier | `DynamicSkillVerifier` | P1 + no phase errors |
 | Attribute Regression | `CausalAttributionEngine` | P6 |

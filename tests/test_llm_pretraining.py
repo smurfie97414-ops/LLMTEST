@@ -3643,6 +3643,7 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             self.assertGreater(influence["certificate_algebra_tool_events"], 0)
             self.assertGreater(influence["certificate_code_hidden_property_events"], 0)
             self.assertGreater(influence["certificate_symbolic_solver_events"], 0)
+            self.assertGreater(influence["certificate_symbolic_system_solver_events"], 0)
             self.assertGreater(influence["input_anchor_observations"], 0)
             self.assertGreater(influence["input_anchor_count"], 0)
             self.assertEqual(influence["input_anchor_fidelity_failures"], 0)
@@ -4313,6 +4314,7 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 self.assertGreater(checkpoint["cortex_phase_state"]["certificate_algebra_tool_events"], 0)
                 self.assertGreater(checkpoint["cortex_phase_state"]["certificate_code_hidden_property_events"], 0)
                 self.assertGreater(checkpoint["cortex_phase_state"]["certificate_symbolic_solver_events"], 0)
+                self.assertGreater(checkpoint["cortex_phase_state"]["certificate_symbolic_system_solver_events"], 0)
                 self.assertGreater(checkpoint["cortex_phase_state"]["input_anchor_observations"], 0)
                 self.assertGreater(checkpoint["cortex_phase_state"]["input_anchor_count"], 0)
                 self.assertEqual(checkpoint["cortex_phase_state"]["input_anchor_fidelity_failures"], 0)
@@ -4519,6 +4521,7 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 self.assertGreater(sidecar["cortex_phase_state_summary"]["certificate_algebra_tool_events"], 0)
                 self.assertGreater(sidecar["cortex_phase_state_summary"]["certificate_code_hidden_property_events"], 0)
                 self.assertGreater(sidecar["cortex_phase_state_summary"]["certificate_symbolic_solver_events"], 0)
+                self.assertGreater(sidecar["cortex_phase_state_summary"]["certificate_symbolic_system_solver_events"], 0)
                 self.assertGreater(sidecar["cortex_phase_state_summary"]["input_anchor_observations"], 0)
                 self.assertGreater(sidecar["cortex_phase_state_summary"]["input_anchor_count"], 0)
                 self.assertEqual(sidecar["cortex_phase_state_summary"]["input_anchor_fidelity_failures"], 0)
@@ -4701,6 +4704,10 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             self.assertGreaterEqual(
                 resumed_influence["certificate_symbolic_solver_events"],
                 first_influence["certificate_symbolic_solver_events"],
+            )
+            self.assertGreaterEqual(
+                resumed_influence["certificate_symbolic_system_solver_events"],
+                first_influence["certificate_symbolic_system_solver_events"],
             )
             self.assertGreaterEqual(
                 resumed_influence["input_anchor_observations"],

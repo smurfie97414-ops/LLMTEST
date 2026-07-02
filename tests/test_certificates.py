@@ -333,6 +333,87 @@ class CertificatesTest(unittest.TestCase):
         self.assertFalse(sympy_symbolic_tool(wrong_roots).passed)
         self.assertFalse(sympy_symbolic_tool(tampered_claims).passed)
 
+    def test_symbolic_algebra_certificate_uses_sympy_solver_for_linear_system(self):
+        state = _latent_state()
+        task = Task(
+            "task-symbolic-system",
+            "algebra",
+            "Solve exactly for x and y: 2x + 3y = 7; -x + 4y = -9. Return only assignments.",
+            "x=5, y=-1",
+            {
+                "kind": "linear_system_2x2",
+                "variables": ("x", "y"),
+                "coefficients": ((2, 3), (-1, 4)),
+                "rhs": (7, -9),
+                "solution": {"x": 5, "y": -1},
+            },
+        )
+        claims, tool, tool_args, anchors = certificate_contract_for_task(task, "x=5, y=-1")
+        cert = build_certificate(
+            certificate_id="cert-symbolic-system",
+            task_id=task.task_id,
+            skill=task.skill,
+            certificate_type=CertificateType.ALGEBRA,
+            answer="x=5, y=-1",
+            claims=claims,
+            uncertainty=0.03,
+            latent_state=state,
+            anchors=anchors,
+            tool=tool,
+            tool_args=tool_args,
+        )
+
+        self.assertEqual(tool, "sympy_symbolic")
+        self.assertEqual(tool_args["system_kind"], "linear_system_2x2")
+        self.assertEqual(tool_args["expected_solution"], {"x": "5", "y": "-1"})
+        self.assertEqual(claims["symbolic_solver"], "sympy")
+        self.assertEqual(claims["solution_map"], {"x": "5", "y": "-1"})
+        self.assertTrue(CertificateVerifier().verify(cert, state).passed)
+        self.assertTrue(sympy_symbolic_tool(cert).passed)
+
+        wrong_assignment = ShortCertificate(
+            certificate_id=cert.certificate_id,
+            task_id=cert.task_id,
+            skill=cert.skill,
+            certificate_type=cert.certificate_type,
+            answer="x=5, y=0",
+            claims=cert.claims,
+            uncertainty=cert.uncertainty,
+            latent_state_checksum=cert.latent_state_checksum,
+            anchors=cert.anchors,
+            tool=cert.tool,
+            tool_args=cert.tool_args,
+        )
+        unlabeled_assignment = ShortCertificate(
+            certificate_id=cert.certificate_id,
+            task_id=cert.task_id,
+            skill=cert.skill,
+            certificate_type=cert.certificate_type,
+            answer="5, -1",
+            claims=cert.claims,
+            uncertainty=cert.uncertainty,
+            latent_state_checksum=cert.latent_state_checksum,
+            anchors=cert.anchors,
+            tool=cert.tool,
+            tool_args=cert.tool_args,
+        )
+        tampered_claims = ShortCertificate(
+            certificate_id=cert.certificate_id,
+            task_id=cert.task_id,
+            skill=cert.skill,
+            certificate_type=cert.certificate_type,
+            answer=cert.answer,
+            claims={**dict(cert.claims), "solution_map": {"x": "5", "y": "0"}},
+            uncertainty=cert.uncertainty,
+            latent_state_checksum=cert.latent_state_checksum,
+            anchors=cert.anchors,
+            tool=cert.tool,
+            tool_args=cert.tool_args,
+        )
+        self.assertFalse(sympy_symbolic_tool(wrong_assignment).passed)
+        self.assertFalse(sympy_symbolic_tool(unlabeled_assignment).passed)
+        self.assertFalse(sympy_symbolic_tool(tampered_claims).passed)
+
     def test_code_certificate_requires_hidden_tests_and_properties_when_declared(self):
         state = _latent_state()
         cert = build_certificate(

@@ -356,6 +356,26 @@ def _parse_exact_symbolic_answer(text: str) -> tuple[sp.Expr, ...] | None:
     return _canonical_symbolic_values(values) if values else None
 
 
+def _parse_exact_symbolic_assignments(text: str, variables: Sequence[str]) -> dict[str, sp.Expr] | None:
+    normalized = text.strip().replace("−", "-")
+    if len(normalized) >= 2 and normalized[0] in "([{" and normalized[-1] in ")]}":
+        normalized = normalized[1:-1].strip()
+    if not normalized:
+        return None
+    expected_variables = tuple(str(variable) for variable in variables)
+    assignments: dict[str, sp.Expr] = {}
+    for token in normalized.split(","):
+        token = token.strip()
+        match = re.fullmatch(r"([A-Za-z]\w{0,15})\s*=\s*([-+]?\d+(?:/\d+)?)", token)
+        if match is None:
+            return None
+        variable = match.group(1)
+        if variable not in expected_variables or variable in assignments:
+            return None
+        assignments[variable] = sp.simplify(sp.Rational(match.group(2)))
+    return assignments if tuple(assignments) == expected_variables else None
+
+
 def _quadratic_symbolic_roots(a: int, b: int, c: int, variable: str) -> tuple[sp.Expr, ...]:
     if not _SYMBOLIC_VARIABLE_RE.fullmatch(variable):
         raise ValueError(f"invalid symbolic variable {variable!r}")
@@ -396,6 +416,75 @@ def _symbolic_quadratic_claims(a: int, b: int, c: int, variable: str) -> tuple[d
         "coefficients": (a, b, c),
         "variable": variable,
         "expected_roots": solution_set,
+        "require_substitution_checks": True,
+    }
+    return claims, tool_args
+
+
+def _linear_system_solution(
+    coefficients: Sequence[Sequence[int]],
+    rhs: Sequence[int],
+    variables: Sequence[str],
+) -> dict[str, sp.Expr]:
+    variable_tuple = tuple(str(variable) for variable in variables)
+    if len(variable_tuple) != 2 or len(set(variable_tuple)) != 2:
+        raise ValueError("linear system certificate requires two distinct variables")
+    if any(_SYMBOLIC_VARIABLE_RE.fullmatch(variable) is None for variable in variable_tuple):
+        raise ValueError(f"invalid symbolic variables {variable_tuple!r}")
+    matrix_rows = tuple(tuple(int(value) for value in row) for row in coefficients)
+    rhs_tuple = tuple(int(value) for value in rhs)
+    if len(matrix_rows) != 2 or any(len(row) != 2 for row in matrix_rows) or len(rhs_tuple) != 2:
+        raise ValueError("linear system certificate requires a 2x2 matrix and 2-vector rhs")
+    matrix = sp.Matrix(matrix_rows)
+    if matrix.det() == 0:
+        raise ValueError("linear system is singular")
+    solution = tuple(sp.simplify(value) for value in matrix.LUsolve(sp.Matrix(rhs_tuple)))
+    if any(value.is_rational is not True for value in solution):
+        raise ValueError("linear system certificate requires exact rational values")
+    return {variable: solution[index] for index, variable in enumerate(variable_tuple)}
+
+
+def _symbolic_linear_system_claims(
+    coefficients: Sequence[Sequence[int]],
+    rhs: Sequence[int],
+    variables: Sequence[str],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    matrix_rows = tuple(tuple(int(value) for value in row) for row in coefficients)
+    rhs_tuple = tuple(int(value) for value in rhs)
+    variable_tuple = tuple(str(variable) for variable in variables)
+    solution = _linear_system_solution(matrix_rows, rhs_tuple, variable_tuple)
+    solution_map = {variable: str(solution[variable]) for variable in variable_tuple}
+    substitution_checks = tuple(
+        {
+            "equation_index": index,
+            "substitution": " + ".join(
+                f"{matrix_rows[index][column]}*({solution[variable_tuple[column]]})"
+                for column in range(2)
+            ),
+            "lhs": str(sum(matrix_rows[index][column] * solution[variable_tuple[column]] for column in range(2))),
+            "rhs": str(rhs_tuple[index]),
+            "residual": "0",
+        }
+        for index in range(2)
+    )
+    claims = {
+        "variables": variable_tuple,
+        "equations": tuple(
+            f"{matrix_rows[index][0]}*{variable_tuple[0]} + {matrix_rows[index][1]}*{variable_tuple[1]} = {rhs_tuple[index]}"
+            for index in range(2)
+        ),
+        "constraint": "exact symbolic 2x2 linear system",
+        "symbolic_solver": "sympy",
+        "solution_map": solution_map,
+        "substitution_checks": substitution_checks,
+        "verification": "SymPy solves the linear system and checks every equation by substitution",
+    }
+    tool_args = {
+        "system_kind": "linear_system_2x2",
+        "variables": variable_tuple,
+        "coefficient_matrix": matrix_rows,
+        "rhs": rhs_tuple,
+        "expected_solution": solution_map,
         "require_substitution_checks": True,
     }
     return claims, tool_args
@@ -445,6 +534,55 @@ def sympy_symbolic_tool(certificate: ShortCertificate) -> ToolVerification:
     if certificate.certificate_type != CertificateType.ALGEBRA:
         return ToolVerification(tool_name, False, 0.0, "certificate type is not algebra")
     args = dict(certificate.tool_args)
+    if str(args.get("system_kind", "")) == "linear_system_2x2":
+        try:
+            variables = tuple(str(variable) for variable in args.get("variables", ()))
+            coefficients = tuple(tuple(int(value) for value in row) for row in args.get("coefficient_matrix", ()))
+            rhs = tuple(int(value) for value in args.get("rhs", ()))
+            solution = _linear_system_solution(coefficients, rhs, variables)
+        except Exception as exc:
+            return ToolVerification(tool_name, False, 0.0, f"invalid symbolic linear system args: {exc!r}")
+
+        expected_solution = {
+            str(variable): str(value)
+            for variable, value in dict(args.get("expected_solution", {})).items()
+        }
+        solution_map = {variable: str(solution[variable]) for variable in variables}
+        if expected_solution != solution_map:
+            return ToolVerification(tool_name, False, 0.0, "expected solution map does not match SymPy solution")
+        answer_solution = _parse_exact_symbolic_assignments(certificate.answer, variables)
+        if answer_solution is None:
+            return ToolVerification(tool_name, False, 0.0, "answer is not an exact symbolic assignment set")
+        answer_map = {variable: str(answer_solution[variable]) for variable in variables}
+        if answer_map != solution_map:
+            return ToolVerification(tool_name, False, 0.0, f"expected solution {solution_map}, got {answer_map}")
+
+        claims = dict(certificate.claims)
+        if str(claims.get("symbolic_solver")) != "sympy":
+            return ToolVerification(tool_name, False, 0.0, "missing SymPy solver claim")
+        if {str(key): str(value) for key, value in dict(claims.get("solution_map", {})).items()} != solution_map:
+            return ToolVerification(tool_name, False, 0.0, "claimed solution map does not match SymPy solution")
+        checks = tuple(dict(item) for item in claims.get("substitution_checks", ()))
+        if bool(args.get("require_substitution_checks", False)) and len(checks) != len(rhs):
+            return ToolVerification(tool_name, False, 0.0, "missing linear-system substitution checks")
+        checked_indices: set[int] = set()
+        for check in checks:
+            try:
+                index = int(check.get("equation_index"))
+            except Exception:
+                return ToolVerification(tool_name, False, 0.0, "substitution check missing equation index")
+            if index < 0 or index >= len(rhs) or index in checked_indices:
+                return ToolVerification(tool_name, False, 0.0, "invalid or duplicate substitution check equation index")
+            lhs = sp.simplify(
+                sum(coefficients[index][column] * solution[variables[column]] for column in range(2))
+            )
+            if lhs != rhs[index] or str(check.get("rhs")) != str(rhs[index]) or str(check.get("residual")) != "0":
+                return ToolVerification(tool_name, False, 0.0, f"equation {index} substitution check failed")
+            checked_indices.add(index)
+        if checked_indices != set(range(len(rhs))):
+            return ToolVerification(tool_name, False, 0.0, "substitution checks do not cover every equation")
+        return ToolVerification(tool_name, True, 1.0, "SymPy linear-system certificate verified")
+
     try:
         degree = int(args.get("degree", 0))
         coefficients = tuple(int(value) for value in args.get("coefficients", ()))
@@ -928,6 +1066,18 @@ def certificate_contract_for_task(task: Task, answer: str, certificate_type: Cer
     if cert_type == CertificateType.ALGEBRA:
         meta = dict(task.metadata)
         kind = str(meta.get("kind", "linear"))
+        if kind == "linear_system_2x2":
+            claims, tool_args = _symbolic_linear_system_claims(
+                meta["coefficients"],
+                meta["rhs"],
+                meta["variables"],
+            )
+            return (
+                claims,
+                "sympy_symbolic",
+                tool_args,
+                tuple(task.anchors),
+            )
         if kind in {"quadratic", "symbolic", "symbolic_quadratic"}:
             a = int(meta["a"])
             b = int(meta["b"])

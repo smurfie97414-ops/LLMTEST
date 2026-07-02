@@ -184,6 +184,7 @@ CORTEX_PHASE_REPORT_REQUIRED_TRAINING_INFLUENCE_KEYS: tuple[str, ...] = (
     "certificate_algebra_tool_events",
     "certificate_code_hidden_property_events",
     "certificate_symbolic_solver_events",
+    "certificate_symbolic_system_solver_events",
     "model_certificate_head_verified_events",
     "latent_workspace_forward_events",
     "latent_workspace_step_events",
@@ -4498,7 +4499,8 @@ def _cortex_architecture_audit_from_summary(summary: Mapping[str, Any]) -> dict[
         and integer("model_certificate_head_verified_events") > 0
         and integer("certificate_algebra_tool_events") > 0
         and integer("certificate_code_hidden_property_events") > 0
-        and integer("certificate_symbolic_solver_events") > 0,
+        and integer("certificate_symbolic_solver_events") > 0
+        and integer("certificate_symbolic_system_solver_events") > 0,
         {
             "P5": phase_count("P5"),
             "certificate_head_forward_events": integer("certificate_head_forward_events"),
@@ -4506,8 +4508,9 @@ def _cortex_architecture_audit_from_summary(summary: Mapping[str, Any]) -> dict[
             "certificate_algebra_tool_events": integer("certificate_algebra_tool_events"),
             "certificate_code_hidden_property_events": integer("certificate_code_hidden_property_events"),
             "certificate_symbolic_solver_events": integer("certificate_symbolic_solver_events"),
+            "certificate_symbolic_system_solver_events": integer("certificate_symbolic_system_solver_events"),
         },
-        "certificate generator/head must materialize a verified model-head certificate plus multi-step algebra, SymPy symbolic solver and richer code tool contracts in training",
+        "certificate generator/head must materialize a verified model-head certificate plus multi-step algebra, SymPy quadratic and linear-system symbolic solvers, and richer code tool contracts in training",
     )
     add(
         "hierarchical_dynamic_verifier",
@@ -4979,7 +4982,8 @@ def _cortex_phase_deliverable_audit_from_summary(summary: Mapping[str, Any]) -> 
         and count("latent_workspace_certificate_binding_events") > 0
         and count("certificate_algebra_tool_events") > 0
         and count("certificate_code_hidden_property_events") > 0
-        and count("certificate_symbolic_solver_events") > 0,
+        and count("certificate_symbolic_solver_events") > 0
+        and count("certificate_symbolic_system_solver_events") > 0,
         {
             "certificate_efficiency_events": count("certificate_efficiency_events"),
             "delatentization_probe_events": count("delatentization_probe_events"),
@@ -4993,8 +4997,9 @@ def _cortex_phase_deliverable_audit_from_summary(summary: Mapping[str, Any]) -> 
             "certificate_algebra_tool_events": count("certificate_algebra_tool_events"),
             "certificate_code_hidden_property_events": count("certificate_code_hidden_property_events"),
             "certificate_symbolic_solver_events": count("certificate_symbolic_solver_events"),
+            "certificate_symbolic_system_solver_events": count("certificate_symbolic_system_solver_events"),
         },
-        "latent proof state must include an explicit multi-step workspace, verified model-head certificate, random de-latentization, multi-step algebra, SymPy symbolic solver and richer code tool verification",
+        "latent proof state must include an explicit multi-step workspace, verified model-head certificate, random de-latentization, multi-step algebra, SymPy quadratic and linear-system solvers, and richer code tool verification",
     )
     add(
         "P6",
@@ -7641,6 +7646,7 @@ class CortexTrainingPhaseController:
             "certificate_algebra_tool_events": int(self.integration_counts.get("certificate_algebra_tool_events", 0)),
             "certificate_code_hidden_property_events": int(self.integration_counts.get("certificate_code_hidden_property_events", 0)),
             "certificate_symbolic_solver_events": int(self.integration_counts.get("certificate_symbolic_solver_events", 0)),
+            "certificate_symbolic_system_solver_events": int(self.integration_counts.get("certificate_symbolic_system_solver_events", 0)),
             "input_anchor_observations": int(self.input_anchor_observations),
             "input_anchor_count": int(self.input_anchor_count),
             "input_anchor_fidelity_failures": int(self.input_anchor_fidelity_failures),
@@ -7998,6 +8004,7 @@ class CortexTrainingPhaseController:
             "certificate_algebra_tool_events": int(self.integration_counts.get("certificate_algebra_tool_events", 0)),
             "certificate_code_hidden_property_events": int(self.integration_counts.get("certificate_code_hidden_property_events", 0)),
             "certificate_symbolic_solver_events": int(self.integration_counts.get("certificate_symbolic_solver_events", 0)),
+            "certificate_symbolic_system_solver_events": int(self.integration_counts.get("certificate_symbolic_system_solver_events", 0)),
             "model_certificate_head_events": int(self.integration_counts.get("model_certificate_head_events", 0)),
             "model_certificate_head_verified_events": int(self.integration_counts.get("model_certificate_head_verified_events", 0)),
             "model_certificate_head_latent_checksum_events": int(self.integration_counts.get("model_certificate_head_latent_checksum_events", 0)),
@@ -8375,6 +8382,48 @@ class CortexTrainingPhaseController:
                 tool_args=symbolic_tool_args,
             )
             symbolic_verification = self.certificate_verifier.verify(symbolic_certificate, symbolic_state)
+            symbolic_system_task = Task(
+                f"phase-p5-symbolic-system-{step}",
+                "algebra",
+                "Solve exactly for x and y: 2x + 3y = 7; -x + 4y = -9. Return only assignments as 'x=..., y=...'.",
+                "x=5, y=-1",
+                {
+                    "kind": "linear_system_2x2",
+                    "variables": ("x", "y"),
+                    "coefficients": ((2, 3), (-1, 4)),
+                    "rhs": (7, -9),
+                    "solution": {"x": 5, "y": -1},
+                },
+            )
+            symbolic_system_answer = "x=5, y=-1"
+            (
+                symbolic_system_claims,
+                symbolic_system_tool,
+                symbolic_system_tool_args,
+                symbolic_system_anchors,
+            ) = certificate_contract_for_task(symbolic_system_task, symbolic_system_answer)
+            symbolic_system_state = LatentProofState(
+                state_id=f"llm-phase-{step}-symbolic-system",
+                task_id=symbolic_system_task.task_id,
+                skill=symbolic_system_task.skill,
+                tensor=torch.tensor([[float(step), 2.0, 5.0, -1.0]], dtype=torch.float32),
+                latent_steps=4,
+                visible_reasoning_tokens=0,
+            )
+            symbolic_system_certificate = build_certificate(
+                certificate_id=f"llm-cert-symbolic-system-{step}",
+                task_id=symbolic_system_task.task_id,
+                skill=symbolic_system_task.skill,
+                certificate_type=CertificateType.ALGEBRA,
+                answer=symbolic_system_answer,
+                claims=symbolic_system_claims,
+                uncertainty=0.03,
+                latent_state=symbolic_system_state,
+                anchors=symbolic_system_anchors,
+                tool=symbolic_system_tool,
+                tool_args=symbolic_system_tool_args,
+            )
+            symbolic_system_verification = self.certificate_verifier.verify(symbolic_system_certificate, symbolic_system_state)
             code_source = "def solve(x):\n    return x + 1\n"
             code_task = Task(
                 f"phase-p5-code-{step}",
@@ -8422,16 +8471,19 @@ class CortexTrainingPhaseController:
                 self._record_error("P5", ValueError(f"rich code certificate failed: {code_verification.reason}"))
             if not symbolic_verification.passed:
                 self._record_error("P5", ValueError(f"SymPy symbolic certificate failed: {symbolic_verification.reason}"))
+            if not symbolic_system_verification.passed:
+                self._record_error("P5", ValueError(f"SymPy linear-system certificate failed: {symbolic_system_verification.reason}"))
             efficiency = evaluate_certificate_efficiency(
                 "slow visible reasoning " * 32,
                 certificate,
                 verification,
                 reference_uncertainty=0.05,
             )
-            self._count("certificate_tool_verification_events", 4)
+            self._count("certificate_tool_verification_events", 5)
             self._count("certificate_algebra_tool_events")
             self._count("certificate_code_hidden_property_events")
-            self._count("certificate_symbolic_solver_events")
+            self._count("certificate_symbolic_solver_events", 2)
+            self._count("certificate_symbolic_system_solver_events")
             self._count("certificate_efficiency_events")
             self._touch("P5")
             audit["certificate"] = {
@@ -8442,6 +8494,8 @@ class CortexTrainingPhaseController:
                 "algebra_certificate": algebra_certificate.to_dict(),
                 "symbolic_verified": symbolic_verification.to_dict(),
                 "symbolic_certificate": symbolic_certificate.to_dict(),
+                "symbolic_system_verified": symbolic_system_verification.to_dict(),
+                "symbolic_system_certificate": symbolic_system_certificate.to_dict(),
                 "code_verified": code_verification.to_dict(),
                 "code_certificate": code_certificate.to_dict(),
                 "delatentization_probe": asdict(probe),
@@ -8462,7 +8516,9 @@ class CortexTrainingPhaseController:
                 self.bit_ledger.add_certificate(code_certificate.to_dict())
             if symbolic_verification.passed:
                 self.bit_ledger.add_certificate(symbolic_certificate.to_dict())
-            if verification.passed and algebra_verification.passed and symbolic_verification.passed and code_verification.passed:
+            if symbolic_system_verification.passed:
+                self.bit_ledger.add_certificate(symbolic_system_certificate.to_dict())
+            if verification.passed and algebra_verification.passed and symbolic_verification.passed and symbolic_system_verification.passed and code_verification.passed:
                 self._add_verified_phase_replay(
                     "P5",
                     algebra_task,
@@ -8470,10 +8526,12 @@ class CortexTrainingPhaseController:
                     metadata={
                         "certificate_id": algebra_certificate.certificate_id,
                         "symbolic_certificate_id": symbolic_certificate.certificate_id,
+                        "symbolic_system_certificate_id": symbolic_system_certificate.certificate_id,
                         "code_certificate_id": code_certificate.certificate_id,
                         "reduction_ratio": efficiency.reduction_ratio,
                         "multi_step_algebra": True,
                         "sympy_symbolic_solver": True,
+                        "sympy_linear_system_solver": True,
                         "rich_code_tests": True,
                     },
                 )
@@ -8486,6 +8544,17 @@ class CortexTrainingPhaseController:
                         "solver": "sympy",
                         "symbolic_quadratic": True,
                         "roots": tuple(symbolic_certificate.claims.get("solution_set", ())),
+                    },
+                )
+                self._add_verified_phase_replay(
+                    "P5",
+                    symbolic_system_task,
+                    answer=CandidateAnswer(symbolic_system_answer, confidence=0.97, certificate=symbolic_system_certificate.to_dict()),
+                    metadata={
+                        "certificate_id": symbolic_system_certificate.certificate_id,
+                        "solver": "sympy",
+                        "symbolic_linear_system": True,
+                        "solution_map": dict(symbolic_system_certificate.claims.get("solution_map", {})),
                     },
                 )
         except Exception as exc:
@@ -9036,6 +9105,7 @@ class CortexTrainingPhaseController:
                 "certificate_algebra_tool_events": int(self.integration_counts.get("certificate_algebra_tool_events", 0)),
                 "certificate_code_hidden_property_events": int(self.integration_counts.get("certificate_code_hidden_property_events", 0)),
                 "certificate_symbolic_solver_events": int(self.integration_counts.get("certificate_symbolic_solver_events", 0)),
+                "certificate_symbolic_system_solver_events": int(self.integration_counts.get("certificate_symbolic_system_solver_events", 0)),
                 "model_certificate_head_events": int(self.integration_counts.get("model_certificate_head_events", 0)),
                 "model_certificate_head_verified_events": int(self.integration_counts.get("model_certificate_head_verified_events", 0)),
                 "model_certificate_head_latent_checksum_events": int(self.integration_counts.get("model_certificate_head_latent_checksum_events", 0)),
@@ -9227,6 +9297,7 @@ class CortexTrainingPhaseController:
                     "certificate_algebra_tool_events": int(self.integration_counts.get("certificate_algebra_tool_events", 0)),
                     "certificate_code_hidden_property_events": int(self.integration_counts.get("certificate_code_hidden_property_events", 0)),
                     "certificate_symbolic_solver_events": int(self.integration_counts.get("certificate_symbolic_solver_events", 0)),
+                    "certificate_symbolic_system_solver_events": int(self.integration_counts.get("certificate_symbolic_system_solver_events", 0)),
                     "model_certificate_head_events": int(self.integration_counts.get("model_certificate_head_events", 0)),
                     "model_certificate_head_verified_events": int(self.integration_counts.get("model_certificate_head_verified_events", 0)),
                     "model_certificate_head_latent_checksum_events": int(self.integration_counts.get("model_certificate_head_latent_checksum_events", 0)),
@@ -9400,6 +9471,7 @@ class CortexTrainingPhaseController:
                     "certificate_algebra_tool_events": int(self.integration_counts.get("certificate_algebra_tool_events", 0)),
                     "certificate_code_hidden_property_events": int(self.integration_counts.get("certificate_code_hidden_property_events", 0)),
                     "certificate_symbolic_solver_events": int(self.integration_counts.get("certificate_symbolic_solver_events", 0)),
+                    "certificate_symbolic_system_solver_events": int(self.integration_counts.get("certificate_symbolic_system_solver_events", 0)),
                     "model_certificate_head_events": int(self.integration_counts.get("model_certificate_head_events", 0)),
                     "model_certificate_head_verified_events": int(self.integration_counts.get("model_certificate_head_verified_events", 0)),
                     "model_certificate_head_latent_checksum_events": int(self.integration_counts.get("model_certificate_head_latent_checksum_events", 0)),

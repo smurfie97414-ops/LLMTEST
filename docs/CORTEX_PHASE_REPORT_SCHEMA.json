@@ -148,6 +148,7 @@
         "certificate_algebra_tool_events",
         "certificate_code_hidden_property_events",
         "certificate_symbolic_solver_events",
+        "certificate_symbolic_system_solver_events",
         "model_certificate_head_verified_events",
         "latent_workspace_forward_events",
         "latent_workspace_step_events",

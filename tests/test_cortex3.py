@@ -58,6 +58,27 @@ class Cortex3Test(unittest.TestCase):
         self.assertFalse(skill.verify(task, CandidateAnswer("-2, 4")).passed)
         self.assertFalse(skill.verify(task, CandidateAnswer("x = -2, 3")).passed)
 
+    def test_algebra_oracle_accepts_exact_symbolic_linear_system_assignments(self):
+        skill = AlgebraSkill()
+        task = Task(
+            "system-oracle",
+            "algebra",
+            "Solve exactly for x and y: 2x + 3y = 7; -x + 4y = -9. Return only assignments.",
+            "x=5, y=-1",
+            {
+                "kind": "linear_system_2x2",
+                "variables": ("x", "y"),
+                "coefficients": ((2, 3), (-1, 4)),
+                "rhs": (7, -9),
+                "solution": {"x": 5, "y": -1},
+            },
+        )
+
+        self.assertTrue(skill.verify(task, CandidateAnswer("x=5, y=-1")).passed)
+        self.assertFalse(skill.verify(task, CandidateAnswer("5, -1")).passed)
+        self.assertFalse(skill.verify(task, CandidateAnswer("y=-1, x=5")).passed)
+        self.assertFalse(skill.verify(task, CandidateAnswer("x=5, y=0")).passed)
+
     def test_reference_beats_corrupted_candidate(self):
         verifier = DynamicSkillVerifier([ArithmeticSkill(), LongContextAnchorSkill(), InstructionSkill()])
         ref = verifier.evaluate(ReferenceRuleAgent(), n_per_skill=3, seed=0)

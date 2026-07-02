@@ -17,6 +17,7 @@ Current executable coverage:
 - Persisted run artifacts: `cortex3_reporting.write_cycle_run` writes versioned `summary.json`, `report.md` and optional `fault_matrix.json`; per-skill reports include all cases, not only failures.
 - Oracle quality auditor: `OracleQualityAuditor` probes every default skill for false positives and false negatives using correct reference answers and deliberately wrong answers.
 - Strict exact-output oracles: arithmetic, algebra, long-context anchors, entity tracking and calibration reject embedded or extra-text answers when the task contract says “return only”.
+- Algebra symbolic oracle coverage now includes exact 2x2 linear systems in addition to scalar linear equations and quadratic roots: generated tasks require ordered assignments such as `x=5, y=-1`, metamorphic variants swap/scale equations, anti-metamorphic variants change the RHS, and unlabeled or reordered answers are rejected.
 - Full phase report contract: `docs/CORTEX_PHASE_REPORT_SCHEMA.json` publishes the P1-P10 JSON Schema, and `validate_cortex_phase_report_contract` now gates final full-Cortex training reports before `training_report.json` / `cortex_phase_report.json` are written.
 - First domains: arithmetic, algebra, executable code unit tests, entity tracking, long context exact anchors, instruction following and calibration.
 - Injected defects: number alteration, variable inversion, latent KV corruption, MTP horizon overshoot, activation overquantization, expert misrouting, incomplete certificate and overconfident unknown.
@@ -32,6 +33,7 @@ Evidence:
 - `.\.venv\Scripts\python.exe -m py_compile cortex3.py cortex3_analysis.py cortex3_cycle.py cortex3_ledgers.py cortex3_phases.py cortex3_selection.py cortex3_reporting.py cortex3_ternary.py cortex3_future.py cortex3_memory.py cortex3_certificates.py cortex3_attribution.py cortex3_regrowth.py tools\run_cycle_report.py`
 - Direct Torch validation in `.venv`: CUDA PyTorch `torch==2.11.0+cu128`, `numpy==2.5.0`, `BitLinear(...)(torch.ones(1, 3)) -> shape (1, 2)` with compression and activation logs recorded.
 - `tests.test_llm_pretraining.LLMPretrainingHarnessTest.test_cortex_phase_report_contract_accepts_complete_full_phase_payload`, `test_published_cortex_phase_report_schema_matches_runtime_contract`, `test_cortex_phase_report_contract_rejects_missing_phase_or_critical_key` and `test_full_cortex_phase_controller_uses_all_modules_during_training`.
+- `tests.test_cortex3.Cortex3Test.test_algebra_oracle_accepts_exact_symbolic_linear_system_assignments` verifies exact ordered 2x2 assignment acceptance and rejection of unlabeled, reordered or wrong assignments.
 
 Remaining Phase 1 hardening:
 
@@ -131,7 +133,7 @@ Current executable coverage:
 - `CertificateVerifier` checks uncertainty bounds, latent checksum and tool-backed verification.
 - `CertificateVerifier` accepts explicitly calibrated high-uncertainty certificates, so `UNKNOWN` can stay low-confidence without being treated as proof corruption.
 - `RandomDelatentizer` samples latent dimensions deterministically for audit probes and detects tampering.
-- Tool-backed checks include arithmetic, exact match, model-token certificate consistency, anchor fidelity, multi-step linear algebra, SymPy-backed symbolic quadratic algebra, richer executable code unit tests and compiled-circuit contracts.
+- Tool-backed checks include arithmetic, exact match, model-token certificate consistency, anchor fidelity, multi-step linear algebra, SymPy-backed symbolic quadratic algebra, SymPy-backed exact 2x2 linear systems, richer executable code unit tests and compiled-circuit contracts.
 - `CertificateType.COMPILED_CIRCUIT`, `build_compiled_circuit_certificate` and the `compiled_circuit` tool bind compiled skill reuse to a canonical contract checksum, source/frontier task lineage, DSV pass state, runtime output verification and answer checksum.
 - `ProofCarryingAnswer` converts answer + certificate + uncertainty into `CandidateAnswer` with a serializable latent proof payload.
 - `ProofCarryingGenerator` connects a calibrated certificate head to DSV-compatible answer generation and verifies every emitted certificate.
@@ -139,12 +141,13 @@ Current executable coverage:
 - `write_cycle_run` can persist short certificates into `summary.json`.
 - `UltraFastInferenceEngine` treats proof-carrying certificate verification as a gate; a tampered latent proof makes `InferenceResult.passed` false and zeroes verified capability per cost.
 - `CompiledFrontierAgent` attaches a verified P5 compiled-circuit certificate to every selected Frontier circuit answer; the compiled-circuit contract now also binds the P3 output-goal contract id, obligations, pass state and violations. The LLM phase report persists `frontier_compiled_contract_verified`, `frontier_output_goal_contract_passed` and the contract checksum for accepted P7 repairs.
-- `CertificateType.ALGEBRA` now has two strict tool paths. `algebra_linear` requires a multi-step proof for integer linear equations: subtract constant, divide by coefficient and substitute the result back into the equation. `sympy_symbolic` handles quadratic symbolic tasks through SymPy, verifies exact root sets and substitution checks, and is required by the full LLM P5 audit through `certificate_symbolic_solver_events`. `code_tests` separates visible and hidden tests, can require hidden tests, and checks deterministic/no-argument-mutation properties when requested. The full LLM P5 audit fails the deliverable if linear algebra, symbolic algebra or rich code verification rejects.
+- `CertificateType.ALGEBRA` now has two strict tool paths. `algebra_linear` requires a multi-step proof for integer linear equations: subtract constant, divide by coefficient and substitute the result back into the equation. `sympy_symbolic` handles quadratic symbolic tasks and exact 2x2 linear systems through SymPy, verifies exact root/assignment sets and substitution checks, and is required by the full LLM P5 audit through `certificate_symbolic_solver_events` plus `certificate_symbolic_system_solver_events`. `code_tests` separates visible and hidden tests, can require hidden tests, and checks deterministic/no-argument-mutation properties when requested. The full LLM P5 audit fails the deliverable if linear algebra, symbolic algebra/system solving or rich code verification rejects.
+- `tests.test_certificates.CertificatesTest.test_symbolic_algebra_certificate_uses_sympy_solver_for_linear_system` verifies the 2x2 certificate path accepts a correct assignment and rejects wrong, unlabeled or tampered solution-map claims.
 - `tools/run_cycle_report.py` writes a trained proof-carrying certificate smoke by default; `--skip-certificates` disables it.
 
 Remaining:
 
-- Expand tool verification to broader symbolic domains beyond the current exact quadratic SymPy path, plus additional specialized solvers/oracles for non-algebra tasks.
+- Expand tool verification to broader symbolic domains beyond the current exact quadratic and 2x2 linear-system SymPy paths, plus additional specialized solvers/oracles for non-algebra tasks.
 - Compare workspace-enabled vs workspace-disabled training on held-out reasoning traces once long tests are authorized.
 - Benchmark certificate-token savings and semantic reliability of model-head certificates over held-out reasoning traces.
 

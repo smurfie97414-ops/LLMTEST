@@ -262,6 +262,30 @@ def _exact_int_tuple(text: str) -> tuple[int, ...] | None:
     return tuple(sorted(values)) if values else None
 
 
+def _format_assignment_solution(solution: Mapping[str, Any], variables: Sequence[str]) -> str:
+    return ", ".join(f"{variable}={int(solution[variable])}" for variable in variables)
+
+
+def _parse_exact_assignment_solution(text: str, variables: Sequence[str]) -> dict[str, int] | None:
+    normalized = text.strip().replace("−", "-")
+    if len(normalized) >= 2 and normalized[0] in "([{" and normalized[-1] in ")]}":
+        normalized = normalized[1:-1].strip()
+    if not normalized:
+        return None
+    expected_variables = tuple(str(variable) for variable in variables)
+    assignments: dict[str, int] = {}
+    for token in normalized.split(","):
+        token = token.strip()
+        match = re.fullmatch(r"([A-Za-z]\w{0,15})\s*=\s*([-+]?\d+)", token)
+        if match is None:
+            return None
+        variable, value = match.group(1), int(match.group(2))
+        if variable not in expected_variables or variable in assignments:
+            return None
+        assignments[variable] = value
+    return assignments if tuple(assignments) == expected_variables else None
+
+
 @dataclass(frozen=True)
 class OracleQualityProbeResult:
     skill: str
@@ -458,18 +482,78 @@ class AlgebraSkill(SkillSpec):
         tasks: list[Task] = []
         variables = ["x", "y", "z"]
         for idx in range(n):
+            if rng.choice(["linear", "linear", "linear_system_2x2"]) == "linear_system_2x2":
+                x_var, y_var = rng.sample(variables, 2)
+                solution = {x_var: rng.randint(-12, 12), y_var: rng.randint(-12, 12)}
+                while True:
+                    coefficients = (
+                        (rng.choice([i for i in range(-8, 9) if i != 0]), rng.choice([i for i in range(-8, 9) if i != 0])),
+                        (rng.choice([i for i in range(-8, 9) if i != 0]), rng.choice([i for i in range(-8, 9) if i != 0])),
+                    )
+                    determinant = coefficients[0][0] * coefficients[1][1] - coefficients[0][1] * coefficients[1][0]
+                    if determinant != 0:
+                        break
+                rhs = (
+                    coefficients[0][0] * solution[x_var] + coefficients[0][1] * solution[y_var],
+                    coefficients[1][0] * solution[x_var] + coefficients[1][1] * solution[y_var],
+                )
+                expected = _format_assignment_solution(solution, (x_var, y_var))
+                prompt = (
+                    f"Solve the exact 2x2 system for {x_var} and {y_var}: "
+                    f"{coefficients[0][0]}{x_var} + {coefficients[0][1]}{y_var} = {rhs[0]}; "
+                    f"{coefficients[1][0]}{x_var} + {coefficients[1][1]}{y_var} = {rhs[1]}. "
+                    f"Return only assignments as '{x_var}=..., {y_var}=...'."
+                )
+                metadata = {
+                    "kind": "linear_system_2x2",
+                    "variables": (x_var, y_var),
+                    "coefficients": coefficients,
+                    "rhs": rhs,
+                    "solution": solution,
+                }
+                tasks.append(Task(f"algebra-system-{idx}-{rng.randrange(10**9)}", self.name, prompt, expected, metadata, group_id=f"algebra-system-group-{idx}-{expected}"))
+                continue
             variable = rng.choice(variables)
-            solution = rng.randint(-25, 25)
+            solution_int = rng.randint(-25, 25)
             a = rng.choice([i for i in range(-12, 13) if i not in (0, 1, -1)])
             b = rng.randint(-80, 80)
-            c = a * solution + b
+            c = a * solution_int + b
             prompt = f"Solve exactly for {variable}: {a}{variable} + {b} = {c}. Return only the integer value of {variable}."
-            metadata = {"variable": variable, "solution": solution, "a": a, "b": b, "c": c, "kind": "linear"}
-            tasks.append(Task(f"algebra-{idx}-{rng.randrange(10**9)}", self.name, prompt, solution, metadata, group_id=f"algebra-group-{idx}-{solution}"))
+            metadata = {"variable": variable, "solution": solution_int, "a": a, "b": b, "c": c, "kind": "linear"}
+            tasks.append(Task(f"algebra-{idx}-{rng.randrange(10**9)}", self.name, prompt, solution_int, metadata, group_id=f"algebra-group-{idx}-{solution_int}"))
         return tasks
 
     def metamorphic(self, task: Task, rng: random.Random) -> list[Task]:
         meta = dict(task.metadata)
+        kind = str(meta.get("kind", "linear"))
+        if kind == "linear_system_2x2":
+            coefficients = tuple(tuple(int(value) for value in row) for row in meta["coefficients"])
+            rhs = tuple(int(value) for value in meta["rhs"])
+            variables = tuple(str(variable) for variable in meta["variables"])
+            swapped = Task(
+                task.task_id + "-swap-equations",
+                self.name,
+                f"Same system with equations swapped. Solve for {variables[0]} and {variables[1]}: "
+                f"{coefficients[1][0]}{variables[0]} + {coefficients[1][1]}{variables[1]} = {rhs[1]}; "
+                f"{coefficients[0][0]}{variables[0]} + {coefficients[0][1]}{variables[1]} = {rhs[0]}. "
+                f"Return only assignments as '{variables[0]}=..., {variables[1]}=...'.",
+                task.expected,
+                {**meta, "coefficients": (coefficients[1], coefficients[0]), "rhs": (rhs[1], rhs[0]), "metamorphic": "swap_equations"},
+                group_id=task.group_id,
+            )
+            scale = rng.choice([2, -2, 3])
+            scaled = Task(
+                task.task_id + "-scale-first-equation",
+                self.name,
+                f"Equivalent system after scaling the first equation by {scale}. Solve for {variables[0]} and {variables[1]}: "
+                f"{coefficients[0][0] * scale}{variables[0]} + {coefficients[0][1] * scale}{variables[1]} = {rhs[0] * scale}; "
+                f"{coefficients[1][0]}{variables[0]} + {coefficients[1][1]}{variables[1]} = {rhs[1]}. "
+                f"Return only assignments as '{variables[0]}=..., {variables[1]}=...'.",
+                task.expected,
+                {**meta, "coefficients": ((coefficients[0][0] * scale, coefficients[0][1] * scale), coefficients[1]), "rhs": (rhs[0] * scale, rhs[1]), "metamorphic": "scale_equation"},
+                group_id=task.group_id,
+            )
+            return [swapped, scaled]
         a, b, c = int(meta["a"]), int(meta["b"]), int(meta["c"])
         solution = int(meta["solution"])
         variable = str(meta["variable"])
@@ -495,6 +579,30 @@ class AlgebraSkill(SkillSpec):
 
     def anti_metamorphic(self, task: Task, rng: random.Random) -> list[Task]:
         meta = dict(task.metadata)
+        kind = str(meta.get("kind", "linear"))
+        if kind == "linear_system_2x2":
+            coefficients = tuple(tuple(int(value) for value in row) for row in meta["coefficients"])
+            variables = tuple(str(variable) for variable in meta["variables"])
+            base_solution = {str(key): int(value) for key, value in dict(meta["solution"]).items()}
+            changed = {
+                variables[0]: base_solution[variables[0]] + rng.choice([-3, -2, 2, 3]),
+                variables[1]: base_solution[variables[1]] + rng.choice([-3, -2, 2, 3]),
+            }
+            rhs = (
+                coefficients[0][0] * changed[variables[0]] + coefficients[0][1] * changed[variables[1]],
+                coefficients[1][0] * changed[variables[0]] + coefficients[1][1] * changed[variables[1]],
+            )
+            expected = _format_assignment_solution(changed, variables)
+            return [Task(
+                task.task_id + "-changed-system-solution",
+                self.name,
+                f"Changed-answer variant. Solve for {variables[0]} and {variables[1]}: "
+                f"{coefficients[0][0]}{variables[0]} + {coefficients[0][1]}{variables[1]} = {rhs[0]}; "
+                f"{coefficients[1][0]}{variables[0]} + {coefficients[1][1]}{variables[1]} = {rhs[1]}. "
+                f"Return only assignments as '{variables[0]}=..., {variables[1]}=...'.",
+                expected,
+                {**meta, "rhs": rhs, "solution": changed, "anti_metamorphic": "changed_system_rhs"},
+            )]
         a, b = int(meta["a"]), int(meta["b"])
         variable = str(meta["variable"])
         new_solution = int(meta["solution"]) + rng.choice([-3, -2, 2, 3])
@@ -510,6 +618,34 @@ class AlgebraSkill(SkillSpec):
     def verify(self, task: Task, answer: CandidateAnswer) -> VerificationCaseResult:
         meta = dict(task.metadata)
         kind = str(meta.get("kind", "linear"))
+        if kind == "linear_system_2x2":
+            variables = tuple(str(variable) for variable in meta.get("variables", ()))
+            parsed = _parse_exact_assignment_solution(answer.text, variables)
+            if parsed is None:
+                return _result(task, answer, False, 0.0, "answer is not an exact ordered assignment set")
+            try:
+                coefficients = tuple(tuple(int(value) for value in row) for row in meta["coefficients"])
+                rhs = tuple(int(value) for value in meta["rhs"])
+                matrix = sp.Matrix(coefficients)
+                if matrix.det() == 0:
+                    return _result(task, answer, False, 0.0, "linear system is singular")
+                solution_values = matrix.LUsolve(sp.Matrix(rhs))
+                expected = {
+                    variables[index]: sp.simplify(solution_values[index])
+                    for index in range(len(variables))
+                }
+                if any(value.is_integer is not True for value in expected.values()):
+                    return _result(task, answer, False, 0.0, "linear system does not have an all-integer solution")
+            except Exception as exc:
+                return _result(task, answer, False, 0.0, f"invalid linear system task: {exc!r}")
+            passed = all(parsed[variable] == int(expected[variable]) for variable in variables)
+            return _result(
+                task,
+                answer,
+                passed,
+                1.0 if passed else 0.0,
+                "linear system solved symbolically" if passed else f"expected {_format_assignment_solution({k: int(v) for k, v in expected.items()}, variables)}, got {answer.text.strip()!r}",
+            )
         if kind in {"quadratic", "symbolic", "symbolic_quadratic"}:
             parsed_roots = _exact_int_tuple(answer.text)
             if parsed_roots is None:
@@ -1086,6 +1222,14 @@ class CorruptedCompressedAgent:
         if task.skill == "arithmetic":
             return CandidateAnswer(str(int(task.expected) + self.arithmetic_bias), confidence=0.82, cost=CostTrace(generated_tokens=1, weight_bits_read=32))
         if task.skill == "algebra":
+            if str(task.metadata.get("kind", "")) == "linear_system_2x2":
+                variables = tuple(str(variable) for variable in task.metadata.get("variables", ()))
+                solution = {str(key): int(value) for key, value in dict(task.metadata.get("solution", {})).items()}
+                if variables and solution:
+                    corrupted = dict(solution)
+                    corrupted[variables[0]] = int(corrupted[variables[0]]) - self.arithmetic_bias
+                    text = _format_assignment_solution(corrupted, variables)
+                    return CandidateAnswer(text, confidence=0.80, cost=CostTrace(generated_tokens=max(1, len(text.split())), activation_bits=4, weight_bits_read=32))
             return CandidateAnswer(str(int(task.expected) - self.arithmetic_bias), confidence=0.80, cost=CostTrace(generated_tokens=1, activation_bits=4, weight_bits_read=32))
         if task.skill == "long_context_anchor":
             text = str(task.expected)
