@@ -209,6 +209,38 @@ class RecursiveImprovementTest(unittest.TestCase):
 
         self.assertTrue(evaluation.reward_hacking_flags)
 
+    def test_gate_rejects_cost_accounting_manipulation(self):
+        verifier = _verifier()
+        proposal = ImprovementProposal(
+            "cost-hack",
+            "repair arithmetic while hiding runtime cost",
+            ProposalKind.COMPRESSION,
+            ("arithmetic",),
+            expected_quality_delta=0.2,
+            expected_cost_delta=-1.0,
+            expected_robustness_delta=0.1,
+            risk=0.1,
+            diversity_tags=("compression", "arithmetic"),
+            patch_payload={"cost_hacking": True},
+        )
+        sandbox = SandboxTrainer().train(proposal, baseline_agent=CorruptedCompressedAgent(), reference_agent=ReferenceRuleAgent())
+        evaluation = DynamicEvaluator(verifier).evaluate(
+            proposal,
+            sandbox,
+            baseline_agent=CorruptedCompressedAgent(),
+            reference_agent=ReferenceRuleAgent(),
+            protected_skills=(),
+            seed=6,
+            n_per_skill=1,
+        )
+        decision = PatchAcceptanceGate().decide(evaluation, RecursiveImprovementEngine(verifier).archive, protected_skills=())
+
+        self.assertGreater(evaluation.quality_delta, 0.0)
+        self.assertLess(evaluation.cost_delta, 0.0)
+        self.assertTrue(any("cost" in flag for flag in evaluation.reward_hacking_flags))
+        self.assertFalse(decision.accepted)
+        self.assertEqual(decision.reason, "reward hacking detected")
+
     def test_gate_rejects_calibration_regression(self):
         verifier = _verifier()
         proposal = ImprovementProposal(

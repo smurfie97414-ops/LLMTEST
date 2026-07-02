@@ -8,6 +8,8 @@ C97 renforce P1 sans run long: `CodeUnitTestSkill` genere et verifie maintenant 
 
 C98 renforce P4 sans run long: les credits `MemoryUtilityCredit` issus de `learned_memory*` ne servent plus seulement au prior/loss, ils biaisent aussi la selection future de `CognitiveMemory.reconstruct` pour preferer les segments exact/latent deja utiles et declasser les segments appris mais inutiles, tout en gardant l'inclusion dure des ancres requises.
 
+C99 renforce P10 sans run long: `RewardHackingDetector` detecte maintenant les manipulations de comptabilite de cout et les reponses non vides/passees a cout effectif nul, donc une proposition ne peut plus fabriquer une amelioration Pareto en cachant son cout d'execution.
+
 Ce document explique comment l'architecture Cortex-3 complete agit pendant un entrainement LLM reel. Le but est de separer clairement trois niveaux :
 
 - **present dans le code** : un module existe.
@@ -662,7 +664,7 @@ P10 :
 3. evalue qualite, cout, robustesse ;
 4. verifie protected skills ;
 5. detecte calibration regression ;
-6. detecte reward hacking ;
+6. detecte reward hacking et cost-accounting hacking ;
 7. verifie diversite/collapse ;
 8. accepte ou rejette ;
 9. archive la decision ;

@@ -301,7 +301,7 @@ Current executable coverage:
 - `SandboxTrainer` first applies proposals as in-memory sandbox agents; it records no touched repo files and creates rollback tokens for verifier-gated evaluation.
 - `ProposalPatchedAgent` simulates repair, protected-skill degradation, reward-hacking behavior and calibration regression for verifier-gated evaluation.
 - `DynamicEvaluator` compares baseline vs sandbox agents on main suites and anti/metamorphic robustness suites, then measures quality delta, cost delta, robustness delta, calibration delta, protected losses and cross-skill collapse flags.
-- `RewardHackingDetector` flags declared overfitting, robustness-suite collapse and overconfident failures on affected skills.
+- `RewardHackingDetector` flags declared overfitting, robustness-suite collapse, overconfident failures on affected skills, declared cost-accounting manipulation and zero-effective-cost passed non-empty answers on main or robustness suites.
 - `DiversityPreserver` prevents one proposal kind from dominating the evolutionary archive.
 - `PatchAcceptanceGate` requires Pareto improvement, no protected-skill regression, no calibration regression, no reward hacking and no diversity/collapse failure.
 - `EvolutionaryArchive` records accepted and rejected decisions with proposal lineage, full sandbox/evaluation payloads and kind counts; it can save/load the complete archive as `archive.json` instead of only restoring counters.
@@ -327,6 +327,7 @@ Evidence:
 - `tests.test_recursive_improvement.RecursiveImprovementTest.test_engine_prioritizes_accepted_frontier_repair_proposals` verifies that a Frontier repair becomes the first P10 proposal and is accepted under the normal gates.
 - `tests.test_recursive_improvement.RecursiveImprovementTest.test_persistent_archive_round_trips_full_decisions_and_rollbacks` verifies full accepted/rejected decisions, evaluation reports and rollback tokens round-trip through persistent archive files.
 - `tests.test_recursive_improvement.RecursiveImprovementTest.test_persistent_archive_rejects_missing_full_evaluation_reports` and `test_persistent_archive_rejects_missing_rollback_file_for_accepted_records` verify P10 refuses incomplete persistent evidence.
+- `tests.test_recursive_improvement.RecursiveImprovementTest.test_gate_rejects_cost_accounting_manipulation` verifies that an otherwise Pareto-looking sandbox repair is rejected when it hides runtime cost through zero-cost passed answers.
 - `tests/test_llm_pretraining.py::LLMPretrainingHarnessTest::test_cortex_phase_state_survives_checkpoint_resume` verifies that P1-P10 replay state plus P2/P3 internal ledgers persist through a checkpoint resume and keep influencing optimizer steps, including multi-generation recursive-improvement events and evolved child proposals.
 - The same LLM resume test now also verifies that a fresh independent `CortexTrainingPhaseController` with a different run directory reloads the shared P10 archive from `cortex_improvement_archive_dir` without using the checkpoint.
 - `tests.test_llm_pretraining.LLMPretrainingHarnessTest.test_full_cortex_phase_controller_uses_all_modules_during_training` verifies the applied recursive model patch has `proposal_kind == "compiled_frontier"`, carries the Frontier repair payload, and records at least two recursive-improvement generations with evolved proposal events.
