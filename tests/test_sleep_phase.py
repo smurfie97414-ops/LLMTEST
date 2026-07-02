@@ -1,6 +1,7 @@
 import json
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from cortex3 import CandidateAnswer, CorruptedCompressedAgent, DynamicSkillVerifier, ReferenceRuleAgent, Task, default_skill_specs
@@ -9,6 +10,7 @@ from cortex3_frontier import CompiledFrontierAgent, FrontierCircuitRegistry, Fro
 from cortex3_reporting import write_cycle_run
 from cortex3_sleep import (
     AntiCollapseFilter,
+    AntiCollapseDecision,
     ExampleOrigin,
     FailureReplayBuffer,
     LocalExternalProvenanceAdapter,
@@ -246,6 +248,12 @@ class SleepPhaseTest(unittest.TestCase):
         self.assertGreater(circuit.training["sleep_accepted_examples"], 0)
         self.assertGreater(circuit.training["sleep_support_examples"], 0)
         self.assertTrue(circuit.training["sleep_source_example_ids"])
+        self.assertTrue(circuit.training["sleep_filter_accepted"])
+        self.assertTrue(circuit.training["sleep_diversity_ok"])
+        self.assertTrue(circuit.training["sleep_calibration_ok"])
+        self.assertIn("origin_counts", circuit.training["sleep_filter_metrics"])
+        self.assertGreaterEqual(circuit.training["sleep_source_min_verification_level"], 0)
+        self.assertLessEqual(circuit.training["sleep_source_max_contamination_risk"], 0.35)
         self.assertTrue(circuit.heldout["gate_passed"])
         self.assertEqual(circuit.heldout["passed"], circuit.heldout["total"])
         self.assertEqual(registry.compiled_skills(), (circuit.skill,))
@@ -257,6 +265,38 @@ class SleepPhaseTest(unittest.TestCase):
         self.assertTrue(answer.certificate["frontier_heldout_gate_passed"])
         self.assertTrue(answer.certificate["frontier_compiled_contract_verified"])
         self.assertTrue(verifier.oracle_registry.verify(task.skill, task, answer).passed)
+
+    def test_sleep_frontier_compilation_refuses_failed_anti_collapse_gate(self):
+        verifier = _verifier()
+        report = CortexCycle(verifier).run(ReferenceRuleAgent(), CorruptedCompressedAgent(), seed=6, n_per_skill=1)
+        sleep = SleepPhaseConsolidator(verifier).ingest_cycle(report, seed=6)
+        blocked_decision = AntiCollapseDecision(
+            False,
+            ("projected calibration gap increases",),
+            sleep.accepted_examples,
+            sleep.rejected_examples,
+            sleep.filter_decision.metrics,
+            False,
+        )
+        blocked_sleep = replace(
+            sleep,
+            filter_decision=blocked_decision,
+            diversity_ok=False,
+            calibration_ok=False,
+        )
+        registry = FrontierCircuitRegistry()
+
+        frontier = FrontierSkillDiscovery(verifier).compile_sleep_consolidation(
+            blocked_sleep,
+            seed=6,
+            max_skills=1,
+            epochs=20,
+            registry=registry,
+        )
+
+        self.assertFalse(frontier.passed)
+        self.assertEqual(frontier.circuits, ())
+        self.assertEqual(registry.compiled_skills(), ())
 
     def test_real_exogenous_reservoir_and_reporting_persist_sleep_phase(self):
         verifier = _verifier()

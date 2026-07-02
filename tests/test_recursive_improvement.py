@@ -153,6 +153,56 @@ class RecursiveImprovementTest(unittest.TestCase):
         self.assertEqual(proposal.patch_payload["task_id"], failure.task.task_id)
         self.assertTrue(improvement.decisions[0].accepted, improvement.decisions[0].reason)
 
+    def test_sleep_frontier_proposals_require_anti_collapse_proof(self):
+        base_circuit = {
+            "passed": True,
+            "skill": "arithmetic",
+            "frontier_task_ids": ("sleep-arith-1",),
+            "heldout_task_ids": ("sleep-arith-heldout",),
+            "source_failure_ids": ("sleep-example-1",),
+            "training": {
+                "source_kind": "sleep_consolidation",
+                "sleep_accepted_examples": 1,
+                "sleep_support_examples": 2,
+                "sleep_source_example_ids": ("sleep-example-1",),
+                "sleep_source_origins": ("failure_replay",),
+                "sleep_source_synthetic_count": 0,
+                "sleep_source_real_count": 1,
+                "sleep_source_max_contamination_risk": 0.1,
+                "sleep_source_min_verification_level": 2,
+                "sleep_filter_accepted": True,
+                "sleep_filter_reasons": (),
+                "sleep_filter_metrics": {"origin_counts": {"failure_replay": 1}},
+                "sleep_diversity_ok": True,
+                "sleep_calibration_ok": True,
+                "sleep_rare_skill_gain": 0.5,
+                "sleep_calibration_gap_delta": -0.01,
+            },
+            "heldout": {
+                "total": 1,
+                "passed": 1,
+                "gate_passed": True,
+                "pass_rate": 1.0,
+                "aggregate_score": 1.0,
+            },
+            "dsv": {"passed": 1, "total": 1},
+        }
+
+        accepted = ProposalGenerator().from_sleep_frontier_circuits((base_circuit,))
+        rejected = ProposalGenerator().from_sleep_frontier_circuits((
+            {**base_circuit, "training": {**base_circuit["training"], "sleep_filter_accepted": False}},
+        ))
+
+        self.assertEqual(len(accepted), 1)
+        payload = accepted[0].patch_payload
+        self.assertEqual(payload["action"], "compile_sleep_consolidation_frontier")
+        self.assertTrue(payload["sleep_filter_accepted"])
+        self.assertTrue(payload["sleep_diversity_ok"])
+        self.assertTrue(payload["sleep_calibration_ok"])
+        self.assertEqual(payload["sleep_source_origins"], ("failure_replay",))
+        self.assertEqual(payload["sleep_filter_metrics"]["origin_counts"]["failure_replay"], 1)
+        self.assertEqual(rejected, ())
+
     def test_gate_rejects_protected_skill_regression(self):
         verifier = _verifier()
         proposal = ImprovementProposal(

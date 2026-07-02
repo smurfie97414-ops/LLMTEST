@@ -631,6 +631,7 @@ P9 construit :
 - filtre anti-collapse ;
 - schedule de consolidation ;
 - promotion des familles coherentes acceptees en circuits Frontier `sleep_consolidation` ;
+- gate dur anti-collapse/diversite/calibration avant toute compilation Frontier sleep ;
 - verification held-out separee ;
 - FastSolve immediat via `CompiledFrontierAgent` ;
 - proposition P10 `compiled_frontier` issue du sommeil.
@@ -649,7 +650,7 @@ P9 consolide les signaux de P1/P6/P7/P8/P10, les spans reels du dataloader et le
 
 ### Impact Apprentissage
 
-P9 est une memoire d'entrainement verifiee et une source de compilation. Elle transforme les corrections lentes, les exemples tool/metamorphiques, les spans reels verifies du corpus et les sources externes oracle-verifiees en exemples causalement entrainables, puis transforme une famille coherente en competence FastSolve held-out gated. Dans le checkpoint, P9 conserve ses replays, ses pools sleep, les exemples reservoir `REAL_EXOGENOUS` marques `from_llm_input_batch` ou `external_provenance_adapter`, ses rapports `sleep_frontier_reports`, les rapports `external_provenance_reports`, les compteurs `sleep_frontier_*` et les circuits dans `frontier_registry`.
+P9 est une memoire d'entrainement verifiee et une source de compilation. Elle transforme les corrections lentes, les exemples tool/metamorphiques, les spans reels verifies du corpus et les sources externes oracle-verifiees en exemples causalement entrainables, puis transforme une famille coherente en competence FastSolve held-out gated seulement si le gate anti-collapse global a accepte le batch. La preuve anti-collapse, les origines, la contamination max et le niveau minimal de verification restent dans le contrat de training du circuit puis dans le payload P10 `compiled_frontier`. Dans le checkpoint, P9 conserve ses replays, ses pools sleep, les exemples reservoir `REAL_EXOGENOUS` marques `from_llm_input_batch` ou `external_provenance_adapter`, ses rapports `sleep_frontier_reports`, les rapports `external_provenance_reports`, les compteurs `sleep_frontier_*` et les circuits dans `frontier_registry`.
 
 ## Phase 10 - Recursive Improvement
 

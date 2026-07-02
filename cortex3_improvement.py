@@ -413,6 +413,12 @@ class ProposalGenerator:
             training = dict(payload.get("training") or {})
             if str(training.get("source_kind", "")) != "sleep_consolidation":
                 continue
+            if not (
+                bool(training.get("sleep_filter_accepted", False))
+                and bool(training.get("sleep_diversity_ok", False))
+                and bool(training.get("sleep_calibration_ok", False))
+            ):
+                continue
             heldout = dict(payload.get("heldout") or {})
             heldout_total = int(heldout.get("total", 0) or 0)
             heldout_passed = int(heldout.get("passed", 0) or 0)
@@ -447,6 +453,18 @@ class ProposalGenerator:
                     "frontier_task_ids": task_ids,
                     "heldout_task_ids": tuple(str(item) for item in payload.get("heldout_task_ids", ())),
                     "sleep_source_example_ids": tuple(str(item) for item in training.get("sleep_source_example_ids", ())),
+                    "sleep_source_origins": tuple(str(item) for item in training.get("sleep_source_origins", ())),
+                    "sleep_source_synthetic_count": int(training.get("sleep_source_synthetic_count", 0) or 0),
+                    "sleep_source_real_count": int(training.get("sleep_source_real_count", 0) or 0),
+                    "sleep_source_max_contamination_risk": float(training.get("sleep_source_max_contamination_risk", 0.0) or 0.0),
+                    "sleep_source_min_verification_level": int(training.get("sleep_source_min_verification_level", 0) or 0),
+                    "sleep_filter_accepted": bool(training.get("sleep_filter_accepted", False)),
+                    "sleep_filter_reasons": tuple(str(item) for item in training.get("sleep_filter_reasons", ())),
+                    "sleep_filter_metrics": dict(training.get("sleep_filter_metrics") or {}),
+                    "sleep_diversity_ok": bool(training.get("sleep_diversity_ok", False)),
+                    "sleep_calibration_ok": bool(training.get("sleep_calibration_ok", False)),
+                    "sleep_rare_skill_gain": float(training.get("sleep_rare_skill_gain", 0.0) or 0.0),
+                    "sleep_calibration_gap_delta": float(training.get("sleep_calibration_gap_delta", 0.0) or 0.0),
                     "sleep_accepted_examples": int(training.get("sleep_accepted_examples", 0) or 0),
                     "sleep_support_examples": int(training.get("sleep_support_examples", 0) or 0),
                     "frontier_compiled_verified": True,

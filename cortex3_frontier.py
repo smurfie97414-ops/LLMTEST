@@ -788,7 +788,17 @@ class FrontierSkillDiscovery:
         if not 0.0 <= float(min_heldout_pass_rate) <= 1.0:
             raise ValueError("min_heldout_pass_rate must be between 0 and 1")
 
+        filter_decision = getattr(sleep_report, "filter_decision", None)
+        filter_accepted = True if filter_decision is None else bool(getattr(filter_decision, "accepted", False))
+        diversity_ok = bool(getattr(sleep_report, "diversity_ok", filter_accepted))
+        calibration_ok = bool(getattr(sleep_report, "calibration_ok", filter_accepted))
+        if not (filter_accepted and diversity_ok and calibration_ok):
+            return FrontierDiscoveryReport(tuple(), tuple(), False)
+
         raw_examples = tuple(getattr(sleep_report, "accepted_examples", ()))
+        filter_metrics = getattr(filter_decision, "metrics", None)
+        filter_metrics_payload = filter_metrics.to_dict() if hasattr(filter_metrics, "to_dict") else {}
+        filter_reasons = tuple(str(reason) for reason in getattr(filter_decision, "reasons", ()))
         sleep_examples_by_task = {
             example.task.task_id: example
             for example in raw_examples
@@ -830,6 +840,10 @@ class FrontierSkillDiscovery:
             base_examples: list[MicroTrainingExample] = []
             seen_task_ids: set[str] = set()
             source_example_ids: list[str] = []
+            source_origins: list[str] = []
+            source_contamination_risks: list[float] = []
+            source_verification_levels: list[int] = []
+            source_synthetic_flags: list[bool] = []
             for example in (ordered_groups[0] if ordered_groups else ()):
                 if example.task.task_id in seen_task_ids:
                     continue
@@ -841,6 +855,10 @@ class FrontierSkillDiscovery:
                 base_examples.append(example)
                 seen_task_ids.add(example.task.task_id)
                 source_example_ids.append(str(getattr(sleep_example, "example_id", example.task.task_id)))
+                source_origins.append(str(getattr(getattr(sleep_example, "origin", ""), "value", getattr(sleep_example, "origin", ""))))
+                source_contamination_risks.append(float(getattr(sleep_example, "contamination_risk", 1.0)))
+                source_verification_levels.append(int(getattr(sleep_example, "verification_level", 0)))
+                source_synthetic_flags.append(bool(getattr(sleep_example, "synthetic", False)))
             if not base_examples:
                 continue
 
@@ -924,6 +942,18 @@ class FrontierSkillDiscovery:
                     "sleep_accepted_examples": len(base_examples),
                     "sleep_support_examples": support_added,
                     "sleep_source_example_ids": tuple(source_example_ids),
+                    "sleep_source_origins": tuple(source_origins),
+                    "sleep_source_synthetic_count": sum(1 for value in source_synthetic_flags if value),
+                    "sleep_source_real_count": sum(1 for value in source_synthetic_flags if not value),
+                    "sleep_source_max_contamination_risk": max(source_contamination_risks, default=0.0),
+                    "sleep_source_min_verification_level": min(source_verification_levels, default=0),
+                    "sleep_filter_accepted": filter_accepted,
+                    "sleep_filter_reasons": filter_reasons,
+                    "sleep_filter_metrics": filter_metrics_payload,
+                    "sleep_diversity_ok": diversity_ok,
+                    "sleep_calibration_ok": calibration_ok,
+                    "sleep_rare_skill_gain": float(getattr(sleep_report, "rare_skill_gain", 0.0)),
+                    "sleep_calibration_gap_delta": float(getattr(sleep_report, "calibration_gap_delta", 0.0)),
                 },
                 dsv={
                     "passed": dsv.passed,
