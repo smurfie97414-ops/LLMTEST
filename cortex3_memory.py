@@ -164,6 +164,7 @@ class CognitiveMemoryConfig:
     top_k_latent: int = 3
     max_summary_terms: int = 16
     anchor_boost: float = 0.40
+    utility_score_weight: float = 0.25
 
     def __post_init__(self) -> None:
         if self.recent_exact_limit < 1:
@@ -174,6 +175,8 @@ class CognitiveMemoryConfig:
             raise ValueError("top_k values cannot be negative")
         if self.max_summary_terms < 1:
             raise ValueError("max_summary_terms must be at least 1")
+        if self.utility_score_weight < 0.0:
+            raise ValueError("utility_score_weight cannot be negative")
 
 
 @dataclass(frozen=True)
@@ -405,7 +408,15 @@ class LatentKVStore:
         self.segments.append(latent)
         return latent
 
-    def retrieve(self, query_embedding: torch.Tensor, query_tokens: set[str], anchor_kinds: set[str], top_k: int) -> list[MemorySegment]:
+    def retrieve(
+        self,
+        query_embedding: torch.Tensor,
+        query_tokens: set[str],
+        anchor_kinds: set[str],
+        top_k: int,
+        score_bias_by_segment: Mapping[str, float] | None = None,
+    ) -> list[MemorySegment]:
+        score_bias_by_segment = score_bias_by_segment or {}
         scored = []
         for segment in self.segments:
             score = float(torch.dot(query_embedding, segment.embedding))
@@ -413,6 +424,7 @@ class LatentKVStore:
                 score += 0.10
             if any(anchor.kind in anchor_kinds or anchor.value.lower() in query_tokens for anchor in segment.anchors):
                 score += self.config.anchor_boost
+            score += float(score_bias_by_segment.get(segment.segment_id, 0.0))
             scored.append((score, segment))
         return [segment for score, segment in sorted(scored, key=lambda item: item[0], reverse=True)[:top_k] if score > 0.0]
 
@@ -551,12 +563,40 @@ class CognitiveMemory:
             kinds.update(_ANCHOR_INTENT.get(token, ()))
         return kinds
 
-    def _score_exact(self, segment: MemorySegment, query_embedding: torch.Tensor, query_tokens: set[str], anchor_kinds: set[str]) -> float:
+    def _learned_utility_score_biases(self) -> dict[str, float]:
+        if not self.utility_credits or self.config.utility_score_weight <= 0.0:
+            return {}
+        by_segment: dict[str, list[float]] = {}
+        for credit in self.utility_credits:
+            if not credit.retention_source.startswith("learned_memory"):
+                continue
+            by_segment.setdefault(credit.segment_id, []).append(float(credit.utility))
+        biases: dict[str, float] = {}
+        for segment_id, utilities in by_segment.items():
+            if not utilities:
+                continue
+            # Recent credits matter more, but old credits still contribute.
+            tail = utilities[-8:]
+            mean_utility = sum(tail) / float(len(tail))
+            clipped = max(-1.0, min(1.0, mean_utility))
+            biases[segment_id] = clipped * self.config.utility_score_weight
+        return biases
+
+    def _score_exact(
+        self,
+        segment: MemorySegment,
+        query_embedding: torch.Tensor,
+        query_tokens: set[str],
+        anchor_kinds: set[str],
+        score_bias_by_segment: Mapping[str, float] | None = None,
+    ) -> float:
         score = float(torch.dot(query_embedding, segment.embedding))
         if query_tokens.intersection(segment.token_counts):
             score += 0.10
         if any(anchor.kind in anchor_kinds or anchor.value.lower() in query_tokens for anchor in segment.anchors):
             score += self.config.anchor_boost
+        if score_bias_by_segment is not None:
+            score += float(score_bias_by_segment.get(segment.segment_id, 0.0))
         return score
 
     def _required_anchors(self, selected: Sequence[MemorySegment], query_tokens: set[str], anchor_kinds: set[str], explicit: Sequence[Anchor] | None) -> tuple[Anchor, ...]:
@@ -580,9 +620,10 @@ class CognitiveMemory:
         query_tokens = set(tokenize(query))
         query_embedding = embed_text(query, self.config.embedding_dim)
         anchor_kinds = self._query_anchor_kinds(query_tokens)
+        score_bias_by_segment = self._learned_utility_score_biases()
 
         exact_scored = [
-            (self._score_exact(segment, query_embedding, query_tokens, anchor_kinds), segment)
+            (self._score_exact(segment, query_embedding, query_tokens, anchor_kinds, score_bias_by_segment), segment)
             for segment in self.recent.segments
         ]
         exact_segments = [
@@ -590,7 +631,7 @@ class CognitiveMemory:
             for score, segment in sorted(exact_scored, key=lambda item: item[0], reverse=True)[:self.config.top_k_exact]
             if score > 0.0
         ]
-        latent_segments = self.latent.retrieve(query_embedding, query_tokens, anchor_kinds, self.config.top_k_latent)
+        latent_segments = self.latent.retrieve(query_embedding, query_tokens, anchor_kinds, self.config.top_k_latent, score_bias_by_segment)
         if required_anchors is not None:
             required_keys = {(anchor.kind, anchor.value) for anchor in required_anchors}
 

@@ -4,7 +4,7 @@ import unittest
 
 from cortex3 import Anchor, CorruptedCompressedAgent, DynamicSkillVerifier, ReferenceRuleAgent, default_skill_specs
 from cortex3_cycle import CortexCycle
-from cortex3_memory import AnchorFidelityVerifier, CognitiveMemory, CognitiveMemoryConfig, MemoryMode, MemoryRetentionDecision, embed_text
+from cortex3_memory import AnchorFidelityVerifier, CognitiveMemory, CognitiveMemoryConfig, MemoryMode, MemoryRetentionDecision, MemoryUtilityCredit, embed_text
 from cortex3_reporting import write_cycle_run
 
 
@@ -202,6 +202,70 @@ class CognitiveMemoryTest(unittest.TestCase):
         self.assertEqual(report["learned_memory_utility_negative_count"], 1)
         self.assertEqual(report["learned_memory_utility_selected_count"], 1)
         self.assertEqual(report["learned_memory_utility_unselected_count"], 1)
+
+    def test_learned_utility_credit_biases_future_reconstruction_selection(self):
+        memory = CognitiveMemory(
+            CognitiveMemoryConfig(
+                recent_exact_limit=2,
+                embedding_dim=32,
+                top_k_exact=1,
+                top_k_latent=0,
+                utility_score_weight=0.75,
+            )
+        )
+        def decision(segment_id: str) -> MemoryRetentionDecision:
+            return MemoryRetentionDecision(
+                segment_id=segment_id,
+                requested_mode=MemoryMode.EXACT,
+                applied_mode=MemoryMode.EXACT,
+                exact_prob=0.80,
+                latent_prob=0.15,
+                drop_prob=0.05,
+                storage_ratio=0.90,
+                confidence=0.80,
+                source="learned_memory_policy",
+            )
+
+        memory.ingest("stale", "shared learned retrieval phrase", retention_decision=decision("stale"))
+        memory.ingest("useful", "shared learned retrieval phrase", retention_decision=decision("useful"))
+        memory.utility_credits.extend(
+            (
+                MemoryUtilityCredit(
+                    segment_id="stale",
+                    source="prior-cycle",
+                    phase="P4",
+                    query="shared learned retrieval phrase",
+                    selected=False,
+                    fidelity_passed=True,
+                    fidelity_score=1.0,
+                    required_anchor_count=0,
+                    utility=-0.50,
+                    requested_mode=MemoryMode.EXACT,
+                    applied_mode=MemoryMode.EXACT,
+                    retention_source="learned_memory_policy",
+                    reason="unselected_retained",
+                ),
+                MemoryUtilityCredit(
+                    segment_id="useful",
+                    source="prior-cycle",
+                    phase="P4",
+                    query="shared learned retrieval phrase",
+                    selected=True,
+                    fidelity_passed=True,
+                    fidelity_score=1.0,
+                    required_anchor_count=0,
+                    utility=0.90,
+                    requested_mode=MemoryMode.EXACT,
+                    applied_mode=MemoryMode.EXACT,
+                    retention_source="learned_memory_policy",
+                    reason="selected_faithful",
+                ),
+            )
+        )
+
+        reconstruction = memory.reconstruct("shared learned retrieval phrase")
+
+        self.assertEqual(reconstruction.selected_segment_ids, ("useful",))
 
     def test_recent_exact_kv_eviction_creates_latent_old_kv(self):
         memory = CognitiveMemory(CognitiveMemoryConfig(recent_exact_limit=1, embedding_dim=32))
