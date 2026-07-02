@@ -74,6 +74,7 @@ Current executable coverage:
 - `ARDecoderAgent(use_future_contracts=True)` now routes generation through `FutureContractEngine`, accepts or rejects speculative token blocks, records per-block traces, preserves DSV pass rate and accounts for real decoder steps spent on speculation.
 - Inference result JSON now persists answer `cost` and `raw`, so autoregressive future-contract generation traces survive into run artifacts.
 - `OutputGoalContract` and `OutputGoalDecision` extend FSP beyond token ids: P3 now gates complete expected outputs, exact/no-extra-text obligations and required anchors, records output-goal decisions in the future-contract ledger, persists them through checkpoints and feeds rejected output-goals into `L_future_contract`.
+- Generic P8 self-speculative FSP now gates contracts against tokens derived from the actual emitted answer text, records `observed_tokens_source`, `observed_tokens` and `self_verified_tokens=false`, and rejects incomplete observed token blocks instead of accepting a contract by comparing it to its own predicted tokens.
 - `CortexTrainingPhaseController` emits a strict P3 output-goal contract for the `ACCEPT/REJECT` gate result; the phase raises instead of silently continuing if the output-goal gate rejects.
 
 Remaining:
@@ -230,6 +231,7 @@ Evidence:
 - `python -m unittest tests.test_inference` verifies that P8 `kernel_dispatches` match the P2 `packed_ternary_dispatches` ledger backend/layer/native fields instead of generic pre-forward labels.
 - `python -m unittest tests.test_frontier_discovery.FrontierSkillDiscoveryTest.test_frontier_discovery_slow_solves_distills_and_compiles_fragile_skill` verifies that P8 creates and uses an internal P4 memory binding for compiled FastSolve when no memory instance is explicitly supplied.
 - `python -m unittest tests.test_certificates` and `python -m unittest tests.test_inference` verify that exact-match certificates reject wrong answers such as `OK extra` against the real task target.
+- `python -m unittest tests.test_future_contracts` and `python -m unittest tests.test_inference` verify that incomplete observed future-token blocks are rejected and that P8 FSP reports answer-text observations rather than self-verified contract tokens.
 
 Remaining:
 

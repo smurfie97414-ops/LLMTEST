@@ -87,6 +87,20 @@ class FutureContractsTest(unittest.TestCase):
         self.assertEqual(len(trace.mtp_fsp_events), 2)
         self.assertFalse(trace.mtp_fsp_events[-1].accepted)
 
+    def test_future_contract_rejects_incomplete_observed_block(self):
+        engine = FutureContractEngine(MTPFSPConfig(hidden_size=4, vocab_size=9))
+        target = (1, 2, 3, 4)
+        logits = torch.full((1, 4, 9), -20.0)
+        for index, token_id in enumerate(target):
+            logits[0, index, token_id] = 20.0
+
+        contract = engine.draft_contract_from_logits({4: logits}, confidence=0.99, domain="general", risk=0.01, contract_id="incomplete")
+        decision = engine.gate_contract(contract, observed_tokens=target[:2])
+
+        self.assertFalse(decision.accepted)
+        self.assertEqual(decision.reason, "observed tokens incomplete for future contract")
+        self.assertLess(decision.contract.accepted_horizon, contract.accepted_horizon)
+
     def test_output_goal_contract_accepts_exact_result_and_rejects_extra_text_or_missing_anchor(self):
         engine = FutureContractEngine(MTPFSPConfig(hidden_size=4, vocab_size=7), heads=_confident_heads())
         exact_task = Task("goal-exact", "instruction_following", "Output OK exactly.", "OK")

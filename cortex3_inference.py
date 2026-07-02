@@ -341,7 +341,14 @@ class SelfSpeculativeDecoder:
             heads.confidence_head.bias.fill_(5.0)
         self.engine = FutureContractEngine(heads.config, heads=heads)
 
-    def speculate(self, hidden: torch.Tensor, route: InferenceRoute, task: Task) -> Mapping[str, Any]:
+    def _observed_tokens_from_answer(self, answer_text: str, horizon: int) -> tuple[int, ...]:
+        encoded = answer_text.encode("utf-8", errors="replace")
+        if not encoded:
+            return ()
+        limit = max(1, min(int(horizon), len(encoded)))
+        return tuple(int(byte % self.engine.config.vocab_size) for byte in encoded[:limit])
+
+    def speculate(self, hidden: torch.Tensor, route: InferenceRoute, task: Task, *, answer_text: str | None = None) -> Mapping[str, Any]:
         domain = "math" if task.skill in {"arithmetic", "algebra"} else "code" if task.skill == "code_unit_tests" else "exact_anchor" if task.skill in {"long_context_anchor", "entity_tracking"} else "general"
         risk = 0.80 if route.path == InferencePath.CAREFUL else 0.40 if route.path == InferencePath.NORMAL else 0.05
         contract = self.engine.draft_contract(hidden, domain=domain, risk=risk, contract_id=f"{task.task_id}-{route.path.value}")
@@ -353,13 +360,22 @@ class SelfSpeculativeDecoder:
                 accepted=contract.accepted and route.verifier_level == 0,
                 reason=f"{contract.reason}; capped by {route.path.value} route",
             )
-        decision = self.engine.gate_contract(contract, observed_tokens=contract.token_ids if route.verifier_level > 0 else None)
+        observed_tokens = (
+            self._observed_tokens_from_answer(answer_text, contract.accepted_horizon)
+            if answer_text is not None
+            else None
+        )
+        decision = self.engine.gate_contract(contract, observed_tokens=observed_tokens)
         return {
             "contract_id": decision.contract.contract_id,
             "horizon": decision.contract.accepted_horizon,
             "initial_accepted": contract.accepted,
             "gate_accepted": decision.accepted,
             "reason": decision.reason,
+            "contract_token_ids": tuple(int(token) for token in contract.token_ids[:contract.accepted_horizon]),
+            "observed_tokens": tuple(int(token) for token in observed_tokens or ()),
+            "observed_tokens_source": "answer_text" if answer_text is not None else "none",
+            "self_verified_tokens": answer_text is None,
             "acceptance_rate": self.engine.ledger.acceptance_rate,
             "cost": asdict(decision.cost),
         }
@@ -549,7 +565,7 @@ class UltraFastInferenceEngine:
             self.trace.record_expert(f"{task.skill}-specialist", route.reason, cost=float(route.experts_activated))
         x = self._input_tensor(task, reconstruction)
         hidden, layers_ran, exit_decision, kernel_dispatches = self.core.forward_route(x, route, self.early_exit)
-        future = self.speculative.speculate(hidden, route, task)
+        future = self.speculative.speculate(hidden, route, task, answer_text=base_answer.text)
         answer = CandidateAnswer(
             text=base_answer.text,
             confidence=base_answer.confidence,

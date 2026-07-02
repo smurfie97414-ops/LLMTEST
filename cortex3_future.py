@@ -458,8 +458,15 @@ class FutureContractEngine:
 
     def revise_contract(self, contract: FutureContract, *, temporal_loss: float | None = None, observed_tokens: Sequence[int] | None = None, reason: str = "") -> FutureContract:
         new_temporal_loss = contract.temporal_loss if temporal_loss is None else temporal_loss
-        mismatch = observed_tokens is not None and tuple(observed_tokens[:contract.accepted_horizon]) != contract.token_ids[:len(observed_tokens)]
-        must_shrink = new_temporal_loss > self.config.temporal_loss_threshold or mismatch or contract.confidence < self.config.confidence_threshold
+        observed_tuple = tuple(observed_tokens or ())
+        incomplete_observation = observed_tokens is not None and len(observed_tuple) < contract.accepted_horizon
+        mismatch = observed_tokens is not None and observed_tuple[:contract.accepted_horizon] != contract.token_ids[:len(observed_tuple)]
+        must_shrink = (
+            new_temporal_loss > self.config.temporal_loss_threshold
+            or incomplete_observation
+            or mismatch
+            or contract.confidence < self.config.confidence_threshold
+        )
         new_horizon = contract.accepted_horizon
         if must_shrink:
             candidates = [horizon for horizon in self.config.horizons if horizon < contract.accepted_horizon]
@@ -469,7 +476,9 @@ class FutureContractEngine:
             and contract.confidence >= self.config.confidence_threshold
             and new_temporal_loss <= self.config.temporal_loss_threshold
         )
-        if mismatch:
+        if incomplete_observation:
+            revision_reason = "observed tokens incomplete for future contract"
+        elif mismatch:
             revision_reason = "observed tokens broke future contract"
         elif new_temporal_loss > self.config.temporal_loss_threshold:
             revision_reason = "temporal consistency exceeded threshold"

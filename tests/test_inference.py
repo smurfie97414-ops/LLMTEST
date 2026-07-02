@@ -188,11 +188,14 @@ class UltraFastInferenceTest(unittest.TestCase):
         fast = engine.infer(easy)
         careful_math = engine.infer(math, forced_path=InferencePath.CAREFUL)
 
-        self.assertEqual(fast.future_contract["horizon"], 8)
-        self.assertTrue(fast.future_contract["gate_accepted"])
+        self.assertLessEqual(fast.future_contract["horizon"], 8)
+        self.assertEqual(fast.future_contract["observed_tokens_source"], "answer_text")
+        self.assertFalse(fast.future_contract["self_verified_tokens"])
+        self.assertEqual(fast.future_contract["observed_tokens"], (ord("O") % engine.config.vocab_size, ord("K") % engine.config.vocab_size))
         self.assertEqual(careful_math.route.mtp_horizon, 1)
         self.assertEqual(careful_math.future_contract["horizon"], 1)
-        self.assertTrue(careful_math.future_contract["gate_accepted"])
+        self.assertEqual(careful_math.future_contract["observed_tokens_source"], "answer_text")
+        self.assertFalse(careful_math.future_contract["self_verified_tokens"])
         self.assertEqual(careful_math.trace_summary["mtp_fsp_events"][0]["horizon"], 1)
 
     def test_careful_route_runs_strong_verification_certificate_and_expert_trace(self):
@@ -280,7 +283,9 @@ class UltraFastInferenceTest(unittest.TestCase):
             payload = json.loads(artifacts.summary_json.read_text(encoding="utf-8"))
 
         self.assertEqual(payload["inference"][0]["route"]["path"], "fast")
-        self.assertEqual(payload["inference"][0]["future_contract"]["horizon"], 8)
+        self.assertLessEqual(payload["inference"][0]["future_contract"]["horizon"], 8)
+        self.assertEqual(payload["inference"][0]["future_contract"]["observed_tokens_source"], "answer_text")
+        self.assertFalse(payload["inference"][0]["future_contract"]["self_verified_tokens"])
         self.assertTrue(payload["inference"][0]["kernel_dispatches"])
 
 
