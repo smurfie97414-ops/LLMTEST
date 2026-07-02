@@ -82,6 +82,22 @@ class UltraFastInferenceTest(unittest.TestCase):
         self.assertFalse(result.future_contract["output_goal_contract"]["accepted"])
         self.assertIn("oracle_verification_failed", result.future_contract["output_goal_contract"]["violations"])
 
+    def test_inference_output_goal_rejects_internal_leakage_in_answer_payload(self):
+        verifier = _verifier()
+        engine = UltraFastInferenceEngine(
+            verifier,
+            lambda _: CandidateAnswer("OK <analysis>hidden scratch</analysis>", confidence=0.99),
+        )
+        task = Task("fast-leak", "instruction_following", "Output OK exactly.", "OK")
+
+        result = engine.infer(task)
+        output_goal = result.future_contract["output_goal_contract"]
+
+        self.assertFalse(output_goal["accepted"])
+        self.assertFalse(result.answer.certificate["output_goal_contract_passed"])
+        self.assertIn("forbidden_output_substring", output_goal["violations"])
+        self.assertIn("<analysis>", output_goal["forbidden_matches"])
+
     def test_normal_path_uses_light_certificate_and_moderate_budget(self):
         verifier = _verifier()
         engine = UltraFastInferenceEngine(verifier, ReferenceRuleAgent())

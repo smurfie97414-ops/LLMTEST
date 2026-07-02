@@ -526,6 +526,7 @@ def _restore_future_contract_ledger(ledger: FutureContractLedger, payload: Mappi
             expected_type=str(contract_data.get("expected_type", "")),
             expected_text=str(contract_data.get("expected_text", "")),
             required_anchor_values=tuple(str(value) for value in contract_data.get("required_anchor_values", ())),
+            forbidden_substrings=tuple(str(value) for value in contract_data.get("forbidden_substrings", ())),
             obligations=tuple(str(value) for value in contract_data.get("obligations", ())),
             risk=float(contract_data.get("risk", 0.0)),
         )
@@ -536,6 +537,7 @@ def _restore_future_contract_ledger(ledger: FutureContractLedger, payload: Mappi
                 accepted=bool(decision_data.get("accepted", False)),
                 reason=str(decision_data.get("reason", "")),
                 violations=tuple(str(value) for value in decision_data.get("violations", ())),
+                forbidden_matches=tuple(str(value) for value in decision_data.get("forbidden_matches", ())),
                 cost=_cost_trace_from_payload(cost_data),
             )
         )

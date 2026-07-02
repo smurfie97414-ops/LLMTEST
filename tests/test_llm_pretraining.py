@@ -11,6 +11,7 @@ from unittest.mock import patch
 import torch
 
 from cortex3 import Task
+from cortex3_future import FutureContractLedger
 from cortex3_objective import FINAL_LOSS_TERMS
 from cortex3_sleep import ExampleOrigin
 from cortex3_llm import (
@@ -55,6 +56,7 @@ from cortex3_llm import (
     main as llm_main,
     validate_cortex_phase_report_contract,
     _profile_autosize_adaptive_measurement_inputs,
+    _restore_future_contract_ledger,
     run_llm_batch_profile_autosize,
     run_llm_batch_profile,
     run_llm_batch_profile_matrix,
@@ -67,6 +69,57 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
     def _corpus(self, root: Path, *, repeats: int = 80) -> TextCorpusConfig:
         files = build_seed_corpus(root / "text", repeats=repeats)
         return TextCorpusConfig.from_paths(files, min_chars_per_chunk=512)
+
+    def test_future_ledger_restore_preserves_forbidden_output_goal_fields_with_legacy_default(self):
+        ledger = FutureContractLedger()
+        payload = {
+            "output_goal_decisions": [
+                {
+                    "contract": {
+                        "contract_id": "legacy-output",
+                        "task_id": "legacy-task",
+                        "skill": "instruction_following",
+                        "expected_type": "str",
+                        "expected_text": "OK",
+                        "required_anchor_values": [],
+                        "obligations": ["exact_output"],
+                        "risk": 0.0,
+                    },
+                    "answer_text": "OK",
+                    "accepted": True,
+                    "reason": "output-goal contract accepted",
+                    "violations": [],
+                    "cost": {"generated_tokens": 1, "verifier_steps": 1},
+                },
+                {
+                    "contract": {
+                        "contract_id": "new-output",
+                        "task_id": "new-task",
+                        "skill": "instruction_following",
+                        "expected_type": "NoneType",
+                        "expected_text": "",
+                        "required_anchor_values": [],
+                        "forbidden_substrings": ["<analysis>"],
+                        "obligations": ["no_internal_leakage"],
+                        "risk": 0.2,
+                    },
+                    "answer_text": "OK <analysis>hidden</analysis>",
+                    "accepted": False,
+                    "reason": "forbidden_output_substring",
+                    "violations": ["forbidden_output_substring"],
+                    "forbidden_matches": ["<analysis>"],
+                    "cost": {"generated_tokens": 2, "verifier_steps": 1},
+                },
+            ]
+        }
+
+        _restore_future_contract_ledger(ledger, payload)
+
+        legacy, current = ledger.output_goal_decisions
+        self.assertEqual(legacy.contract.forbidden_substrings, ())
+        self.assertEqual(legacy.forbidden_matches, ())
+        self.assertEqual(current.contract.forbidden_substrings, ("<analysis>",))
+        self.assertEqual(current.forbidden_matches, ("<analysis>",))
 
     def _valid_cortex_phase_report_contract_payload(self):
         architecture_checks = {

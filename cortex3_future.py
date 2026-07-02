@@ -232,6 +232,7 @@ class OutputGoalContract:
     expected_type: str
     expected_text: str
     required_anchor_values: tuple[str, ...]
+    forbidden_substrings: tuple[str, ...]
     obligations: tuple[str, ...]
     risk: float
 
@@ -243,6 +244,7 @@ class OutputGoalDecision:
     accepted: bool
     reason: str
     violations: tuple[str, ...]
+    forbidden_matches: tuple[str, ...]
     cost: CostTrace
 
     def to_dict(self) -> dict[str, Any]:
@@ -252,6 +254,7 @@ class OutputGoalDecision:
             "accepted": self.accepted,
             "reason": self.reason,
             "violations": list(self.violations),
+            "forbidden_matches": list(self.forbidden_matches),
             "cost": asdict(self.cost),
         }
 
@@ -318,9 +321,68 @@ _EXACT_OUTPUT_SKILLS = {
     "long_context_anchor",
 }
 
+_INTERNAL_LEAKAGE_MARKERS: tuple[str, ...] = (
+    "<analysis>",
+    "</analysis>",
+    "<scratchpad>",
+    "</scratchpad>",
+    "chain-of-thought:",
+    "chain_of_thought:",
+    "hidden reasoning:",
+    "internal_trace=",
+    "debug_trace=",
+    "output_goal_contract=",
+    "frontier_compiled_contract=",
+    "latent_workspace_trace=",
+)
+
+_FORBIDDEN_METADATA_KEYS: tuple[str, ...] = (
+    "forbidden_output_substrings",
+    "forbidden_substrings",
+    "disallowed_output_substrings",
+)
+
 
 def _expected_text(task: Task) -> str:
     return "" if task.expected is None else str(task.expected)
+
+
+def _metadata_string_values(metadata: Mapping[str, Any], keys: Sequence[str]) -> tuple[str, ...]:
+    values: list[str] = []
+    for key in keys:
+        raw = metadata.get(key)
+        if raw is None:
+            continue
+        if isinstance(raw, str):
+            candidates = (raw,)
+        elif isinstance(raw, (tuple, list, set, frozenset)):
+            candidates = tuple(raw)
+        else:
+            candidates = (raw,)
+        for item in candidates:
+            text = str(item).strip()
+            if text:
+                values.append(text)
+    return tuple(values)
+
+
+def _output_goal_forbidden_substrings(task: Task) -> tuple[str, ...]:
+    expected_lower = _expected_text(task).lower()
+    prompt_lower = task.prompt.lower()
+    forbidden: list[str] = []
+    for marker in _INTERNAL_LEAKAGE_MARKERS:
+        marker_lower = marker.lower()
+        if marker_lower not in expected_lower and marker_lower not in prompt_lower:
+            forbidden.append(marker)
+    forbidden.extend(_metadata_string_values(task.metadata, _FORBIDDEN_METADATA_KEYS))
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in forbidden:
+        key = item.lower()
+        if key not in seen:
+            out.append(item)
+            seen.add(key)
+    return tuple(out)
 
 
 def _output_goal_obligations(task: Task) -> tuple[str, ...]:
@@ -338,6 +400,11 @@ def _output_goal_obligations(task: Task) -> tuple[str, ...]:
         obligations.append("executable_code_contract")
     if task.skill == "calibration":
         obligations.append("calibrated_unknown_contract")
+    forbidden = _output_goal_forbidden_substrings(task)
+    if forbidden:
+        obligations.append("no_internal_leakage")
+    if _metadata_string_values(task.metadata, _FORBIDDEN_METADATA_KEYS):
+        obligations.append("no_forbidden_output")
     out: list[str] = []
     seen: set[str] = set()
     for item in obligations:
@@ -536,6 +603,7 @@ class FutureContractEngine:
             expected_type=type(task.expected).__name__,
             expected_text=_expected_text(task),
             required_anchor_values=tuple(anchor.value for anchor in task.anchors),
+            forbidden_substrings=_output_goal_forbidden_substrings(task),
             obligations=_output_goal_obligations(task),
             risk=max(0.0, min(1.0, float(risk))),
         )
@@ -559,6 +627,12 @@ class FutureContractEngine:
         missing_anchors = tuple(value for value in contract.required_anchor_values if value and value not in answer.text)
         if missing_anchors:
             violations.append("required_anchor_missing")
+        answer_lower = answer.text.lower()
+        forbidden_matches = tuple(
+            item for item in contract.forbidden_substrings if item and item.lower() in answer_lower
+        )
+        if forbidden_matches:
+            violations.append("forbidden_output_substring")
         if output_verified is False:
             violations.append("oracle_verification_failed")
         accepted = not violations
@@ -574,6 +648,7 @@ class FutureContractEngine:
             accepted=accepted,
             reason=reason,
             violations=tuple(violations),
+            forbidden_matches=forbidden_matches,
             cost=cost,
         )
         self.ledger.record_output_goal(decision)

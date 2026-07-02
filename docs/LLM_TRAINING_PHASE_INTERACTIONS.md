@@ -367,7 +367,8 @@ Le controleur :
 - draft un future contract ;
 - compare le contrat aux tokens observes ;
 - accepte ou rejette ;
-- enregistre la decision dans le future ledger.
+- enregistre la decision dans le future ledger ;
+- draft aussi un output-goal contract qui verifie expected/exact/anchors, bloque les marqueurs de fuite interne et applique les interdits declares par la tache.
 
 ### Interaction Avec Les Autres Phases
 
@@ -381,7 +382,7 @@ P3 nourrit :
 
 ### Impact Apprentissage
 
-Le modele est pousse a predire plusieurs horizons sans tricher : les contrats sont verifies contre les futurs tokens observes. Cela evite que MTP soit seulement une tete supplementaire inutilisee.
+Le modele est pousse a predire plusieurs horizons sans tricher : les contrats sont verifies contre les futurs tokens observes. Cela evite que MTP soit seulement une tete supplementaire inutilisee. Le contrat de sortie est aussi une contrainte d'apprentissage: une reponse peut etre rejetee meme si elle contient une valeur plausible, si elle fuit une trace interne ou une chaine interdite declaree par la tache.
 
 ## Phase 4 - Cognitive Memory / KV / Anchor Ledger
 

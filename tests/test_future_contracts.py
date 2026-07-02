@@ -124,6 +124,36 @@ class FutureContractsTest(unittest.TestCase):
         self.assertIn("oracle_verification_failed", missing_anchor.violations)
         self.assertEqual(len(engine.ledger.output_goal_decisions), 3)
 
+    def test_output_goal_contract_rejects_internal_and_declared_forbidden_output(self):
+        engine = FutureContractEngine(MTPFSPConfig(hidden_size=4, vocab_size=7), heads=_confident_heads())
+        internal_task = Task("goal-leak", "instruction_following", "Produce a concise answer.", None)
+        internal = engine.gate_output_goal(
+            internal_task,
+            CandidateAnswer("OK <analysis>hidden scratch</analysis>", confidence=0.99),
+            output_verified=True,
+        )
+        declared_task = Task(
+            "goal-forbidden",
+            "calibration",
+            "Say whether the answer is known.",
+            None,
+            {"forbidden_output_substrings": ("PRIVATE-ANCHOR", "training_contract_frontier_output_goal")},
+        )
+        declared = engine.gate_output_goal(
+            declared_task,
+            CandidateAnswer("unknown, but PRIVATE-ANCHOR leaked", confidence=0.99),
+            output_verified=True,
+        )
+
+        self.assertFalse(internal.accepted)
+        self.assertIn("no_internal_leakage", internal.contract.obligations)
+        self.assertIn("forbidden_output_substring", internal.violations)
+        self.assertIn("<analysis>", internal.forbidden_matches)
+        self.assertFalse(declared.accepted)
+        self.assertIn("no_forbidden_output", declared.contract.obligations)
+        self.assertIn("PRIVATE-ANCHOR", declared.forbidden_matches)
+        self.assertEqual(len(engine.ledger.output_goal_decisions), 2)
+
     def test_risky_domain_shortens_and_requires_gate_before_acceptance(self):
         trace = CompressionTraceLedger()
         engine = FutureContractEngine(MTPFSPConfig(hidden_size=4, vocab_size=7), heads=_confident_heads(), trace_ledger=trace)
