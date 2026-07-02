@@ -15,7 +15,7 @@ from cortex3 import (
     Task,
     default_skill_specs,
 )
-from cortex3_attribution import AblationDimension, AttributionPolicyMemory, CausalAttributionEngine, cluster_regressions
+from cortex3_attribution import AblationDimension, AttributionPolicyMemory, CausalAttributionEngine, CauseEstimate, cluster_regressions
 from cortex3_cycle import CortexCycle
 from cortex3_future import FutureContractEngine, MTPFSPConfig, MTPFSPHeads
 from cortex3_inference import InferencePath, UltraFastInferenceEngine
@@ -59,7 +59,7 @@ class CausalAttributionTest(unittest.TestCase):
             policy.observe(
                 skill="arithmetic",
                 cause="numeric_precision",
-                intervention="increase_local_activation_bits",
+                intervention="increase_activation_bits_to_8",
                 recovered=True,
                 score_delta=1.0,
                 gain_per_cost=1.0,
@@ -75,6 +75,66 @@ class CausalAttributionTest(unittest.TestCase):
         numeric_signal = next(signal for signal in learned.policy_signals if signal.cause == "numeric_precision")
         self.assertEqual(numeric_signal.successes, 5)
         self.assertGreater(numeric_signal.policy_weight, 1.0)
+
+    def test_attribution_policy_is_specific_to_the_causal_intervention(self):
+        policy = AttributionPolicyMemory()
+        estimates = (
+            CauseEstimate("numeric_precision", 0.35, AblationDimension.ACTIVATION_PRECISION, "increase_activation_bits_to_8", True, 0.6, 0.6),
+            CauseEstimate("block_overcompressed", 0.65, AblationDimension.BLOCK, "restore_block_float_or_residual", True, 0.7, 0.7),
+        )
+        for _ in range(8):
+            policy.observe(
+                skill="arithmetic",
+                cause="numeric_precision",
+                intervention="stale_precision_intervention",
+                recovered=True,
+                score_delta=1.0,
+                gain_per_cost=1.0,
+            )
+
+        unmatched, unmatched_signals, unmatched_applied = policy.apply("arithmetic", estimates)
+
+        self.assertFalse(unmatched_applied)
+        self.assertEqual(unmatched[0].cause, "block_overcompressed")
+        numeric_unmatched = next(signal for signal in unmatched_signals if signal.cause == "numeric_precision")
+        self.assertEqual(numeric_unmatched.attempts, 0)
+        self.assertEqual(numeric_unmatched.policy_weight, 1.0)
+
+        for _ in range(8):
+            policy.observe(
+                skill="arithmetic",
+                cause="numeric_precision",
+                intervention="increase_activation_bits_to_8",
+                recovered=True,
+                score_delta=1.0,
+                gain_per_cost=1.0,
+            )
+        matched, matched_signals, matched_applied = policy.apply("arithmetic", estimates)
+        round_tripped = AttributionPolicyMemory.from_dict(policy.to_dict())
+        restored_signal = round_tripped.signal_for("arithmetic", "numeric_precision", "increase_activation_bits_to_8")
+
+        self.assertTrue(matched_applied)
+        self.assertEqual(matched[0].cause, "numeric_precision")
+        numeric_matched = next(signal for signal in matched_signals if signal.cause == "numeric_precision")
+        self.assertEqual(numeric_matched.attempts, 8)
+        self.assertGreater(numeric_matched.policy_weight, 1.0)
+        self.assertEqual(restored_signal.attempts, 8)
+        self.assertEqual(restored_signal.successes, 8)
+        legacy = AttributionPolicyMemory.from_dict({
+            "entries": [{
+                "skill": "arithmetic",
+                "cause": "numeric_precision",
+                "attempts": 3,
+                "successes": 3,
+                "failures": 0,
+                "mean_score_delta": 1.0,
+                "mean_gain_per_cost": 1.0,
+                "interventions": {"legacy_precision_patch": 3},
+            }]
+        })
+        legacy_signal = legacy.signal_for("arithmetic", "numeric_precision", "increase_activation_bits_to_8")
+        self.assertEqual(legacy_signal.attempts, 3)
+        self.assertEqual(legacy_signal.successes, 3)
 
     def test_real_forward_trace_drives_layer_block_and_activation_probes(self):
         verifier = _verifier()

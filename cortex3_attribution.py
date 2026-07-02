@@ -99,10 +99,10 @@ class AttributionPolicyMemory:
         self.prior_failure = float(prior_failure)
         self.min_weight = float(min_weight)
         self.max_weight = float(max_weight)
-        self._stats: dict[tuple[str, str], dict[str, Any]] = {}
+        self._stats: dict[tuple[str, str, str], dict[str, Any]] = {}
 
-    def _key(self, skill: str, cause: str) -> tuple[str, str]:
-        return (str(skill), str(cause))
+    def _key(self, skill: str, cause: str, intervention: str = "") -> tuple[str, str, str]:
+        return (str(skill), str(cause), str(intervention))
 
     def _empty_stats(self) -> dict[str, Any]:
         return {
@@ -113,6 +113,28 @@ class AttributionPolicyMemory:
             "gain_per_cost_total": 0.0,
             "interventions": Counter(),
         }
+
+    def _merged_stats(self, skill: str, cause: str, intervention: str = "") -> dict[str, Any]:
+        merged = self._empty_stats()
+        keys: list[tuple[str, str, str]] = []
+        if intervention:
+            keys.append(self._key(skill, cause, intervention))
+            keys.append(self._key(skill, cause, ""))
+        else:
+            keys.extend(key for key in self._stats if key[0] == str(skill) and key[1] == str(cause))
+        for key in keys:
+            stats = self._stats.get(key)
+            if not stats:
+                continue
+            merged["attempts"] = int(merged.get("attempts", 0) or 0) + int(stats.get("attempts", 0) or 0)
+            merged["successes"] = int(merged.get("successes", 0) or 0) + int(stats.get("successes", 0) or 0)
+            merged["failures"] = int(merged.get("failures", 0) or 0) + int(stats.get("failures", 0) or 0)
+            merged["score_delta_total"] = float(merged.get("score_delta_total", 0.0) or 0.0) + float(stats.get("score_delta_total", 0.0) or 0.0)
+            merged["gain_per_cost_total"] = float(merged.get("gain_per_cost_total", 0.0) or 0.0) + float(stats.get("gain_per_cost_total", 0.0) or 0.0)
+            interventions = Counter(merged.get("interventions") or {})
+            interventions.update(Counter(dict(stats.get("interventions") or {})))
+            merged["interventions"] = interventions
+        return merged
 
     def _signal_from_stats(self, skill: str, cause: str, stats: Mapping[str, Any]) -> AttributionPolicySignal:
         attempts = int(stats.get("attempts", 0) or 0)
@@ -148,8 +170,8 @@ class AttributionPolicyMemory:
             confidence=confidence,
         )
 
-    def signal_for(self, skill: str, cause: str) -> AttributionPolicySignal:
-        return self._signal_from_stats(str(skill), str(cause), self._stats.get(self._key(skill, cause), self._empty_stats()))
+    def signal_for(self, skill: str, cause: str, intervention: str = "") -> AttributionPolicySignal:
+        return self._signal_from_stats(str(skill), str(cause), self._merged_stats(skill, cause, intervention))
 
     def observe(
         self,
@@ -161,8 +183,9 @@ class AttributionPolicyMemory:
         score_delta: float,
         gain_per_cost: float,
         protected_regression: bool = False,
+        applied_intervention: str | None = None,
     ) -> AttributionPolicySignal:
-        key = self._key(skill, cause)
+        key = self._key(skill, cause, intervention)
         stats = self._stats.setdefault(key, self._empty_stats())
         stats["attempts"] = int(stats.get("attempts", 0)) + 1
         success = bool(recovered) and not bool(protected_regression) and float(score_delta) > 0.0
@@ -173,7 +196,7 @@ class AttributionPolicyMemory:
         stats["score_delta_total"] = float(stats.get("score_delta_total", 0.0)) + max(0.0, float(score_delta))
         stats["gain_per_cost_total"] = float(stats.get("gain_per_cost_total", 0.0)) + max(0.0, float(gain_per_cost))
         interventions = Counter(stats.get("interventions") or {})
-        interventions.update((str(intervention),))
+        interventions.update((str(applied_intervention or intervention),))
         stats["interventions"] = interventions
         return self._signal_from_stats(str(skill), str(cause), stats)
 
@@ -194,7 +217,8 @@ class AttributionPolicyMemory:
         task = getattr(failure, "task", None)
         skill = str(getattr(task, "skill", getattr(action, "target", "")))
         kind = getattr(action, "kind", "")
-        intervention = str(getattr(kind, "value", kind))
+        applied_intervention = str(getattr(kind, "value", kind))
+        intervention = str(metadata.get("attribution_selected_best_intervention") or applied_intervention)
         return self.observe(
             skill=skill,
             cause=cause,
@@ -203,6 +227,7 @@ class AttributionPolicyMemory:
             score_delta=float(getattr(selected, "score_delta", 0.0)),
             gain_per_cost=float(getattr(selected, "gain_per_cost", 0.0)),
             protected_regression=protected_regression,
+            applied_intervention=applied_intervention,
         )
 
     def observe_model_regrowth_application(
@@ -225,7 +250,8 @@ class AttributionPolicyMemory:
         task = getattr(failure, "task", None)
         skill = str(application.get("failure_skill") or getattr(task, "skill", getattr(action, "target", "")))
         kind = getattr(action, "kind", "")
-        intervention = str(getattr(kind, "value", kind))
+        applied_intervention = str(getattr(kind, "value", kind))
+        intervention = str(metadata.get("attribution_selected_best_intervention") or applied_intervention)
 
         repair_delta = float(application.get("repair_loss_delta", 0.0) or 0.0)
         protected_delta = float(application.get("protected_loss_delta", 0.0) or 0.0)
@@ -254,6 +280,7 @@ class AttributionPolicyMemory:
             score_delta=effective_score_delta,
             gain_per_cost=effective_score_delta / effective_cost,
             protected_regression=protected_regression,
+            applied_intervention=applied_intervention,
         )
 
     def apply(
@@ -263,7 +290,7 @@ class AttributionPolicyMemory:
     ) -> tuple[tuple[CauseEstimate, ...], tuple[AttributionPolicySignal, ...], bool]:
         if not estimates:
             return tuple(), tuple(), False
-        signals = tuple(self.signal_for(skill, estimate.cause) for estimate in estimates)
+        signals = tuple(self.signal_for(skill, estimate.cause, estimate.best_intervention) for estimate in estimates)
         adjusted_mass = [
             max(0.0, float(estimate.probability)) * max(0.0, signal.policy_weight)
             for estimate, signal in zip(estimates, signals)
@@ -297,10 +324,11 @@ class AttributionPolicyMemory:
 
     def to_dict(self) -> dict[str, Any]:
         entries = []
-        for (skill, cause), stats in sorted(self._stats.items()):
+        for (skill, cause, intervention), stats in sorted(self._stats.items()):
             signal = self._signal_from_stats(skill, cause, stats)
             entries.append({
                 **signal.to_dict(),
+                "intervention_key": intervention,
                 "interventions": dict(Counter(stats.get("interventions") or {})),
             })
         return {
@@ -329,6 +357,7 @@ class AttributionPolicyMemory:
             cause = str(item.get("cause", ""))
             if not skill or not cause:
                 continue
+            intervention = str(item.get("intervention_key", ""))
             stats = memory._empty_stats()
             stats["attempts"] = int(item.get("attempts", 0) or 0)
             stats["successes"] = int(item.get("successes", 0) or 0)
@@ -336,7 +365,7 @@ class AttributionPolicyMemory:
             stats["score_delta_total"] = float(item.get("mean_score_delta", 0.0) or 0.0) * max(1, stats["attempts"])
             stats["gain_per_cost_total"] = float(item.get("mean_gain_per_cost", 0.0) or 0.0) * max(1, stats["attempts"])
             stats["interventions"] = Counter(dict(item.get("interventions") or {}))
-            memory._stats[memory._key(skill, cause)] = stats
+            memory._stats[memory._key(skill, cause, intervention)] = stats
         return memory
 
 

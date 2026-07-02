@@ -501,7 +501,7 @@ P6 est le pont entre detection et correction :
 
 ### Impact Apprentissage
 
-P6 evite de transformer toute regression en retraining global aveugle. Il donne une cible de correction, ce qui rend P7 possible et mesure le cout relatif d'une reparation locale. Le controleur LLM conserve maintenant une memoire de politique d'attribution : quand P7 applique une reparation non-regressive sur les vrais poids Transformer, ameliore `repair_loss_delta`, reste sous la tolerance de `protected_loss_delta`, modifie effectivement les parametres et produit un rollback signe/executable, le couple skill/cause gagne un signal de succes, de gain par cout et d'intervention dominante. Les attributions suivantes peuvent donc privilegier les causes qui ont deja produit des reparations verifiees par patch modele reel, au lieu de rester sur un classement purement statique ou simule.
+P6 evite de transformer toute regression en retraining global aveugle. Il donne une cible de correction, ce qui rend P7 possible et mesure le cout relatif d'une reparation locale. Le controleur LLM conserve maintenant une memoire de politique d'attribution : quand P7 applique une reparation non-regressive sur les vrais poids Transformer, ameliore `repair_loss_delta`, reste sous la tolerance de `protected_loss_delta`, modifie effectivement les parametres et produit un rollback signe/executable, le triplet skill/cause/intervention P6 gagne un signal de succes, de gain par cout et d'intervention appliquee dominante. Les attributions suivantes peuvent donc privilegier les interventions causales exactes qui ont deja produit des reparations verifiees par patch modele reel, sans transferer ce credit a une intervention voisine sous la meme cause.
 
 ## Phase 7 - Minimal Regrowth
 
