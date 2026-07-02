@@ -3813,6 +3813,28 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
                 latest_recursive,
             )
             self.assertTrue(latest_recursive["proposal_patch_payload"]["frontier_output_goal_contract_passed"], latest_recursive)
+            self.assertEqual(latest_recursive["training_contract_source"], "compiled_frontier_fastsolve", latest_recursive)
+            self.assertEqual(
+                latest_recursive["training_contract_task_id"],
+                latest_recursive["proposal_patch_payload"]["task_id"],
+                latest_recursive,
+            )
+            self.assertEqual(latest_recursive["training_contract_skill"], latest_recursive["affected_skills"][0], latest_recursive)
+            self.assertTrue(latest_recursive["training_contract_answer_checksum"], latest_recursive)
+            self.assertTrue(latest_recursive["training_contract_frontier_compiled_selected"], latest_recursive)
+            self.assertTrue(latest_recursive["training_contract_frontier_compiled_verified"], latest_recursive)
+            self.assertTrue(latest_recursive["training_contract_frontier_output_goal_contract_passed"], latest_recursive)
+            self.assertTrue(latest_recursive["training_contract_frontier_compiled_contract_verified"], latest_recursive)
+            self.assertTrue(latest_recursive["training_contract_frontier_compiled_contract_checksum"], latest_recursive)
+            self.assertTrue(latest_recursive["training_contract_frontier_memory_binding_passed"], latest_recursive)
+            self.assertTrue(latest_recursive["training_contract_frontier_memory_binding_id"], latest_recursive)
+            self.assertGreater(latest_recursive["training_contract_frontier_memory_binding_fidelity"], 0.0, latest_recursive)
+            self.assertTrue(latest_recursive["training_contract_frontier_heldout_gate_passed"], latest_recursive)
+            self.assertEqual(
+                latest_recursive["training_contract_frontier_heldout_passed"],
+                latest_recursive["training_contract_frontier_heldout_total"],
+                latest_recursive,
+            )
             self.assertTrue(latest_recursive["p10_decision_accepted"], latest_recursive)
             self.assertTrue(latest_recursive["p10_decision_reason"], latest_recursive)
             self.assertEqual(tuple(latest_recursive["reward_hacking_flags"]), (), latest_recursive)
@@ -3841,6 +3863,17 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             self.assertGreaterEqual(latest_recursive_artifact["verification_level"], 3, latest_recursive_artifact)
             self.assertGreater(latest_recursive_artifact["repair_loss_delta"], 0.0, latest_recursive_artifact)
             self.assertTrue(latest_recursive_artifact["non_regression_passed"], latest_recursive_artifact)
+            self.assertEqual(latest_recursive_artifact["training_contract_source"], "compiled_frontier_fastsolve", latest_recursive_artifact)
+            self.assertEqual(
+                latest_recursive_artifact["training_contract_frontier_compiled_contract_checksum"],
+                latest_recursive["training_contract_frontier_compiled_contract_checksum"],
+                latest_recursive_artifact,
+            )
+            self.assertEqual(
+                latest_recursive_artifact["training_contract_frontier_memory_binding_id"],
+                latest_recursive["training_contract_frontier_memory_binding_id"],
+                latest_recursive_artifact,
+            )
             self.assertTrue(phase_report["objective_feedback_history"], phase_report)
             latest_feedback = phase_report["objective_feedback_history"][-1]
             self.assertEqual(latest_feedback["term_count"], len(FINAL_LOSS_TERMS))

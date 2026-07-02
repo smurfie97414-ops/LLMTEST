@@ -4185,6 +4185,32 @@ def _cortex_architecture_audit_from_summary(summary: Mapping[str, Any]) -> dict[
         and bool(item.get("non_regression_passed"))
         for item in recursive_verified_artifacts
     )
+    recursive_compiled_frontier_training_contract_grounded = any(
+        str(item.get("proposal_kind", "")) == ProposalKind.COMPILED_FRONTIER.value
+        and str(item.get("training_contract_source", "")) == "compiled_frontier_fastsolve"
+        and bool(item.get("training_contract_answer_checksum"))
+        and bool(item.get("training_contract_frontier_compiled_selected"))
+        and bool(item.get("training_contract_frontier_compiled_verified"))
+        and bool(item.get("training_contract_frontier_output_goal_contract_passed"))
+        and bool(item.get("training_contract_frontier_compiled_contract_verified"))
+        and bool(item.get("training_contract_frontier_compiled_contract_checksum"))
+        and bool(item.get("training_contract_frontier_memory_binding_passed"))
+        and bool(item.get("training_contract_frontier_memory_binding_id"))
+        and float(item.get("training_contract_frontier_memory_binding_fidelity", 0.0) or 0.0) > 0.0
+        and bool(item.get("training_contract_frontier_heldout_gate_passed"))
+        and int(item.get("training_contract_frontier_heldout_total", 0) or 0) > 0
+        and int(item.get("training_contract_frontier_heldout_passed", 0) or 0)
+        == int(item.get("training_contract_frontier_heldout_total", 0) or 0)
+        for item in recursive_model_applications
+    )
+    recursive_compiled_frontier_artifact_grounded = any(
+        str(item.get("proposal_kind", "")) == ProposalKind.COMPILED_FRONTIER.value
+        and str(item.get("training_contract_source", "")) == "compiled_frontier_fastsolve"
+        and bool(item.get("training_contract_frontier_compiled_contract_checksum"))
+        and bool(item.get("training_contract_frontier_memory_binding_id"))
+        and bool(item.get("training_contract_frontier_memory_binding_passed"))
+        for item in recursive_verified_artifacts
+    )
     checks: list[dict[str, Any]] = []
 
     def add(component: str, passed: bool, observed: Mapping[str, Any], requirement: str) -> None:
@@ -4590,7 +4616,9 @@ def _cortex_architecture_audit_from_summary(summary: Mapping[str, Any]) -> dict[
         and number("recursive_model_repair_loss_delta") > 0.0
         and recursive_model_non_regressing
         and recursive_model_reward_hacking_cleared
-        and recursive_artifact_verified,
+        and recursive_artifact_verified
+        and recursive_compiled_frontier_training_contract_grounded
+        and recursive_compiled_frontier_artifact_grounded,
         {
             "P10": phase_count("P10"),
             "improvement_decisions": improvement_decisions,
@@ -4604,8 +4632,10 @@ def _cortex_architecture_audit_from_summary(summary: Mapping[str, Any]) -> dict[
             "recursive_model_non_regressing": recursive_model_non_regressing,
             "recursive_model_reward_hacking_cleared": recursive_model_reward_hacking_cleared,
             "recursive_artifact_verified": recursive_artifact_verified,
+            "recursive_compiled_frontier_training_contract_grounded": recursive_compiled_frontier_training_contract_grounded,
+            "recursive_compiled_frontier_artifact_grounded": recursive_compiled_frontier_artifact_grounded,
         },
-        "recursive improvement sandbox must evaluate a proposal, apply an accepted signed non-regressing anti-reward-hacking-cleared patch to real Transformer state, persist an executable rollback artifact, and materialize a verified replay artifact",
+        "recursive improvement sandbox must evaluate a proposal, apply an accepted signed non-regressing anti-reward-hacking-cleared patch to real Transformer state, ground compiled Frontier patches in FastSolve/P4/P5 contracts, persist an executable rollback artifact, and materialize a verified replay artifact",
     )
     add(
         "training_feedback_loop",
@@ -4776,6 +4806,32 @@ def _cortex_phase_deliverable_audit_from_summary(summary: Mapping[str, Any]) -> 
         and int(item.get("verification_level", 0) or 0) >= 3
         and float(item.get("repair_loss_delta", 0.0) or 0.0) > 0.0
         and bool(item.get("non_regression_passed"))
+        for item in recursive_verified_artifacts
+    )
+    recursive_compiled_frontier_training_contract_grounded = any(
+        str(item.get("proposal_kind", "")) == ProposalKind.COMPILED_FRONTIER.value
+        and str(item.get("training_contract_source", "")) == "compiled_frontier_fastsolve"
+        and bool(item.get("training_contract_answer_checksum"))
+        and bool(item.get("training_contract_frontier_compiled_selected"))
+        and bool(item.get("training_contract_frontier_compiled_verified"))
+        and bool(item.get("training_contract_frontier_output_goal_contract_passed"))
+        and bool(item.get("training_contract_frontier_compiled_contract_verified"))
+        and bool(item.get("training_contract_frontier_compiled_contract_checksum"))
+        and bool(item.get("training_contract_frontier_memory_binding_passed"))
+        and bool(item.get("training_contract_frontier_memory_binding_id"))
+        and float(item.get("training_contract_frontier_memory_binding_fidelity", 0.0) or 0.0) > 0.0
+        and bool(item.get("training_contract_frontier_heldout_gate_passed"))
+        and int(item.get("training_contract_frontier_heldout_total", 0) or 0) > 0
+        and int(item.get("training_contract_frontier_heldout_passed", 0) or 0)
+        == int(item.get("training_contract_frontier_heldout_total", 0) or 0)
+        for item in recursive_model_applications
+    )
+    recursive_compiled_frontier_artifact_grounded = any(
+        str(item.get("proposal_kind", "")) == ProposalKind.COMPILED_FRONTIER.value
+        and str(item.get("training_contract_source", "")) == "compiled_frontier_fastsolve"
+        and bool(item.get("training_contract_frontier_compiled_contract_checksum"))
+        and bool(item.get("training_contract_frontier_memory_binding_id"))
+        and bool(item.get("training_contract_frontier_memory_binding_passed"))
         for item in recursive_verified_artifacts
     )
 
@@ -5088,7 +5144,9 @@ def _cortex_phase_deliverable_audit_from_summary(summary: Mapping[str, Any]) -> 
         and number("recursive_model_repair_loss_delta") > 0.0
         and recursive_model_non_regressing
         and recursive_model_reward_hacking_cleared
-        and recursive_artifact_verified,
+        and recursive_artifact_verified
+        and recursive_compiled_frontier_training_contract_grounded
+        and recursive_compiled_frontier_artifact_grounded,
         {
             "recursive_proposal_events": count("recursive_proposal_events"),
             "recursive_sandbox_trials": count("recursive_sandbox_trials"),
@@ -5111,8 +5169,10 @@ def _cortex_phase_deliverable_audit_from_summary(summary: Mapping[str, Any]) -> 
             "recursive_model_non_regressing": recursive_model_non_regressing,
             "recursive_model_reward_hacking_cleared": recursive_model_reward_hacking_cleared,
             "recursive_artifact_verified": recursive_artifact_verified,
+            "recursive_compiled_frontier_training_contract_grounded": recursive_compiled_frontier_training_contract_grounded,
+            "recursive_compiled_frontier_artifact_grounded": recursive_compiled_frontier_artifact_grounded,
         },
-        "recursive improvement must propose, sandbox, evolve across generations, evaluate, gate against reward hacking, persist evolutionary and executable rollback archives, apply a signed model patch, preserve rollback tokens, run diversity checks and materialize a verified replay artifact",
+        "recursive improvement must propose, sandbox, evolve across generations, evaluate, gate against reward hacking, persist evolutionary and executable rollback archives, apply a signed model patch grounded in FastSolve/P4/P5 compiled Frontier contracts, preserve rollback tokens, run diversity checks and materialize a verified replay artifact",
     )
 
     failed_checks = tuple(f"{check['phase']}:{check['deliverable']}" for check in checks if not check["passed"])
@@ -6993,6 +7053,125 @@ class CortexTrainingPhaseController:
             f"accepted:{decision.evaluation.proposal.proposal_id}",
         )
 
+    def _frontier_task_for_recursive_proposal(
+        self,
+        decision: AcceptanceDecision,
+        cycle_report: Any,
+        *,
+        step: int,
+    ) -> Task:
+        proposal = decision.evaluation.proposal
+        requested_task_id = str(proposal.patch_payload.get("task_id") or "")
+        if requested_task_id:
+            for failure in cycle_report.regressions:
+                if failure.task.task_id == requested_task_id:
+                    return failure.task
+        affected = tuple(str(skill) for skill in proposal.affected_skills)
+        for skill in affected:
+            for circuit in self.frontier_registry.circuits_for_skill(skill):
+                for task in tuple(circuit.verified_tasks) + tuple(circuit.heldout_tasks):
+                    if requested_task_id and task.task_id == requested_task_id:
+                        return task
+        if requested_task_id:
+            raise ValueError(
+                f"P10 compiled Frontier proposal {proposal.proposal_id} references unknown task {requested_task_id}"
+            )
+        task = self._recursive_improvement_task(decision, cycle_report, step=step)
+        if self.frontier_registry.select(task) is None:
+            raise ValueError(
+                f"P10 compiled Frontier proposal {proposal.proposal_id} has no exact reconstructible circuit for {task.task_id}"
+            )
+        return task
+
+    def _recursive_patch_training_contract(
+        self,
+        decision: AcceptanceDecision,
+        cycle_report: Any,
+        *,
+        step: int,
+    ) -> tuple[Task, CandidateAnswer, dict[str, Any]]:
+        proposal = decision.evaluation.proposal
+        if proposal.kind != ProposalKind.COMPILED_FRONTIER:
+            task = self._recursive_improvement_task(decision, cycle_report, step=step)
+            requested_task_id = str(proposal.patch_payload.get("task_id") or "")
+            if requested_task_id:
+                for failure in cycle_report.regressions:
+                    if failure.task.task_id == requested_task_id:
+                        task = failure.task
+                        break
+            answer = self.reference_agent(task)
+            return task, answer, {
+                "training_contract_source": "reference_agent",
+                "training_contract_task_id": task.task_id,
+                "training_contract_skill": task.skill,
+                "training_contract_answer_checksum": _sha256_json({"answer": answer.text}),
+            }
+
+        task = self._frontier_task_for_recursive_proposal(decision, cycle_report, step=step)
+        compiled_agent = CompiledFrontierAgent(
+            self.frontier_registry,
+            verifier=self.verifier,
+            memory=self.memory,
+            require_memory_binding=True,
+        )
+        answer = compiled_agent(task)
+        verification = self.verifier.oracle_registry.verify(task.skill, task, answer)
+        certificate = dict(answer.certificate)
+        raw = dict(answer.raw)
+        checks = {
+            "frontier_compiled_selected": bool(raw.get("frontier_compiled_selected")),
+            "frontier_compiled_verified": bool(
+                raw.get("frontier_compiled_verified")
+                or certificate.get("frontier_verification_passed")
+            ),
+            "frontier_output_goal_contract_passed": bool(certificate.get("frontier_output_goal_contract_passed")),
+            "frontier_compiled_contract_verified": bool(certificate.get("frontier_compiled_contract_verified")),
+            "frontier_memory_binding_passed": bool(certificate.get("frontier_memory_binding_passed")),
+            "frontier_heldout_gate_passed": bool(certificate.get("frontier_heldout_gate_passed")),
+        }
+        failed = tuple(name for name, passed in checks.items() if not passed)
+        heldout_passed = int(certificate.get("frontier_heldout_passed", 0) or 0)
+        heldout_total = int(certificate.get("frontier_heldout_total", 0) or 0)
+        if (
+            failed
+            or not verification.passed
+            or heldout_total <= 0
+            or heldout_passed < heldout_total
+        ):
+            raise ValueError(
+                "P10 compiled Frontier patch contract rejected "
+                f"{proposal.proposal_id}: failed={failed}, oracle={verification.reason}, "
+                f"heldout={heldout_passed}/{heldout_total}"
+            )
+        contract = {
+            "training_contract_source": "compiled_frontier_fastsolve",
+            "training_contract_task_id": task.task_id,
+            "training_contract_skill": task.skill,
+            "training_contract_answer_checksum": _sha256_json({"answer": answer.text}),
+            "training_contract_frontier_compiled_selected": checks["frontier_compiled_selected"],
+            "training_contract_frontier_compiled_verified": checks["frontier_compiled_verified"],
+            "training_contract_frontier_output_goal_contract_passed": checks["frontier_output_goal_contract_passed"],
+            "training_contract_frontier_compiled_contract_verified": checks["frontier_compiled_contract_verified"],
+            "training_contract_frontier_compiled_contract_checksum": str(
+                certificate.get("frontier_compiled_contract_checksum", "")
+            ),
+            "training_contract_frontier_memory_binding_passed": checks["frontier_memory_binding_passed"],
+            "training_contract_frontier_memory_binding_id": str(certificate.get("frontier_memory_binding_id", "")),
+            "training_contract_frontier_memory_binding_fidelity": float(
+                certificate.get("frontier_memory_binding_fidelity", 0.0) or 0.0
+            ),
+            "training_contract_frontier_heldout_gate_passed": checks["frontier_heldout_gate_passed"],
+            "training_contract_frontier_heldout_passed": heldout_passed,
+            "training_contract_frontier_heldout_total": heldout_total,
+            "training_contract_frontier_oracle_score": float(verification.score),
+            "training_contract_frontier_verification_reason": verification.reason,
+        }
+        if not contract["training_contract_frontier_compiled_contract_checksum"]:
+            raise ValueError(f"P10 compiled Frontier proposal {proposal.proposal_id} produced no compiled contract checksum")
+        if not contract["training_contract_frontier_memory_binding_id"]:
+            raise ValueError(f"P10 compiled Frontier proposal {proposal.proposal_id} produced no P4 memory binding id")
+        return task, answer, contract
+
     def _materialize_recursive_improvement_artifact(
         self,
         decision: AcceptanceDecision,
@@ -7004,15 +7183,11 @@ class CortexTrainingPhaseController:
         if not decision.accepted:
             raise ValueError(f"P10 cannot materialize rejected proposal {decision.evaluation.proposal.proposal_id}")
         proposal = decision.evaluation.proposal
-        task = self._recursive_improvement_task(decision, cycle_report, step=step)
-        task_id = str(proposal.patch_payload.get("task_id") or "")
-        if task_id:
-            for failure in cycle_report.regressions:
-                if failure.task.task_id == task_id:
-                    task = failure.task
-                    break
-
-        answer = self.reference_agent(task)
+        task, answer, training_contract = self._recursive_patch_training_contract(
+            decision,
+            cycle_report,
+            step=step,
+        )
         artifact_type_by_kind = {
             ProposalKind.TEST: "verified_regression_test_replay",
             ProposalKind.SKILL_SPEC: "verified_skill_micro_family_seed",
@@ -7046,6 +7221,7 @@ class CortexTrainingPhaseController:
             "rollback_token": decision.evaluation.sandbox.rollback_token,
             "source_task_id": task.task_id,
             "affected_skills": tuple(proposal.affected_skills),
+            "training_contract": training_contract,
         }
         example = self._add_verified_phase_replay(
             "P10",
@@ -7068,6 +7244,7 @@ class CortexTrainingPhaseController:
             "repair_loss_delta": float(model_patch.get("repair_loss_delta", 0.0) or 0.0),
             "protected_loss_delta": float(model_patch.get("protected_loss_delta", 0.0) or 0.0),
             "non_regression_passed": bool(model_patch.get("non_regression_passed")),
+            **training_contract,
         }
         self.recursive_verified_artifacts.append(artifact)
         self._count("recursive_verified_artifact_events")
@@ -7243,14 +7420,11 @@ class CortexTrainingPhaseController:
         if not decision.accepted:
             raise ValueError(f"P10 cannot apply rejected proposal {decision.evaluation.proposal.proposal_id}: {decision.reason}")
         proposal = decision.evaluation.proposal
-        task = self._recursive_improvement_task(decision, cycle_report, step=step)
-        task_id = str(proposal.patch_payload.get("task_id") or "")
-        if task_id:
-            for failure in cycle_report.regressions:
-                if failure.task.task_id == task_id:
-                    task = failure.task
-                    break
-        proposal_answer = self.reference_agent(task)
+        task, proposal_answer, training_contract = self._recursive_patch_training_contract(
+            decision,
+            cycle_report,
+            step=step,
+        )
         repair_batch = self._batch_from_task(task, proposal_answer)
         protected_batches = tuple(self.replay_batches[-4:])
         if not protected_batches:
@@ -7332,6 +7506,7 @@ class CortexTrainingPhaseController:
                     "repair_loss_delta": repair_delta,
                     "protected_loss_delta": protected_delta,
                     "decision_proof": decision_proof,
+                    "training_contract": training_contract,
                 }
                 accepted_report = {
                     "step": step,
@@ -7355,6 +7530,7 @@ class CortexTrainingPhaseController:
                     "protected_loss_tolerance": protected_tolerance,
                     "non_regression_passed": True,
                     "requantized_ternary_core": bool(self.model.config.use_ternary_core),
+                    **training_contract,
                     **decision_proof,
                 }
                 break

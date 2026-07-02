@@ -2,7 +2,7 @@
 
 Etat long-run verifie le 2026-07-01 depuis le run local `runs/cortex3-c4-cuda-large-fullphases-20260630_133618`.
 
-Etat court actualise le 2026-07-02: les corrections C87/C88/C89/C90/C91 ont ete validees par tests courts sans relancer de run long. C87 branche les circuits compiles Frontier dans la memoire cognitive learned avec retention latente et utility credit. C88 aligne P8 sur le vrai dispatch P2 execute par `BitLinear` apres forward. C89 oblige P8 a utiliser un binding P4 pour les circuits compiles meme quand sa memoire est interne. C90 lie les certificats exact-match P5/P8 au target de tache au lieu de la reponse produite. C91 force le FSP P8 generique a comparer ses contrats aux tokens observes depuis la reponse reelle.
+Etat court actualise le 2026-07-02: les corrections C87/C88/C89/C90/C91/C92 ont ete validees par tests courts sans relancer de run long. C87 branche les circuits compiles Frontier dans la memoire cognitive learned avec retention latente et utility credit. C88 aligne P8 sur le vrai dispatch P2 execute par `BitLinear` apres forward. C89 oblige P8 a utiliser un binding P4 pour les circuits compiles meme quand sa memoire est interne. C90 lie les certificats exact-match P5/P8 au target de tache au lieu de la reponse produite. C91 force le FSP P8 generique a comparer ses contrats aux tokens observes depuis la reponse reelle. C92 force les patchs P10 `compiled_frontier` a etre entraines depuis le FastSolve certifie avec binding P4, output-goal et certificat P5 au lieu d'une cible de reference generique.
 
 Ce document explique comment l'architecture Cortex-3 complete agit pendant un entrainement LLM reel. Le but est de separer clairement trois niveaux :
 
@@ -50,6 +50,7 @@ Preuve post-integration des deux nouvelles briques :
 - `tests.test_certificates` et `tests.test_inference` prouvent qu'une mauvaise reponse ne peut plus passer un certificat exact-match en utilisant sa propre sortie comme expected.
 - `tests.test_future_contracts` et `tests.test_inference` prouvent qu'un bloc FSP observe incomplet est rejete et que le P8 generique publie `observed_tokens_source=answer_text` au lieu d'un auto-gate sur `contract.token_ids`.
 - `test_full_cortex_phase_controller_uses_all_modules_during_training` a ete relance apres correction du build CUDA local et passe en test court garde; il verifie les nouveaux champs de retention/utility compiled-circuit et l'architecture P1-P10.
+- `test_full_cortex_phase_controller_uses_all_modules_during_training` verifie maintenant aussi que l'application modele P10 `compiled_frontier` et son artefact replay portent `training_contract_source=compiled_frontier_fastsolve`, le checksum du certificat `compiled_circuit`, le binding memoire P4, la fidelite memoire, l'output-goal accepte et le gate held-out.
 
 Le long run devra produire un nouveau sidecar sous le commit de cette integration pour remplacer l'ancien audit `22/22` par l'audit courant plus strict incluant `native_ternary_cuda_kernel` et `future_output_goal_contracts`.
 
@@ -245,7 +246,7 @@ Correspondance runtime :
 | Attribute Regression | `CausalAttributionEngine` | P6 |
 | Minimal Regrowth | `MinimalRegrowthEngine` + model patch | P7 patch evidence |
 | Sleep / consolidation | `SleepPhaseConsolidator` | P9 replay/synthetic/reservoir |
-| Recursive Improvement | `RecursiveImprovementEngine` + signed model patch | P10 patch evidence |
+| Recursive Improvement | `RecursiveImprovementEngine` + signed model patch | P10 patch evidence + FastSolve/P4/P5 training contract for `compiled_frontier` |
 
 ## Phase 1 - Verifier OS
 
