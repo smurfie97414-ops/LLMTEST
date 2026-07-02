@@ -646,6 +646,88 @@ def anchor_tool(certificate: ShortCertificate) -> ToolVerification:
     return ToolVerification("anchor_fidelity", passed, 1.0 if passed else 0.0, "anchors preserved" if passed else f"missing anchors: {missing}")
 
 
+def _normalized_text(value: Any) -> str:
+    return str(value).strip().lower()
+
+
+def _anchor_values_by_kind(certificate: ShortCertificate, kind: str) -> set[str]:
+    return {str(anchor.value) for anchor in certificate.anchors if str(anchor.kind) == kind}
+
+
+def entity_tracking_tool(certificate: ShortCertificate) -> ToolVerification:
+    tool_name = "entity_tracking"
+    if certificate.skill != "entity_tracking":
+        return ToolVerification(tool_name, False, 0.0, "certificate skill is not entity_tracking")
+    args = dict(certificate.tool_args)
+    claims = dict(certificate.claims)
+    kind = str(args.get("kind", claims.get("kind", "")))
+    expected = str(args.get("expected", claims.get("final_answer", "")))
+    if not expected:
+        return ToolVerification(tool_name, False, 0.0, "missing expected final entity state")
+    if _normalized_text(certificate.answer) != _normalized_text(expected):
+        return ToolVerification(tool_name, False, 0.0, f"expected {expected!r}, got {certificate.answer!r}")
+    if str(claims.get("final_answer", expected)) != expected:
+        return ToolVerification(tool_name, False, 0.0, "claimed final answer does not match expected")
+    if str(claims.get("ask_kind", args.get("ask_kind", ""))) != str(args.get("ask_kind", "")):
+        return ToolVerification(tool_name, False, 0.0, "ask kind mismatch")
+
+    if kind == "transfer_chain":
+        required = ("starter", "carrier", "final_holder", "item")
+        missing = [key for key in required if not str(args.get(key, ""))]
+        if missing:
+            return ToolVerification(tool_name, False, 0.0, f"missing transfer fields: {missing}")
+        starter = str(args["starter"])
+        carrier = str(args["carrier"])
+        final_holder = str(args["final_holder"])
+        item = str(args["item"])
+        if expected != final_holder:
+            return ToolVerification(tool_name, False, 0.0, "expected answer is not final_holder")
+        if final_holder not in _anchor_values_by_kind(certificate, "person") or item not in _anchor_values_by_kind(certificate, "item"):
+            return ToolVerification(tool_name, False, 0.0, "missing final-holder or item anchor")
+        chain = tuple(dict(step) for step in claims.get("transfer_chain", ()))
+        expected_steps = (
+            {"event": "initial_holder", "holder": starter, "item": item},
+            {"event": "handoff", "from": starter, "to": carrier, "item": item},
+            {"event": "handoff", "from": carrier, "to": final_holder, "item": item},
+        )
+        if len(chain) < len(expected_steps):
+            return ToolVerification(tool_name, False, 0.0, "missing transfer-chain proof steps")
+        for expected_step, provided in zip(expected_steps, chain):
+            for key, value in expected_step.items():
+                if str(provided.get(key)) != str(value):
+                    return ToolVerification(tool_name, False, 0.0, f"transfer step {expected_step['event']!r} mismatch on {key!r}")
+        distractor = dict(claims.get("distractor") or {})
+        if str(distractor.get("touches_item", "false")).lower() not in {"false", "0"}:
+            return ToolVerification(tool_name, False, 0.0, "distractor is claimed to touch the item")
+        if str(distractor.get("person", args.get("distractor", ""))) != str(args.get("distractor", "")):
+            return ToolVerification(tool_name, False, 0.0, "distractor person mismatch")
+        return ToolVerification(tool_name, True, 1.0, "entity transfer-chain certificate verified")
+
+    if kind == "location_chain":
+        required = ("person", "start", "middle", "final")
+        missing = [key for key in required if not str(args.get(key, ""))]
+        if missing:
+            return ToolVerification(tool_name, False, 0.0, f"missing location fields: {missing}")
+        person = str(args["person"])
+        final = str(args["final"])
+        if expected != final:
+            return ToolVerification(tool_name, False, 0.0, "expected answer is not final location")
+        if person not in _anchor_values_by_kind(certificate, "person") or final not in _anchor_values_by_kind(certificate, "location"):
+            return ToolVerification(tool_name, False, 0.0, "missing person or final-location anchor")
+        path = tuple(str(value) for value in claims.get("location_path", ()))
+        expected_path = (str(args["start"]), str(args["middle"]), final)
+        if path != expected_path:
+            return ToolVerification(tool_name, False, 0.0, "location path does not match task transition chain")
+        distractor = dict(claims.get("distractor") or {})
+        if str(distractor.get("person", args.get("other", ""))) != str(args.get("other", "")):
+            return ToolVerification(tool_name, False, 0.0, "distractor person mismatch")
+        if str(distractor.get("place", args.get("distractor", ""))) != str(args.get("distractor", "")):
+            return ToolVerification(tool_name, False, 0.0, "distractor place mismatch")
+        return ToolVerification(tool_name, True, 1.0, "entity location-chain certificate verified")
+
+    return ToolVerification(tool_name, False, 0.0, f"unsupported entity tracking kind {kind!r}")
+
+
 def exact_match_tool(certificate: ShortCertificate) -> ToolVerification:
     expected = certificate.tool_args.get("expected")
     passed = expected is None or str(expected) == certificate.answer
@@ -789,6 +871,7 @@ def default_tool_registry() -> ToolVerifierRegistry:
     registry.register("arithmetic", arithmetic_tool)
     registry.register("anchor_fidelity", anchor_tool)
     registry.register("compiled_circuit", compiled_circuit_tool)
+    registry.register("entity_tracking", entity_tracking_tool)
     registry.register("exact_match", exact_match_tool)
     registry.register("model_token_certificate", model_token_certificate_tool)
     registry.register("sympy_symbolic", sympy_symbolic_tool)
@@ -1070,7 +1153,87 @@ def certificate_contract_for_task(task: Task, answer: str, certificate_type: Cer
             },
             tuple(task.anchors),
         )
-    if task.skill in {"long_context_anchor", "entity_tracking"}:
+    if task.skill == "entity_tracking":
+        meta = dict(task.metadata)
+        kind = str(meta.get("kind", ""))
+        expected = expected_answer
+        if kind == "transfer_chain":
+            claims = {
+                "kind": kind,
+                "ask_kind": str(meta.get("ask_kind", "final_holder")),
+                "final_answer": expected,
+                "transfer_chain": (
+                    {
+                        "event": "initial_holder",
+                        "holder": str(meta.get("starter", "")),
+                        "item": str(meta.get("item", "")),
+                        "place": str(meta.get("start_place", "")),
+                    },
+                    {
+                        "event": "handoff",
+                        "from": str(meta.get("starter", "")),
+                        "to": str(meta.get("carrier", "")),
+                        "item": str(meta.get("item", "")),
+                    },
+                    {
+                        "event": "handoff",
+                        "from": str(meta.get("carrier", "")),
+                        "to": str(meta.get("final_holder", expected)),
+                        "item": str(meta.get("item", "")),
+                    },
+                ),
+                "distractor": {
+                    "person": str(meta.get("distractor", "")),
+                    "place": str(meta.get("distractor_place", "")),
+                    "touches_item": False,
+                },
+                "verification": "tool checks final holder, item anchor, transfer steps and distractor non-contact",
+            }
+            tool_args = {
+                "kind": kind,
+                "ask_kind": str(meta.get("ask_kind", "final_holder")),
+                "expected": expected,
+                "starter": str(meta.get("starter", "")),
+                "carrier": str(meta.get("carrier", "")),
+                "final_holder": str(meta.get("final_holder", expected)),
+                "distractor": str(meta.get("distractor", "")),
+                "item": str(meta.get("item", "")),
+            }
+        else:
+            claims = {
+                "kind": "location_chain",
+                "ask_kind": str(meta.get("ask_kind", "final_location")),
+                "final_answer": expected,
+                "target_person": str(meta.get("person", "")),
+                "location_path": (
+                    str(meta.get("start", "")),
+                    str(meta.get("middle", "")),
+                    str(meta.get("final", expected)),
+                ),
+                "distractor": {
+                    "person": str(meta.get("other", "")),
+                    "place": str(meta.get("distractor", "")),
+                },
+                "verification": "tool checks target person, ordered location path, final-location anchor and distractor",
+            }
+            tool_args = {
+                "kind": "location_chain",
+                "ask_kind": str(meta.get("ask_kind", "final_location")),
+                "expected": expected,
+                "person": str(meta.get("person", "")),
+                "other": str(meta.get("other", "")),
+                "start": str(meta.get("start", "")),
+                "middle": str(meta.get("middle", "")),
+                "final": str(meta.get("final", expected)),
+                "distractor": str(meta.get("distractor", "")),
+            }
+        return (
+            claims,
+            "entity_tracking",
+            tool_args,
+            tuple(task.anchors),
+        )
+    if task.skill == "long_context_anchor":
         return (
             {
                 "anchors_used": [asdict(anchor) for anchor in task.anchors],

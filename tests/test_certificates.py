@@ -25,6 +25,7 @@ from cortex3_certificates import (
     code_unit_test_tool,
     compiled_circuit_tool,
     default_tool_registry,
+    entity_tracking_tool,
     evaluate_certificate_efficiency,
     exact_match_tool,
     model_token_certificate_tool,
@@ -188,6 +189,77 @@ class CertificatesTest(unittest.TestCase):
 
         self.assertEqual(tool_args["expected"], "OK")
         self.assertFalse(exact_match_tool(cert).passed)
+
+    def test_entity_tracking_certificate_verifies_transfer_chain_not_only_anchor_presence(self):
+        state = _latent_state()
+        task = Task(
+            "entity-transfer-cert",
+            "entity_tracking",
+            "Read the story and answer only with the person holding the badge at the end.",
+            "Sofia",
+            {
+                "kind": "transfer_chain",
+                "starter": "Mira",
+                "carrier": "Noah",
+                "final_holder": "Sofia",
+                "final": "Sofia",
+                "distractor": "Eli",
+                "distractor_place": "archive",
+                "item": "badge",
+                "start_place": "atelier",
+                "carrier_place": "gare",
+                "ask_kind": "final_holder",
+            },
+            (Anchor("person", "Sofia", "entity-transfer-cert"), Anchor("item", "badge", "entity-transfer-cert")),
+        )
+        claims, tool, tool_args, anchors = certificate_contract_for_task(task, "Sofia")
+        cert = build_certificate(
+            certificate_id="cert-entity-transfer",
+            task_id=task.task_id,
+            skill=task.skill,
+            certificate_type=CertificateType.ANCHOR_FIDELITY,
+            answer="Sofia",
+            claims=claims,
+            uncertainty=0.05,
+            latent_state=state,
+            anchors=anchors,
+            tool=tool,
+            tool_args=tool_args,
+        )
+
+        self.assertEqual(tool, "entity_tracking")
+        self.assertTrue(CertificateVerifier().verify(cert, state).passed)
+        self.assertTrue(entity_tracking_tool(cert).passed)
+
+        wrong_answer = ShortCertificate(
+            certificate_id=cert.certificate_id,
+            task_id=cert.task_id,
+            skill=cert.skill,
+            certificate_type=cert.certificate_type,
+            answer="Noah",
+            claims=cert.claims,
+            uncertainty=cert.uncertainty,
+            latent_state_checksum=cert.latent_state_checksum,
+            anchors=cert.anchors,
+            tool=cert.tool,
+            tool_args=cert.tool_args,
+        )
+        tampered_chain = ShortCertificate(
+            certificate_id=cert.certificate_id,
+            task_id=cert.task_id,
+            skill=cert.skill,
+            certificate_type=cert.certificate_type,
+            answer=cert.answer,
+            claims={**dict(cert.claims), "transfer_chain": tuple(dict(step, to="Noah") for step in cert.claims["transfer_chain"])},
+            uncertainty=cert.uncertainty,
+            latent_state_checksum=cert.latent_state_checksum,
+            anchors=cert.anchors,
+            tool=cert.tool,
+            tool_args=cert.tool_args,
+        )
+
+        self.assertFalse(entity_tracking_tool(wrong_answer).passed)
+        self.assertFalse(entity_tracking_tool(tampered_chain).passed)
 
     def test_code_certificate_runs_real_unit_tests(self):
         state = _latent_state()
@@ -607,7 +679,7 @@ class CertificatesTest(unittest.TestCase):
 
     def test_default_registry_contains_required_tools(self):
         registry = default_tool_registry()
-        self.assertEqual(set(registry.names), {"algebra_linear", "anchor_fidelity", "arithmetic", "code_tests", "compiled_circuit", "exact_match", "model_token_certificate", "sympy_symbolic"})
+        self.assertEqual(set(registry.names), {"algebra_linear", "anchor_fidelity", "arithmetic", "code_tests", "compiled_circuit", "entity_tracking", "exact_match", "model_token_certificate", "sympy_symbolic"})
 
     def test_cycle_run_artifacts_can_include_short_certificates(self):
         state = _latent_state()

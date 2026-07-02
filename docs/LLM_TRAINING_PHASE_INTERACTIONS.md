@@ -444,6 +444,7 @@ La phase cree :
 - une verification par outil ;
 - une verification algebrique lineaire multi-step ;
 - une verification symbolique SymPy de racines quadratiques exactes ;
+- une verification entity-tracking de chaine de transfert/lieux avec distracteurs et ancres ;
 - une verification code visible/cachee/proprietes ;
 - une random de-latentization probe ;
 - une mesure d'efficacite certificat vs raisonnement visible.
@@ -459,7 +460,7 @@ P5 alimente :
 
 ### Impact Apprentissage
 
-Le modele possede un `LatentReasoningWorkspace` et une `CertificateHead` dans le forward. Le workspace execute plusieurs pas latents, renvoie un feedback dans les hidden states avant logits/MTP/certificat, puis `latent_workspace_loss` lie son resume a l'etat latent de certificat. Le loss de certificat pousse la tete a produire une reponse finale et une incertitude coherente. P5 materialise maintenant cette sortie en `ShortCertificate` verifie par checksum latent, coherence token (`model_token_certificate`) et claims de binding workspace, puis persiste l'artefact dans le rapport et les checkpoints. Les certificats algebre/code sont des preuves outil plus fortes: lineaire multi-step, solveur symbolique SymPy pour quadratiques exactes, tests code visibles/caches/proprietes. Le certificat symbolique cree aussi un replay P5 verifie, donc le solveur specialise agit sur le corpus de replay au lieu de rester un audit separe.
+Le modele possede un `LatentReasoningWorkspace` et une `CertificateHead` dans le forward. Le workspace execute plusieurs pas latents, renvoie un feedback dans les hidden states avant logits/MTP/certificat, puis `latent_workspace_loss` lie son resume a l'etat latent de certificat. Le loss de certificat pousse la tete a produire une reponse finale et une incertitude coherente. P5 materialise maintenant cette sortie en `ShortCertificate` verifie par checksum latent, coherence token (`model_token_certificate`) et claims de binding workspace, puis persiste l'artefact dans le rapport et les checkpoints. Les certificats algebre/entity/code sont des preuves outil plus fortes: lineaire multi-step, solveur symbolique SymPy pour quadratiques exactes, chaine entity-tracking avec distracteurs et ancres, tests code visibles/caches/proprietes. Le certificat symbolique cree aussi un replay P5 verifie, donc le solveur specialise agit sur le corpus de replay au lieu de rester un audit separe.
 
 ## Phase 6 - Causal Attribution
 
