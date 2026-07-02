@@ -217,11 +217,32 @@ class RecursiveImprovementTest(unittest.TestCase):
                 "aggregate_score": 1.0,
             },
             "dsv": {"passed": 1, "total": 1},
+            "fastsolve": {
+                "circuit_id": "sleep-circuit",
+                "task_id": "sleep-arith-1",
+                "skill": "arithmetic",
+                "verified": True,
+                "frontier_compiled_selected": True,
+                "frontier_compiled_verified": True,
+                "frontier_output_goal_contract_passed": True,
+                "frontier_output_goal_contract": {"accepted": True, "task_id": "sleep-arith-1"},
+                "frontier_compiled_contract_verified": True,
+                "frontier_compiled_contract_checksum": "sleep-compiled-checksum",
+                "heldout_gate_passed": True,
+                "heldout_passed": 1,
+                "heldout_total": 1,
+                "frontier_memory_binding_id": "sleep-memory-binding",
+                "frontier_memory_binding_passed": True,
+                "frontier_memory_binding_fidelity": 1.0,
+            },
         }
 
         accepted = ProposalGenerator().from_sleep_frontier_circuits((base_circuit,))
         rejected = ProposalGenerator().from_sleep_frontier_circuits((
             {**base_circuit, "training": {**base_circuit["training"], "sleep_filter_accepted": False}},
+        ))
+        missing_fastsolve = ProposalGenerator().from_sleep_frontier_circuits((
+            {key: value for key, value in base_circuit.items() if key != "fastsolve"},
         ))
 
         self.assertEqual(len(accepted), 1)
@@ -232,7 +253,14 @@ class RecursiveImprovementTest(unittest.TestCase):
         self.assertTrue(payload["sleep_calibration_ok"])
         self.assertEqual(payload["sleep_source_origins"], ("failure_replay",))
         self.assertEqual(payload["sleep_filter_metrics"]["origin_counts"]["failure_replay"], 1)
+        self.assertTrue(payload["sleep_fastsolve_verified"])
+        self.assertTrue(payload["frontier_output_goal_contract_passed"])
+        self.assertTrue(payload["frontier_compiled_contract_verified"])
+        self.assertTrue(payload["frontier_compiled_contract_checksum"])
+        self.assertTrue(payload["frontier_memory_binding_passed"])
+        self.assertEqual(payload["frontier_memory_binding_id"], "sleep-memory-binding")
         self.assertEqual(rejected, ())
+        self.assertEqual(missing_fastsolve, ())
 
     def test_gate_rejects_protected_skill_regression(self):
         verifier = _verifier()

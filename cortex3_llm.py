@@ -6754,24 +6754,56 @@ class CortexTrainingPhaseController:
             )
             fastsolve_reports.append(
                 {
+                    "circuit_id": circuit_id,
                     "task_id": task.task_id,
                     "skill": task.skill,
                     "answer": answer.text,
                     "verified": verification.passed,
+                    "frontier_compiled_selected": bool(answer.raw.get("frontier_compiled_selected", False)),
+                    "frontier_compiled_verified": bool(
+                        answer.raw.get("frontier_compiled_verified", False)
+                        or answer.certificate.get("frontier_verification_passed", False)
+                    ),
+                    "frontier_output_goal_contract_passed": bool(
+                        answer.certificate.get("frontier_output_goal_contract_passed", False)
+                    ),
+                    "frontier_output_goal_contract": dict(
+                        answer.certificate.get("frontier_output_goal_contract") or {}
+                    ),
                     "frontier_compiled_contract_verified": bool(
                         answer.certificate.get("frontier_compiled_contract_verified", False)
+                    ),
+                    "frontier_compiled_contract_checksum": str(
+                        answer.certificate.get("frontier_compiled_contract_checksum", "")
                     ),
                     "heldout_gate_passed": bool(runtime_circuit.report.heldout.get("gate_passed", False)),
                     "heldout_passed": int(runtime_circuit.report.heldout.get("passed", 0)),
                     "heldout_total": int(runtime_circuit.report.heldout.get("total", 0)),
                     "memory_binding": memory_binding_report,
+                    "frontier_memory_binding_id": str(answer.certificate.get("frontier_memory_binding_id", "")),
                     "frontier_memory_binding_passed": bool(answer.certificate.get("frontier_memory_binding_passed", False)),
+                    "frontier_memory_binding_fidelity": float(
+                        answer.certificate.get("frontier_memory_binding_fidelity", 0.0) or 0.0
+                    ),
                 }
             )
         if not fastsolve_reports:
             raise ValueError("P9 sleep Frontier circuits compiled but no runtime FastSolve task was verified")
+        fastsolve_by_circuit_id = {
+            str(item.get("circuit_id", "")): dict(item)
+            for item in fastsolve_reports
+            if str(item.get("circuit_id", ""))
+        }
+        enriched_circuits: list[dict[str, Any]] = []
+        for circuit_payload in tuple(payload.get("circuits", ())):
+            circuit_data = dict(circuit_payload)
+            fastsolve = fastsolve_by_circuit_id.get(compiled_circuit_id(circuit_data))
+            if fastsolve is not None:
+                circuit_data["fastsolve"] = fastsolve
+            enriched_circuits.append(circuit_data)
         final_payload = {
             **payload,
+            "circuits": tuple(enriched_circuits),
             "registry_path": str(registry_path),
             "fastsolve": tuple(fastsolve_reports),
         }

@@ -10,6 +10,8 @@ C98 renforce P4 sans run long: les credits `MemoryUtilityCredit` issus de `learn
 
 C99 renforce P10 sans run long: `RewardHackingDetector` detecte maintenant les manipulations de comptabilite de cout et les reponses non vides/passees a cout effectif nul, donc une proposition ne peut plus fabriquer une amelioration Pareto en cachant son cout d'execution.
 
+C100-C106 renforcent les ponts structurels sans run long: les ancres de transfert P1 deviennent exploitables par P4, P3 rejette les fuites internes/output-goal interdits, P5 certifie les chaines entity-tracking, P6 apprend par intervention exacte, P9 bloque les promotions sleep sans preuve anti-collapse globale, P10 refuse les reparations Frontier incompletes, et les circuits P9 sleep-promoted doivent maintenant porter leur preuve FastSolve/P4/P5/output-goal avant toute proposition P10.
+
 Ce document explique comment l'architecture Cortex-3 complete agit pendant un entrainement LLM reel. Le but est de separer clairement trois niveaux :
 
 - **present dans le code** : un module existe.
@@ -634,7 +636,7 @@ P9 construit :
 - gate dur anti-collapse/diversite/calibration avant toute compilation Frontier sleep ;
 - verification held-out separee ;
 - FastSolve immediat via `CompiledFrontierAgent` ;
-- proposition P10 `compiled_frontier` issue du sommeil.
+- proposition P10 `compiled_frontier` issue du sommeil seulement si le circuit transporte aussi sa preuve FastSolve runtime : oracle, output-goal, certificat compile et binding memoire P4.
 
 Le filtre rejette les exemples qui menacent :
 
@@ -692,6 +694,7 @@ P10 est la boucle d'amelioration recursive au-dessus des autres phases :
 - P2 est requantifie apres patch ;
 - P9 peut consolider l'effet.
 - les runs suivants peuvent repartir d'une archive P10 deja peuplee sans reprendre le checkpoint, ce qui garde la pression de diversite et l'historique rollback actifs entre runs independants.
+- les propositions `compiled_frontier` venues de P7 ou P9 sont bloquees avant sandbox si leur preuve FastSolve/P4/P5/output-goal est incomplete.
 
 ### Impact Apprentissage
 
@@ -699,7 +702,7 @@ P10 agit par :
 
 - replay P10 ;
 - patch direct des poids ;
-- proposition `compiled_frontier` uniquement depuis un payload P7/Frontier deja prouve par FastSolve, P4, P5, output-goal et held-out ;
+- proposition `compiled_frontier` uniquement depuis un payload P7/Frontier ou P9/sleep deja prouve par FastSolve, P4, P5, output-goal et held-out ;
 - rollback executable des poids si un patch signe doit etre retire : verification du checksum post-patch, restauration des tensors pre-patch, puis requantification du coeur ternaire ;
 - archive evolutive durable, strictement restauree sans `fallback_score`, qui influence les gates de diversite des runs suivants ;
 - evolution multi-generation bornee depuis des parents acceptes, avec lineage et pression vers les types de propositions sous-representes ;

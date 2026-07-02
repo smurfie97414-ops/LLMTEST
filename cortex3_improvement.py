@@ -450,6 +450,30 @@ class ProposalGenerator:
             heldout_passed = int(heldout.get("passed", 0) or 0)
             if heldout_total <= 0 or heldout_passed < heldout_total or not bool(heldout.get("gate_passed", False)):
                 continue
+            fastsolve = dict(payload.get("fastsolve") or {})
+            fastsolve_heldout_total = int(fastsolve.get("heldout_total", 0) or 0)
+            fastsolve_heldout_passed = int(fastsolve.get("heldout_passed", 0) or 0)
+            output_goal_contract = dict(fastsolve.get("frontier_output_goal_contract") or {})
+            compiled_contract_checksum = str(fastsolve.get("frontier_compiled_contract_checksum", ""))
+            memory_binding_id = str(fastsolve.get("frontier_memory_binding_id", ""))
+            if not (
+                bool(fastsolve.get("verified"))
+                and bool(fastsolve.get("frontier_compiled_selected"))
+                and bool(fastsolve.get("frontier_compiled_verified"))
+                and bool(fastsolve.get("heldout_gate_passed"))
+                and fastsolve_heldout_total > 0
+                and fastsolve_heldout_passed == fastsolve_heldout_total
+                and fastsolve_heldout_passed == heldout_passed
+                and fastsolve_heldout_total == heldout_total
+                and bool(fastsolve.get("frontier_output_goal_contract_passed"))
+                and bool(output_goal_contract.get("accepted"))
+                and bool(fastsolve.get("frontier_compiled_contract_verified"))
+                and bool(compiled_contract_checksum)
+                and bool(fastsolve.get("frontier_memory_binding_passed"))
+                and bool(memory_binding_id)
+                and float(fastsolve.get("frontier_memory_binding_fidelity", 0.0) or 0.0) > 0.0
+            ):
+                continue
             skill = str(payload.get("skill") or "")
             task_ids = tuple(str(item) for item in payload.get("frontier_task_ids", ()))
             if not skill or not task_ids:
@@ -493,11 +517,23 @@ class ProposalGenerator:
                     "sleep_calibration_gap_delta": float(training.get("sleep_calibration_gap_delta", 0.0) or 0.0),
                     "sleep_accepted_examples": int(training.get("sleep_accepted_examples", 0) or 0),
                     "sleep_support_examples": int(training.get("sleep_support_examples", 0) or 0),
+                    "sleep_fastsolve_task_id": str(fastsolve.get("task_id", "")),
+                    "sleep_fastsolve_verified": True,
+                    "frontier_compiled_selected": True,
                     "frontier_compiled_verified": True,
                     "frontier_heldout_gate_passed": True,
                     "frontier_heldout_passed": heldout_passed,
                     "frontier_heldout_total": heldout_total,
                     "frontier_heldout_pass_rate": float(heldout.get("pass_rate", 0.0) or 0.0),
+                    "frontier_output_goal_contract_passed": True,
+                    "frontier_output_goal_contract": output_goal_contract,
+                    "frontier_compiled_contract_verified": True,
+                    "frontier_compiled_contract_checksum": compiled_contract_checksum,
+                    "frontier_memory_binding_id": memory_binding_id,
+                    "frontier_memory_binding_passed": True,
+                    "frontier_memory_binding_fidelity": float(
+                        fastsolve.get("frontier_memory_binding_fidelity", 0.0) or 0.0
+                    ),
                     "frontier_dsv_passed": int(dsv.get("passed", 0) or 0),
                     "frontier_dsv_total": int(dsv.get("total", 0) or 0),
                     "source_kind": "sleep_consolidation",

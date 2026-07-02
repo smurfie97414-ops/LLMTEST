@@ -3897,6 +3897,16 @@ class LLMPretrainingHarnessTest(unittest.TestCase):
             sleep_circuit = latest_sleep_frontier["circuits"][0]
             self.assertEqual(sleep_circuit["training"]["source_kind"], "sleep_consolidation")
             self.assertTrue(sleep_circuit["heldout"]["gate_passed"], sleep_circuit)
+            self.assertTrue(sleep_circuit["fastsolve"]["verified"], sleep_circuit)
+            self.assertTrue(sleep_circuit["fastsolve"]["frontier_compiled_selected"], sleep_circuit)
+            self.assertTrue(sleep_circuit["fastsolve"]["frontier_compiled_verified"], sleep_circuit)
+            self.assertTrue(sleep_circuit["fastsolve"]["frontier_output_goal_contract_passed"], sleep_circuit)
+            self.assertTrue(sleep_circuit["fastsolve"]["frontier_output_goal_contract"]["accepted"], sleep_circuit)
+            self.assertTrue(sleep_circuit["fastsolve"]["frontier_compiled_contract_verified"], sleep_circuit)
+            self.assertTrue(sleep_circuit["fastsolve"]["frontier_compiled_contract_checksum"], sleep_circuit)
+            self.assertTrue(sleep_circuit["fastsolve"]["frontier_memory_binding_passed"], sleep_circuit)
+            self.assertTrue(sleep_circuit["fastsolve"]["frontier_memory_binding_id"], sleep_circuit)
+            self.assertGreater(sleep_circuit["fastsolve"]["frontier_memory_binding_fidelity"], 0.0, sleep_circuit)
             self.assertTrue(phase_report["frontier_repair_candidates"], phase_report)
             model_backed_phase_events = [
                 event
